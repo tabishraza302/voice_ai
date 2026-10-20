@@ -1,0 +1,87 @@
+[project]
+name = "voice-ai"
+version = "0.1.0"
+description = "Fully local, air-gapped English + Hindi voice agent with an AI-observability layer."
+readme = "README.md"
+requires-python = ">=3.12"
+
+# Every version is pinned exactly. Rationale (see AGENTS.md): this project is
+# measured, not vibe-coded — the WER/latency numbers in the README are only
+# reproducible against these exact versions.
+dependencies = [
+    # Orchestration. `runner` brings the dev runner AND pipecat-ai-prebuilt
+    # (the browser client at /client). `kokoro` = default TTS. `webrtc` =
+    # SmallWebRTCTransport. `tracing` = OpenTelemetry.
+    # `whisper` is here only to make pipecat.services.whisper.stt importable:
+    # that module does `from faster_whisper import WhisperModel` at module
+    # level, even though WhisperSTTServiceMLX never calls it (it sets
+    # engine="mlx" and uses mlx-whisper for inference). Without the extra,
+    # the module raises ImportError and the whole mlx-whisper STT backend
+    # is unreachable. faster-whisper is never invoked on this path.
+    # NOT `local-smart-turn`: LocalSmartTurnAnalyzerV3 runs the bundled
+    # smart-turn-v3.2-cpu.onnx through onnxruntime (a base dependency) and
+    # needs no torch, no transformers and no model download. That extra would
+    # pull torch + coremltools (~3 GB) for nothing.
+    # `cli` is NOT taken as an extra on purpose: it pulls ruff and
+    # pipecat-ai-context-hub, which drags in chromadb and kubernetes.
+    # The eval harness only needs the CLI's own dependencies, and the
+    # `dev` extra below pins exactly those, so `python -m pipecat.evals`
+    # works without a 40 MB dependency tree.
+    "pipecat-ai[kokoro,runner,webrtc,tracing,whisper]==1.13.0",
+    # The browser client. Already a transitive dep of the `runner` extra;
+    # pinned here so the lockfile is exact.
+    "pipecat-ai-prebuilt==1.3.0",
+    # STT runtime: NVIDIA Nemotron 3.5 ASR Streaming 0.6B via MLX, served
+    # over its OpenAI-compatible HTTP API. `server` = the FastAPI server,
+    # `stt` = sentencepiece + zstandard for the tokenizer.
+    "mlx-audio[server,stt]==0.5.9",
+    # The English-tier STT and the A/B baseline for the WER harness.
+    "mlx-whisper==0.4.3",
+    # Observability.
+    "prometheus-client==0.26.0",
+    "opentelemetry-sdk==1.39.1",
+    "opentelemetry-exporter-otlp-proto-grpc==1.39.1",
+    # Quality harness.
+    "jiwer==4.0.0",
+    "whisper-normalizer==0.1.15",
+    "indic-nlp-library==0.92",
+    "datasets[audio]==4.4.1",
+    # Audio I/O. NOTE: these are pinned to the ranges pipecat-ai itself
+    # requires (soundfile~=0.13.1, soxr~=1.0.0). Newer majors are
+    # incompatible with pipecat-ai 1.13.0 and will not resolve.
+    "soundfile==0.13.1",
+    "soxr==1.0.0",
+    # Runtime introspection for the memory baseline and the memory gauge.
+    "psutil==7.1.3",
+    # Settings.
+    "pydantic-settings==2.12.0",
+]
+
+[project.optional-dependencies]
+# Optional swap backends (see the "Swappable layers" section of the plan).
+# Kept out of the default install because several pull torch.
+swaps = [
+    "pipecat-ai[mlx-whisper,funasr,pocket-tts,openai]==1.13.0",
+]
+dev = [
+    "pytest==9.0.1",
+    "pytest-asyncio==1.3.0",
+    # What `python -m pipecat.evals` (the eval harness) needs. The
+    # `cli` extra would also work but pulls ruff, chromadb and
+    # kubernetes; these four are what the eval command actually
+    # imports.
+    "typer==0.27.3",
+    "rich==15.0.0",
+    "jinja2==3.1.6",
+    "questionary==2.1.1",
+]
+
+[tool.uv]
+# Not an installable library: a runnable project. `uv run python -m bot.bot`.
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
+asyncio_mode = "auto"

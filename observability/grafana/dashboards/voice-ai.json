@@ -1,0 +1,396 @@
+{
+  "title": "voice-ai",
+  "uid": "voice-ai",
+  "tags": [
+    "voice-ai"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "editable": true,
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "End-to-end user to bot latency (p50 / p95)",
+      "description": "The SLO metric: from the user stopping speaking to the bot starting to speak. This is the number a user feels.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(voice_user_bot_latency_seconds_bucket[5m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(voice_user_bot_latency_seconds_bucket[5m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(voice_user_bot_latency_seconds_bucket[5m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1.5
+              },
+              {
+                "color": "red",
+                "value": 2.0
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "TTFB by service (p95)",
+      "description": "Diagnosis: which stage of the pipeline is slow. Not the SLO - see panel 1 for that.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, processor) (rate(voice_turn_ttfb_seconds_bucket[5m])))",
+          "legendFormat": "{{processor}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "TTFA (time to first audio) by service",
+      "description": "TTFB plus any silence the TTS pads on. A gap between TTFB and TTFA is silence, not slowness.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 8
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, processor) (rate(voice_turn_ttfa_seconds_bucket[5m])))",
+          "legendFormat": "{{processor}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "TTFAT (time to first answer token)",
+      "description": "How long the LLM took to produce its first answer token. Includes any reasoning time.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 8
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, processor) (rate(voice_turn_ttfat_seconds_bucket[5m])))",
+          "legendFormat": "{{processor}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Text aggregation latency",
+      "description": "Time from the first LLM token to the first complete sentence - the cost of waiting for a sentence before speaking it.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 8
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, processor) (rate(voice_text_aggregation_seconds_bucket[5m])))",
+          "legendFormat": "{{processor}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Resident memory by component",
+      "description": "The 16 GB guard. The python series is the agent; the others are the observability stack.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "targets": [
+        {
+          "expr": "voice_process_resident_memory_bytes",
+          "legendFormat": "{{component}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 10000000000
+              },
+              {
+                "color": "red",
+                "value": 12000000000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "LLM token rate",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "targets": [
+        {
+          "expr": "sum by (kind) (rate(voice_llm_tokens_total[5m]))",
+          "legendFormat": "{{kind}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "tps"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "STT audio seconds and TTS characters",
+      "description": "How much audio went in and how much text came out. A rising STT seconds with flat TTS characters means the bot is being interrupted.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "targets": [
+        {
+          "expr": "sum by (model) (rate(voice_stt_audio_seconds_total[5m]))",
+          "legendFormat": "STT {{model}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (model) (rate(voice_tts_characters_total[5m]))",
+          "legendFormat": "TTS {{model}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "Turns interrupted",
+      "description": "How often the user interrupts the bot. A rising count with rising latency usually means the bot is talking too long.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 24
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(voice_turn_interrupted_total[1h]))",
+          "legendFormat": "interrupts",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "Agent up",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 24
+      },
+      "targets": [
+        {
+          "expr": "up{job=\"voice-agent\"}",
+          "legendFormat": "up",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "DOWN",
+                  "color": "red"
+                },
+                "1": {
+                  "text": "UP",
+                  "color": "green"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Service processing time (p95)",
+      "description": "How long each service worked on a turn, end to end. TTFB and TTFAT measure the wait; this measures the work.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 32
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, processor) (rate(voice_service_processing_seconds_bucket[5m])))",
+          "legendFormat": "{{processor}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    }
+  ]
+}

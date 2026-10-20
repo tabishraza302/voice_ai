@@ -1,0 +1,84 @@
+# The OpenTelemetry collector: OTLP in, Phoenix and Prometheus out.
+#
+# One upstream change bites here: since collector v0.123.0 the
+# `service.telemetry.metrics.address` setting is **ignored**. The
+# self-metrics must be declared with the `readers:` pull form instead,
+# or the collector exports nothing about itself. The port stays 8888
+# because that is the pull reader's default.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Must be first: it sheds load before anything else allocates.
+  # `check_interval` must be greater than zero: collector v0.163.1
+  # rejects the processor without it, and the error is only in the
+  # container's log, not on the host.
+  memory_limiter:
+    limit_mib: 256
+    spike_limit_mib: 64
+    check_interval: 1s
+  resource:
+    attributes:
+      - key: service.namespace
+        value: voice-ai
+        action: upsert
+      # Phoenix files a trace under the project named by the
+      # OpenInference resource attribute `openinference.project.name`,
+      # NOT by `service.name` — with only the latter, every trace lands
+      # in Phoenix's "default" project. The collector is the Phoenix
+      # boundary, so the name belongs here rather than in the agent.
+      - key: openinference.project.name
+        value: voice-ai
+        action: upsert
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+exporters:
+  # The host's Phoenix, over OTLP/HTTP. Phoenix runs on the host
+  # because Docker Desktop's VM is capped at 1.93 GB here and the other
+  # projects' stacks already hold most of it — see docker-compose.yml.
+  #
+  # OTLP/HTTP rather than gRPC: Phoenix's gRPC receiver wants port 4317,
+  # and the `hear_help` stack already holds it on this host. Phoenix
+  # serves OTLP/HTTP on the same port as its UI, so 6006 works.
+  #
+  # The endpoint is the *root*: the exporter appends `/v1/traces` itself,
+  # and a full path here becomes `/v1/traces/v1/traces` (405).
+  otlp_http/phoenix:
+    endpoint: http://host.docker.internal:6006
+    tls:
+      insecure: true
+    sending_queue:
+      enabled: true
+    retry_on_failure:
+      enabled: true
+  prometheus:
+    endpoint: 0.0.0.0:9464
+    enable_open_metrics: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlp_http/phoenix]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [prometheus]
+  telemetry:
+    metrics:
+      # The pull form. `address:` is ignored since v0.123.0.
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888

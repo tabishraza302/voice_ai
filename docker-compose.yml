@@ -1,0 +1,122 @@
+# The observability stack: traces into Phoenix, metrics into Prometheus,
+# dashboards in Grafana.
+#
+# **Every port here is shifted off the ones the other projects on this
+# machine already hold.** `hear_help-tempo-1` has 4317/4318,
+# `newotnite-api-1` has 3000, and hear_help's next-server has *:3002, so
+# this stack uses 4319, 4320 and 3003. A port that a *host* process
+# holds on the IPv6 wildcard is not usable even when Docker publishes
+# the same number on 127.0.0.1: a browser that resolves localhost to
+# ::1 reaches the host process, not the container.
+#
+# **Phoenix runs on the host, not in Docker.** Docker Desktop's VM is
+# capped at 1.93 GB on this machine, and the `hear_help` stack already
+# holds about 1.05 GB of it (its Grafana alone is 735 MB). Phoenix was
+# OOM-killed by the VM's kernel at 1g, at 768m, and in
+# `PHOENIX_LITE_MODE` — no cgroup limit leaves it enough room to start.
+# The host has ~10 GB free, so Phoenix runs there: `make phoenix`, an
+# isolated `uv tool` environment, on 6006. The collector reaches it over
+# OTLP/HTTP at http://host.docker.internal:6006/v1/traces.
+#
+# **Every mem_limit is mandatory.** This machine is shared with two other
+# projects' stacks that are not ours to stop.
+
+name: voice-ai
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.163.1
+    ports:
+      # 4319 (not 4317) — the hear_help stack holds 4317/4318.
+      - "127.0.0.1:4319:4317"
+      - "127.0.0.1:4320:4318"
+      # The collector's own Prometheus exporter, so the host can check it.
+      - "127.0.0.1:9464:9464"
+    volumes:
+      - ./observability/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    extra_hosts:
+      # The host's Phoenix. See the network note at the bottom of this
+      # file for why every name is pinned rather than resolved.
+      - "host.docker.internal:host-gateway"
+    networks:
+      voice-ai-net:
+        ipv4_address: 10.88.0.4
+    mem_limit: 384m
+
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    ports:
+      # 9091 on the host, 9090 in the container. The host's 9090 belongs
+      # to the hear_help stack, and a host process on the IPv4 wildcard
+      # takes the port away from a container that publishes the same
+      # number on 127.0.0.1.
+      - "127.0.0.1:9091:9090"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+    extra_hosts:
+      # The agent runs on the host, so Prometheus scrapes it at
+      # host.docker.internal.
+      - "host.docker.internal:host-gateway"
+      # The collector's two Prometheus endpoints.
+      - "otel-collector:10.88.0.4"
+    networks:
+      voice-ai-net:
+        ipv4_address: 10.88.0.2
+    mem_limit: 384m
+
+  grafana:
+    image: grafana/grafana:13.2.4
+    ports:
+      # 3003 (not 3000, not 3002) — newotnite-api-1 holds 3000, and
+      # hear_help's next-server holds *:3002. Docker publishes on
+      # 127.0.0.1 only, so a host process on the IPv6 wildcard would
+      # still win for a browser that resolves localhost to ::1.
+      - "127.0.0.1:3003:3000"
+    environment:
+      # Set explicitly so Grafana does not treat the password as
+      # "default" and force a change on first login. The stack is
+      # published on 127.0.0.1 only.
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./observability/grafana/dashboards/voice-ai.json:/var/lib/grafana/dashboards/voice-ai.json:ro
+      # The Prometheus datasource and the dashboard provider. Without
+      # these, Grafana comes up blank: no datasource, and the dashboard
+      # file is never read.
+      #
+      # The two subdirectories are mounted separately, not the whole
+      # provisioning tree: a bind mount over /etc/grafana/provisioning
+      # would hide the image's own alerting/ and access-control/
+      # directories, and Grafana logs an error for the missing one.
+      - ./observability/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./observability/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    extra_hosts:
+      - "prometheus:10.88.0.2"
+    networks:
+      voice-ai-net:
+        ipv4_address: 10.88.0.3
+    mem_limit: 512m
+
+networks:
+  # **Every address here is fixed, and every name is in /etc/hosts.**
+  # Docker Desktop's embedded DNS on this machine intermittently takes
+  # 5-19 seconds to answer, and a name that resolves slowly is a
+  # name that sometimes does not resolve at all: the Prometheus scrape
+  # of the agent blew its 10 s timeout, and Grafana's dashboard went
+  # to "No data" for 19 s when Prometheus was recreated with a new
+  # address. A fixed subnet outside Docker's automatic 172.16-172.31
+  # pool and outside the machine's LAN, plus an /etc/hosts entry per
+  # name, takes DNS off every path that matters.
+  #
+  # 10.88.0.2 prometheus · 10.88.0.3 grafana · 10.88.0.4 otel-collector
+  voice-ai-net:
+    name: voice-ai-net
+    ipam:
+      config:
+        - subnet: 10.88.0.0/24
+
+volumes:
+  grafana_data:
