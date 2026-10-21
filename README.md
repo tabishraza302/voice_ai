@@ -3,13 +3,15 @@
 A **fully local, air-gapped** English + Hindi voice agent with a real
 AI-observability layer.
 
-Nothing in it talks to the internet at runtime. Every model runs on the
-machine; the traces, metrics and dashboards are produced by four local
-containers. The numbers in this README were measured on the machine that
+The agent itself never talks to the internet: every model runs on the
+machine, and the traces, metrics and dashboards are produced by local
+containers and a local Phoenix. The measurement scripts do fetch their
+fixtures (FLEURS) and their models from the hub — once, before the
+demo. The numbers in this README were measured on the machine that
 wrote it, and every one of them has a script behind it.
 
 ```
-make install && make models && make up
+scripts/voice-ai.sh install && scripts/voice-ai.sh models && scripts/voice-ai.sh start
 # then open http://localhost:7860/client
 ```
 
@@ -73,37 +75,116 @@ an assertion that the pipeline module imports no concrete service class.
 
 ### The swap catalogue
 
-Every option is local. Every cost is real.
+Every option is local. Every cost is real — and every one of them is
+measured on this machine, or it is not claimed.
 
 | Layer | Default | Swap to | Real cost | When |
 |---|---|---|---|---|
-| STT | `mlx-audio` + Nemotron 3.5 ASR 0.6B | `mlx-whisper` + `whisper-large-v3-turbo` | 1.61 GB vs 1.28 GB; **Hindi 35.56 % vs 6.81 % WER**, English 4.08 % vs 7.91 % | The MLX Nemotron conversion fails to load, or English matters more than Hindi |
-| STT | `mlx-audio` + Nemotron | `funasr` (SenseVoice) | CPU only, no Metal path; **no Hindi** | English-only deployment |
-| TTS | `kokoro` | `mlx-audio` + `chatterbox-multilingual-v3` | +1.0 GB RAM; a different model behind the same service | Kokoro's grade-C Hindi voices prove unintelligible |
-| TTS | `kokoro` | `pocket-tts` | Local, different timbre | A different voice character is wanted |
-| LLM | `ollama` + `gemma3:4b` | `ollama` + `gemma3:12b` | +4.8 GB | The tier rule selects it — measurement, not preference |
+| STT | `mlx-audio` + Nemotron 3.5 ASR 0.6B | `mlx-whisper` + `whisper-large-v3-turbo` | 1.28 GB → 1.61 GB of weights; **Hindi 7.18 % → 35.92 % WER**, English 8.56 % → 4.98 % | The MLX Nemotron conversion fails to load, or English matters more than Hindi |
+| TTS | `kokoro` | `mlx-audio` + `chatterbox-multilingual-v3` | A second TTS model behind the same service; not installed by default, so not measured here | Kokoro's grade-C Hindi voices prove unintelligible |
+| LLM | `ollama` + `gemma3:4b` | `ollama` + `gemma3:12b` | +4.8 GB | The tier rule selects it when its weights are on the machine — measurement, not preference |
 | LLM | `ollama` | `openai-compatible` + llama.cpp / vLLM / LM Studio | Same model, different runtime | Ollama is dropped from the stack |
 | LLM | `gemma3:4b` | `gemma3:1b` | −2.5 GB | The tier rule selects it when under 3.5 GB is left |
-| LLM | `gemma3:4b` | `qwen3:8b` | 5.2 GB | **Not on this endpoint.** qwen3 thinks by default and Ollama's OpenAI-compatible API cannot forward `think: false`, so the turn spends its whole budget on reasoning and returns an empty answer |
+| LLM | `gemma3:4b` | `qwen3:8b` | **Not on this endpoint.** qwen3 thinks by default and Ollama's OpenAI-compatible API cannot forward `think: false`, so the turn spends its whole budget on reasoning and returns an empty answer | Never, on this stack |
+
+Two more backends ship in the dependency set — `funasr` (SenseVoice)
+and `pocket-tts` — and neither is registered. A swap is not a `.env`
+edit until it has a factory in `bot/services.py` and a router in
+`bot/language.py`; see "A new backend is a new implementation" in
+`AGENTS.md`.
 
 Swapping is a `.env` edit:
 
 ```bash
 stt_provider=mlx-whisper
 tts_provider=mlx-audio
-tts_model=mlx-community/chatterbox-multilingual-v3
 ```
 
-**A swap changes the measured numbers.** Re-run `make eval` and
-`make bench`, and update the tables below.
+One line is enough: the model that the other provider left behind is
+resolved to the new provider's own model, so the service and the
+routers always agree on what is loaded.
+
+**A swap changes the measured numbers.** Re-run
+`scripts/voice-ai.sh eval` and `scripts/voice-ai.sh bench`, and update
+the tables below.
 
 ---
 
 ## The measured numbers
 
 <!-- MEASURED:START -->
-_Not yet measured on this machine. Run `make memory`, `make bench` and
-`make eval`, then update this section._
+Measured on this machine — an M5 MacBook Air, 16 GB, macOS 27 — with
+the other projects' stacks stopped. Every row below has a script behind
+it: `scripts/voice-ai.sh memory`, `bench`, `eval`.
+
+### The LLM tier
+
+| | |
+|---|---|
+| Total unified memory | 16.0 GB |
+| macOS baseline (active + wired + compressed) | 2.67 GB |
+| Ollama, `gemma3:4b` resident | 2.62 GB |
+| mlx-audio STT server, one model | 0.29 GB |
+| Kokoro, marginal | 0.48 GB |
+| The agent's own process | 0.11 GB |
+| Reserve for the other projects' stacks | 1.5 GB |
+| **Available for the LLM** | **11.05 GB** |
+| **Memory ceiling — the tier the rule selects** | **`gemma3:12b`** (8.16 GB) |
+| **Tier that actually runs here** | **`gemma3:4b`** (3.35 GB) |
+
+The rule is arithmetic, not preference: it subtracts everything that is
+not the LLM and picks the largest Gemma 3 rung that fits. The ceiling
+is `gemma3:12b` — but its 7.3 GB of weights are not on this machine,
+and this link fetches them at about 260 KB/s, which is seven hours of
+pulling. So the *configured* tier is the largest rung that both fits
+and is installed, and `scripts/voice-ai.sh apply-tier` writes that one
+and says which it picked. On a machine with the 12B weights, the same
+rule configures `gemma3:12b` with no edit.
+
+### STT speed
+
+Measured through the same HTTP endpoint the bot uses, on FLEURS clips.
+
+| Language | Clips | Audio | Inference | Real-time factor | Time to final transcript (p50 / p99) |
+|---|---:|---:|---:|---:|---:|
+| English | 9 | 80.4 s | 7.6 s | 0.094 | 0.94 s / 1.06 s |
+| Hindi | 10 | 113.6 s | 11.8 s | 0.104 | 1.26 s / 1.80 s |
+
+A real-time factor of 0.1 means the model transcribes ten seconds of
+speech per second. The p99 the bot is configured with is **1.80 s**:
+that is `ttfs_p99_latency` in `.env.example`, written by
+`scripts/voice-ai.sh apply-tier`.
+
+### STT quality
+
+WER over 40 FLEURS clips per language, through the same HTTP endpoint
+the bot uses. The numbers below use the `standard` normalization —
+OpenAI's `whisper-normalizer`, which is what every published FLEURS
+number is computed with.
+
+| Model | `en_us` WER | `hi_in` WER | `en_us` CER | `hi_in` CER |
+|---|---:|---:|---:|---:|
+| Nemotron 3.5 ASR 0.6B | 8.56 % | **7.18 %** | 4.96 % | 4.29 % |
+| Nemotron 3.5 ASR 0.6B, 8-bit | 8.45 % | 7.24 % | 4.92 % | 4.36 % |
+| `whisper-large-v3-turbo` | **4.98 %** | 35.92 % | 2.42 % | 27.45 % |
+
+This is the repo's own measurement, and it lands where the published
+figures do: **Nemotron is 5.0× better on Hindi** (35.92 / 7.18) and
+**Whisper is 1.7× better on English** (8.56 / 4.98). The 8-bit Nemotron
+is within noise of the bf16 one, which is why it is the fallback tier
+and not the default.
+
+The report holds two more views of the same corpus, and neither changes
+the conclusion. The `indic` normalization (`indicnlp`) gives the same
+numbers on this corpus. The `romanized` one is the standard
+normalization with both scripts folded to Latin, so a model that answers
+in Latin script is not punished for it: **7.13 %** for Nemotron on
+Hindi, **35.19 %** for Whisper.
+
+One caveat on precision: Whisper's transcription is not
+bit-deterministic on Metal. Two runs over the same 40 clips differed by
+about 1.5 WER points on Hindi — one character in a handful of clips.
+Nemotron's output was byte-identical across the same check.
 <!-- MEASURED:END -->
 
 ### The published comparison
@@ -111,7 +192,9 @@ _Not yet measured on this machine. Run `make memory`, `make bench` and
 These are the figures the measurements are compared against. They come
 from NVIDIA's model card and from Whisper's published FLEURS baselines,
 and they were computed on different hardware with a particular text
-normalization — which is exactly why this repo measures its own.
+normalization — which is exactly why this repo measures its own. Every
+published number the README quotes is recorded in
+`evals/wer_eval.py` under `published_reference`.
 
 | Model | FLEURS `hi_in` WER | FLEURS `en_us` WER |
 |---|---:|---:|
@@ -125,10 +208,11 @@ upgrade, not a consolation prize. And Nemotron is *better at Hindi than
 at English*, which is unusual for a multilingual model and is why one
 model can serve both languages acceptably.
 
-The chunk size is a real dial. Nemotron's MLX config defaults to
-`att_context_size: [56, 13]` — the 1.12 s look-ahead, the most accurate
-of the four supported points. On Hindi, 6.81 % at 1.12 s becomes 8.13 %
-at the 80 ms chunk, and auto-detect goes from 8.23 % to 11.47 %.
+The chunk size is a real dial, and the same model card reports what it
+costs. Nemotron's MLX config defaults to `att_context_size: [56, 13]` —
+the 1.12 s look-ahead, the most accurate of the four supported points.
+On Hindi, 6.81 % at 1.12 s becomes 8.13 % at the 80 ms chunk, and
+auto-detect goes from 8.23 % to 11.47 %.
 
 ---
 
@@ -174,10 +258,12 @@ the host:
 
 | Service | Where | Host port | Why that port |
 |---|---|---|---|
-| Phoenix | **the host** (`make phoenix`) | 6006 | Docker Desktop's VM is capped at 1.93 GB and the `hear_help` stack already holds ~1.05 GB of it. Phoenix was OOM-killed at 1g, at 768m, and in `PHOENIX_LITE_MODE`. The collector reaches it over OTLP/HTTP at `http://host.docker.internal:6006` |
-| otel-collector | container | 4319, 4320, 9464 | Not 4317/4318: the `hear_help` stack holds them |
+| Phoenix | **the host** (`scripts/voice-ai.sh phoenix`) | 6006 (UI and OTLP/HTTP), 6007 (gRPC) | Docker Desktop's VM is capped at 1.93 GB and the `hear_help` stack already holds ~1.05 GB of it. Phoenix was OOM-killed at 1g, at 768m, and in `PHOENIX_LITE_MODE`. The collector reaches it over OTLP/HTTP at `http://host.docker.internal:6006` |
+| otel-collector | container | 4319, 9464 | Not 4317/4318: the `hear_help` stack holds them. Only OTLP/gRPC is published — the collector's HTTP receiver stays inside the container network, because nothing on the host sends OTLP/HTTP |
 | Prometheus | container | 9091 | Not 9090: the `hear_help` stack's Prometheus holds it on the host, and Phoenix's own Prometheus endpoint is off — it binds 9090 with no way to move it |
 | Grafana | container | 3003 | Not 3000: `newotnite-api-1` holds it. Not 3002: hear_help's next-server holds `*:3002`, and a host process on the IPv6 wildcard beats Docker's `127.0.0.1` publish for any browser that resolves `localhost` to `::1` |
+| Ollama | the host | 11434 | The LLM runtime; it is the one service that was already running here |
+| mlx-audio | the host | 8020 | The STT and TTS server. The WER harness runs its own on 8021+ |
 
 Every container has a `mem_limit`. This is a 16 GB machine shared with
 two other projects; an unbounded container is the most likely way to
@@ -201,10 +287,10 @@ Two Phoenix facts worth knowing, because both cost an afternoon:
 
 ### The metrics contract
 
-`bot/observers.py` owns the metric names, and
-`observability/prometheus.yml`, `observability/alerts.yml` and
-`observability/grafana/dashboards/voice-ai.json` all reference them by
-name.
+`bot/observers.py` owns the metric names. `observability/alerts.yml`
+and `observability/grafana/dashboards/voice-ai.json` reference them by
+name; `observability/prometheus.yml` is coupled to them by endpoint —
+it scrapes the agent and the collector, it does not name a series.
 
 | Metric | Type | What it means |
 |---|---|---|
@@ -220,7 +306,9 @@ name.
 | `voice_turn_interrupted_total` | Counter | Turns the user interrupted. |
 | `voice_process_resident_memory_bytes` | Gauge | Resident memory by component. |
 
-Labels are bounded to `processor` and `model`. Never a session id.
+Labels are bounded to a fixed set: `processor` and `model` on the
+pipeline metrics, `kind` on the token counter, `component` on the memory
+gauge. Never a session id, a user id or a call id.
 
 Two of these only appear once the *voice* path runs, not the browser
 client's text box: `voice_stt_audio_seconds_total` needs audio, and
@@ -260,11 +348,19 @@ a stated reason.
 
 ## Running it
 
+Everything is a subcommand of one script, so there is one way in:
+
 ```bash
-make install     # venv + dependencies + the host-side Phoenix
-make models      # STT, TTS and LLM weights
-make up          # observability stack, STT server, agent
+scripts/voice-ai.sh install   # venv + dependencies + the host-side Phoenix
+scripts/voice-ai.sh models    # STT, TTS and LLM weights
+scripts/voice-ai.sh start     # Phoenix, the observability stack, the STT server, the agent
 ```
+
+`start` brings the pieces up in order and waits until each one is
+actually ready, rather than sleeping and hoping. It leaves the agent in
+the foreground; `--background` puts it in the background instead.
+`scripts/voice-ai.sh help` lists every command, and
+`scripts/voice-ai.sh status` says what is running.
 
 Then open **http://localhost:7860/client** and talk to it.
 
@@ -277,6 +373,12 @@ Then open **http://localhost:7860/client** and talk to it.
 | Metrics (raw) | http://localhost:7860/metrics/ |
 
 Grafana's login is `admin` / `admin`.
+
+To stop everything again, in reverse:
+
+```bash
+scripts/voice-ai.sh stop
+```
 
 ### Talking to it
 
@@ -295,31 +397,30 @@ the mode that survives code-switching.
 ### Measuring
 
 ```bash
-make memory          # the memory baseline, and the LLM tier it selects
-make bench           # STT speed: real-time factor and time-to-final-transcript
-make eval            # FLEURS WER/CER, per model and per normalization
-make eval-scenarios  # behavioural evals (needs the agent running)
-make smoke           # synthesise speech, transcribe it back (needs: make stt)
-make test            # the regression suite
+scripts/voice-ai.sh memory          # the memory baseline, and the LLM tier it selects
+scripts/voice-ai.sh bench           # STT speed: real-time factor and time-to-final-transcript
+scripts/voice-ai.sh eval            # FLEURS WER/CER, per model and per normalization
+scripts/voice-ai.sh eval-scenarios  # behavioural evals (needs the agent running)
+scripts/voice-ai.sh smoke           # synthesise speech, transcribe it back (needs: stt)
+scripts/voice-ai.sh test            # the regression suite
 ```
 
-`make memory` writes `data/memory_baseline.json` and applies the tier
+`memory` writes `data/memory_baseline.json` and applies the tier
 rule: it subtracts the measured macOS baseline, the STT, the TTS, the
 agent and a 1.5 GB reserve for the other projects' Docker stacks, and
 picks `gemma3:12b`, `gemma3:4b` or `gemma3:1b` from what is left.
-`make apply-tier` writes the result into `.env.example`.
+`apply-tier` writes the result into `.env.example`.
 
 ### The other projects on this box
 
 This is a shared 16 GB machine: the `hear_help` and `newotnite` stacks
 are running here too, and they hold the memory and some of the ports
-voice-ai needs. So voice-ai stops them before it runs — `make up`,
-`make run`, `make bench` and `make eval` all do it, and it is
-reversible:
+voice-ai needs. So voice-ai stops them before it runs — `start` does it,
+and it is reversible:
 
 ```bash
-make stop-others   # stop the hear_help and newotnite containers
-make start-others  # bring them back exactly as they were
+scripts/voice-ai.sh others stop   # stop the hear_help and newotnite containers
+scripts/voice-ai.sh others start  # bring them back exactly as they were
 ```
 
 Only `docker stop` is used: no container is removed, no volume is
@@ -328,10 +429,14 @@ rule is the headroom left for them.
 
 ### Air-gapped
 
-Every model is downloaded by `make models` before the demo. After that,
-disconnect the network and the conversation still works — that is the
-claim, and it is only true because
+Every model is downloaded by `scripts/voice-ai.sh models` before the
+demo. After that, disconnect the network and the conversation still
+works — that is the claim, and it is only true because
 `PHOENIX_ALLOW_EXTERNAL_RESOURCES=false` and nothing else reaches out.
+
+The boundary is the *agent*. `scripts/voice-ai.sh bench` and `eval`
+fetch the FLEURS clips and their models from the hub, so the
+measurement scripts need the network; the agent never does.
 
 ---
 

@@ -21,9 +21,9 @@ Every claim in the README has a script behind it:
 
 | Claim | Script |
 |---|---|
-| Which LLM tier fits | `make memory` |
-| How fast the STT is | `make bench` |
-| How accurate the STT is | `make eval` |
+| Which LLM tier fits | `scripts/voice-ai.sh memory` |
+| How fast the STT is | `scripts/voice-ai.sh bench` |
+| How accurate the STT is | `scripts/voice-ai.sh eval` |
 
 If you change a model, a prompt, a chunking rule or a latency budget,
 **re-run the relevant script and update the README's table with the new
@@ -100,22 +100,21 @@ resolve.
 
 The `newotnite` and `hear_help` Docker stacks are running on this
 machine, and voice-ai needs the memory and the ports they hold. **So
-they are stopped before voice-ai runs** — `make stop-others`, which
-`make up`, `make run`, `make bench` and `make eval` all call, and
-`make start-others` reverses. **Stop only: never remove, prune,
-reconfigure or touch a volume.** `docker system prune` would affect
-their workflows — do not run it.
+they are stopped before voice-ai runs** — `scripts/voice-ai.sh start`
+does it, and `scripts/voice-ai.sh others start` reverses it. **Stop
+only: never remove, prune, reconfigure or touch a volume.** `docker
+system prune` would affect their workflows — do not run it.
 
 Their containers hold host ports 4317, 4318, 3000 and 9090, and
 hear_help's next-server holds `*:3002`. This project's ports are
-therefore shifted: 4319 and 4320 for OTLP, 3003 for Grafana, 6006 for
-Phoenix, 9091 for Prometheus, 8020 for the STT server, 7860 for the
-agent. **Check for a conflict before adding a port** — and check for
-host processes, not just containers: Docker publishes on 127.0.0.1, so a
-host process on the IPv6 wildcard still wins for a browser that
-resolves `localhost` to `::1`. A port held by the *other* stack is
-held even while that stack is stopped, if something else on the host
-takes it — measure, do not assume.
+therefore shifted: 4319 for OTLP, 3003 for Grafana, 6006 and
+6007 for Phoenix, 9091 for Prometheus, 8020 for the STT server, 7860
+for the agent. Ollama keeps its own 11434. **Check for a conflict before
+adding a port** — and check for host processes, not just containers:
+Docker publishes on 127.0.0.1, so a host process on the IPv6 wildcard
+still wins for a browser that resolves `localhost` to `::1`. A port
+held by the *other* stack is held even while that stack is stopped, if
+something else on the host takes it — measure, do not assume.
 
 Memory is the binding constraint, not disk: 16 GB unified, shared with
 two other projects. The `mem_limit` on every container in
@@ -126,9 +125,9 @@ likely way to push this box into swap.
 capped at 1.93 GB here and the `hear_help` stack already holds about
 1.05 GB of it (its Grafana alone is 735 MB). Phoenix was OOM-killed by
 the VM's kernel at 1g, at 768m, and in `PHOENIX_LITE_MODE` — no cgroup
-limit leaves it enough room to start. `make install` puts it in its own
-`uv tool` environment; `make phoenix` runs it on the host, and the
-collector reaches it over OTLP/HTTP at
+limit leaves it enough room to start. `scripts/voice-ai.sh install` puts
+it in its own `uv tool` environment; `scripts/voice-ai.sh phoenix` runs
+it on the host, and the collector reaches it over OTLP/HTTP at
 `http://host.docker.internal:6006`. Its own Prometheus endpoint is off:
 it binds 9090 with a hardcoded port and no env var to move it, and the
 host's 9090 belongs to the other stack.
@@ -173,7 +172,7 @@ data/           generated measurements (gitignored)
 
 ## Before you call a change done
 
-- `make test` passes.
+- `scripts/voice-ai.sh test` passes.
 - If you touched a model, a prompt or a latency path: the relevant
   measurement script has been re-run and the README updated.
 - If you touched a metric: `tests/test_observers.py` passes, and the
