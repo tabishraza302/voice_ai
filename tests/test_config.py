@@ -38,11 +38,11 @@ def test_every_field_has_a_default():
 
 def test_env_overrides(monkeypatch):
     monkeypatch.setenv("stt_provider", "mlx-whisper")
-    monkeypatch.setenv("llm_model", "qwen3:8b")
+    monkeypatch.setenv("llm_model", "gemma3:12b")
     monkeypatch.setenv("vad_stop_secs", "0.5")
     s = Settings(_env_file=None)
     assert s.stt_provider == "mlx-whisper"
-    assert s.llm_model == "qwen3:8b"
+    assert s.llm_model == "gemma3:12b"
     assert s.vad_stop_secs == 0.5
 
 

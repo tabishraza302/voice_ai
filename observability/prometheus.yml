@@ -32,8 +32,13 @@ scrape_configs:
     scrape_timeout: 14s
     static_configs:
       - targets: ["host.docker.internal:7860"]
-        labels:
-          component: agent
+      # No target labels here. A target label that shares a name with a
+      # scraped label *takes* the name: Prometheus renames the scraped one
+      # to `exported_<label>`. A `component: agent` target label therefore
+      # turned the memory gauge's `component` label into
+      # `exported_component`, and the dashboard legend and the alert both
+      # stopped matching. The `job` label already says where a series
+      # came from.
 
   # The collector's Prometheus exporter: the metrics it forwards from
   # the agent's OTLP stream.

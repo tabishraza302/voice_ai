@@ -43,6 +43,18 @@ from bot.services import (
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
+# A swap is two lines: the provider and the model it serves. Swapping the
+# provider alone points it at the other provider's checkpoint, which the
+# factories refuse.
+STT_MODELS = {
+    "mlx-audio": "mlx-community/nemotron-3.5-asr-streaming-0.6b",
+    "mlx-whisper": "mlx-community/whisper-large-v3-turbo",
+}
+TTS_MODELS = {
+    "kokoro": "kokoro",
+    "mlx-audio": "mlx-community/chatterbox-multilingual-v3",
+}
+
 
 class TestRegistries:
     def test_registries_are_not_empty(self):
@@ -52,7 +64,9 @@ class TestRegistries:
 
     @pytest.mark.parametrize("provider", sorted(STT_BACKENDS))
     def test_stt_provider_builds_an_stt_service(self, provider):
-        settings = Settings(_env_file=None, stt_provider=provider)
+        settings = Settings(
+            _env_file=None, stt_provider=provider, stt_model=STT_MODELS[provider]
+        )
         assert isinstance(build_stt(settings), STTService)
 
     @pytest.mark.parametrize("provider", sorted(LLM_BACKENDS))
@@ -62,7 +76,9 @@ class TestRegistries:
 
     @pytest.mark.parametrize("provider", sorted(TTS_BACKENDS))
     def test_tts_provider_builds_a_tts_service(self, provider):
-        settings = Settings(_env_file=None, tts_provider=provider)
+        settings = Settings(
+            _env_file=None, tts_provider=provider, tts_model=TTS_MODELS[provider]
+        )
         assert isinstance(build_tts(settings), TTSService)
 
     def test_unknown_provider_raises_and_names_the_options(self):
@@ -71,6 +87,28 @@ class TestRegistries:
         message = str(excinfo.value)
         assert "nope" in message
         assert "mlx-audio" in message
+
+    def test_swapping_the_provider_uses_that_providers_model(self):
+        # A one-line swap leaves the other provider's checkpoint behind.
+        # The registries and the routers read the same settings, so the
+        # pairing is resolved once — and both see the model that is
+        # actually loaded.
+        settings = Settings(_env_file=None, stt_provider="mlx-whisper")
+        build_stt(settings)
+        assert settings.stt_model == STT_MODELS["mlx-whisper"]
+
+        settings = Settings(_env_file=None, tts_provider="mlx-audio")
+        build_tts(settings)
+        assert settings.tts_model == TTS_MODELS["mlx-audio"]
+
+    def test_the_ollama_service_carries_the_configured_keep_alive(self):
+        # The setting only means anything if it reaches the request
+        # *body*: Ollama's OpenAI-compatible endpoint honours `keep_alive`
+        # there, and the OpenAI client rejects it as a top-level
+        # argument.
+        settings = Settings(_env_file=None, llm_provider="ollama", llm_keep_alive="7m")
+        service = build_llm(settings)
+        assert service._settings.extra == {"extra_body": {"keep_alive": "7m"}}
 
 
 class TestRouterCoverage:
@@ -136,6 +174,10 @@ class TestSwapChangesNoMetric:
 
         names = set(METRIC_NAMES)
         for provider in ("mlx-audio", "mlx-whisper"):
-            settings = Settings(_env_file=None, stt_provider=provider)
+            settings = Settings(
+                _env_file=None,
+                stt_provider=provider,
+                stt_model=STT_MODELS[provider],
+            )
             build_stt(settings)
         assert names == set(METRIC_NAMES)

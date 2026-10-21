@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     # --- STT layer -------------------------------------------------------
     # "mlx-audio" is the default: NVIDIA Nemotron 3.5 ASR Streaming 0.6B,
     # served by mlx_audio.server and consumed over its OpenAI-compatible
-    # HTTP API. "mlx-whisper" and "funasr" are the registered alternates.
+    # HTTP API. "mlx-whisper" is the registered alternate.
     stt_provider: str = "mlx-audio"
     stt_model: str = "mlx-community/nemotron-3.5-asr-streaming-0.6b"
     # "auto" | "en" | "hi". "auto" maps to Nemotron's language-ID prompt
@@ -65,14 +65,18 @@ class Settings(BaseSettings):
     # A trivial "say hello" spent 200 completion tokens on reasoning and
     # returned an *empty* answer, which for a voice agent is seconds of
     # dead air. Gemma 3 answers the same prompt in 13 tokens, in
-    # Devanagari. See the README's "Why not Qwen 3" note.
+    # Devanagari. See the README's swap catalogue.
     llm_provider: str = "ollama"
+    # The built-in default is the conservative rung. The tier the memory
+    # rule actually selects for this machine is written into
+    # `.env.example` by `scripts/voice-ai.sh apply-tier`.
     llm_model: str = "gemma3:4b"
     llm_base_url: str = "http://localhost:11434/v1"
-    # Minutes to keep the model resident after a request. 0 lets Ollama
-    # unload it immediately: on a shared machine, permanently pinning 5.2 GB
-    # is the wrong default. `make warm` pre-loads on demand instead.
-    llm_keep_alive: str = "0"
+    # How long Ollama keeps the model resident after a turn. "0" unloads
+    # it immediately, which with the 12B tier is an 8 GB reload between
+    # every turn. 5m is Ollama's own default; `scripts/voice-ai.sh warm`
+    # pins the model for 30m on demand.
+    llm_keep_alive: str = "5m"
     llm_temperature: float = 0.7
     llm_max_tokens: int = 200
 
@@ -82,7 +86,10 @@ class Settings(BaseSettings):
     # mlx-community/chatterbox-multilingual-v3, the escape hatch if
     # Kokoro's grade-C Hindi voices prove unintelligible.
     tts_provider: str = "kokoro"
-    tts_model: str = "mlx-community/chatterbox-multilingual-v3"
+    # The model id reported in the metrics. It is the label, not a
+    # checkpoint: Kokoro runs in-process from its ONNX file, and the
+    # mlx-audio TTS swap sets this to the model it actually serves.
+    tts_model: str = "kokoro"
     tts_voice_en: str = "af_heart"
     tts_voice_hi: str = "hf_alpha"
     tts_speed: float = 1.0
@@ -92,9 +99,10 @@ class Settings(BaseSettings):
 
     # --- Observability ---------------------------------------------------
     # The OTLP gRPC endpoint of the local collector. Not 4317: the
-    # hear_help stack already holds 4317/4318 on this host.
+    # hear_help stack already holds 4317/4318 on this host. The collector
+    # is what talks to Phoenix, so Phoenix's own address is not a setting
+    # here — it lives in observability/otel-collector.yaml.
     otlp_endpoint: str = "http://localhost:4319"
-    phoenix_endpoint: str = "http://localhost:6006"
     enable_tracing: bool = True
     enable_metrics: bool = True
 

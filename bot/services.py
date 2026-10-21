@@ -13,8 +13,9 @@ dispatches. An unknown provider raises, listing what is registered — a
 typo in ``.env`` must fail loudly at startup, not silently fall back to
 the default and leave you wondering why your swap did nothing.
 
-**The routers.** The factories and the routers live together on purpose:
-a provider that has a service but no router is a provider that will
+**The routers.** The routers live in ``bot/language.py``, one per
+backend, because the settings delta they build is backend-specific. A
+provider that has a service but no router is a provider that will
 misbehave the first time the language changes. ``build_voice_router`` and
 ``build_stt_language_router`` therefore resolve through the same provider
 name, and the test suite asserts that every registered provider has both.
@@ -43,6 +44,14 @@ from bot.language import (
 from bot.stt_service import LocalMlxSTTService
 from bot.tts_service import LocalMlxTTSService
 
+# The two STT checkpoints this repo knows about. They are named here so a
+# provider swap that leaves the model behind fails with a clear message
+# instead of a checkpoint loader error.
+NEMOTRON_MODEL = "mlx-community/nemotron-3.5-asr-streaming-0.6b"
+WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
+KOKORO_MODEL = "kokoro"
+CHATTERBOX_MODEL = "mlx-community/chatterbox-multilingual-v3"
+
 
 # ---------------------------------------------------------------------------
 # STT backends
@@ -65,6 +74,22 @@ def build_stt_mlx_audio(settings: Settings) -> STTService:
     )
 
 
+def resolve_models(settings: Settings) -> Settings:
+    """Pair every provider with the model it serves.
+
+    A swap is one line in `.env` — `stt_provider=mlx-whisper` — and the
+    model that line leaves behind belongs to the other provider. The
+    factories and the routers read the same settings, so the pairing is
+    resolved once, here, and everything downstream sees the model that
+    is actually loaded.
+    """
+    if settings.stt_provider == "mlx-whisper" and settings.stt_model == NEMOTRON_MODEL:
+        settings.stt_model = WHISPER_MODEL
+    if settings.tts_provider == "mlx-audio" and settings.tts_model == KOKORO_MODEL:
+        settings.tts_model = CHATTERBOX_MODEL
+    return settings
+
+
 def build_stt_mlx_whisper(settings: Settings) -> STTService:
     """Pipecat's MLX Whisper service — the English tier and the A/B baseline.
 
@@ -74,6 +99,7 @@ def build_stt_mlx_whisper(settings: Settings) -> STTService:
     """
     from pipecat.services.whisper.stt import WhisperSTTServiceMLX
 
+    settings = resolve_models(settings)
     language = _parse_language(settings.stt_language)
     return WhisperSTTServiceMLX(
         settings=WhisperSTTServiceMLX.Settings(
@@ -113,11 +139,22 @@ def _llm_settings(settings: Settings) -> dict[str, Any]:
 
 
 def build_llm_ollama(settings: Settings) -> LLMService:
-    """Ollama — the default local LLM runtime."""
+    """Ollama — the default local LLM runtime.
+
+    `keep_alive` travels in `extra_body`, which Pipecat merges into the
+    request JSON as-is: Ollama's OpenAI-compatible endpoint honours it,
+    and it is the only way to say how long the model stays resident
+    after a turn. It cannot be a top-level parameter — the OpenAI client
+    rejects keyword arguments it does not know. The other
+    OpenAI-compatible servers do not know the field, so it is not sent
+    to them.
+    """
+    llm_settings = _llm_settings(settings)
+    llm_settings["extra"] = {"extra_body": {"keep_alive": settings.llm_keep_alive}}
     return OLLamaLLMService(
         base_url=settings.llm_base_url,
         api_key="ollama",
-        settings=OLLamaLLMService.Settings(**_llm_settings(settings)),
+        settings=OLLamaLLMService.Settings(**llm_settings),
     )
 
 
@@ -163,6 +200,7 @@ def build_tts_mlx_audio(settings: Settings) -> TTSService:
     the fix is a different model, not a different framework.
     `mlx-community/chatterbox-multilingual-v3` is the intended one.
     """
+    settings = resolve_models(settings)
     return LocalMlxTTSService(
         model=settings.tts_model,
         base_url=settings.tts_base_url,

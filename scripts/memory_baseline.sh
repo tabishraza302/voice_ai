@@ -7,9 +7,9 @@
 #   >= 9.0 -> gemma3:12b  >= 3.5 -> gemma3:4b  else -> gemma3:1b + 8-bit STT
 #
 # The 1.5 GB reserve covers the `newotnite` and `hear_help` Docker stacks.
-# They are stopped while voice-ai runs (`make stop-others`), so this
-# baseline is measured with them down and the reserve is the headroom
-# left for them.
+# They are stopped while voice-ai runs (`scripts/voice-ai.sh start`), so
+# this baseline is measured with them down and the reserve is the
+# headroom left for them.
 #
 # Every component is measured in isolation, in its own process, so the
 # numbers are additive.
@@ -101,7 +101,7 @@ log "measuring Ollama resident size"
 OLLAMA_RESIDENT_GB="null"
 # The model the bot is configured to use, so the measurement matches
 # what will actually be resident at runtime: .env first, then the
-# measured .env.example, which `make apply-tier` writes.
+# measured .env.example, which `scripts/voice-ai.sh apply-tier` writes.
 OLLAMA_MODEL="${OLLAMA_MODEL:-$( { cat .env .env.example 2>/dev/null || true; } | grep -E '^llm_model=' | head -1 | cut -d= -f2 || true)}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-gemma3:4b}"
 if command -v ollama >/dev/null 2>&1 && curl -sf --max-time 3 http://localhost:11434/api/tags >/dev/null; then
@@ -370,6 +370,15 @@ report = {
     "reserve_gb": RESERVE_GB,
     "available_for_llm_gb": round(available, 2),
     "llm_model": llm_model,
+    # The whole ladder, so the tier that gets *configured* can be picked
+    # from the same rule: the memory ceiling is the largest rung that
+    # fits, but a rung whose weights are not on this machine is not a
+    # configuration, it is a 404 waiting to happen.
+    "tier_ladder": [
+        {"model": "gemma3:12b", "min_available_gb": 9.0, "size_gb": 8.16},
+        {"model": "gemma3:4b", "min_available_gb": 3.5, "size_gb": 3.35},
+        {"model": "gemma3:1b", "min_available_gb": 0.0, "size_gb": 0.81},
+    ],
     "stt_model": os.environ.get("MEASURED_STT_MODEL"),
     "stt_fallback_model": stt_fallback,
     "swap": os.environ.get("MEASURED_SWAP"),

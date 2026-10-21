@@ -3,8 +3,9 @@
 
 Two things are measured, and both matter more than they look:
 
-1. **Real-time factor** (RTF) — audio seconds divided by inference seconds.
-   Below 1.0 means the model transcribes faster than speech arrives.
+1. **Real-time factor** (RTF) — inference seconds divided by audio
+   seconds. Below 1.0 means the model transcribes faster than speech
+   arrives.
 2. **Time to final transcript** (TTFS) — how long after the last audio sample
    the final transcript arrives.
 
@@ -76,15 +77,15 @@ class Result:
 
     @property
     def rtf(self) -> float | None:
-        """Real-time factor: audio seconds per second of inference.
+        """Real-time factor: seconds of inference per second of audio.
 
-        Below 1.0 means the model transcribes faster than the audio plays.
-        It is derived from the two measured totals, so it cannot drift
-        out of step with them.
+        Below 1.0 means the model transcribes faster than the audio
+        plays. It is derived from the two measured totals, so it cannot
+        drift out of step with them.
         """
-        if self.inference_seconds <= 0:
+        if self.audio_seconds <= 0:
             return None
-        return self.audio_seconds / self.inference_seconds
+        return self.inference_seconds / self.audio_seconds
 
     @property
     def ttfs_p99(self) -> float | None:
@@ -282,7 +283,7 @@ def main() -> int:
 
     root = args.base_url.rsplit("/v1", 1)[0]
     if not wait_for_server(f"{root}/v1"):
-        die(f"no server at {root}. Start it with: make stt")
+        die(f"no server at {root}. Start it with: scripts/voice-ai.sh stt")
     print("server   : up\n")
 
     clips = load_fixtures(args.languages, args.per_language)

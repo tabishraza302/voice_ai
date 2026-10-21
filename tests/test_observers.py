@@ -63,6 +63,24 @@ class TestMetricNames:
         assert declared == produced
 
 
+class TestLabelCardinality:
+    """Every label must come from the fixed set the docs promise.
+
+    A session id or a user id in a label is unbounded, and Prometheus is
+    the wrong place to store them. This is the mechanical version of that
+    rule: adding a label outside the set fails the suite.
+    """
+
+    ALLOWED = {"processor", "model", "kind", "component"}
+
+    def test_no_instrument_carries_an_unbounded_label(self, observer):
+        for collector in observer.registry._names_to_collectors.values():
+            labels = set(getattr(collector, "_labelnames", ()) or ())
+            assert labels <= self.ALLOWED, (
+                f"{collector._name} carries labels {sorted(labels)}"
+            )
+
+
 class TestLatencyMetrics:
     async def test_ttfb_is_recorded(self, observer):
         await observer.on_push_frame(

@@ -21,10 +21,16 @@ harness — there is one pipeline, not two.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import shutil
+import subprocess
+import time
+import urllib.request
 import uuid
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import urlparse
 
 from loguru import logger
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
@@ -58,6 +64,7 @@ from bot.services import (
     build_stt_language_router,
     build_tts,
     build_voice_router,
+    resolve_models,
 )
 
 # The dev runner's audio rates. 16 kHz in for Silero VAD's sake, 24 kHz
@@ -124,7 +131,65 @@ def build_vad_analyzer(settings: Settings) -> SileroVADAnalyzer:
     return SileroVADAnalyzer(params=VADParams(stop_secs=settings.vad_stop_secs))
 
 
+def _server_answers(root: str) -> bool:
+    """Whether the local mlx-audio server is serving."""
+    try:
+        with urllib.request.urlopen(f"{root}/v1/models", timeout=3) as response:
+            return response.status == 200
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def start_stt_server(settings: Settings) -> subprocess.Popen | None:
+    """Start the local mlx-audio server, when the configuration asks for it.
+
+    The mlx-audio STT and TTS backends both talk to a local
+    ``mlx_audio.server``. `stt_autostart` is off by default so the server
+    can be restarted independently of the agent; with it on, the agent
+    owns the server's lifetime and stops it when it exits.
+
+    Returns the process it started, or None if there was nothing to do.
+    """
+    if not settings.stt_autostart:
+        return None
+
+    port = urlparse(settings.stt_base_url).port or 8020
+    root = f"http://127.0.0.1:{port}"
+    if _server_answers(root):
+        logger.info(f"mlx-audio server already up on {root}")
+        return None
+
+    command = shutil.which("mlx_audio.server") or "mlx_audio.server"
+    logger.info(f"starting the mlx-audio server on {root}")
+    process = subprocess.Popen(
+        [command, "--host", "127.0.0.1", "--port", str(port)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError("the mlx-audio server exited before it was ready")
+        if _server_answers(root):
+            return process
+        await asyncio.sleep(1.0)
+
+    process.terminate()
+    raise RuntimeError(f"the mlx-audio server did not come up on {root}")
+
+
 async def run_bot(transport, settings: Settings, runner_args=None) -> None:
+    """Build and run the pipeline on the given transport."""
+    stt_server = await start_stt_server(settings)
+    try:
+        await _run_pipeline(transport, settings, runner_args)
+    finally:
+        if stt_server is not None:
+            stt_server.terminate()
+
+
+async def _run_pipeline(transport, settings: Settings, runner_args=None) -> None:
     """Build and run the pipeline on the given transport."""
     context = LLMContext()
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
@@ -170,7 +235,10 @@ async def run_bot(transport, settings: Settings, runner_args=None) -> None:
         enable_tracing=settings.enable_tracing,
         enable_turn_tracking=True,
         conversation_id=uuid.uuid4().hex,
-        params=PipelineParams(enable_metrics=True, enable_usage_metrics=True),
+        params=PipelineParams(
+            enable_metrics=settings.enable_metrics,
+            enable_usage_metrics=settings.enable_metrics,
+        ),
         observers=[prometheus_observer, latency_bridge.observer],
     )
 
@@ -246,11 +314,11 @@ def _parse_app_message(message: Any) -> dict[str, Any] | None:
 
 async def bot(runner_args) -> None:
     """The entrypoint the Pipecat dev runner discovers."""
-    settings = Settings()
+    settings = resolve_models(Settings())
     logger.info(
         f"voice-ai starting: stt={settings.stt_provider}/{settings.stt_model} "
         f"llm={settings.llm_provider}/{settings.llm_model} "
-        f"tts={settings.tts_provider}"
+        f"tts={settings.tts_provider}/{settings.tts_model}"
     )
 
     transport = await create_transport(runner_args, transport_params())
@@ -270,7 +338,6 @@ def build_model_resolver(settings: Settings):
     table = {
         "LocalMlxSTTService": settings.stt_model,
         "WhisperSTTServiceMLX": settings.stt_model,
-        "FunASRSTTService": settings.stt_model,
         "KokoroTTSService": settings.tts_model,
         "LocalMlxTTSService": settings.tts_model,
         "OLLamaLLMService": settings.llm_model,

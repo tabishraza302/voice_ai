@@ -65,6 +65,50 @@ pull_stt() {
   pull_hf "$STT_BF16" 1200
   pull_hf "$STT_8BIT" 700
   pull_hf "$STT_WHISPER" 1500
+  pull_whisper_processor
+}
+
+# The MLX conversion of Whisper ships the weights and nothing else: the
+# tokenizer and the feature extractor live in the original OpenAI repo.
+# Both loaders read them from the model directory, so without them
+# Whisper loads and then fails on the first transcription with
+# "Processor not found".
+pull_whisper_processor() {
+  local repo="mlx-community/whisper-large-v3-turbo"
+  local dest="$HOME/.cache/huggingface/hub/models--${repo//\//--}"
+  local snapshot
+  snapshot="$(ls -d "$dest"/snapshots/*/ 2>/dev/null | head -1)"
+  [[ -n "$snapshot" ]] || die "$repo is not downloaded yet"
+  if [[ -f "$snapshot/preprocessor_config.json" ]]; then
+    ok "whisper tokenizer and feature extractor already present"
+    return 0
+  fi
+
+  log "fetching the whisper tokenizer and feature extractor"
+  uv run --no-project python - "$snapshot" <<'PY'
+import sys
+from huggingface_hub import snapshot_download
+
+target = sys.argv[1]
+snapshot_download(
+    "openai/whisper-large-v3",
+    local_dir=target,
+    allow_patterns=[
+        "preprocessor_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "generation_config.json",
+        "vocab.json",
+        "merges.txt",
+    ],
+)
+print(f"  -> {target}")
+PY
+  [[ -f "$snapshot/preprocessor_config.json" ]] \
+    || die "the whisper tokenizer and feature extractor did not arrive"
+  ok "whisper tokenizer and feature extractor ready"
 }
 
 # --- Kokoro (TTS) ----------------------------------------------------------
@@ -102,7 +146,8 @@ PY
 # a thinking model spends the voice agent's whole latency budget on
 # reasoning before it answers. Sizes are the registry's: 3.35 / 8.16 / 0.81 GB.
 pull_llm() {
-  local models=("gemma3:4b" "gemma3:12b")
+  # Every rung of the tier ladder, so the rule can pick any of them.
+  local models=("gemma3:1b" "gemma3:4b" "gemma3:12b")
   case "${1:-}" in
     llm:1b) models=("gemma3:1b") ;;
     llm:4b) models=("gemma3:4b") ;;
@@ -129,6 +174,7 @@ case "${1:-all}" in
   stt) pull_stt ;;
   tts) pull_tts ;;
   llm) pull_llm "${2:-}" ;;
+  llm:*) pull_llm "$1" ;;
   all) pull_stt; pull_tts; pull_llm ;;
   *) die "unknown target '$1' (use: stt | tts | llm | llm:1b | llm:4b | llm:12b | all)" ;;
 esac

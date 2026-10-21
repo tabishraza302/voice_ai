@@ -45,6 +45,12 @@ dependencies = [
     "jiwer==4.0.0",
     "whisper-normalizer==0.1.15",
     "indic-nlp-library==0.92",
+    # Devanagari <-> ITRANS, for the romanized-Hindi comparison. The
+    # Devanagari -> Latin direction in indic-nlp-library 0.92 is broken
+    # (its to_itrans drops characters), and this harness needs exactly
+    # that direction: a model that answers in Latin script must be
+    # comparable with a reference written in Devanagari.
+    "indic-transliteration==2.3.82",
     "datasets[audio]==4.4.1",
     # Audio I/O. NOTE: these are pinned to the ranges pipecat-ai itself
     # requires (soundfile~=0.13.1, soxr~=1.0.0). Newer majors are

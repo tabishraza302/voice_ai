@@ -145,7 +145,7 @@ class LocalMlxTTSService(TTSService):
         """POST to the local server and decode the WAV it returns."""
         import httpx
 
-        url = f"{self._base_url}/audio/speech"
+        url = f"{self._base_url}/v1/audio/speech"
         async with httpx.AsyncClient(timeout=300) as client:
             response = await client.post(url, json=payload)
             if response.status_code != 200:

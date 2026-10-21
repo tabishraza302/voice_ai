@@ -17,6 +17,10 @@ data/
 # Runtime logs: the host Phoenix writes here, not source
 logs/
 
+# The eval harness writes its per-scenario logs into the working
+# directory, not into logs/.
+*.eval.log
+
 # Evaluation fixtures: downloaded by evals/, not source
 evals/fixtures/audio/
 evals/fixtures/*.json
