@@ -35,6 +35,24 @@ Do not cite a remembered benchmark. The published figures are recorded in
 they are the *comparison* baseline — the measured numbers are the ones
 this repo publishes.
 
+**A measurement is a claim about the conditions it was measured under.**
+Speed and memory are properties of this machine; a WER is a property of
+this model on this corpus; a latency budget is a property of this
+deployment. Say the conditions with the number, every time.
+
+**A local baseline is not a production number.** Anything another
+deployment depends on — a threshold, a budget, a tier, a timeout — must
+be re-derived in that deployment's environment, from that environment's
+own measurements. The rule that *re-derives* travels; the number it
+produced here does not. The tier rule is the model for this: it re-runs
+the memory baseline on whatever machine it is asked about, so the same
+rule selects the right tier in production. A hard-coded number would
+not.
+
+So: a rule that needs a value from the environment takes it from config,
+and the config is where the deployment's own value goes. Never smuggle a
+number measured here into a claim about somewhere else.
+
 ### 2. Keep the three layers swappable
 
 STT, TTS and LLM are selected by config, and swapping one must not

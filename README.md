@@ -78,13 +78,20 @@ an assertion that the pipeline module imports no concrete service class.
 Every option is local. Every cost is real — and every one of them is
 measured on this machine, or it is not claimed.
 
+Two kinds of cost appear below, and they are not the same kind.
+**Weights and corpus results belong to the backend**: 1.6 GB of weights
+is 1.6 GB anywhere, and a WER on a named corpus is a fact about that
+model on that corpus. **Headroom, speed and the tier choice belong to
+the machine**: they are this box's, and another machine re-derives them
+by re-running the script that produced them.
+
 | Layer | Default | Swap to | Real cost | When |
 |---|---|---|---|---|
-| STT | `mlx-audio` + Nemotron 3.5 ASR 0.6B | `mlx-whisper` + `whisper-large-v3-turbo` | 1.28 GB → 1.61 GB of weights; **Hindi 7.18 % → 35.92 % WER**, English 8.56 % → 4.98 % | The MLX Nemotron conversion fails to load, or English matters more than Hindi |
+| STT | `mlx-audio` + Nemotron 3.5 ASR 0.6B | `mlx-whisper` + `whisper-large-v3-turbo` | 1.28 GB → 1.61 GB of weights; on FLEURS, **Hindi 7.18 % → 35.92 % WER**, English 8.56 % → 4.98 % | The MLX Nemotron conversion fails to load, or English matters more than Hindi |
 | TTS | `kokoro` | `mlx-audio` + `chatterbox-multilingual-v3` | A second TTS model behind the same service; not installed by default, so not measured here | Kokoro's grade-C Hindi voices prove unintelligible |
-| LLM | `ollama` + `gemma3:4b` | `ollama` + `gemma3:12b` | +4.8 GB | The tier rule selects it when its weights are on the machine — measurement, not preference |
+| LLM | `ollama` + `gemma3:4b` | `ollama` + `gemma3:12b` | +4.8 GB of weights; the headroom to hold it is this machine's | The tier rule selects it when its weights are on the machine — measurement, not preference |
 | LLM | `ollama` | `openai-compatible` + llama.cpp / vLLM / LM Studio | Same model, different runtime | Ollama is dropped from the stack |
-| LLM | `gemma3:4b` | `gemma3:1b` | −2.5 GB | The tier rule selects it when under 3.5 GB is left |
+| LLM | `gemma3:4b` | `gemma3:1b` | −2.5 GB of weights | The tier rule selects it when under 3.5 GB is left |
 | LLM | `gemma3:4b` | `qwen3:8b` | **Not on this endpoint.** qwen3 thinks by default and Ollama's OpenAI-compatible API cannot forward `think: false`, so the turn spends its whole budget on reasoning and returns an empty answer | Never, on this stack |
 
 Two more backends ship in the dependency set — `funasr` (SenseVoice)
@@ -117,6 +124,16 @@ Measured on this machine — an M5 MacBook Air, 16 GB, macOS 27 — with
 the other projects' stacks stopped. Every row below has a script behind
 it: `scripts/voice-ai.sh memory`, `bench`, `eval`.
 
+**These are baselines for this box and this corpus, not production
+budgets.** What travels is the mechanism, the model weights and the
+*rules* that re-derive a value on whatever machine they are asked
+about. What does not travel is speed, memory headroom and latency:
+those are properties of this Apple Silicon box, and a deployment's own
+numbers have to be measured where it runs. A WER is a property of a
+model on a corpus — FLEURS here — and a different corpus can reorder
+the ranking. So nothing below is a claim about another machine, and no
+threshold in the configuration is derived from it.
+
 ### The LLM tier
 
 | | |
@@ -144,6 +161,8 @@ rule configures `gemma3:12b` with no edit.
 ### STT speed
 
 Measured through the same HTTP endpoint the bot uses, on FLEURS clips.
+Speed here is this machine's — Apple Silicon, MLX on Metal — and a
+deployment on other hardware re-measures it with the same script.
 
 | Language | Clips | Audio | Inference | Real-time factor | Time to final transcript (p50 / p99) |
 |---|---:|---:|---:|---:|---:|
@@ -173,6 +192,13 @@ figures do: **Nemotron is 5.0× better on Hindi** (35.92 / 7.18) and
 **Whisper is 1.7× better on English** (8.56 / 4.98). The 8-bit Nemotron
 is within noise of the bf16 one, which is why it is the fallback tier
 and not the default.
+
+That ranking is a FLEURS ranking. FLEURS is read speech in a quiet
+room; a deployment that hears phone calls, or a domain vocabulary, or
+code-switching measures on its own corpus first — and the order can
+change. What this table buys a deployment is the *harness*: the same
+script, the same normalization and the same three views, pointed at a
+different corpus.
 
 The report holds two more views of the same corpus, and neither changes
 the conclusion. The `indic` normalization (`indicnlp`) gives the same
