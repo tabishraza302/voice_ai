@@ -55,6 +55,7 @@ from pipecat.utils.time import time_now_iso8601
 from pipecat.workers.runner import WorkerRunner
 
 from bot.config import Settings
+from bot.context import ContextShapingProcessor
 from bot.language import parse_language_request
 from bot.observers import LatencyBridge, PrometheusObserver, mount_metrics
 from bot.pipeline import LanguageRoutingProcessor
@@ -204,6 +205,8 @@ async def _run_pipeline(transport, settings: Settings, runner_args=None) -> None
     llm = build_llm(settings)
     tts = build_tts(settings)
 
+    context_shaper = ContextShapingProcessor()
+
     router = LanguageRoutingProcessor(voice_router=build_voice_router(settings))
 
     # Observers. The Prometheus observer turns Pipecat's metrics frames
@@ -222,6 +225,9 @@ async def _run_pipeline(transport, settings: Settings, runner_args=None) -> None
             transport.input(),
             stt,
             user_aggregator,
+            # Between the aggregator and the LLM: the history is rewritten
+            # here, so the model never sees two user messages in a row.
+            context_shaper,
             llm,
             router,
             tts,

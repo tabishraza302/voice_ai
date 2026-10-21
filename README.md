@@ -265,6 +265,8 @@ browser (Pipecat's prebuilt client)
 │ context      │ LLMContextAggregatorPair                   │
 │              │   user aggregator before the LLM           │
 │              │   assistant aggregator after the output     │
+│              │ ContextShapingProcessor                    │
+│              │   merges consecutive user turns            │
 └──────────────┴───────────────────────────────────────────┘
         │                              │
         │ OTel spans                   │ Prometheus series
@@ -276,6 +278,18 @@ browser (Pipecat's prebuilt client)
 The assistant aggregator sits **after** the transport output, so the
 context records what was actually *spoken*: words cut off by an
 interruption never reach the LLM's history.
+
+The context shaper sits **between the user aggregator and the LLM**,
+because two user messages in a row is not a conversation. It happens
+when the user speaks again before the bot has answered: Pipecat cancels
+the in-flight generation, the assistant message never lands, and the
+next user message is appended after the one before it. The traces show
+the result — a turn whose LLM span ended with no output and no error
+(a cancellation, not a failure), followed by a context of `[user
+"Hello.", user "Can you hear me?"]`, and a model that answered the
+malformed history with *"Hello, what is what? Please finish your
+question."* Consecutive user messages are merged into the one turn
+they really are, before the model sees them.
 
 ### The observability stack
 
