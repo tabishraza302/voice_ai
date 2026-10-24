@@ -114,41 +114,26 @@ Watch for transitive conflicts: Pipecat 1.13.0 requires
 `soundfile~=0.13.1` and `soxr~=1.0.0`, so the newer majors do not
 resolve.
 
-### 6. This machine is shared
+### 6. Resource isolation and port hygiene
 
-The `newotnite` and `hear_help` Docker stacks are running on this
-machine, and voice-ai needs the memory and the ports they hold. **So
-they are stopped before voice-ai runs** — `scripts/voice-ai.sh start`
-does it, and `scripts/voice-ai.sh others start` reverses it. **Stop
-only: never remove, prune, reconfigure or touch a volume.** `docker
-system prune` would affect their workflows — do not run it.
+This project runs locally alongside user and system processes.
 
-Their containers hold host ports 4317, 4318, 3000 and 9090, and
-hear_help's next-server holds `*:3002`. This project's ports are
-therefore shifted: 4319 for OTLP, 3003 for Grafana, 6006 and
-6007 for Phoenix, 9091 for Prometheus, 8020 for the STT server, 7860
-for the agent. Ollama keeps its own 11434. **Check for a conflict before
-adding a port** — and check for host processes, not just containers:
-Docker publishes on 127.0.0.1, so a host process on the IPv6 wildcard
-still wins for a browser that resolves `localhost` to `::1`. A port
-held by the *other* stack is held even while that stack is stopped, if
-something else on the host takes it — measure, do not assume.
+The project ports are shifted off standard defaults to prevent collisions:
+4319 for OTLP (avoiding 4317), 3003 for Grafana (avoiding 3000), 6006 and
+6007 for Phoenix, 9091 for Prometheus (avoiding 9090), 8020 for the STT server,
+7860 for the agent. Ollama keeps its standard 11434. **Check for a conflict before
+adding a port** — and check for host processes, not just containers.
 
-Memory is the binding constraint, not disk: 16 GB unified, shared with
-two other projects. The `mem_limit` on every container in
-`docker-compose.yml` is mandatory. An unbounded container is the most
-likely way to push this box into swap.
+Memory is the binding constraint on Apple Silicon: unified memory is shared between
+GPU, models, OS, and containers. The `mem_limit` on every container in
+`docker-compose.yml` is mandatory to prevent pushing the host into swap.
 
-**Phoenix runs on the host, not in Docker.** Docker Desktop's VM is
-capped at 1.93 GB here and the `hear_help` stack already holds about
-1.05 GB of it (its Grafana alone is 735 MB). Phoenix was OOM-killed by
-the VM's kernel at 1g, at 768m, and in `PHOENIX_LITE_MODE` — no cgroup
-limit leaves it enough room to start. `scripts/voice-ai.sh install` puts
+**Phoenix runs on the host, not in Docker.** Docker Desktop's VM memory limits
+leave insufficient headroom for Phoenix. `scripts/voice-ai.sh install` puts
 it in its own `uv tool` environment; `scripts/voice-ai.sh phoenix` runs
 it on the host, and the collector reaches it over OTLP/HTTP at
-`http://host.docker.internal:6006`. Its own Prometheus endpoint is off:
-it binds 9090 with a hardcoded port and no env var to move it, and the
-host's 9090 belongs to the other stack.
+`http://host.docker.internal:6006`. Its internal Prometheus endpoint is off:
+it binds 9090 with a hardcoded port and no env var to move it.
 
 **Phoenix files a trace under `openinference.project.name`,** not under
 `service.name`. With only `service.name`, every trace lands in Phoenix's
