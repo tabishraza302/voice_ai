@@ -34,3 +34,6 @@ models/
 
 # macOS
 .DS_Store
+
+# Internal planning and local documentation
+docs/
