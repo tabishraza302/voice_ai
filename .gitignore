@@ -21,9 +21,8 @@ logs/
 # directory, not into logs/.
 *.eval.log
 
-# Evaluation fixtures: downloaded by evals/, not source
-evals/fixtures/audio/
-evals/fixtures/*.json
+# Evaluation harness and local fixtures
+evals/
 *.wav
 *.flac
 *.mp3
