@@ -15,6 +15,7 @@ from bot.language import (
     KokoroVoiceRouter,
     LocalMlxVoiceRouter,
     NemotronSttLanguageRouter,
+    RealtimeSttLanguageRouter,
     SentenceChunker,
     WhisperSttLanguageRouter,
     detect_script,
@@ -77,6 +78,36 @@ class TestSentenceChunker:
         assert all(len(c) <= 41 for c in chunks)
 
 
+class TestForceCut:
+    """The deadline cuts the reply at a clause boundary."""
+
+    def test_the_cut_is_at_the_last_clause_boundary(self):
+        chunker = SentenceChunker()
+        chunker.feed("Certainly, I have checked the system, and it")
+        assert chunker.force_cut() == ["Certainly, I have checked the system,"]
+
+    def test_the_tail_stays_in_the_buffer(self):
+        chunker = SentenceChunker()
+        chunker.feed("Certainly, I have checked the system, and it")
+        chunker.force_cut()
+        assert chunker.flush() == ["and it"]
+
+    def test_a_number_is_not_cut_in_half(self):
+        # The comma in "1,000" is not a clause boundary.
+        chunker = SentenceChunker()
+        chunker.feed("The total is 1,000 ")
+        assert chunker.force_cut() == ["The total is 1,000"]
+
+    def test_text_without_a_clause_boundary_is_released_whole(self):
+        chunker = SentenceChunker()
+        chunker.feed("no boundary here")
+        assert chunker.force_cut() == ["no boundary here"]
+
+    def test_an_empty_buffer_cuts_nothing(self):
+        chunker = SentenceChunker()
+        assert chunker.force_cut() == []
+
+
 class TestVoiceRouters:
     def test_kokoro_router_switches_voice_and_language(self):
         router = KokoroVoiceRouter(Settings())
@@ -116,15 +147,15 @@ class TestSttLanguageRouters:
 
 class TestRouterSelection:
     def test_voice_router_for_the_default_provider(self):
-        assert isinstance(select_voice_router(Settings()), KokoroVoiceRouter)
+        assert isinstance(select_voice_router(Settings()), LocalMlxVoiceRouter)
 
-    def test_voice_router_for_the_mlx_provider(self):
-        settings = Settings(tts_provider="mlx-audio")
-        assert isinstance(select_voice_router(settings), LocalMlxVoiceRouter)
+    def test_voice_router_for_the_kokoro_provider(self):
+        settings = Settings(tts_provider="kokoro")
+        assert isinstance(select_voice_router(settings), KokoroVoiceRouter)
 
     def test_stt_router_for_the_default_provider(self):
         assert isinstance(
-            select_stt_language_router(Settings()), NemotronSttLanguageRouter
+            select_stt_language_router(Settings()), RealtimeSttLanguageRouter
         )
 
     def test_stt_router_for_the_whisper_provider(self):

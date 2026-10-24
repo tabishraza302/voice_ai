@@ -153,15 +153,20 @@ else
   warn "ollama not running — skipping"
 fi
 
-log "measuring STT server resident size (one model only)"
+log "measuring the mlx-audio server resident size"
 STT_RESIDENT_GB="null"
 STT_MODEL="${STT_MODEL:-mlx-community/nemotron-3.5-asr-streaming-0.6b}"
+TTS_MODEL="${TTS_MODEL:-mlx-community/Kokoro-82M-4bit}"
 STT_PORT="${STT_PORT:-8020}"
+# The TTS provider decides where the TTS weights live: in the server
+# (mlx-audio) or in the agent's own process (kokoro).
+TTS_PROVIDER="$(uv run python -c 'from bot.config import Settings; print(Settings().tts_provider)')"
 if [[ -d "$HOME/.cache/huggingface/hub/models--${STT_MODEL//\//--}" ]]; then
   # Done in one Python block: the server is `uv run`'s child, so the
   # shell's `$!` is uv's pid, not the server's, and measuring the wrong
   # process reports nothing.
   STT_RESIDENT_GB=$(MEASURED_STT_MODEL="$STT_MODEL" MEASURED_STT_PORT="$STT_PORT" \
+    MEASURED_TTS_MODEL="$TTS_MODEL" MEASURED_TTS_PROVIDER="$TTS_PROVIDER" \
     MEASURED_REPO="$REPO_ROOT" uv run python - <<'PY'
 import os
 import subprocess
@@ -172,6 +177,8 @@ import wave
 import psutil
 
 model = os.environ["MEASURED_STT_MODEL"]
+tts_model = os.environ["MEASURED_TTS_MODEL"]
+tts_provider = os.environ["MEASURED_TTS_PROVIDER"]
 port = int(os.environ["MEASURED_STT_PORT"])
 repo = os.environ["MEASURED_REPO"]
 
@@ -239,6 +246,36 @@ try:
         except Exception as exc:
             print(f"load failed: {exc}", file=__import__("sys").stderr)
 
+        # The TTS model lives in the same server when the TTS provider is
+        # mlx-audio, so it has to be resident for the measurement to be
+        # the deployment's memory.
+        if tts_provider == "mlx-audio":
+            try:
+                load = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/v1/models?model_name={tts_model}",
+                    method="POST",
+                )
+                with urllib.request.urlopen(load, timeout=900) as response:
+                    response.read()
+                speak = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/v1/audio/speech",
+                    data=json.dumps(
+                        {
+                            "model": tts_model,
+                            "input": "One.",
+                            "voice": "af_heart",
+                            "lang_code": "en",
+                            "response_format": "wav",
+                        }
+                    ).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(speak, timeout=900) as response:
+                    response.read()
+            except Exception as exc:
+                print(f"tts load failed: {exc}", file=__import__("sys").stderr)
+
         # Measure the server process itself, and any child it spawned.
         total = 0
         for proc in psutil.process_iter(["pid", "cmdline", "memory_info"]):
@@ -258,16 +295,17 @@ finally:
         process.kill()
 PY
 )
-  ok "mlx_audio.server resident (1 model): ${STT_RESIDENT_GB} GB"
+  ok "mlx_audio.server resident: ${STT_RESIDENT_GB} GB"
 else
   warn "${STT_MODEL} not downloaded yet — skipping (run scripts/pull_models.sh stt)"
 fi
 
-log "measuring Kokoro resident size"
 TTS_RESIDENT_GB="null"
-# Use `settings=`: the direct `voice=` kwarg was deprecated in Pipecat
-# 0.0.105 and now raises, which would silently measure nothing.
-TTS_OUT=$(uv run python - <<'PY' 2>/tmp/kokoro_measure_err.log || true
+if [[ "$TTS_PROVIDER" == "kokoro" ]]; then
+  log "measuring Kokoro resident size"
+  # Use `settings=`: the direct `voice=` kwarg was deprecated in Pipecat
+  # 0.0.105 and now raises, which would silently measure nothing.
+  TTS_OUT=$(uv run python - <<'PY' 2>/tmp/kokoro_measure_err.log || true
 import os
 import psutil
 from pipecat.services.kokoro.tts import KokoroTTSService
@@ -282,12 +320,16 @@ after = psutil.Process(os.getpid()).memory_info().rss
 print(f"{(after - before) / 1024**3:.2f}")
 PY
 )
-if [[ -n "$TTS_OUT" ]]; then
-  TTS_RESIDENT_GB="$TTS_OUT"
+  if [[ -n "$TTS_OUT" ]]; then
+    TTS_RESIDENT_GB="$TTS_OUT"
+  else
+    warn "kokoro measurement failed; see /tmp/kokoro_measure_err.log"
+  fi
+  ok "kokoro marginal resident: ${TTS_RESIDENT_GB} GB"
 else
-  warn "kokoro measurement failed; see /tmp/kokoro_measure_err.log"
+  # The TTS weights are in the server's own process, counted above.
+  ok "the TTS lives in the mlx-audio server (${TTS_PROVIDER}); no separate TTS process"
 fi
-ok "kokoro marginal resident: ${TTS_RESIDENT_GB} GB"
 
 log "measuring the bot process (pipecat + services) resident size"
 PYTHON_RESIDENT_GB=$(uv run python - <<'PY' 2>/dev/null || true

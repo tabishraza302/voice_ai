@@ -6,17 +6,19 @@ and every default is documented in ``bot/config.py``.
 
 from __future__ import annotations
 
+import pytest
+
 from bot.config import SYSTEM_PROMPT, Settings
 
 
 def test_defaults():
     s = Settings(_env_file=None)
-    assert s.stt_provider == "mlx-audio"
+    assert s.stt_provider == "mlx-audio-realtime"
     assert s.stt_model == "mlx-community/nemotron-3.5-asr-streaming-0.6b"
     assert s.stt_language == "auto"
     assert s.llm_provider == "ollama"
     assert s.llm_model == "gemma3:4b"
-    assert s.tts_provider == "kokoro"
+    assert s.tts_provider == "mlx-audio"
     assert s.tts_voice_en == "af_heart"
     assert s.tts_voice_hi == "hf_alpha"
     assert s.port == 7860
@@ -52,6 +54,41 @@ def test_vad_analyzer_uses_the_configured_stop_window():
 
     analyzer = build_vad_analyzer(Settings(_env_file=None))
     assert analyzer.params.stop_secs == 0.8
+
+
+def test_the_mlx_server_is_needed_by_either_layer():
+    from bot.bot import needs_mlx_audio_server
+
+    assert needs_mlx_audio_server(Settings(_env_file=None, stt_provider="mlx-audio"))
+    assert needs_mlx_audio_server(
+        Settings(_env_file=None, stt_provider="mlx-audio-realtime", tts_provider="kokoro")
+    )
+    assert needs_mlx_audio_server(
+        Settings(_env_file=None, stt_provider="mlx-whisper", tts_provider="mlx-audio")
+    )
+    assert not needs_mlx_audio_server(
+        Settings(_env_file=None, stt_provider="mlx-whisper", tts_provider="kokoro")
+    )
+
+
+def test_a_missing_mlx_server_names_the_layer_that_needs_it():
+    """A bot that starts and speaks nothing is the failure mode to avoid."""
+    import asyncio
+
+    from bot.bot import start_mlx_audio_server
+
+    settings = Settings(
+        _env_file=None,
+        stt_provider="mlx-whisper",
+        tts_provider="mlx-audio",
+        stt_base_url="http://127.0.0.1:9/v1",
+        tts_base_url="http://127.0.0.1:9",
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.run(start_mlx_audio_server(settings))
+    message = str(excinfo.value)
+    assert "tts" in message
+    assert "127.0.0.1:9" in message
 
 
 def test_system_prompt_is_shared_and_says_no_markdown():

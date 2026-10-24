@@ -61,6 +61,14 @@ dependencies = [
     "psutil==7.1.3",
     # Settings.
     "pydantic-settings==2.12.0",
+    # Text processing for the mlx-audio Kokoro TTS model. mlx-audio's
+    # Kokoro pipeline raises ImportError without it, which made the
+    # `tts_provider=mlx-audio` swap unusable. The `en` extra is what
+    # brings the English grapheme-to-phoneme converter and espeak-ng
+    # (the "hi" voices go through espeak-ng, so the Hindi path needs it
+    # too). It does pull torch through spacy-curated-transformers; that
+    # is the cost of the MLX Kokoro path, not the ONNX one.
+    "misaki[en]==0.9.4",
 ]
 
 [project.optional-dependencies]

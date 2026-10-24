@@ -128,9 +128,11 @@ class KokoroVoiceRouter:
 class LocalMlxVoiceRouter:
     """Voice selection for the local mlx-audio TTS service.
 
-    mlx-audio's Chatterbox models take a language code rather than a
-    per-voice pack, so the delta carries the language and leaves the voice
-    to the model's own default.
+    mlx-audio's Kokoro model ships the same per-voice packs as the ONNX
+    build (``af_heart`` for English, ``hf_alpha`` for Hindi), so the
+    delta carries the voice id as well as the language. A model with no
+    voice packs ignores the id — Chatterbox clones a voice from
+    reference audio — so sending it is always safe.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -142,6 +144,9 @@ class LocalMlxVoiceRouter:
             model=self._settings.tts_model,
             language=language,
             speed=self._settings.tts_speed,
+            voice=(
+                self._settings.tts_voice_hi if script == "devanagari" else self._settings.tts_voice_en
+            ),
         )
 
 
@@ -177,6 +182,28 @@ class WhisperSttLanguageRouter:
         )
 
 
+class RealtimeSttLanguageRouter:
+    """Language selection for the streaming STT path — there is none.
+
+    ``/v1/realtime`` accepts a model, a format and a turn-detection mode,
+    and no language. Returning an empty delta would be exactly the silent
+    no-op the protocols in this file exist to prevent: the caller would
+    log "language set" and the next turn would transcribe in whatever the
+    model picks. So this router refuses, and the message says which
+    provider does support a language.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+
+    def delta_for(self, language: Language | None) -> Any:
+        raise ValueError(
+            "mlx-audio-realtime has no language switch: /v1/realtime "
+            "takes model, format and turn_detection only. Use "
+            "stt_provider=mlx-audio to pin a language."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Sentence chunking
 # ---------------------------------------------------------------------------
@@ -189,6 +216,19 @@ _TERMINATORS = "।.?!…"
 # comfortably under that for any script, and keeps the gap between the
 # first spoken clause and the rest short.
 MAX_CHUNK_CHARS = 200
+
+# Punctuation that ends a clause rather than a sentence. The cut only
+# happens after one of these, and only when the next character is
+# whitespace, so "1,000" is not cut in half.
+CLAUSE_ENDINGS = ",;:—–，、"
+
+
+def _clause_cut(text: str) -> int:
+    """The index just past the last clause boundary in `text`, or -1."""
+    for i in range(len(text) - 1, -1, -1):
+        if text[i] in CLAUSE_ENDINGS and (i + 1 == len(text) or text[i + 1].isspace()):
+            return i + 1
+    return -1
 
 
 class SentenceChunker:
@@ -251,6 +291,26 @@ class SentenceChunker:
         self._buffer = ""
         return [remainder] if remainder else []
 
+    def force_cut(self) -> list[str]:
+        """Cut the buffer now, at its last clause boundary.
+
+        The first chunk of a reply is released this way when the model
+        has not finished a sentence by the deadline: the bot starts
+        speaking a clause rather than waiting for a full stop. The
+        remainder stays in the buffer, so the rest of the sentence is
+        spoken next.
+        """
+        text = self._buffer.strip()
+        if not text:
+            return []
+        cut = _clause_cut(text)
+        if cut <= 0:
+            self._buffer = ""
+            return [text]
+        head = text[:cut].strip()
+        self._buffer = text[cut:].strip()
+        return [head] if head else []
+
 
 # ---------------------------------------------------------------------------
 # Router selection
@@ -296,6 +356,8 @@ def select_stt_language_router(settings: Settings) -> SttLanguageRouter:
     provider = settings.stt_provider
     if provider == "mlx-audio":
         return NemotronSttLanguageRouter(settings)
+    if provider == "mlx-audio-realtime":
+        return RealtimeSttLanguageRouter(settings)
     if provider == "mlx-whisper":
         return WhisperSttLanguageRouter(settings)
     raise ValueError(

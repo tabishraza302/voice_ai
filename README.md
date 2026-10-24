@@ -10,6 +10,10 @@ fixtures (FLEURS) and their models from the hub — once, before the
 demo. The numbers in this README were measured on the machine that
 wrote it, and every one of them has a script behind it.
 
+The one exception is opt-in: pointing the `openai-compatible` LLM
+provider at a cloud API instead of a local server sends that turn
+somewhere else. The default configuration reaches nothing.
+
 ```
 scripts/voice-ai.sh install && scripts/voice-ai.sh models && scripts/voice-ai.sh start
 # then open http://localhost:7860/client
@@ -26,9 +30,9 @@ dashboard.
 
 | | |
 |---|---|
-| **STT** | NVIDIA Nemotron 3.5 ASR Streaming 0.6B, via `mlx-audio` on Metal |
+| **STT** | NVIDIA Nemotron 3.5 ASR Streaming 0.6B, over `mlx-audio`'s realtime WebSocket on Metal |
 | **LLM** | `gemma3` on Ollama, tier chosen by measurement |
-| **TTS** | Kokoro (in-process ONNX) |
+| **TTS** | Kokoro-82M (in-process ONNX, or the same model on Metal through `mlx-audio`) |
 | **Orchestration** | Pipecat 1.13.0 |
 | **Transport** | Serverless WebRTC; the browser client is Pipecat's own |
 | **Traces** | OpenTelemetry → Collector → Arize Phoenix |
@@ -87,12 +91,15 @@ by re-running the script that produced them.
 
 | Layer | Default | Swap to | Real cost | When |
 |---|---|---|---|---|
-| STT | `mlx-audio` + Nemotron 3.5 ASR 0.6B | `mlx-whisper` + `whisper-large-v3-turbo` | 1.28 GB → 1.61 GB of weights; on FLEURS, **Hindi 7.18 % → 35.92 % WER**, English 8.56 % → 4.98 % | The MLX Nemotron conversion fails to load, or English matters more than Hindi |
-| TTS | `kokoro` | `mlx-audio` + `chatterbox-multilingual-v3` | A second TTS model behind the same service; not installed by default, so not measured here | Kokoro's grade-C Hindi voices prove unintelligible |
+| STT | `mlx-audio-realtime` + Nemotron 3.5 ASR 0.6B | `mlx-whisper` + `whisper-large-v3-turbo` | 1.28 GB → 1.61 GB of weights; on FLEURS, **Hindi 7.18 % → 35.92 % WER**, English 8.56 % → 4.98 % | The MLX Nemotron conversion fails to load, or English matters more than Hindi |
+| STT | `mlx-audio-realtime` + Nemotron 3.5 ASR 0.6B | `mlx-audio` + Nemotron 3.5 ASR 0.6B | Same Nemotron checkpoint over batch HTTP (`/v1/audio/transcriptions`) instead of the WebSocket transport: the transcript waits for the whole segment, so TTFS p50 / p99 is **0.94 s / 1.06 s (English)** and **1.26 s / 1.80 s (Hindi)** against the realtime **0.89 s / 0.99 s** and **1.00 s / 1.45 s** (FLEURS, this machine, local `mlx_audio.server`; worst p99 1.45 s → 1.80 s). It buys what `/v1/realtime` cannot: a language field, so `stt_language=en|hi` is accepted and a mid-session switch can be routed | The session must pin a language, or the STT itself must follow a mid-session language switch |
+| TTS | `mlx-audio` + `Kokoro-82M-4bit` | `kokoro` (in-process ONNX) | **Time to first audio 0.33 s against 0.79 s** (p50 of five sentences, warm, this machine); the default needs the server, the swap does not, and the swap costs 0.48 GB in the agent's own process | The mlx-audio server is not wanted on this deployment, or its memory is not there |
 | LLM | `ollama` + `gemma3:4b` | `ollama` + `gemma3:12b` | +4.8 GB of weights; the headroom to hold it is this machine's | The tier rule selects it when its weights are on the machine — measurement, not preference |
 | LLM | `ollama` | `openai-compatible` + llama.cpp / vLLM / LM Studio | Same model, different runtime | Ollama is dropped from the stack |
-| LLM | `gemma3:4b` | `gemma3:1b` | −2.5 GB of weights | The tier rule selects it when under 3.5 GB is left |
-| LLM | `gemma3:4b` | `qwen3:8b` | **Not on this endpoint.** qwen3 thinks by default and Ollama's OpenAI-compatible API cannot forward `think: false`, so the turn spends its whole budget on reasoning and returns an empty answer | Never, on this stack |
+| LLM | `ollama` + `gemma3:4b` | `openai-compatible` + a cloud API (`gpt-5.4-mini`) | **Quality up, latency up:** the LLM stage goes from 0.25 s to 1.12 s (median over six turns, this machine) — about +0.87 s on a 2.2 s turn — and the reply gets shorter (16 → 11 tokens) and better in Hindi. The turn leaves the machine, and the air-gap claim above stops holding | The local model's Hindi is not good enough, and the network is there |
+| LLM | `gemma3:4b` | `gemma3:1b` | −2.5 GB of weights; **it answers Hindi questions in English** (both its builds, on every sample), so the rung below the 4B one breaks the bot's language contract while keeping the persona | The tier rule selects it when under 3.5 GB is left — and the bot stops speaking Hindi |
+| LLM | `gemma3:4b` | `qwen3:4b-instruct-2507-q4_K_M` | **0.027 s faster to the first token** (0.057 s against 0.084 s, median of five on the bot's own endpoint) and 0.79 GB smaller on disk, at the same resident memory — but its Hindi is fluent nonsense on a content question: 5 of 5 replies invented a pizza recipe out of rocks, ice and sleep, while gemma3:4b answered all five correctly | Only with the model id pinned to the `-instruct-2507` tag. The family default `qwen3:4b` thinks, and Ollama's OpenAI-compatible endpoint forwards neither `think: false` nor `enable_thinking` — only `reasoning_effort: none`, which Ollama does forward |
+| LLM | `gemma3:4b` | `gemma4:e2b` | **The fastest model measured here: 0.042 s to the first token** against 0.084 s, on the bot's own endpoint — but only with `reasoning_effort: none`, without which it thinks on that endpoint for 2.3 s. Its Hindi is correct (5 of 5 on both Hindi prompts, where `gemma4:e4b` answered 2 of 5 in English). It costs **6.89 GB resident against 2.62 GB**, on a box where memory is the binding constraint | A box with the headroom for it, and the flag wired into the Ollama provider |
 
 Two more backends ship in the dependency set — `funasr` (SenseVoice)
 and `pocket-tts` — and neither is registered. A swap is not a `.env`
@@ -139,30 +146,100 @@ threshold in the configuration is derived from it.
 | | |
 |---|---|
 | Total unified memory | 16.0 GB |
-| macOS baseline (active + wired + compressed) | 2.67 GB |
+| macOS baseline (active + wired + compressed) | 2.31 GB |
 | Ollama, `gemma3:4b` resident | 2.62 GB |
-| mlx-audio STT server, one model | 0.29 GB |
-| Kokoro, marginal | 0.48 GB |
-| The agent's own process | 0.11 GB |
+| mlx-audio server, both models (ASR + TTS) | 0.45 GB |
+| The agent's own process | 0.13 GB |
 | Reserve for the other projects' stacks | 1.5 GB |
-| **Available for the LLM** | **11.05 GB** |
+| **Available for the LLM** | **11.61 GB** |
 | **Memory ceiling — the tier the rule selects** | **`gemma3:12b`** (8.16 GB) |
 | **Tier that actually runs here** | **`gemma3:4b`** (3.35 GB) |
 
 The rule is arithmetic, not preference: it subtracts everything that is
 not the LLM and picks the largest Gemma 3 rung that fits. The ceiling
-is `gemma3:12b` — but its 7.3 GB of weights are not on this machine,
-and this link fetches them at about 260 KB/s, which is seven hours of
-pulling. So the *configured* tier is the largest rung that both fits
-and is installed, and `scripts/voice-ai.sh apply-tier` writes that one
-and says which it picked. On a machine with the 12B weights, the same
-rule configures `gemma3:12b` with no edit.
+is `gemma3:12b`, whose weights are not on this machine. So the
+*configured* tier is the largest rung that both fits and is installed,
+and `scripts/voice-ai.sh apply-tier` writes that one and says which it
+picked. On a machine with the 12B weights, the same rule configures
+`gemma3:12b` with no edit.
+
+The TTS is part of that arithmetic, and where it lives changes it. The
+mlx-audio server holds both the ASR model and the Kokoro TTS model
+(0.45 GB resident, measured); the in-process Kokoro swap adds 0.48 GB
+to the agent's own process instead.
+
+### The turn, stage by stage
+
+One turn, measured end to end: a recorded utterance replayed through
+the **real** pipeline — real STT, real TTS, real VAD, real turn
+strategies — with a stub LLM that streams a fixed reply, so the number
+does not move with the model's mood.
+`STT_PROVIDER=mlx-audio scripts/voice-ai.sh turn-bench` (batch
+transport); medians of five runs, on this machine, with the agent
+stopped so nothing else competes for the CPU. Run-to-run spread is about
+±0.05 s.
+
+| Stage | Time | From the end of the user's speech |
+|---|---:|---:|
+| The VAD decides the user has stopped | 0.79 s | 0.79 s |
+| The final transcript arrives | 0.77 s | 1.56 s |
+| The model's first token | 0.20 s | 1.76 s |
+| The first sound of the reply | 0.46 s | 2.23 s |
+
+The first row is the silence window, in full (`vad_stop_secs = 0.8`); the
+second is the STT request and the model's inference on the whole
+segment; the third is the turn analyzer's verdict and the context
+write; the fourth is the model's first sentence and then the TTS.
+
+**Where the 0.8 s of STT time goes.** On this batch path the bot sends
+the whole utterance to the STT in one request, and the model's cost
+grows with the audio it is given: 2 s of audio takes 0.18 s to
+transcribe, 8.8 s takes 0.69 s.
+The 0.19 s a two-second clip suggests is not what a nine-second
+utterance costs. Nothing in this repository is slow here — Pipecat's
+batch STT transcribes the segment it was handed, and the model is
+linear in its length.
+
+**The streaming transport — the default — takes that 0.8 s to 0.14 s.**
+Same clip, same VAD, same stub LLM, with `stt_provider=mlx-audio-realtime`
+and the in-process Kokoro for the reply: the final transcript lands
+**0.93 s** after the user stops instead of 1.56 s, and the STT stage
+itself — VAD stop to transcript — is **0.14 s** against 0.77 s. The
+audio was transcribed while the user was still speaking, so what is left
+after the silence window is the buffered tail, not the whole segment.
+`STT_PROVIDER=mlx-audio-realtime scripts/voice-ai.sh turn-bench
+--backend kokoro --runs 3`, this machine; artifact
+`data/turn_bench_realtime.json`. The reply's TTS is Kokoro here, which
+the batch table above did not use — it changes the last row only, not
+the two that move.
+
+**The 0.8 s silence window is load-bearing.** The turn analyzer judged
+**9 of 10** natural internal pauses in six FLEURS clips to be a
+complete turn, and the ASR put a sentence-final full stop on **3 of 4**
+mid-utterance fragments. A shorter window buys latency with answers to
+fragments — which is what the traces already show ("Hello, what is
+what? Please finish your question."). The window stays.
+
+**Speaking the first clause.** The bot waits at most
+`first_chunk_deadline_seconds` for the model's first whole sentence
+and then speaks the first clause, with the rest of the sentence
+following. That takes **0.21 s** off the time to the first sound
+(0.668 s → 0.463 s):
+`STT_PROVIDER=mlx-audio scripts/voice-ai.sh turn-bench --deadline 0
+--out data/turn_bench_deadline0.json`, against the default-deadline
+run above. A deadline of 0.4 s would buy nothing — the
+model's first sentence is already complete by then — and 0.1 s would
+buy 0.43 s at the price of a first chunk one word long. The cost is
+prosody: the bot may say "Certainly," before the rest of the sentence.
+Setting the deadline to 0 turns the cut off.
 
 ### STT speed
 
-Measured through the same HTTP endpoint the bot uses, on FLEURS clips.
-Speed here is this machine's — Apple Silicon, MLX on Metal — and a
-deployment on other hardware re-measures it with the same script.
+Measured through the batch HTTP endpoint (`/v1/audio/transcriptions`), on
+FLEURS clips; the streaming default's time to the final transcript is in
+the swap table above. Speed here is this machine's — Apple Silicon, MLX
+on Metal — and a deployment on other hardware re-measures it with the
+same script.
 
 | Language | Clips | Audio | Inference | Real-time factor | Time to final transcript (p50 / p99) |
 |---|---:|---:|---:|---:|---:|
@@ -171,15 +248,18 @@ deployment on other hardware re-measures it with the same script.
 
 A real-time factor of 0.1 means the model transcribes ten seconds of
 speech per second. The p99 the bot is configured with is **1.80 s**:
-that is `ttfs_p99_latency` in `.env.example`, written by
+the batch transport's worst, and the larger of the two, so it also
+covers a runtime switch to streaming (whose worst is 1.45 s). That is
+`ttfs_p99_latency` in `.env.example`, written by
 `scripts/voice-ai.sh apply-tier`.
 
 ### STT quality
 
-WER over 40 FLEURS clips per language, through the same HTTP endpoint
-the bot uses. The numbers below use the `standard` normalization —
-OpenAI's `whisper-normalizer`, which is what every published FLEURS
-number is computed with.
+WER over 40 FLEURS clips per language, through the batch HTTP endpoint
+(`/v1/audio/transcriptions`, the transport the eval harness speaks; the
+streaming default runs the same checkpoint). The numbers below use the
+`standard` normalization — OpenAI's `whisper-normalizer`, which is what
+every published FLEURS number is computed with.
 
 | Model | `en_us` WER | `hi_in` WER | `en_us` CER | `hi_in` CER |
 |---|---:|---:|---:|---:|
@@ -211,6 +291,35 @@ One caveat on precision: Whisper's transcription is not
 bit-deterministic on Metal. Two runs over the same 40 clips differed by
 about 1.5 WER points on Hindi — one character in a handful of clips.
 Nemotron's output was byte-identical across the same check.
+
+### TTS speed
+
+Time to first audio — the gap between the bot deciding what to say and
+the first sound of it. Five sentences (two English of different lengths,
+one longer, two Hindi), each spoken through a real Pipecat pipeline,
+so the number includes the service's own bookkeeping and the resampler.
+Warm: the first request in each language loads the model and is
+discarded, because a cold load is not what a conversation feels like.
+`scripts/voice-ai.sh tts-bench`; this machine, the MLX model on Metal
+and the ONNX build on the CPU.
+
+| Backend | Time to first audio (p50) | (max) | Real-time factor |
+|---|---:|---:|---:|
+| `mlx-audio` + Kokoro-82M-4bit, Metal | **0.33 s** | 0.52 s | 0.07 |
+| `kokoro`, in-process ONNX, CPU | 0.79 s | 1.33 s | 0.25 |
+
+Run-to-run spread on this machine is about ±0.02 s on the medians, so
+the numbers are quoted to the precision the measurement holds; the gap
+between the two backends is an order of magnitude larger than that
+spread.
+
+The same voices on both sides (`af_heart` for English, `hf_alpha` for
+Hindi), so the swap is a runtime change and not a voice change. The
+mlx-audio backend is the default because it reaches the first sound
+2.4× sooner; it needs the server, which the STT needs anyway. The
+in-process Kokoro is the swap for a deployment that does not want the
+server: it costs 0.48 GB in the agent's own process and 0.46 s more
+before the first sound.
 <!-- MEASURED:END -->
 
 ### The published comparison
@@ -251,22 +360,22 @@ browser (Pipecat's prebuilt client)
 ┌──────────────────────────────────────────────────────────┐
 │ SmallWebRTCTransport                                     │
 ├──────────────────────────────────────────────────────────┤
-│ STT          │ LocalMlxSTTService → mlx_audio.server      │
-│              │   NVIDIA Nemotron 3.5 ASR (Metal)          │
+│ STT          │ LocalMlxRealtimeSTTService (the default)  │
+│              │  → mlx_audio.server, Nemotron 3.5 (Metal) │
 ├──────────────┼───────────────────────────────────────────┤
-│ LLM          │ OLLamaLLMService → Ollama → gemma3         │
+│ LLM          │ OLLamaLLMService → Ollama → gemma3        │
 ├──────────────┼───────────────────────────────────────────┤
-│ routing      │ LanguageRoutingProcessor                   │
-│              │   sentence split → script detect → voice    │
-│              │   (VoiceRouter protocol: no backend named) │
+│ routing      │ LanguageRoutingProcessor                  │
+│              │   sentence split → script detect → voice  │
+│              │   (VoiceRouter protocol: no backend named)│
 ├──────────────┼───────────────────────────────────────────┤
-│ TTS          │ KokoroTTSService (in-process ONNX)         │
+│ TTS          │ Kokoro-82M (Metal via mlx-audio, or ONNX) │
 ├──────────────┼───────────────────────────────────────────┤
-│ context      │ LLMContextAggregatorPair                   │
-│              │   user aggregator before the LLM           │
-│              │   assistant aggregator after the output     │
-│              │ ContextShapingProcessor                    │
-│              │   merges consecutive user turns            │
+│ context      │ LLMContextAggregatorPair                  │
+│              │   user aggregator before the LLM          │
+│              │   assistant aggregator after the output   │
+│              │ ContextShapingProcessor                   │
+│              │   merges consecutive user turns           │
 └──────────────┴───────────────────────────────────────────┘
         │                              │
         │ OTel spans                   │ Prometheus series
@@ -407,6 +516,7 @@ Then open **http://localhost:7860/client** and talk to it.
 | | |
 |---|---|
 | Agent | http://localhost:7860/client |
+| STT mode switch | http://localhost:7860/settings (also a corner bar on the client page) |
 | Phoenix (traces) | http://localhost:6006 |
 | Grafana (dashboards) | http://localhost:3003 |
 | Prometheus | http://localhost:9091 |
@@ -425,20 +535,31 @@ scripts/voice-ai.sh stop
 Type in the client's message box, or speak. The bot replies in the
 language you used.
 
+The STT transport is switchable while the agent runs: the **STT** bar in
+the client's bottom-right corner, or
+[`/settings`](http://localhost:7860/settings), moves between batch HTTP
+and the realtime WebSocket. The choice applies to the next connection —
+a session keeps the transport it started with.
+
 To force a language, send an RTVI message:
 
 ```json
 {"type": "set_language", "language": "hi"}
 ```
 
-`auto` (the default) uses Nemotron's language-ID conditioning, which is
-the mode that survives code-switching.
+`auto` (the default, and the only value the realtime transport accepts)
+is Nemotron's language-ID conditioning on the batch transport — the mode
+that survives code-switching. To pin `en` or `hi`, switch the transport
+to batch (`/settings`, or `stt_provider=mlx-audio`).
 
 ### Measuring
 
 ```bash
 scripts/voice-ai.sh memory          # the memory baseline, and the LLM tier it selects
-scripts/voice-ai.sh bench           # STT speed: real-time factor and time-to-final-transcript
+scripts/voice-ai.sh bench           # STT speed, batch: real-time factor, time to final
+scripts/voice-ai.sh bench --realtime # STT speed, streaming: TTFS p50/p99
+scripts/voice-ai.sh turn-bench      # the turn, end to end (the default: streaming STT)
+STT_PROVIDER=mlx-audio scripts/voice-ai.sh turn-bench  # the same turn, batch STT
 scripts/voice-ai.sh eval            # FLEURS WER/CER, per model and per normalization
 scripts/voice-ai.sh eval-scenarios  # behavioural evals (needs the agent running)
 scripts/voice-ai.sh smoke           # synthesise speech, transcribe it back (needs: stt)

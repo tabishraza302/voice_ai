@@ -1,6 +1,6 @@
 """The language-routing processor.
 
-This sits between the LLM and the TTS. It does three things:
+This sits between the LLM and the TTS. It does four things:
 
 1. **Splits the LLM's reply into sentences.** The LLM streams tokens; the
    TTS needs whole sentences, because a sentence is the smallest unit that
@@ -12,13 +12,23 @@ This sits between the LLM and the TTS. It does three things:
    mid-answer ("Sure. अब मैं आपकी मदद करता हूँ।"), so the voice is decided
    per sentence, not per turn.
 
-3. **Measures the cost of waiting for a sentence.** The first sentence of
-   a reply is not spoken until it is complete, and that wait is the price
-   of this design. The TTS cannot measure it: in ``TOKEN`` mode Pipecat
-   deliberately skips the TTS's own text-aggregation metric, because
-   *this* processor is where the aggregation happens. So the measurement
-   is taken here, and reported as the same
-   ``TextAggregationMetricsData`` the TTS would have reported.
+3. **Cuts the first sentence short when the model is slow.** The bot is
+   silent until the model finishes its first sentence, and that wait is
+   the largest single part of the time to the first sound. So the first
+   chunk is released at the last clause boundary once
+   ``deadline_seconds`` have passed, and the rest of the sentence follows.
+
+4. **Measures the cost of waiting for a sentence.** The TTS cannot measure
+   it: in ``TOKEN`` mode Pipecat deliberately skips the TTS's own
+   text-aggregation metric, because *this* processor is where the
+   aggregation happens. So the measurement is taken here, and reported as
+   the same ``TextAggregationMetricsData`` the TTS would have reported.
+
+The sentences it pushes are plain ``TextFrame``s, not ``LLMTextFrame``s:
+the LLM's own frames are already on the wire as the model streams them,
+and Pipecat's RTVI observer reports a frame when it is first pushed, so a
+second ``LLMTextFrame`` per sentence would report the reply twice — in the
+eval harness's transcript as well as in a client's.
 
 **It names no TTS backend.** The settings delta comes from the injected
 ``VoiceRouter``, which is the whole point: swapping the TTS provider
@@ -37,6 +47,7 @@ from pipecat.frames.frames import (
     LLMFullResponseStartFrame,
     LLMTextFrame,
     MetricsFrame,
+    TextFrame,
     TTSUpdateSettingsFrame,
 )
 from pipecat.metrics.metrics import TextAggregationMetricsData
@@ -48,10 +59,15 @@ from bot.language import SentenceChunker, Script, VoiceRouter, detect_script
 class LanguageRoutingProcessor(FrameProcessor):
     """Splits LLM text into sentences and routes each one to the right voice."""
 
-    def __init__(self, voice_router: VoiceRouter) -> None:
+    def __init__(self, voice_router: VoiceRouter, deadline_seconds: float = 0.25) -> None:
         super().__init__()
         self._router = voice_router
         self._chunker = SentenceChunker()
+        # How long the first sentence of a reply may take before the bot
+        # speaks the first clause instead. The bot is silent until the
+        # model finishes a sentence, and that wait is the largest single
+        # part of the time to the first sound.
+        self._deadline_seconds = deadline_seconds
         # The voice currently in force, so a delta is only pushed when the
         # script actually changes. Pushing an unchanged delta on every
         # sentence would restart the TTS's audio context each time.
@@ -62,6 +78,9 @@ class LanguageRoutingProcessor(FrameProcessor):
         # for, and the later ones cost nothing.
         self._first_token_at: float | None = None
         self._aggregation_reported = False
+        # Whether this reply's first chunk has been spoken yet. Until it
+        # has, the deadline can cut the reply short.
+        self._first_chunk_spoken = False
 
     @property
     def current_script(self) -> Script | None:
@@ -79,8 +98,11 @@ class LanguageRoutingProcessor(FrameProcessor):
         if isinstance(frame, LLMTextFrame):
             if self._first_token_at is None and not self._aggregation_reported:
                 self._first_token_at = time.monotonic()
-            for sentence in self._chunker.feed(frame.text):
-                await self._speak(sentence)
+            chunks = self._chunker.feed(frame.text)
+            if not chunks and self._first_chunk_pending() and self._deadline_passed():
+                chunks = self._chunker.force_cut()
+            for chunk in chunks:
+                await self._speak(chunk)
             return
 
         if isinstance(frame, (LLMFullResponseEndFrame, EndFrame)):
@@ -106,7 +128,16 @@ class LanguageRoutingProcessor(FrameProcessor):
             await self.push_frame(TTSUpdateSettingsFrame(delta=delta))
             self._current_script = script
 
-        await self.push_frame(LLMTextFrame(sentence))
+        # Not an ``LLMTextFrame``, deliberately. Pipecat's RTVI observer
+        # reports every LLM text frame the moment it is pushed — and the
+        # LLM's own frames are pushed before this processor can consume
+        # them — so re-emitting an ``LLMTextFrame`` here would put the
+        # reply on the wire twice: once as the model streamed it, once as
+        # the sentences that are actually spoken. The spoken sentences are
+        # plain text; the model's frames keep their meaning as the model's
+        # text.
+        await self.push_frame(TextFrame(sentence))
+        self._first_chunk_spoken = True
 
         # After the sentence, not before: the delta-then-text order is a
         # hard constraint — the voice must be set before the text it
@@ -120,6 +151,26 @@ class LanguageRoutingProcessor(FrameProcessor):
         """A new reply is starting: the next first token starts the clock."""
         self._first_token_at = None
         self._aggregation_reported = False
+        self._first_chunk_spoken = False
+
+    def _first_chunk_pending(self) -> bool:
+        """Whether this reply's first chunk has not been spoken yet."""
+        return self._first_token_at is not None and not self._first_chunk_spoken
+
+    def _deadline_passed(self) -> bool:
+        """Whether the first sentence has taken too long.
+
+        The deadline is checked when text arrives rather than on a
+        timer: there is nothing to cut until there is text, and the
+        model's own pace is what the deadline is about.
+
+        A deadline of zero turns the cut off, which is the behaviour
+        before the deadline existed: the bot waits for the whole
+        sentence.
+        """
+        if self._first_token_at is None or self._deadline_seconds <= 0:
+            return False
+        return time.monotonic() - self._first_token_at >= self._deadline_seconds
 
     def _end_response(self) -> None:
         """The reply is over: the next one gets a fresh measurement."""

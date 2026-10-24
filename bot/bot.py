@@ -56,6 +56,7 @@ from pipecat.workers.runner import WorkerRunner
 
 from bot.config import Settings
 from bot.context import ContextShapingProcessor
+from bot.control import apply_mode, mount_control
 from bot.language import parse_language_request
 from bot.observers import LatencyBridge, PrometheusObserver, mount_metrics
 from bot.pipeline import LanguageRoutingProcessor
@@ -72,6 +73,11 @@ from bot.services import (
 # out for the TTS engines.
 AUDIO_IN_SAMPLE_RATE = 16000
 AUDIO_OUT_SAMPLE_RATE = 24000
+
+# Both STT providers are clients of the same local server and the same
+# checkpoint; they differ in transport only. Anything that asks "does the
+# STT need the server" must list them together.
+MLX_AUDIO_STT_PROVIDERS = ("mlx-audio", "mlx-audio-realtime")
 
 # The process-wide Prometheus observer. See get_prometheus_observer().
 _PROMETHEUS_OBSERVER: PrometheusObserver | None = None
@@ -141,23 +147,70 @@ def _server_answers(root: str) -> bool:
         return False
 
 
-async def start_stt_server(settings: Settings) -> subprocess.Popen | None:
-    """Start the local mlx-audio server, when the configuration asks for it.
+def needs_mlx_audio_server(settings: Settings) -> bool:
+    """Whether the local mlx-audio server is needed by any layer.
+
+    Both STT providers talk to it, one over HTTP and one over a WebSocket,
+    and so does the mlx-audio TTS backend. A deployment that uses none of
+    them does not need it at all, which is why this is a question about
+    the configuration rather than a constant.
+    """
+    return settings.stt_provider in MLX_AUDIO_STT_PROVIDERS or settings.tts_provider == "mlx-audio"
+
+
+def _server_clients(settings: Settings) -> list[str]:
+    """The layers that talk to the local mlx-audio server."""
+    clients = []
+    if settings.stt_provider in MLX_AUDIO_STT_PROVIDERS:
+        clients.append("stt")
+    if settings.tts_provider == "mlx-audio":
+        clients.append("tts")
+    return clients
+
+
+def _server_root(settings: Settings) -> str:
+    """The root URL of the local mlx-audio server.
+
+    Both layers point at the same server; the STT's URL is the canonical
+    one when it is the STT that uses it.
+    """
+    url = settings.stt_base_url if settings.stt_provider in MLX_AUDIO_STT_PROVIDERS else settings.tts_base_url
+    port = urlparse(url).port or 8020
+    return f"http://127.0.0.1:{port}"
+
+
+async def start_mlx_audio_server(settings: Settings) -> subprocess.Popen | None:
+    """Make sure the local mlx-audio server is up, and own it if we start it.
 
     The mlx-audio STT and TTS backends both talk to a local
     ``mlx_audio.server``. `stt_autostart` is off by default so the server
     can be restarted independently of the agent; with it on, the agent
     owns the server's lifetime and stops it when it exits.
 
+    A layer that *needs* the server is a different matter. The agent
+    does not spawn a server the operator did not ask for — that would
+    take the port away from whoever is managing it — but a bot with no
+    voice is worse than a clear failure, so when the server is required
+    and is not answering, the agent says which layer needs it and stops.
+
     Returns the process it started, or None if there was nothing to do.
     """
-    if not settings.stt_autostart:
-        return None
+    clients = _server_clients(settings)
+    required_by = " and ".join(clients)
 
-    port = urlparse(settings.stt_base_url).port or 8020
-    root = f"http://127.0.0.1:{port}"
+    root = _server_root(settings)
+    port = urlparse(root).port or 8020
+
     if _server_answers(root):
         logger.info(f"mlx-audio server already up on {root}")
+        return None
+
+    if not settings.stt_autostart:
+        if clients:
+            raise RuntimeError(
+                f"the mlx-audio server is required by {required_by} "
+                f"but is not answering on {root}"
+            )
         return None
 
     command = shutil.which("mlx_audio.server") or "mlx_audio.server"
@@ -177,17 +230,22 @@ async def start_stt_server(settings: Settings) -> subprocess.Popen | None:
         await asyncio.sleep(1.0)
 
     process.terminate()
+    if clients:
+        raise RuntimeError(
+            f"the mlx-audio server is required by {required_by} "
+            f"but is not answering on {root}"
+        )
     raise RuntimeError(f"the mlx-audio server did not come up on {root}")
 
 
 async def run_bot(transport, settings: Settings, runner_args=None) -> None:
     """Build and run the pipeline on the given transport."""
-    stt_server = await start_stt_server(settings)
+    server = await start_mlx_audio_server(settings)
     try:
         await _run_pipeline(transport, settings, runner_args)
     finally:
-        if stt_server is not None:
-            stt_server.terminate()
+        if server is not None:
+            server.terminate()
 
 
 async def _run_pipeline(transport, settings: Settings, runner_args=None) -> None:
@@ -207,7 +265,10 @@ async def _run_pipeline(transport, settings: Settings, runner_args=None) -> None
 
     context_shaper = ContextShapingProcessor()
 
-    router = LanguageRoutingProcessor(voice_router=build_voice_router(settings))
+    router = LanguageRoutingProcessor(
+        voice_router=build_voice_router(settings),
+        deadline_seconds=settings.first_chunk_deadline_seconds,
+    )
 
     # Observers. The Prometheus observer turns Pipecat's metrics frames
     # into the series that observability/prometheus.yml, alerts.yml and
@@ -291,7 +352,15 @@ def _register_app_message_handler(transport, pipeline, settings: Settings) -> No
             except ValueError as exc:
                 logger.warning(f"ignoring set_language: {exc}")
                 return
-            delta = build_stt_language_router(settings).delta_for(language)
+            try:
+                delta = build_stt_language_router(settings).delta_for(language)
+            except ValueError as exc:
+                # A backend with no language switch (the realtime one)
+                # says so here. The session stays on its configured mode;
+                # the request is dropped and logged, not turned into a
+                # broken turn.
+                logger.warning(f"ignoring set_language: {exc}")
+                return
             await pipeline.push_frame(STTUpdateSettingsFrame(delta=delta))
             logger.info(f"STT language set to {language or 'auto'}")
             return
@@ -320,7 +389,10 @@ def _parse_app_message(message: Any) -> dict[str, Any] | None:
 
 async def bot(runner_args) -> None:
     """The entrypoint the Pipecat dev runner discovers."""
-    settings = resolve_models(Settings())
+    # `apply_mode` resolves the override set on the control page against
+    # the .env default and pairs the model with the provider. It runs per
+    # session because the switch is allowed to change between sessions.
+    settings = apply_mode(Settings())
     logger.info(
         f"voice-ai starting: stt={settings.stt_provider}/{settings.stt_model} "
         f"llm={settings.llm_provider}/{settings.llm_model} "
@@ -343,6 +415,7 @@ def build_model_resolver(settings: Settings):
     """
     table = {
         "LocalMlxSTTService": settings.stt_model,
+        "LocalMlxRealtimeSTTService": settings.stt_model,
         "WhisperSTTServiceMLX": settings.stt_model,
         "KokoroTTSService": settings.tts_model,
         "LocalMlxTTSService": settings.tts_model,
@@ -400,6 +473,11 @@ if __name__ == "__main__":
         from bot.tracing import setup_tracing
 
         setup_tracing(settings)
+
+    # The STT switch owns "/" and "/settings". It is registered before
+    # the runner mounts its own "/" -> "/client/" redirect, so route
+    # order puts this page first.
+    mount_control(runner.app, settings)
 
     # Mount the metrics endpoint before the runner starts serving.
     mount_observability(settings)

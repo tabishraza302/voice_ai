@@ -20,7 +20,7 @@ from bot.stt_service import LocalMlxSTTService
 
 @pytest.fixture
 def service() -> LocalMlxSTTService:
-    settings = Settings(_env_file=None)
+    settings = Settings(_env_file=None, stt_provider="mlx-audio")
     return build_stt(settings)
 
 
@@ -42,7 +42,9 @@ class TestAutoDetect:
         # Pipecat's stock OpenAISTTService asserts language is not None,
         # which would make auto-detect unreachable. The stored value stays
         # None: None is what "auto-detect" means to this service.
-        settings = Settings(_env_file=None, stt_language="auto")
+        settings = Settings(
+            _env_file=None, stt_provider="mlx-audio", stt_language="auto"
+        )
         stt = build_stt(settings)
         assert stt._settings.language is None
 
@@ -50,7 +52,9 @@ class TestAutoDetect:
         # Pipecat converts the Language enum through
         # language_to_service_language() at construction time, so the
         # stored value is Nemotron's prompt key, not the enum.
-        settings = Settings(_env_file=None, stt_language="hi")
+        settings = Settings(
+            _env_file=None, stt_provider="mlx-audio", stt_language="hi"
+        )
         stt = build_stt(settings)
         assert stt._settings.language == "hi-IN"
 
@@ -77,7 +81,9 @@ class TestRequestShape:
         assert captured["file"][0] == "audio.wav"
 
     async def test_forced_hindi_sends_the_prompt_key(self, monkeypatch):
-        settings = Settings(_env_file=None, stt_language="hi")
+        settings = Settings(
+            _env_file=None, stt_provider="mlx-audio", stt_language="hi"
+        )
         stt = build_stt(settings)
         captured: dict = {}
 
@@ -97,7 +103,7 @@ class TestRequestShape:
 
 class TestRouter:
     def test_router_delta_is_the_services_own_settings_type(self):
-        settings = Settings(_env_file=None)
+        settings = Settings(_env_file=None, stt_provider="mlx-audio")
         router = build_stt_language_router(settings)
         delta = router.delta_for(Language.HI)
         assert isinstance(delta, LocalMlxSTTService.Settings)

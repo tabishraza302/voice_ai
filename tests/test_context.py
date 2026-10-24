@@ -6,7 +6,7 @@ resulting malformed history with "Hello, what is what? Please finish
 your question."
 """
 
-from bot.context import merge_consecutive_user_messages
+from bot.context import ContextShapingProcessor, merge_consecutive_user_messages
 
 
 def test_two_user_messages_become_one_turn():
@@ -74,3 +74,68 @@ def test_the_merged_history_keeps_its_place():
     merged = merge_consecutive_user_messages(messages)
     assert [m["role"] for m in merged] == ["user", "assistant", "user", "assistant"]
     assert merged[2]["content"] == "One. Two."
+
+
+class TestTheFrameReachesTheModel:
+    """The shaper must not swallow the frame the model runs on.
+
+    A processor starts its frame-processing task when the base class sees
+    the StartFrame, so a ``process_frame`` that overrides the base one
+    without calling ``super()`` never gets that task — and every frame
+    that is not a system frame sits in its queue and is never processed.
+    The context frame is not a system frame, so the model would never see
+    it, and the bot would never answer.
+    """
+
+    async def test_the_context_frame_is_passed_on_and_merged(self):
+        import asyncio
+        import contextlib
+
+        from pipecat.frames.frames import LLMContextFrame
+        from pipecat.pipeline.pipeline import Pipeline
+        from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+        from pipecat.processors.aggregators.llm_context import LLMContext
+        from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+        from pipecat.workers.runner import WorkerRunner
+
+        class Capture(FrameProcessor):
+            """Stands in for the LLM service."""
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.contexts: list[LLMContext] = []
+
+            async def process_frame(self, frame, direction: FrameDirection):
+                await super().process_frame(frame, direction)
+                if isinstance(frame, LLMContextFrame):
+                    self.contexts.append(frame.context)
+                await self.push_frame(frame, direction)
+
+        capture = Capture()
+        pipeline = Pipeline([ContextShapingProcessor(), capture])
+        worker = PipelineWorker(pipeline, params=PipelineParams())
+        runner = WorkerRunner()
+        await runner.add_workers(worker)
+        run_task = asyncio.create_task(runner.run())
+        await asyncio.sleep(0.5)
+
+        context = LLMContext(
+            messages=[
+                {"role": "user", "content": "Hello."},
+                {"role": "user", "content": "Can you hear me?"},
+            ]
+        )
+        await worker.queue_frame(LLMContextFrame(context=context))
+        await asyncio.sleep(0.5)
+
+        # The pipeline is taken down rather than ended: a processor that
+        # drops the frame would drop the EndFrame too, and the run would
+        # never finish.
+        run_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await run_task
+
+        assert len(capture.contexts) == 1, "the context frame never reached the model"
+        assert [m["content"] for m in capture.contexts[0].messages] == [
+            "Hello. Can you hear me?"
+        ]

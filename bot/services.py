@@ -41,15 +41,23 @@ from bot.language import (
     select_stt_language_router,
     select_voice_router,
 )
+from bot.stt_realtime import LocalMlxRealtimeSTTService
 from bot.stt_service import LocalMlxSTTService
 from bot.tts_service import LocalMlxTTSService
 
 # The two STT checkpoints this repo knows about. They are named here so a
 # provider swap that leaves the model behind fails with a clear message
-# instead of a checkpoint loader error.
+# instead of a checkpoint loader error. Nemotron serves both STT paths:
+# the batch endpoint loads it for whole-turn transcription, and
+# `/v1/realtime` streams it through `create_streaming_session`.
 NEMOTRON_MODEL = "mlx-community/nemotron-3.5-asr-streaming-0.6b"
 WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
 KOKORO_MODEL = "kokoro"
+# The two mlx-audio TTS checkpoints this repo knows about. Kokoro-82M is
+# the default: same model and same voice packs as the in-process ONNX
+# build, on the Metal GPU. Chatterbox is the multilingual escape hatch —
+# it clones a voice from reference audio and ignores a voice id.
+MLX_KOKORO_MODEL = "mlx-community/Kokoro-82M-4bit"
 CHATTERBOX_MODEL = "mlx-community/chatterbox-multilingual-v3"
 
 
@@ -61,15 +69,43 @@ CHATTERBOX_MODEL = "mlx-community/chatterbox-multilingual-v3"
 def build_stt_mlx_audio(settings: Settings) -> STTService:
     """NVIDIA Nemotron 3.5 ASR Streaming 0.6B via the local mlx-audio server.
 
-    The default. Auto-detect is available (``stt_language="auto"``) because
-    the subclass removes Pipecat's `language is not None` assertion — see
-    ``bot/stt_service.py`` for the other two upstream mismatches it fixes.
+    The batch transport, and the swap when the language must be pinned:
+    its OpenAI-compatible endpoint takes a language field, which
+    ``/v1/realtime`` does not. Auto-detect is available
+    (``stt_language="auto"``) because the subclass removes Pipecat's
+    `language is not None` assertion — see ``bot/stt_service.py`` for the
+    other two upstream mismatches it fixes.
     """
     language = _parse_language(settings.stt_language)
     return LocalMlxSTTService(
         model=settings.stt_model,
         base_url=settings.stt_base_url,
         language=language,
+        ttfs_p99_latency=settings.ttfs_p99_latency,
+    )
+
+
+def build_stt_mlx_audio_realtime(settings: Settings) -> STTService:
+    """Nemotron over the local server's ``/v1/realtime`` WebSocket.
+
+    Same checkpoint as the batch provider, different transport: one
+    WebSocket per session, a commit per turn, text after each commit.
+    The session accepts a model, a rate and a turn-detection mode — no
+    language — so a pinned ``stt_language`` is refused here rather than
+    sent and ignored. Use ``mlx-audio`` when the language must be pinned.
+    """
+    if _parse_language(settings.stt_language) is not None:
+        raise ValueError(
+            "stt_provider=mlx-audio-realtime has no language switch: "
+            "/v1/realtime takes model, format and turn_detection only. "
+            "Set stt_language=auto, or use stt_provider=mlx-audio, whose "
+            "Nemotron prompt conditioning does take one."
+        )
+
+    settings = resolve_models(settings)
+    return LocalMlxRealtimeSTTService(
+        model=settings.stt_model,
+        base_url=settings.stt_base_url,
         ttfs_p99_latency=settings.ttfs_p99_latency,
     )
 
@@ -85,8 +121,24 @@ def resolve_models(settings: Settings) -> Settings:
     """
     if settings.stt_provider == "mlx-whisper" and settings.stt_model == NEMOTRON_MODEL:
         settings.stt_model = WHISPER_MODEL
+    if settings.stt_provider == "mlx-audio-realtime" and settings.stt_model == WHISPER_MODEL:
+        # The realtime endpoint serves any streaming checkpoint, but
+        # whisper-large-v3-turbo is not one: it would fail at load with
+        # "does not support streaming". Nemotron is the streaming model
+        # this repo measured.
+        settings.stt_model = NEMOTRON_MODEL
     if settings.tts_provider == "mlx-audio" and settings.tts_model == KOKORO_MODEL:
-        settings.tts_model = CHATTERBOX_MODEL
+        # The placeholder means "this provider's own model". For mlx-audio
+        # that is Kokoro-82M in MLX form. A user who wants the
+        # multilingual model instead sets its id explicitly
+        # (CHATTERBOX_MODEL), and an explicit id passes through untouched.
+        settings.tts_model = MLX_KOKORO_MODEL
+    if settings.tts_provider == "mlx-audio" and settings.tts_model == CHATTERBOX_MODEL:
+        # Chatterbox has no voice packs: it clones a voice from reference
+        # audio and ignores a voice id. Clearing the ids keeps the
+        # request honest.
+        settings.tts_voice_en = None
+        settings.tts_voice_hi = None
     return settings
 
 
@@ -113,6 +165,7 @@ def build_stt_mlx_whisper(settings: Settings) -> STTService:
 
 STT_BACKENDS: dict[str, Callable[[Settings], STTService]] = {
     "mlx-audio": build_stt_mlx_audio,
+    "mlx-audio-realtime": build_stt_mlx_audio_realtime,
     "mlx-whisper": build_stt_mlx_whisper,
 }
 
@@ -138,6 +191,20 @@ def _llm_settings(settings: Settings) -> dict[str, Any]:
     }
 
 
+def _openai_llm_settings(settings: Settings) -> dict[str, Any]:
+    """The LLM settings for an OpenAI-compatible server.
+
+    One thing differs from the other backends: the name of the length
+    cap. "max_tokens" is what llama.cpp, vLLM and LM Studio accept; the
+    gpt-5 family rejects it outright and answers nothing. The name is a
+    setting because it is a property of the server, not of the code.
+    """
+    llm_settings = _llm_settings(settings)
+    llm_settings.pop("max_tokens", None)
+    llm_settings[settings.llm_max_tokens_parameter] = settings.llm_max_tokens
+    return llm_settings
+
+
 def build_llm_ollama(settings: Settings) -> LLMService:
     """Ollama — the default local LLM runtime.
 
@@ -159,11 +226,16 @@ def build_llm_ollama(settings: Settings) -> LLMService:
 
 
 def build_llm_openai_compatible(settings: Settings) -> LLMService:
-    """Any local OpenAI-compatible server: llama.cpp, vLLM, LM Studio."""
+    """Any OpenAI-compatible server: llama.cpp, vLLM, LM Studio, or a cloud API.
+
+    The credential is the layer's, not the provider's: a local server
+    ignores it, and a cloud API needs it. "local" is what the local
+    servers were sent before there was a setting for it.
+    """
     return OpenAILLMService(
         base_url=settings.llm_base_url,
-        api_key="local",
-        settings=OpenAILLMService.Settings(**_llm_settings(settings)),
+        api_key=settings.llm_api_key or "local",
+        settings=OpenAILLMService.Settings(**_openai_llm_settings(settings)),
     )
 
 
@@ -256,7 +328,13 @@ def build_tts(settings: Settings) -> TTSService:
 
 
 def build_voice_router(settings: Settings) -> VoiceRouter:
-    """Build the voice router that matches the configured TTS provider."""
+    """Build the voice router that matches the configured TTS provider.
+
+    The models are resolved first, because the router's delta carries the
+    model id: it must be the one that is actually loaded, not the
+    placeholder.
+    """
+    settings = resolve_models(settings)
     return select_voice_router(settings)
 
 

@@ -83,6 +83,12 @@ class ContextShapingProcessor(FrameProcessor):
     """
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
+        # The base class starts this processor's frame-processing task when
+        # it sees the StartFrame. A processor that overrides process_frame
+        # without calling super() never gets that task, so every frame that
+        # is not a system frame -- the LLMContextFrame among them -- sits in
+        # its queue and is never processed.
+        await super().process_frame(frame, direction)
         if isinstance(frame, LLMContextFrame):
             frame.context.transform_messages(merge_consecutive_user_messages)
         await self.push_frame(frame, direction)

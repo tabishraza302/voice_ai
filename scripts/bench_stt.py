@@ -22,20 +22,31 @@ call that bypasses serialization and the model cache.
 Usage:
     uv run python scripts/bench_stt.py --languages en hi
     uv run python scripts/bench_stt.py --model mlx-community/whisper-large-v3-turbo
+    uv run python scripts/bench_stt.py --realtime
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
+import base64
 import json
 import os
 import statistics
+import sys
 import time
 import urllib.error
 import urllib.request
 import wave
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
+
+# Scripts run as files, so the repo root is not on sys.path; the realtime
+# URL helper must be the bot's own, not a copy that can drift from it.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from bot.stt_realtime import websocket_url  # noqa: E402
 
 # The Hugging Face hub's default read timeout is 10 s, which trips on a
 # slow link: a 300 MB parquet file can stall for longer than that between
@@ -45,6 +56,7 @@ os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 OUT_PATH = REPO_ROOT / "data" / "stt_bench.json"
+OUT_PATH_REALTIME = REPO_ROOT / "data" / "stt_realtime_bench.json"
 FIXTURE_DIR = REPO_ROOT / "evals" / "fixtures" / "audio"
 
 # The FLEURS configs used by the WER harness, kept in sync so a bench run
@@ -253,6 +265,112 @@ def transcribe(base_url: str, model: str, path: Path, language: str | None) -> t
     return payload.get("text", ""), elapsed
 
 
+async def transcribe_realtime(
+    base_url: str,
+    model: str,
+    path: Path,
+) -> tuple[str, float]:
+    """Stream one clip over WebSocket and measure TTFS.
+
+    20 ms input_audio_buffer.append chunks are not paced in real time;
+    they are sent as fast as the socket accepts. Before the commit the
+    same 0.5 s of silence the service appends is sent, so the tail is
+    decoded before the clock starts and the number describes the deployed
+    path, not a shorter one.
+
+    TTFS measures elapsed time from the input_audio_buffer.commit send
+    until the conversation.item.input_audio_transcription.completed event
+    with a non-empty transcript. The one-second pre-roll the service
+    buffers while the VAD confirms speech is not reproduced: this bench
+    has no VAD, and the clip starts at speech.
+    """
+    import websockets
+
+    url = websocket_url(base_url, model)
+    with wave.open(str(path), "rb") as wf:
+        audio_bytes = wf.readframes(wf.getnframes())
+
+    async with websockets.connect(url) as ws:
+        await ws.recv()  # session.created
+
+        session_update = {
+            "type": "session.update",
+            "session": {
+                "type": "transcription",
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcm", "rate": 16000},
+                        "transcription": {"model": model},
+                        "turn_detection": None,
+                    }
+                },
+            },
+        }
+        await ws.send(json.dumps(session_update))
+
+        transcript = ""
+        ttfs = 0.0
+        t_commit = 0.0
+        loop = asyncio.get_running_loop()
+        done_fut = loop.create_future()
+
+        async def reader() -> None:
+            nonlocal transcript, ttfs
+            try:
+                while True:
+                    msg = await ws.recv()
+                    evt = json.loads(msg)
+                    if evt.get("type") == "conversation.item.input_audio_transcription.completed":
+                        t = evt.get("transcript", "")
+                        if t:
+                            ttfs = time.perf_counter() - t_commit
+                            transcript = t
+                            if not done_fut.done():
+                                done_fut.set_result(None)
+                            break
+            except Exception as exc:
+                if not done_fut.done():
+                    done_fut.set_exception(exc)
+
+        reader_task = asyncio.create_task(reader())
+
+        chunk_size = int(16000 * 0.02) * 2  # 20 ms @ 16 kHz 16-bit mono = 640 bytes
+        for i in range(0, len(audio_bytes), chunk_size):
+            chunk = audio_bytes[i : i + chunk_size]
+            append_msg = {
+                "type": "input_audio_buffer.append",
+                "audio": base64.b64encode(chunk).decode("ascii"),
+            }
+            await ws.send(json.dumps(append_msg))
+
+        # The same 0.5 s tail the service sends, so the last word is decoded
+        # before the commit and the clock starts where the user stops.
+        tail = bytes(int(16000 * 0.5) * 2)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(tail).decode("ascii"),
+                }
+            )
+        )
+
+        t_commit = time.perf_counter()
+        await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+
+        try:
+            await asyncio.wait_for(done_fut, timeout=120.0)
+        finally:
+            if not reader_task.done():
+                reader_task.cancel()
+                try:
+                    await reader_task
+                except asyncio.CancelledError:
+                    pass
+
+        return transcript, ttfs
+
+
 def wait_for_server(base_url: str, timeout: float = 120.0) -> bool:
     deadline = time.time() + timeout
     root = base_url.rsplit("/v1", 1)[0]
@@ -276,6 +394,8 @@ def main() -> int:
     ap.add_argument("--per-language", type=int, default=10)
     ap.add_argument("--language-hint", choices=["auto", "en", "hi"], default="auto",
                     help="language field sent to the model (default: auto)")
+    ap.add_argument("--realtime", action="store_true",
+                    help="stream audio over WebSocket (/v1/realtime) instead of batch HTTP")
     args = ap.parse_args()
 
     print(f"model    : {args.model}")
@@ -298,13 +418,17 @@ def main() -> int:
         key = (args.model, clip.language)
         res = results.setdefault(key, Result(model=args.model, language=clip.language))
         try:
-            text, elapsed = transcribe(args.base_url, args.model, clip.path, hint)
+            if args.realtime:
+                text, elapsed = asyncio.run(
+                    transcribe_realtime(args.base_url, args.model, clip.path)
+                )
+            else:
+                text, elapsed = transcribe(args.base_url, args.model, clip.path, hint)
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", "replace")[:400]
             die(f"HTTP {exc.code} from the STT server: {body}")
         except Exception as exc:  # noqa: BLE001
             die(f"transcription failed for {clip.path.name}: {exc}")
-
         if first_call:
             # The first request pays the model load. Report it, but do not
             # let it pollute the throughput number.
@@ -316,14 +440,19 @@ def main() -> int:
         res.audio_seconds += clip.audio_seconds
         res.inference_seconds += elapsed
         res.ttfs_samples.append(elapsed)
+        clip.transcript = text
         print(f"  {clip.language} {clip.path.name}: {elapsed:.2f}s "
               f"({clip.audio_seconds:.1f}s audio) -> {text[:48]!r}", flush=True)
 
-    payload = {
+    out_path = OUT_PATH_REALTIME if args.realtime else OUT_PATH
+    payload: dict[str, Any] = {
         "endpoint": args.base_url,
-        "language_hint": args.language_hint,
-        "results": [r.to_dict() for r in results.values()],
     }
+    if args.realtime:
+        payload["transport"] = "realtime"
+    payload["language_hint"] = args.language_hint
+    payload["results"] = [r.to_dict() for r in results.values()]
+
     all_rtf = [r.rtf for r in results.values() if r.rtf is not None]
     all_p99 = [r.ttfs_p99 for r in results.values() if r.ttfs_p99 is not None]
     if all_rtf:
@@ -334,8 +463,8 @@ def main() -> int:
             results.values(), key=lambda r: r.ttfs_p99 or 0.0
         ).language
 
-    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    OUT_PATH.write_text(json.dumps(payload, indent=2) + "\n")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2) + "\n")
 
     print("\n=== summary ===")
     for r in results.values():
@@ -344,7 +473,7 @@ def main() -> int:
               f"ttfs_p50={d['ttfs_p50_seconds']}s ttfs_p99={d['ttfs_p99_seconds']}s")
     if payload.get("ttfs_p99_worst"):
         print(f"\n  ttfs_p99_latency to configure Pipecat with: {payload['ttfs_p99_worst']}s")
-    print(f"  wrote {OUT_PATH}")
+    print(f"  wrote {out_path}")
     return 0
 
 

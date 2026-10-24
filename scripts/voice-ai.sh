@@ -344,7 +344,10 @@ cmd_status() {
 
 cmd_memory() { bash scripts/memory_baseline.sh; }
 cmd_apply_tier() { uv run python scripts/apply_tier.py; }
-cmd_bench() { uv run python scripts/bench_stt.py --languages en hi; }
+cmd_bench() { uv run python scripts/bench_stt.py --languages en hi "$@"; }
+cmd_tts_bench() { uv run python scripts/bench_tts.py --backend "${1:-both}"; }
+cmd_turn_bench() { uv run python scripts/bench_turn.py "$@"; }
+cmd_llm_bench() { uv run python scripts/bench_llm_quant.py "$@"; }
 cmd_eval() {
   uv run python evals/wer_eval.py --languages en hi --models nemotron nemotron-8bit whisper
 }
@@ -404,6 +407,13 @@ Measuring:
   memory             The memory baseline, and the LLM tier it selects
   apply-tier         Write the measured tier and latency into .env.example
   bench              STT speed: real-time factor and time-to-final-transcript
+  tts-bench          TTS speed: time to first audio, per backend
+    kokoro | mlx-audio | both
+  turn-bench         One turn, stage by stage: VAD, transcript, LLM, TTS
+    --audio FILE  --backend kokoro|mlx-audio  --runs N
+    --deadline SECS (0 = off)  --out FILE
+  llm-bench          One LLM across the quantizations Ollama publishes
+    --tags TAG...  --runs N
   eval               FLEURS WER/CER, per model and per normalization
   eval-scenarios     The behavioural evals (needs the agent running)
   warm               Pre-load the LLM into Ollama
@@ -444,6 +454,9 @@ main() {
     memory) cmd_memory "$@" ;;
     apply-tier) cmd_apply_tier "$@" ;;
     bench) cmd_bench "$@" ;;
+    tts-bench) cmd_tts_bench "$@" ;;
+    turn-bench) cmd_turn_bench "$@" ;;
+    llm-bench) cmd_llm_bench "$@" ;;
     eval) cmd_eval "$@" ;;
     eval-scenarios) cmd_eval_scenarios "$@" ;;
     warm) cmd_warm "$@" ;;

@@ -112,13 +112,35 @@ PY
 }
 
 # --- Kokoro (TTS) ----------------------------------------------------------
-# The ONNX model and the voice pack are fetched from GitHub releases by
-# Pipecat's own code on first construction. Pre-triggering it here means the
-# first real run is not a 20-second stall.
+# Two builds of the same model: the MLX checkpoint the mlx-audio server
+# serves (the default), and the ONNX model + voice pack Pipecat fetches
+# from GitHub releases on first construction. Both are prefetched here so
+# the air-gapped run never reaches the network.
+TTS_MLX="mlx-community/Kokoro-82M-4bit"
+
 pull_tts() {
-  log "TTS (Kokoro ONNX + voice pack)"
+  log "TTS (Kokoro MLX + ONNX + voice pack)"
   command -v espeak-ng >/dev/null 2>&1 \
     || warn "espeak-ng not on PATH — Hindi phonemization will fail. Install with: brew install espeak-ng"
+
+  pull_hf "$TTS_MLX" 600
+
+  # misaki's English G2P calls spacy.cli.download("en_core_web_sm") on
+  # first use when the model is absent. Install it in the project venv
+  # now, so the demo does not make that network call.
+  log "checking the spacy English model"
+  uv run python - <<'PY'
+import spacy
+
+try:
+    spacy.load("en_core_web_sm")
+except OSError:
+    from spacy.cli import download
+
+    download("en_core_web_sm")
+    spacy.load("en_core_web_sm")
+print("  -> en_core_web_sm ready")
+PY
 
   mkdir -p "$KOKORO_DIR"
   if [[ -f "$KOKORO_MODEL" && -f "$KOKORO_VOICES" ]]; then

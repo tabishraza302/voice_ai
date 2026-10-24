@@ -9,11 +9,14 @@ That matters for the swappable-layers requirement: without this class,
 adding a TTS model would mean writing a bespoke Pipecat service per model.
 With it, swapping the voice is a model id.
 
-The default TTS is still Pipecat's own ``KokoroTTSService`` — it is
-in-process, needs no server, and is the path the plan committed to. This
-class is the *alternate* provider, and it exists so that the fallback when
-Kokoro's grade-C Hindi voices prove unintelligible is one config change
-away rather than a project.
+The default TTS runs through this class: Kokoro-82M on the Metal GPU,
+through the same local server that serves the STT, because it reaches
+the first sound 2.4× sooner than the in-process ONNX build
+(scripts/bench_tts.py, warm, five sentences, this machine). Pipecat's own
+``KokoroTTSService`` is the swap for a deployment that does not want
+the server. This class also serves the multilingual Chatterbox model, so
+the fallback when Kokoro's grade-C Hindi voices prove unintelligible is
+one config change away rather than a project.
 """
 
 from __future__ import annotations
@@ -49,7 +52,7 @@ class LocalMlxTTSSettings(TTSSettings):
 
     model: str | None = None
     voice: str | None = None
-    language: Language | None = None
+    language: Language | str | None = None
     speed: float = 1.0
     lang_code: str | None = None
 
@@ -87,10 +90,34 @@ class LocalMlxTTSService(TTSService):
 
         The mlx-audio TTS families take a two-letter code (``en``, ``hi``),
         which is a different convention from the STT side's ``hi-IN``.
+
+        This is Pipecat's input-side hook: it is called with a
+        ``Language`` when the settings are written, and the *stored*
+        language is the string it returns.
         """
         if language is None:
             return None
-        return language.value.split("-")[0].lower()
+        if isinstance(language, Language):
+            return language.value.split("-")[0].lower()
+        return str(language).split("-")[0].lower()
+
+    def _lang_code(self) -> str | None:
+        """The two-letter language code to send with a synthesis request.
+
+        Pipecat stores the *service-native* language: it converts the
+        ``Language`` enum through ``language_to_service_language()`` when
+        the settings are written, so by the time a request is made this is
+        already ``"hi"`` rather than ``Language.HI``. The enum case is
+        handled anyway, in case a settings object is assigned directly.
+        """
+        if self._settings.lang_code:
+            return self._settings.lang_code
+        language = self._settings.language
+        if language is None:
+            return None
+        if isinstance(language, Language):
+            return self.language_to_service_language(language)
+        return str(language).split("-")[0].lower()
 
     def can_generate_metrics(self) -> bool:
         return True
@@ -112,9 +139,7 @@ class LocalMlxTTSService(TTSService):
             if self._settings.voice:
                 payload["voice"] = self._settings.voice
 
-            lang_code = self._settings.lang_code
-            if not lang_code and self._settings.language is not None:
-                lang_code = self.language_to_service_language(self._settings.language)
+            lang_code = self._lang_code()
             if lang_code:
                 payload["lang_code"] = lang_code
 

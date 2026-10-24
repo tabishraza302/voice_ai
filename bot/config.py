@@ -12,6 +12,7 @@ built by per-backend routers (see ``bot/language.py``).
 
 from __future__ import annotations
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # The bot's behaviour, in one place. Shared by every LLM backend so that
@@ -40,17 +41,25 @@ class Settings(BaseSettings):
     )
 
     # --- STT layer -------------------------------------------------------
-    # "mlx-audio" is the default: NVIDIA Nemotron 3.5 ASR Streaming 0.6B,
-    # served by mlx_audio.server and consumed over its OpenAI-compatible
-    # HTTP API. "mlx-whisper" is the registered alternate.
-    stt_provider: str = "mlx-audio"
+    # "mlx-audio-realtime" is the default: NVIDIA Nemotron 3.5 ASR
+    # Streaming 0.6B, served by mlx_audio.server over its streaming
+    # WebSocket (/v1/realtime), so the turn is transcribed while the user
+    # speaks. It has no language field, so it is auto-language only.
+    # "mlx-audio" is the same checkpoint over the server's
+    # OpenAI-compatible batch HTTP API, which does take a language.
+    # "mlx-whisper" is the registered alternate.
+    stt_provider: str = "mlx-audio-realtime"
     stt_model: str = "mlx-community/nemotron-3.5-asr-streaming-0.6b"
-    # "auto" | "en" | "hi". "auto" maps to Nemotron's language-ID prompt
+    # "auto" | "en" | "hi". The realtime default accepts only "auto"; on
+    # the batch transport "auto" maps to Nemotron's language-ID prompt
     # conditioning, which is what survives code-switching.
     stt_language: str = "auto"
     stt_base_url: str = "http://localhost:8020/v1"
-    # Whether the bot should start the STT server itself. Off by default so
-    # the server can be restarted independently of the agent.
+    # Whether the agent owns the mlx-audio server's lifetime: it starts
+    # the server when it is not already up, and stops it when it exits.
+    # Off by default so the server can be restarted independently of the
+    # agent. A layer that needs the server and cannot reach it is fatal
+    # either way — see needs_mlx_audio_server() in bot/bot.py.
     stt_autostart: bool = False
 
     # --- LLM layer -------------------------------------------------------
@@ -61,11 +70,16 @@ class Settings(BaseSettings):
     # **qwen3 is a thinking model** ("thinking: default true" in
     # `ollama show`), and Ollama's OpenAI-compatible endpoint does not
     # forward `think: false` — nor `chat_template_kwargs` — so the
-    # reasoning cannot be suppressed through Pipecat's Ollama service.
-    # A trivial "say hello" spent 200 completion tokens on reasoning and
-    # returned an *empty* answer, which for a voice agent is seconds of
-    # dead air. Gemma 3 answers the same prompt in 13 tokens, in
-    # Devanagari. See the README's swap catalogue.
+    # reasoning is not suppressed by default. A trivial "say hello"
+    # spent 200 completion tokens on reasoning and returned an *empty*
+    # answer, which for a voice agent is seconds of dead air. Gemma 3
+    # answers the same prompt in 13 tokens, in Devanagari.
+    #
+    # One thing does suppress it: `reasoning_effort: none`, the
+    # OpenAI-standard field, which Ollama *does* forward — it takes
+    # `gemma4:e2b` from 2.3 s to 0.042 s on that endpoint. The Ollama
+    # provider does not send it yet, so a thinking model on this
+    # provider still thinks. See the README's swap catalogue.
     llm_provider: str = "ollama"
     # The built-in default is the conservative rung. The tier the memory
     # rule actually selects for this machine is written into
@@ -79,23 +93,49 @@ class Settings(BaseSettings):
     llm_keep_alive: str = "5m"
     llm_temperature: float = 0.7
     llm_max_tokens: int = 200
+    # The name the LLM server uses for the reply's length cap.
+    # "max_tokens" is what llama.cpp, vLLM and LM Studio accept; the
+    # gpt-5 family rejects it outright ("use max_completion_tokens
+    # instead") and answers nothing.
+    llm_max_tokens_parameter: str = "max_tokens"
+    # The credential for an LLM provider that needs one. The
+    # "openai-compatible" provider sends it as a bearer token; a local
+    # server (llama.cpp, vLLM, LM Studio) needs no credential and
+    # ignores it. `OPENAI_KEY` is accepted as an alias, so a key that
+    # was put in the environment under that name keeps working.
+    llm_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("LLM_API_KEY", "OPENAI_KEY"),
+    )
 
     # --- TTS layer -------------------------------------------------------
-    # "kokoro" is the default. "mlx-audio" runs any mlx-audio TTS model
-    # through the same local server that serves STT — including
-    # mlx-community/chatterbox-multilingual-v3, the escape hatch if
-    # Kokoro's grade-C Hindi voices prove unintelligible.
-    tts_provider: str = "kokoro"
-    # The model id reported in the metrics. It is the label, not a
-    # checkpoint: Kokoro runs in-process from its ONNX file, and the
-    # mlx-audio TTS swap sets this to the model it actually serves.
+    # "mlx-audio" is the default, and it is a measured choice: the median
+    # time to first audio is 0.33 s through the local server against
+    # 0.79 s for the in-process ONNX build (scripts/bench_tts.py, warm,
+    # five sentences, this machine). It is the same Kokoro-82M with the
+    # same voice packs, on the Metal GPU instead of the CPU. "kokoro" is
+    # the alternate: in-process, needs no server, but slower to speak.
+    tts_provider: str = "mlx-audio"
+    # The model id reported in the metrics. It is a placeholder for
+    # "whatever model this provider serves by default", not a checkpoint:
+    # resolve_models maps it to the model actually loaded
+    # (mlx-community/Kokoro-82M-4bit for mlx-audio).
     tts_model: str = "kokoro"
-    tts_voice_en: str = "af_heart"
-    tts_voice_hi: str = "hf_alpha"
+    # The Kokoro voice packs. None means "this model has no voice packs"
+    # (the multilingual Chatterbox clones a voice from reference audio).
+    tts_voice_en: str | None = "af_heart"
+    tts_voice_hi: str | None = "hf_alpha"
     tts_speed: float = 1.0
     # The mlx-audio server's root URL (no /v1 suffix): the TTS endpoint is
     # POST /v1/audio/speech.
     tts_base_url: str = "http://localhost:8020"
+
+    # How long the first sentence of a reply may take before the bot
+    # speaks the first clause instead. The bot is silent until the
+    # model finishes a sentence, and that wait is the largest single
+    # part of the time to the first sound. Zero turns the cut off, which
+    # is the behaviour before the deadline existed.
+    first_chunk_deadline_seconds: float = 0.25
 
     # --- Observability ---------------------------------------------------
     # The OTLP gRPC endpoint of the local collector. Not 4317: the

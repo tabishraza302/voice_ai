@@ -48,11 +48,12 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 # factories refuse.
 STT_MODELS = {
     "mlx-audio": "mlx-community/nemotron-3.5-asr-streaming-0.6b",
+    "mlx-audio-realtime": "mlx-community/nemotron-3.5-asr-streaming-0.6b",
     "mlx-whisper": "mlx-community/whisper-large-v3-turbo",
 }
 TTS_MODELS = {
     "kokoro": "kokoro",
-    "mlx-audio": "mlx-community/chatterbox-multilingual-v3",
+    "mlx-audio": "mlx-community/Kokoro-82M-4bit",
 }
 
 
@@ -173,7 +174,7 @@ class TestSwapChangesNoMetric:
         from bot.observers import METRIC_NAMES
 
         names = set(METRIC_NAMES)
-        for provider in ("mlx-audio", "mlx-whisper"):
+        for provider in ("mlx-audio", "mlx-audio-realtime", "mlx-whisper"):
             settings = Settings(
                 _env_file=None,
                 stt_provider=provider,
