@@ -93,7 +93,7 @@ by re-running the script that produced them.
 |---|---|---|---|---|
 | STT | `mlx-audio-realtime` + Nemotron 3.5 ASR 0.6B | `mlx-whisper` + `whisper-large-v3-turbo` | 1.28 GB → 1.61 GB of weights; on FLEURS, **Hindi 7.18 % → 35.92 % WER**, English 8.56 % → 4.98 % | The MLX Nemotron conversion fails to load, or English matters more than Hindi |
 | STT | `mlx-audio-realtime` + Nemotron 3.5 ASR 0.6B | `mlx-audio` + Nemotron 3.5 ASR 0.6B | Same Nemotron checkpoint over batch HTTP (`/v1/audio/transcriptions`) instead of the WebSocket transport: the transcript waits for the whole segment, so TTFS p50 / p99 is **0.94 s / 1.06 s (English)** and **1.26 s / 1.80 s (Hindi)** against the realtime **0.89 s / 0.99 s** and **1.00 s / 1.45 s** (FLEURS, this machine, local `mlx_audio.server`; worst p99 1.45 s → 1.80 s). It buys what `/v1/realtime` cannot: a language field, so `stt_language=en|hi` is accepted and a mid-session switch can be routed | The session must pin a language, or the STT itself must follow a mid-session language switch |
-| TTS | `mlx-audio` + `Kokoro-82M-4bit` | `kokoro` (in-process ONNX) | **Time to first audio 0.33 s against 0.79 s** (p50 of five sentences, warm, this machine); the default needs the server, the swap does not, and the swap costs 0.48 GB in the agent's own process | The mlx-audio server is not wanted on this deployment, or its memory is not there |
+| TTS | `mlx-audio` + `Kokoro-82M-4bit` | `kokoro` (in-process ONNX) | **Time to first audio 0.28 s against 0.71 s** (p50 of five sentences, warm, this machine); the default needs the server, the swap does not, and the swap costs 0.48 GB in the agent's own process | The mlx-audio server is not wanted on this deployment, or its memory is not there |
 | LLM | `ollama` + `gemma3:4b` | `ollama` + `gemma3:12b` | +4.8 GB of weights; the headroom to hold it is this machine's | The tier rule selects it when its weights are on the machine — measurement, not preference |
 | LLM | `ollama` | `openai-compatible` + llama.cpp / vLLM / LM Studio | Same model, different runtime | Ollama is dropped from the stack |
 | LLM | `ollama` + `gemma3:4b` | `openai-compatible` + a cloud API (`gpt-5.4-mini`) | **Quality up, latency up:** the LLM stage goes from 0.25 s to 1.12 s (median over six turns, this machine) — about +0.87 s on a 2.2 s turn — and the reply gets shorter (16 → 11 tokens) and better in Hindi. The turn leaves the machine, and the air-gap claim above stops holding | The local model's Hindi is not good enough, and the network is there |
@@ -305,8 +305,8 @@ and the ONNX build on the CPU.
 
 | Backend | Time to first audio (p50) | (max) | Real-time factor |
 |---|---:|---:|---:|
-| `mlx-audio` + Kokoro-82M-4bit, Metal | **0.33 s** | 0.52 s | 0.07 |
-| `kokoro`, in-process ONNX, CPU | 0.79 s | 1.33 s | 0.25 |
+| `mlx-audio` + Kokoro-82M-4bit, Metal | **0.28 s** | 0.47 s | 0.07 |
+| `kokoro`, in-process ONNX, CPU | 0.71 s | 1.22 s | 0.23 |
 
 Run-to-run spread on this machine is about ±0.02 s on the medians, so
 the numbers are quoted to the precision the measurement holds; the gap
@@ -316,9 +316,9 @@ spread.
 The same voices on both sides (`af_heart` for English, `hf_alpha` for
 Hindi), so the swap is a runtime change and not a voice change. The
 mlx-audio backend is the default because it reaches the first sound
-2.4× sooner; it needs the server, which the STT needs anyway. The
+2.5× sooner; it needs the server, which the STT needs anyway. The
 in-process Kokoro is the swap for a deployment that does not want the
-server: it costs 0.48 GB in the agent's own process and 0.46 s more
+server: it costs 0.48 GB in the agent's own process and 0.43 s more
 before the first sound.
 <!-- MEASURED:END -->
 

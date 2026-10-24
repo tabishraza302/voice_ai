@@ -11,7 +11,7 @@ With it, swapping the voice is a model id.
 
 The default TTS runs through this class: Kokoro-82M on the Metal GPU,
 through the same local server that serves the STT, because it reaches
-the first sound 2.4× sooner than the in-process ONNX build
+the first sound 2.5× sooner than the in-process ONNX build
 (scripts/bench_tts.py, warm, five sentences, this machine). Pipecat's own
 ``KokoroTTSService`` is the swap for a deployment that does not want
 the server. This class also serves the multilingual Chatterbox model, so
@@ -26,6 +26,7 @@ import wave
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator
 
+import httpx
 import numpy as np
 from loguru import logger
 from pipecat.audio.utils import create_stream_resampler
@@ -70,6 +71,7 @@ class LocalMlxTTSService(TTSService):
         base_url: str,
         sample_rate: int = 24000,
         settings: LocalMlxTTSSettings | None = None,
+        client: httpx.AsyncClient | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -82,6 +84,20 @@ class LocalMlxTTSService(TTSService):
         self._base_url = base_url.rstrip("/")
         self._sample_rate = sample_rate
         self._resampler = create_stream_resampler()
+        self._client = client
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """Return the shared HTTP client, creating it if needed."""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=300)
+        return self._client
+
+    async def cleanup(self) -> None:
+        """Release HTTP client resources at teardown."""
+        await super().cleanup()
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
 
     # -- language ---------------------------------------------------------
 
@@ -168,16 +184,14 @@ class LocalMlxTTSService(TTSService):
 
     async def _synthesize(self, payload: dict) -> tuple[bytes, int]:
         """POST to the local server and decode the WAV it returns."""
-        import httpx
-
         url = f"{self._base_url}/v1/audio/speech"
-        async with httpx.AsyncClient(timeout=300) as client:
-            response = await client.post(url, json=payload)
-            if response.status_code != 200:
-                raise RuntimeError(
-                    f"TTS server returned {response.status_code}: {response.text[:400]}"
-                )
-            body = response.content
+        client = self._get_client()
+        response = await client.post(url, json=payload)
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"TTS server returned {response.status_code}: {response.text[:400]}"
+            )
+        body = response.content
 
         with wave.open(io.BytesIO(body), "rb") as wf:
             sample_rate = wf.getframerate()
