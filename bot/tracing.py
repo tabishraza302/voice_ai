@@ -6,9 +6,8 @@ pipeline is constructed, because Pipecat's tracing decorators capture the
 tracer at decoration time — a provider installed afterwards is not picked
 up by the spans that were already created.
 
-The endpoint is the local collector's gRPC receiver on port 4319, not
-4317: the ``hear_help`` stack already holds 4317/4318 on this host, and
-two containers cannot bind the same port.
+The endpoint is the local collector's gRPC receiver on port 4319, avoiding
+default 4317 collisions on developer workstations.
 """
 
 from __future__ import annotations

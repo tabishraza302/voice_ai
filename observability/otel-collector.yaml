@@ -42,13 +42,10 @@ processors:
 
 exporters:
   # The host's Phoenix, over OTLP/HTTP. Phoenix runs on the host
-  # because Docker Desktop's VM is capped at 1.93 GB here and the other
-  # projects' stacks already hold most of it — see docker-compose.yml.
+  # to preserve Docker VM resources.
   #
-  # OTLP/HTTP rather than gRPC: Phoenix's gRPC receiver wants port 4317,
-  # and the `hear_help` stack already holds it on this host. Phoenix
-  # serves OTLP/HTTP on the same port as its UI, so 6006 works.
-  #
+  # OTLP/HTTP rather than gRPC: Phoenix serves OTLP/HTTP on the same port
+  # as its web UI (6006).
   # The endpoint is the *root*: the exporter appends `/v1/traces` itself,
   # and a full path here becomes `/v1/traces/v1/traces` (405).
   otlp_http/phoenix:

@@ -138,10 +138,10 @@ class Settings(BaseSettings):
     first_chunk_deadline_seconds: float = 0.25
 
     # --- Observability ---------------------------------------------------
-    # The OTLP gRPC endpoint of the local collector. Not 4317: the
-    # hear_help stack already holds 4317/4318 on this host. The collector
-    # is what talks to Phoenix, so Phoenix's own address is not a setting
-    # here — it lives in observability/otel-collector.yaml.
+    # The OTLP gRPC endpoint of the local collector. Default 4319 avoids
+    # standard 4317 port collisions on developer workstations. The collector
+    # is what talks to Phoenix, so Phoenix's own address is configured in
+    # observability/otel-collector.yaml.
     otlp_endpoint: str = "http://localhost:4319"
     enable_tracing: bool = True
     enable_metrics: bool = True

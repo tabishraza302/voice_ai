@@ -11,10 +11,8 @@
 #   scripts/voice-ai.sh status        # what is running, and where
 #   scripts/voice-ai.sh help         # the full list
 #
-# The order of `start` matters: the other projects' stacks go down first
-# (they hold the memory and some of the ports), then Phoenix, then the
-# containers, then the STT server, then the agent — which needs the STT
-# server.
+# The order of `start` matters: Phoenix on the host, then the container stack,
+# then the STT server, then the agent (which needs the STT server).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -39,7 +37,7 @@ PHOENIX_LOG="$LOG_DIR/phoenix.log"
 STT_LOG="$LOG_DIR/stt.log"
 AGENT_LOG="$LOG_DIR/agent.log"
 
-OTHER_PROJECTS=(hear_help newotnite)
+OTHER_PROJECTS=(${OTHER_DOCKER_PROJECTS:-})
 PHOENIX_BIN="${PHOENIX_BIN:-$(command -v phoenix 2>/dev/null || echo "$HOME/.local/bin/phoenix")}"
 
 # --- output ----------------------------------------------------------------
@@ -94,14 +92,13 @@ cmd_models() {
   esac
 }
 
-# --- the other projects on this box -----------------------------------------
+# --- other local container stacks (optional) --------------------------------
 #
-# voice-ai needs the memory and the ports the hear_help and newotnite
-# stacks hold, so they are stopped before voice-ai runs. Stop only: no
-# container is removed, no volume is touched, no configuration is changed,
-# and nothing is pruned.
+# If OTHER_DOCKER_PROJECTS is defined in your environment, voice-ai can
+# pause those container stacks during runs to free host ports and memory.
 
 cmd_others_stop() {
+  [ ${#OTHER_PROJECTS[@]} -gt 0 ] || return 0
   for project in "${OTHER_PROJECTS[@]}"; do
     ids=$(docker ps -q --filter "label=com.docker.compose.project=$project")
     if [ -n "$ids" ]; then
@@ -116,6 +113,7 @@ cmd_others_stop() {
 }
 
 cmd_others_start() {
+  [ ${#OTHER_PROJECTS[@]} -gt 0 ] || return 0
   for project in "${OTHER_PROJECTS[@]}"; do
     ids=$(docker ps -a -q --filter "label=com.docker.compose.project=$project")
     if [ -n "$ids" ]; then
@@ -219,14 +217,15 @@ cmd_start() {
 
   mkdir -p "$RUN_DIR" "$LOG_DIR"
 
-  # 1. The other projects' stacks.
-  if [ "$keep_others" = true ]; then
-    warn "leaving the other projects' stacks alone (--keep-others)"
-  else
-    log "stopping the other projects' stacks"
-    cmd_others_stop
+  # 1. Other local stacks (if specified via OTHER_DOCKER_PROJECTS).
+  if [ ${#OTHER_PROJECTS[@]} -gt 0 ]; then
+    if [ "$keep_others" = true ]; then
+      warn "leaving other project stacks alone (--keep-others)"
+    else
+      log "stopping other project stacks"
+      cmd_others_stop
+    fi
   fi
-
   # 2. Phoenix, on the host.
   log "starting Phoenix"
   cmd_phoenix
@@ -304,8 +303,8 @@ cmd_stop() {
 
   cmd_obs_down
 
-  if [ "$start_others" = true ]; then
-    log "starting the other projects' stacks"
+  if [ "$start_others" = true ] && [ ${#OTHER_PROJECTS[@]} -gt 0 ]; then
+    log "starting other project stacks"
     cmd_others_start
   fi
 
@@ -333,11 +332,13 @@ cmd_status() {
   echo
   echo "containers:"
   docker compose ps --format '  {{.Name}}  {{.State}}  {{.Status}}' 2>/dev/null || true
-  echo "other projects:"
-  for project in "${OTHER_PROJECTS[@]}"; do
-    count=$(docker ps -q --filter "label=com.docker.compose.project=$project" | wc -w | tr -d ' ')
-    echo "  $project: $count running"
-  done
+  if [ ${#OTHER_PROJECTS[@]} -gt 0 ]; then
+    echo "other projects:"
+    for project in "${OTHER_PROJECTS[@]}"; do
+      count=$(docker ps -q --filter "label=com.docker.compose.project=$project" | wc -w | tr -d ' ')
+      echo "  $project: $count running"
+    done
+  fi
 }
 
 # --- measurement and quality ------------------------------------------------
@@ -423,9 +424,9 @@ Quality:
   test               The regression suite
   clean              Remove the generated artifacts
 
-The other projects on this box:
-  others stop        Stop the hear_help and newotnite stacks (stop only)
-  others start       Bring them back up
+Other local stacks (optional, via OTHER_DOCKER_PROJECTS env var):
+  others stop        Stop specified container stacks
+  others start       Start specified container stacks
 EOF
 }
 

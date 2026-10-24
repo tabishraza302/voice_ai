@@ -1,26 +1,15 @@
 # The observability stack: traces into Phoenix, metrics into Prometheus,
 # dashboards in Grafana.
 #
-# **Every port here is shifted off the ones the other projects on this
-# machine already hold.** `hear_help-tempo-1` has 4317/4318,
-# `newotnite-api-1` has 3000, and hear_help's next-server has *:3002, so
-# this stack uses 4319 and 3003. A port that a *host* process
-# holds on the IPv6 wildcard is not usable even when Docker publishes
-# the same number on 127.0.0.1: a browser that resolves localhost to
-# ::1 reaches the host process, not the container.
+# Ports are assigned to avoid common host service collisions (4319 for OTLP,
+# 9091 for Prometheus, 3003 for Grafana).
 #
-# **Phoenix runs on the host, not in Docker.** Docker Desktop's VM is
-# capped at 1.93 GB on this machine, and the `hear_help` stack already
-# holds about 1.05 GB of it (its Grafana alone is 735 MB). Phoenix was
-# OOM-killed by the VM's kernel at 1g, at 768m, and in
-# `PHOENIX_LITE_MODE` — no cgroup limit leaves it enough room to start.
-# The host has ~10 GB free, so Phoenix runs there:
-# `scripts/voice-ai.sh phoenix`, an isolated `uv tool` environment, on
-# 6006. The collector reaches it over OTLP/HTTP at
-# http://host.docker.internal:6006/v1/traces.
+# Phoenix runs directly on the host (port 6006) via `scripts/voice-ai.sh phoenix`
+# in an isolated uv tool environment to avoid Docker Desktop VM memory constraints.
+# The collector reaches it over OTLP/HTTP at http://host.docker.internal:6006/v1/traces.
 #
-# **Every mem_limit is mandatory.** This machine is shared with two other
-# projects' stacks that are not ours to stop.
+# Memory limits (`mem_limit`) are explicitly defined on each container to maintain
+# strict local resource boundaries and prevent swapping.
 
 name: voice-ai
 
@@ -28,12 +17,10 @@ services:
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.163.1
     ports:
-      # 4319 (not 4317) — the hear_help stack holds 4317/4318.
+      # 4319 (not 4317) to avoid default OTLP port collisions on developer workstations.
       #
       # Only gRPC is published. The collector's OTLP/HTTP receiver stays
-      # available *inside* the container network, but nothing on the host
-      # sends it: the agent exports OTLP/gRPC to 4319. Publishing 4320
-      # opened a port on the host that no client ever used.
+      # available *inside* the container network.
       - "127.0.0.1:4319:4317"
       # The collector's own Prometheus exporter, so the host can check it.
       - "127.0.0.1:9464:9464"
@@ -51,10 +38,7 @@ services:
   prometheus:
     image: prom/prometheus:v3.15.0
     ports:
-      # 9091 on the host, 9090 in the container. The host's 9090 belongs
-      # to the hear_help stack, and a host process on the IPv4 wildcard
-      # takes the port away from a container that publishes the same
-      # number on 127.0.0.1.
+      # 9091 on the host, 9090 in the container (avoids default 9090 collisions).
       - "127.0.0.1:9091:9090"
     volumes:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
@@ -73,10 +57,7 @@ services:
   grafana:
     image: grafana/grafana:13.2.4
     ports:
-      # 3003 (not 3000, not 3002) — newotnite-api-1 holds 3000, and
-      # hear_help's next-server holds *:3002. Docker publishes on
-      # 127.0.0.1 only, so a host process on the IPv6 wildcard would
-      # still win for a browser that resolves localhost to ::1.
+      # 3003 on the host, 3000 in the container (avoids default 3000 collisions).
       - "127.0.0.1:3003:3000"
     environment:
       # Set explicitly so Grafana does not treat the password as

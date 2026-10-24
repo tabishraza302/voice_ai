@@ -6,10 +6,8 @@
 #   available_for_llm_gb = 16.0 - macos_baseline - stt - tts - python - 1.5
 #   >= 9.0 -> gemma3:12b  >= 3.5 -> gemma3:4b  else -> gemma3:1b + 8-bit STT
 #
-# The 1.5 GB reserve covers the `newotnite` and `hear_help` Docker stacks.
-# They are stopped while voice-ai runs (`scripts/voice-ai.sh start`), so
-# this baseline is measured with them down and the reserve is the
-# headroom left for them.
+# The reserve (default 1.5 GB, customizable via RESERVE_GB) covers system
+# tasks and swap headroom.
 #
 # Every component is measured in isolation, in its own process, so the
 # numbers are additive.
@@ -379,7 +377,7 @@ stt_gb     = num("MEASURED_STT_GB")
 tts_gb     = num("MEASURED_TTS_GB")
 python_gb  = num("MEASURED_PYTHON_GB")
 
-RESERVE_GB = 1.5   # other projects' Docker stacks + swap headroom
+RESERVE_GB = float(os.environ.get("RESERVE_GB", "1.5"))   # system & swap headroom
 
 available = (
     total_gb
