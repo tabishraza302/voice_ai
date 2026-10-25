@@ -66,38 +66,32 @@ class Settings(BaseSettings):
     # "ollama" is the default. "openai-compatible" points at any local
     # OpenAI-compatible server (llama.cpp, vLLM, LM Studio).
     #
-    # The model is Gemma 3, not Qwen 3, and that is a measured choice:
-    # **qwen3 is a thinking model** ("thinking: default true" in
-    # `ollama show`), and Ollama's OpenAI-compatible endpoint does not
-    # forward `think: false` — nor `chat_template_kwargs` — so the
-    # reasoning is not suppressed by default. A trivial "say hello"
-    # spent 200 completion tokens on reasoning and returned an *empty*
-    # answer, which for a voice agent is seconds of dead air. Gemma 3
-    # answers the same prompt in 13 tokens, in Devanagari.
-    #
-    # One thing does suppress it: `reasoning_effort: none`, the
-    # OpenAI-standard field, which Ollama *does* forward — it takes
-    # `gemma4:e2b` from 2.3 s to 0.042 s on that endpoint. The Ollama
-    # provider does not send it yet, so a thinking model on this
-    # provider still thinks. See the README's swap catalogue.
+    # Qwen3.5 4B is the default. It is a thinking model, and Ollama's
+    # OpenAI-compatible endpoint does not forward `think: false`: without
+    # the reasoning policy below, every turn spends its whole token budget
+    # on hidden reasoning and returns no spoken answer. `reasoning_effort:
+    # none` is the field Ollama does forward.
     llm_provider: str = "ollama"
-    # The built-in default is the conservative rung. The tier the memory
-    # rule actually selects for this machine is written into
-    # `.env.example` by `scripts/voice-ai.sh apply-tier`.
-    llm_model: str = "gemma3:4b"
+    llm_model: str = "qwen3.5:4b"
     llm_base_url: str = "http://localhost:11434/v1"
     # How long Ollama keeps the model resident after a turn. "0" unloads
     # it immediately, which with the 12B tier is an 8 GB reload between
     # every turn. 5m is Ollama's own default; `scripts/voice-ai.sh warm`
     # pins the model for 30m on demand.
     llm_keep_alive: str = "5m"
-    llm_temperature: float = 0.7
+    llm_temperature: float = 0.5
     llm_max_tokens: int = 200
     # The name the LLM server uses for the reply's length cap.
     # "max_tokens" is what llama.cpp, vLLM and LM Studio accept; the
     # gpt-5 family rejects it outright ("use max_completion_tokens
     # instead") and answers nothing.
     llm_max_tokens_parameter: str = "max_tokens"
+    # Suppress hidden reasoning on the OpenAI-compatible endpoint. Ollama
+    # forwards `reasoning_effort` even though it ignores `think`; "none"
+    # is what a voice agent needs, because the reply is read aloud and
+    # the token budget is small. An empty string omits the field, for a
+    # server or model that rejects it.
+    llm_reasoning_effort: str = "none"
     # The credential for an LLM provider that needs one. The
     # "openai-compatible" provider sends it as a bearer token; a local
     # server (llama.cpp, vLLM, LM Studio) needs no credential and

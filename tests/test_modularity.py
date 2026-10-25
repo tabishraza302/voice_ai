@@ -107,9 +107,25 @@ class TestRegistries:
         # *body*: Ollama's OpenAI-compatible endpoint honours `keep_alive`
         # there, and the OpenAI client rejects it as a top-level
         # argument.
-        settings = Settings(_env_file=None, llm_provider="ollama", llm_keep_alive="7m")
+        settings = Settings(
+            _env_file=None,
+            llm_provider="ollama",
+            llm_keep_alive="7m",
+            llm_reasoning_effort="",
+        )
         service = build_llm(settings)
         assert service._settings.extra == {"extra_body": {"keep_alive": "7m"}}
+
+    def test_the_ollama_service_carries_the_reasoning_policy(self):
+        # Qwen3.5 thinks by default, and `think: false` is not forwarded
+        # by Ollama's OpenAI-compatible endpoint. If `reasoning_effort`
+        # does not reach the body, every reply is hidden reasoning and
+        # the bot says nothing.
+        settings = Settings(
+            _env_file=None, llm_provider="ollama", llm_reasoning_effort="none"
+        )
+        service = build_llm(settings)
+        assert service._settings.extra["extra_body"]["reasoning_effort"] == "none"
 
 
 class TestRouterCoverage:

@@ -7,7 +7,7 @@
 #   scripts/pull_models.sh stt          # STT only
 #   scripts/pull_models.sh tts          # TTS only
 #   scripts/pull_models.sh llm          # LLM only
-#   scripts/pull_models.sh llm:4b       # one LLM tier only (1b | 4b | 12b)
+#   scripts/pull_models.sh llm:gemma    # the Gemma fallback ladder
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -163,14 +163,19 @@ PY
 }
 
 # --- Ollama (LLM) ----------------------------------------------------------
-# The Gemma 3 ladder. Every tier is a non-thinking model: qwen3 thinks by
-# default and Ollama's OpenAI-compatible endpoint cannot turn that off, so
-# a thinking model spends the voice agent's whole latency budget on
-# reasoning before it answers. Sizes are the registry's: 3.35 / 8.16 / 0.81 GB.
+# The default LLM: Qwen3.5 4B. The Gemma 3 ladder is the memory-tier
+# fallback the rule in scripts/memory_baseline.sh can select; it is a
+# separate, explicit download because most machines do not need it.
+# Gemma's registry sizes are 3.35 / 8.16 / 0.81 GB.
 pull_llm() {
-  # Every rung of the tier ladder, so the rule can pick any of them.
-  local models=("gemma3:1b" "gemma3:4b" "gemma3:12b")
+  local models=("qwen3.5:4b")
   case "${1:-}" in
+    llm:gemma) models=("gemma3:1b" "gemma3:4b" "gemma3:12b") ;;
+    llm:gemma:1b) models=("gemma3:1b") ;;
+    llm:gemma:4b) models=("gemma3:4b") ;;
+    llm:gemma:12b) models=("gemma3:12b") ;;
+    # The original names. Keep them working; they were the only rungs
+    # before Qwen3.5 became the default.
     llm:1b) models=("gemma3:1b") ;;
     llm:4b) models=("gemma3:4b") ;;
     llm:12b) models=("gemma3:12b") ;;
@@ -198,7 +203,7 @@ case "${1:-all}" in
   llm) pull_llm "${2:-}" ;;
   llm:*) pull_llm "$1" ;;
   all) pull_stt; pull_tts; pull_llm ;;
-  *) die "unknown target '$1' (use: stt | tts | llm | llm:1b | llm:4b | llm:12b | all)" ;;
+  *) die "unknown target '$1' (use: stt | tts | llm | llm:gemma | llm:gemma:1b | llm:gemma:4b | llm:gemma:12b | all)" ;;
 esac
 
 log "done"

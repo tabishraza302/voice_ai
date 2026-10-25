@@ -208,16 +208,20 @@ def _openai_llm_settings(settings: Settings) -> dict[str, Any]:
 def build_llm_ollama(settings: Settings) -> LLMService:
     """Ollama — the default local LLM runtime.
 
-    `keep_alive` travels in `extra_body`, which Pipecat merges into the
-    request JSON as-is: Ollama's OpenAI-compatible endpoint honours it,
-    and it is the only way to say how long the model stays resident
-    after a turn. It cannot be a top-level parameter — the OpenAI client
-    rejects keyword arguments it does not know. The other
-    OpenAI-compatible servers do not know the field, so it is not sent
-    to them.
+    `keep_alive` and the reasoning policy travel in `extra_body`, which
+    Pipecat merges into the request JSON as-is. Ollama's OpenAI-compatible
+    endpoint honours both; it ignores `think`, so `reasoning_effort` is
+    the only way to stop a thinking model from spending the whole reply
+    budget on hidden reasoning. They cannot be top-level parameters —
+    the OpenAI client rejects keyword arguments it does not know. The
+    other OpenAI-compatible servers do not know the fields, so they are
+    not sent to them.
     """
     llm_settings = _llm_settings(settings)
-    llm_settings["extra"] = {"extra_body": {"keep_alive": settings.llm_keep_alive}}
+    extra_body = {"keep_alive": settings.llm_keep_alive}
+    if settings.llm_reasoning_effort:
+        extra_body["reasoning_effort"] = settings.llm_reasoning_effort
+    llm_settings["extra"] = {"extra_body": extra_body}
     return OLLamaLLMService(
         base_url=settings.llm_base_url,
         api_key="ollama",

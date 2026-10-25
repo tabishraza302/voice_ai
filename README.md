@@ -18,7 +18,7 @@ A personal project building a responsive bilingual voice agent that runs entirel
 | Subsystem | Technology |
 |---|---|
 | **STT** | NVIDIA Nemotron 3.5 ASR Streaming 0.6B (MLX on Metal GPU via realtime WebSocket) |
-| **LLM** | Gemma 3 via Ollama (ladder sized by available memory) |
+| **LLM** | Qwen3.5 4B (`qwen3.5:4b`, thinking suppressed) via Ollama |
 | **TTS** | Kokoro-82M (Metal GPU via `mlx-audio`, or in-process ONNX CPU) |
 | **Orchestration** | Pipecat 1.13.0 |
 | **Transport** | Serverless WebRTC via Pipecat prebuilt client |
@@ -93,7 +93,7 @@ browser (Pipecat prebuilt WebRTC client)
 │ STT          │ LocalMlxRealtimeSTTService (WebSocket)    │
 │              │   → mlx_audio.server, Nemotron 3.5 (Metal)│
 ├──────────────┼───────────────────────────────────────────┤
-│ LLM          │ OLLamaLLMService → Ollama → gemma3        │
+│ LLM          │ OLLamaLLMService → Ollama → qwen3.5      │
 ├──────────────┼───────────────────────────────────────────┤
 │ routing      │ LanguageRoutingProcessor                  │
 │              │   sentence split → script detect → voice  │
@@ -135,9 +135,9 @@ STT, TTS, and LLM backends are selected entirely by configuration without touchi
 | **STT** | `mlx-audio-realtime` + Nemotron 3.5 ASR 0.6B | `mlx-whisper` + `whisper-large-v3-turbo` | Weights: 1.28 GB → 1.61 GB. FLEURS WER: **Hindi 7.18 % → 35.92 %**, English 8.56 % → 4.98 %. | When English precision is primary and Hindi is secondary. |
 | **STT** | `mlx-audio-realtime` + Nemotron 3.5 ASR 0.6B | `mlx-audio` + Nemotron 3.5 ASR 0.6B | Batch HTTP endpoint (`/v1/audio/transcriptions`) instead of WebSocket: TTFS p50/p99 increases from 0.89s/0.99s to 0.94s/1.06s (en) and 1.00s/1.45s to 1.26s/1.80s (hi). Supports explicit language pinning (`stt_language=en|hi`). | When mid-session language pinning or explicit locale overrides are required. |
 | **TTS** | `mlx-audio` + `Kokoro-82M-4bit` (Metal) | `kokoro` (in-process ONNX CPU) | Time to first audio: **0.28 s vs 0.71 s** (p50). In-process ONNX adds 0.48 GB to agent process but eliminates dependency on `mlx-audio` server. | When running without the local HTTP server or optimizing process boundaries. |
-| **LLM** | `ollama` + `gemma3:4b` | `ollama` + `gemma3:12b` | Adds ~4.8 GB weights to resident memory. | When sufficient unified memory is available (≥ 24 GB Mac). |
+| **LLM** | `ollama` + `qwen3.5:4b` | `ollama` + `gemma3:4b` | Gemma 3 is non-thinking, so it needs no reasoning policy; the memory baseline measured it at 2.62 GB resident. | When running in a tighter memory tier or preferring Gemma 3 Devanagari styling. |
 | **LLM** | `ollama` | `openai-compatible` + llama.cpp / vLLM / LM Studio | Alternative local inference runtime. | When deploying with non-Ollama runtimes. |
-| **LLM** | `ollama` + `gemma3:4b` | `openai-compatible` + Cloud API (`gpt-5.4-mini`) | TTFT increases from 0.25 s to 1.12 s; breaks air-gapped property. | When testing cloud frontier model reasoning capabilities. |
+| **LLM** | `ollama` + `qwen3.5:4b` | `openai-compatible` + Cloud API (`gpt-5.4-mini`) | Requires a network, so it breaks the air-gapped property. Not measured against the local default. | When testing cloud frontier model reasoning capabilities. |
 
 To swap backends, edit `.env`:
 ```bash
@@ -151,7 +151,9 @@ tts_provider=mlx-audio
 
 Every benchmark below is measured on reference hardware: **Apple Silicon M5 MacBook Air, 16 GB unified memory, macOS 27**.
 
-### LLM Memory Tiering (16 GB Unified Memory)
+### LLM Memory Tiering (Gemma 3 Fallback Ladder, 16 GB Unified Memory)
+
+The default configuration is Qwen3.5 4B (measured above). Separately, `scripts/voice-ai.sh memory` derives a memory ceiling and `apply-tier` can configure the largest installed Gemma 3 rung on a tighter machine. These are the numbers for that fallback ladder, not for the default.
 
 The memory rule computes available headroom by subtracting measured components and a system reserve:
 
@@ -166,6 +168,17 @@ The memory rule computes available headroom by subtracting measured components a
 | **Available for LLM** | **11.61 GB** |
 | **Memory Ceiling (Selected by Rule)** | **`gemma3:12b`** (8.16 GB) |
 | **Installed Tier Active** | **`gemma3:4b`** (3.35 GB) |
+
+### LLM Speed (Qwen3.5 4B via Ollama)
+
+Measured on the bot's actual endpoint (`/v1/chat/completions`), streaming, warm, five samples per prompt after a discarded warm-up. Settings: `reasoning_effort=none`, `temperature=0.5`, `max_tokens=200`, and the system prompt from `bot/config.py`. Hardware and runtime: M5 MacBook Air, 16 GB, Ollama 0.40.9, `qwen3.5:4b` (nvfp4).
+
+| Prompt | Time to first content token (p50) | Total reply (p50) | Completion tokens (p50) | Hidden reasoning |
+|---|---:|---:|---:|---:|
+| English: "Can you hear me?" | 0.07 s | 0.54 s | 15 | 0 chars |
+| Hindi: "क्या आप मुझे सुन सकते हैं?" | 0.07 s | 0.76 s | 22 | 0 chars |
+
+Qwen3.5 thinks by default, and Ollama's OpenAI-compatible endpoint does not forward `think: false`. Without `reasoning_effort=none`, the same English request spent the entire 200-token cap on hidden reasoning and returned **no content**; with the cap removed, the benchmark path generated a median of 2,412 reasoning tokens and still produced no spoken answer. That is why the Ollama factory sends the field. The build is 4.0 GB on disk and 4.4–4.7 GB resident while warm, depending on the context Ollama has allocated.
 
 ### End-to-End Turn Latency Breakdown
 

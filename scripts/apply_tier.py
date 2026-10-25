@@ -92,7 +92,7 @@ def choose_tier(baseline: dict) -> tuple[str, str]:
                 rung["model"],
                 f"{ceiling} fits in memory but its weights are not on this machine",
             )
-    return ceiling, "none of the rungs are installed; pull it with: scripts/voice-ai.sh models llm"
+    return ceiling, "none of the rungs are installed; pull it with: scripts/voice-ai.sh models llm:gemma"
 
 
 def main() -> int:

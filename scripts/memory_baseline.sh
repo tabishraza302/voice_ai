@@ -6,6 +6,9 @@
 #   available_for_llm_gb = 16.0 - macos_baseline - stt - tts - python - 1.5
 #   >= 9.0 -> gemma3:12b  >= 3.5 -> gemma3:4b  else -> gemma3:1b + 8-bit STT
 #
+# The ladder is the Gemma 3 fallback, not the default LLM. The default is
+# Qwen3.5 4B; `apply-tier` writes a rung here only when asked to.
+#
 # The reserve (default 1.5 GB, customizable via RESERVE_GB) covers system
 # tasks and swap headroom.
 #
@@ -101,7 +104,7 @@ OLLAMA_RESIDENT_GB="null"
 # what will actually be resident at runtime: .env first, then the
 # measured .env.example, which `scripts/voice-ai.sh apply-tier` writes.
 OLLAMA_MODEL="${OLLAMA_MODEL:-$( { cat .env .env.example 2>/dev/null || true; } | grep -E '^llm_model=' | head -1 | cut -d= -f2 || true)}"
-OLLAMA_MODEL="${OLLAMA_MODEL:-gemma3:4b}"
+OLLAMA_MODEL="${OLLAMA_MODEL:-qwen3.5:4b}"
 if command -v ollama >/dev/null 2>&1 && curl -sf --max-time 3 http://localhost:11434/api/tags >/dev/null; then
   MODEL="$OLLAMA_MODEL"
   if ollama list 2>/dev/null | awk '{print $1}' | grep -qx "$MODEL"; then
@@ -388,10 +391,11 @@ available = (
     - RESERVE_GB
 )
 
-# The Gemma 3 ladder. Every tier is a non-thinking model: a thinking model
-# burns the latency budget on reasoning before it answers, and Ollama's
-# OpenAI-compatible endpoint cannot turn the reasoning off. Sizes are the
-# registry's, measured: 3.35 GB, 8.16 GB, 0.81 GB.
+# The Gemma 3 fallback ladder. Gemma is non-thinking, so it needs no
+# reasoning policy, and every rung is small enough for a constrained
+# machine. Sizes are the registry's, measured: 3.35 GB, 8.16 GB, 0.81 GB.
+# The default LLM is Qwen3.5 4B; this ladder answers "which model fits"
+# for deployments that choose to let the memory rule pick one.
 if available >= 9.0:
     llm_model, stt_fallback = "gemma3:12b", None
 elif available >= 3.5:

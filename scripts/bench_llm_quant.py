@@ -7,28 +7,26 @@ smaller and usually faster; it may also be a different model in
 practice. The only way to know is to measure all three axes — speed,
 size and what the model actually says — for every build.
 
-Two axes are measured, because Ollama publishes both:
+Two axes are measured:
 
-* **Precision** — fp16 (the base build), q8_0 and q4_K_M. Those are
-  the three Ollama publishes for this model; there is no 7, 6 or 5-bit
-  build to measure.
-* **Variant** — the same weights ship as a *hybrid* model that thinks by
-  default, an *instruct* model that does not, and a *thinking* model
-  that only does. The variant decides whether the model burns the
-  latency budget on reasoning before it answers, which is a bigger
-  difference than any quantization.
+* **Precision** — the default nvfp4 build, q8_0 and q4_K_M. Those are
+  the three this repo measures; Ollama publishes more (bf16, mxfp8), and
+  ``--tags`` accepts any of them.
+* **Reasoning** — Qwen3.5 thinks by default. The native endpoint can be
+  told ``think: false``; the OpenAI-compatible endpoint cannot, and
+  needs the OpenAI-standard ``reasoning_effort: none`` instead.
 
 Three paths are measured per build, because the endpoint decides what
 the bot experiences:
 
-* `/api/chat` with ``think: false`` — the path that works.
+* `/api/chat` with ``think: false`` — the reference path.
 * `/api/chat` with thinking on — what the model does by default.
-* `/v1/chat/completions`` — the path the bot actually uses, where
-  Ollama ignores ``think``.
+* `/v1/chat/completions`` — the path the bot actually uses, measured
+  both with and without ``reasoning_effort: none``.
 
 Usage:
     uv run python scripts/bench_llm_quant.py
-    uv run python scripts/bench_llm_quant.py --tags qwen3:4b-q4_K_M --runs 6
+    uv run python scripts/bench_llm_quant.py --tags qwen3.5:4b-q8_0 --runs 6
 """
 
 from __future__ import annotations
@@ -76,15 +74,12 @@ SYSTEM = (
 QUESTION = "Can you hear me?"
 HINDI = "क्या आप मुझे सुन सकते हैं?"
 
-# Every build Ollama publishes for qwen3:4b: the three precisions, of
-# each of the three variants.
+# The three Qwen3.5 4B builds this repo measures. The default tag is the
+# nvfp4 build; q8_0 and q4_K_M are the alternatives.
 BUILDS = [
-    "qwen3:4b-fp16",
-    "qwen3:4b-q8_0",
-    "qwen3:4b-q4_K_M",
-    "qwen3:4b-instruct-2507-fp16",
-    "qwen3:4b-instruct-2507-q8_0",
-    "qwen3:4b-instruct-2507-q4_K_M",
+    "qwen3.5:4b",
+    "qwen3.5:4b-q8_0",
+    "qwen3.5:4b-q4_K_M",
 ]
 
 # A reply that opens by answering the question, rather than talking about

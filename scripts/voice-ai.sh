@@ -87,8 +87,9 @@ cmd_models() {
   local target="${1:-all}"
   case "$target" in
     stt|tts|llm|all) bash scripts/pull_models.sh "$target" ;;
-    llm:1b|llm:4b|llm:12b) bash scripts/pull_models.sh "$target" ;;
-    *) die "unknown target '$target' (use: stt | tts | llm | llm:1b | llm:4b | llm:12b | all)" ;;
+    llm:gemma|llm:gemma:1b|llm:gemma:4b|llm:gemma:12b|llm:1b|llm:4b|llm:12b)
+      bash scripts/pull_models.sh "$target" ;;
+    *) die "unknown target '$target' (use: stt | tts | llm | llm:gemma | llm:gemma:1b | llm:gemma:4b | llm:gemma:12b | all)" ;;
   esac
 }
 
@@ -359,7 +360,7 @@ cmd_test() { uv run pytest; }
 cmd_warm() {
   local model
   model=$(configured_llm_model)
-  [ -n "$model" ] || model="gemma3:4b"
+  [ -n "$model" ] || model="qwen3.5:4b"
   curl -sf http://localhost:11434/api/generate \
     -d "{\"model\":\"$model\",\"prompt\":\"hi\",\"stream\":false,\"keep_alive\":\"30m\"}" >/dev/null \
     && ok "LLM warm ($model, resident for 30m)"
@@ -402,7 +403,8 @@ Setup:
   install            The venv, the dependencies and the host-side Phoenix
   models             Download the models
     stt | tts | llm | all
-    llm:1b | llm:4b | llm:12b   one LLM tier only
+    llm:gemma | llm:gemma:1b | llm:gemma:4b | llm:gemma:12b
+                       the Gemma fallback ladder, or one rung of it
 
 Measuring:
   memory             The memory baseline, and the LLM tier it selects
