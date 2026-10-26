@@ -11,9 +11,23 @@ import {
   Mic,
 } from "lucide-react";
 import { api } from "@/lib/api-client";
-import { DEFAULT_CATALOG } from "@/lib/constants";
+import {
+  DEFAULT_CATALOG,
+  MAX_TOKENS,
+  SPEED,
+  TEMPERATURE,
+} from "@/lib/constants";
+import {
+  formFromAgent,
+  isDirty,
+  slugify,
+  toCreatePayload,
+  toUpdatePayload,
+  validateForm,
+  type AgentFormValues,
+} from "@/lib/agent-form-model";
 import { VoiceTestModal } from "@/components/VoiceTestModal";
-import type { AgentCreate, Agent } from "@/types/agent";
+import type { Agent } from "@/types/agent";
 
 interface AgentFormProps {
   initialAgent?: Agent;
@@ -43,42 +57,35 @@ export function AgentForm({ initialAgent, isNew = false }: AgentFormProps) {
     loadCatalog();
   }, []);
 
-  const [formData, setFormData] = useState<AgentCreate>({
-    slug: initialAgent?.slug || "custom-assistant",
-    name: initialAgent?.name || "New Voice Agent",
-    description: initialAgent?.description || "",
-    persona_prompt:
-      initialAgent?.persona_prompt ??
-      "You are a friendly, knowledgeable, and quick voice assistant. Respond with brevity and natural speech rhythm.",
-    llm_model: initialAgent?.llm_model || "qwen3.5:4b",
-    llm_temperature: initialAgent?.llm_temperature ?? 0.6,
-    llm_reasoning_effort: initialAgent?.llm_reasoning_effort ?? "none",
-    llm_max_tokens: initialAgent?.llm_max_tokens ?? 256,
-    stt_provider: initialAgent?.stt_provider || "mlx-audio-realtime",
-    tts_voice_en: initialAgent?.tts_voice_en || "af_heart",
-    tts_voice_hi: initialAgent?.tts_voice_hi || "hf_alpha",
-    tts_speed: initialAgent?.tts_speed ?? 1.0,
-  });
+  const [formData, setFormData] = useState<AgentFormValues>(() =>
+    initialAgent
+      ? formFromAgent(initialAgent)
+      : {
+          slug: slugify("New Voice Agent"),
+          name: "New Voice Agent",
+          description: "",
+          persona_prompt:
+            "You are a friendly, knowledgeable, and quick voice assistant. Respond with brevity and natural speech rhythm.",
+          llm_model: "qwen3.5:4b",
+          llm_temperature: 0.6,
+          llm_reasoning_effort: "none",
+          llm_max_tokens: 256,
+          stt_provider: "mlx-audio-realtime",
+          tts_voice_en: "af_heart",
+          tts_voice_hi: "hf_alpha",
+          tts_speed: 1.0,
+        }
+  );
+  const [slugTouched, setSlugTouched] = useState(!isNew);
 
   const estimatedTokens = useMemo(() => {
     return Math.ceil((formData.persona_prompt || "").length / 4);
   }, [formData.persona_prompt]);
 
   const activeAgentForTesting = currentAgent || null;
-  const hasUnsavedChanges = Boolean(currentAgent && (
-    currentAgent.name !== formData.name ||
-    currentAgent.slug !== formData.slug ||
-    currentAgent.description !== formData.description ||
-    currentAgent.persona_prompt !== formData.persona_prompt ||
-    currentAgent.llm_model !== formData.llm_model ||
-    currentAgent.llm_temperature !== formData.llm_temperature ||
-    currentAgent.llm_reasoning_effort !== formData.llm_reasoning_effort ||
-    currentAgent.llm_max_tokens !== formData.llm_max_tokens ||
-    currentAgent.stt_provider !== formData.stt_provider ||
-    currentAgent.tts_voice_en !== formData.tts_voice_en ||
-    currentAgent.tts_voice_hi !== formData.tts_voice_hi ||
-    currentAgent.tts_speed !== formData.tts_speed
-  ));
+  const hasUnsavedChanges = Boolean(
+    currentAgent && isDirty(formData, currentAgent)
+  );
 
   const handleActivated = useCallback((activatedAgent: Agent) => {
     setCurrentAgent(activatedAgent);
@@ -103,15 +110,25 @@ export function AgentForm({ initialAgent, isNew = false }: AgentFormProps) {
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    setSaving(true);
     setError(null);
+    const errors = validateForm(formData, { requireSlug: isNew });
+    const firstError = errors.name ?? errors.slug ?? errors.persona;
+    if (firstError) {
+      setError(firstError);
+      return;
+    }
+    setSaving(true);
     try {
       if (isNew) {
-        const created = await api.createAgent(formData);
+        const created = await api.createAgent(toCreatePayload(formData));
         router.push(`/agents/${created.id}`);
       } else if (currentAgent) {
-        const updated = await api.updateAgent(currentAgent.id, formData);
+        const updated = await api.updateAgent(
+          currentAgent.id,
+          toUpdatePayload(formData)
+        );
         setCurrentAgent(updated);
+        setFormData(formFromAgent(updated));
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Failed to save agent";
@@ -235,7 +252,13 @@ export function AgentForm({ initialAgent, isNew = false }: AgentFormProps) {
                   type="text"
                   value={formData.name}
                   onChange={(e) =>
-                    setFormData({ ...formData, name: e.target.value })
+                    setFormData({
+                      ...formData,
+                      name: e.target.value,
+                      ...(isNew && !slugTouched
+                        ? { slug: slugify(e.target.value) }
+                        : {}),
+                    })
                   }
                   required
                   className="field-control"
@@ -250,9 +273,10 @@ export function AgentForm({ initialAgent, isNew = false }: AgentFormProps) {
                   id="agent-slug"
                   type="text"
                   value={formData.slug}
-                  onChange={(e) =>
-                    setFormData({ ...formData, slug: e.target.value })
-                  }
+                  onChange={(e) => {
+                    setSlugTouched(true);
+                    setFormData({ ...formData, slug: e.target.value });
+                  }}
                   required
                   maxLength={64}
                   readOnly={!isNew}
@@ -290,7 +314,7 @@ export function AgentForm({ initialAgent, isNew = false }: AgentFormProps) {
                     {formData.persona_prompt.length} chars
                   </span>
                   <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-copper-500/10 text-copper-300 border border-copper-500/20 font-semibold">
-                    ~{estimatedTokens} tokens
+                    ~{estimatedTokens} tokens (est.)
                   </span>
                 </div>
               </div>
@@ -302,6 +326,7 @@ export function AgentForm({ initialAgent, isNew = false }: AgentFormProps) {
                   setFormData({ ...formData, persona_prompt: e.target.value })
                 }
                 required
+                maxLength={20000}
                 className="field-control min-h-40 font-mono leading-relaxed"
                 placeholder="Define character, tone of voice, brevity rules, or bilingual personality..."
               />
@@ -413,19 +438,19 @@ export function AgentForm({ initialAgent, isNew = false }: AgentFormProps) {
                 <label htmlFor="agent-tts-speed" className="text-sm font-medium text-limestone-300">
                   Synthesis Speed Multiplier:{" "}
                   <span className="text-moss-400 font-mono font-bold">
-                    {formData.tts_speed}x
+                    {formData.tts_speed.toFixed(2)}x
                   </span>
                 </label>
                 <span className="text-[11px] text-limestone-500">
-                  0.8x (Deliberate) to 1.4x (Brisk)
+                  {SPEED.min.toFixed(2)}x to {SPEED.max.toFixed(2)}x
                 </span>
               </div>
               <input
                 id="agent-tts-speed"
                 type="range"
-                min="0.8"
-                max="1.4"
-                step="0.05"
+                min={SPEED.min}
+                max={SPEED.max}
+                step={SPEED.step}
                 value={formData.tts_speed}
                 onChange={(e) =>
                   setFormData({
@@ -501,7 +526,7 @@ export function AgentForm({ initialAgent, isNew = false }: AgentFormProps) {
                   <label htmlFor="agent-temperature" className="field-label">
                     Temperature:{" "}
                     <span className="text-copper-400 font-mono font-bold">
-                      {formData.llm_temperature}
+                      {formData.llm_temperature.toFixed(2)}
                     </span>
                   </label>
                   <span className="text-[11px] text-limestone-500 font-mono">
@@ -517,9 +542,9 @@ export function AgentForm({ initialAgent, isNew = false }: AgentFormProps) {
                 <input
                   id="agent-temperature"
                   type="range"
-                  min="0"
-                  max="1.2"
-                  step="0.05"
+                  min={TEMPERATURE.min}
+                  max={TEMPERATURE.max}
+                  step={TEMPERATURE.step}
                   value={formData.llm_temperature}
                   onChange={(e) =>
                     setFormData({
@@ -546,9 +571,9 @@ export function AgentForm({ initialAgent, isNew = false }: AgentFormProps) {
                 <input
                   id="agent-max-tokens"
                   type="range"
-                  min="64"
-                  max="1024"
-                  step="32"
+                  min={MAX_TOKENS.min}
+                  max={MAX_TOKENS.max}
+                  step={MAX_TOKENS.step}
                   value={formData.llm_max_tokens}
                   onChange={(e) =>
                     setFormData({

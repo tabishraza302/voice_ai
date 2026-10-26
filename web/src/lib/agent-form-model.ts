@@ -81,11 +81,20 @@ export function isDirty(values: AgentFormValues, agent: Agent): boolean {
   );
 }
 
-export function validateForm(values: AgentFormValues): AgentFormErrors {
+export interface ValidateFormOptions {
+  requireSlug?: boolean;
+}
+
+export function validateForm(
+  values: AgentFormValues,
+  { requireSlug = true }: ValidateFormOptions = {}
+): AgentFormErrors {
   const errors: AgentFormErrors = {};
   if (!values.name.trim()) errors.name = "Name is required.";
-  const slug = values.slug.trim();
-  if (!slug || slugify(slug) !== slug) errors.slug = "Slug is required.";
+  if (requireSlug) {
+    const slug = values.slug.trim();
+    if (!slug || slugify(slug) !== slug) errors.slug = "Slug is required.";
+  }
   if (!values.persona_prompt.trim()) errors.persona = "Instructions are required.";
   return errors;
 }

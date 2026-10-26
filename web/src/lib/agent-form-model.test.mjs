@@ -210,6 +210,25 @@ describe("validateForm", () => {
     expect(validateForm({ ...form, slug: "  " })).toEqual({ slug: "Slug is required." });
   });
 
+  test("rejects a stored slug that slugify would change when slug is required", () => {
+    expect(validateForm({ ...form, slug: "Legacy Agent" })).toEqual({ slug: "Slug is required." });
+  });
+
+  test("skips slug validation when slug is not required", () => {
+    for (const slug of ["Legacy Agent", "", "  ", "Bilingual Assistant!"]) {
+      expect(validateForm({ ...form, slug }, { requireSlug: false })).toEqual({});
+    }
+  });
+
+  test("still requires name and instructions when slug is not required", () => {
+    expect(
+      validateForm({ ...form, slug: "Legacy Agent", name: "  ", persona_prompt: "\n\t" }, { requireSlug: false })
+    ).toEqual({
+      name: "Name is required.",
+      persona: "Instructions are required.",
+    });
+  });
+
   test("rejects a slug that slugify would change", () => {
     expect(validateForm({ ...form, slug: "Bilingual Assistant!" })).toEqual({ slug: "Slug is required." });
   });
