@@ -21,8 +21,16 @@ import { api } from "@/lib/api-client";
 import { VoiceSession } from "@/lib/voice-session";
 import { TranscriptLog } from "@/lib/transcript-log";
 import {
+  appendAssistantTokenLine,
   appendTranscriptLine,
+  appendUserPartialLine,
+  assistantTokenFromDataChannel,
+  classifyUserDeltaAfterFinal,
+  dataChannelEventType,
+  finishLiveLine,
+  replaceTranscriptLine,
   transcriptFromDataChannel,
+  userPartialFromDataChannel,
 } from "@/lib/transcript-protocol";
 import type { Agent } from "@/types/agent";
 
@@ -31,6 +39,7 @@ export interface TranscriptItem {
   role: "user" | "assistant";
   text: string;
   time: string;
+  live?: boolean;
 }
 
 interface VoiceTestModalProps {
@@ -72,6 +81,21 @@ export function VoiceTestModal({
   const sessionGenerationRef = useRef(0);
   // One dedupe log per mounted modal; reset when a call is torn down.
   const transcriptLogRef = useRef<TranscriptLog | null>(null);
+  // Which representation is filling the current assistant bubble: the live
+  // token stream (realtime) or a completed transcript (fallback when tokens
+  // are unavailable). A user line starts the next turn.
+  const assistantSourceRef = useRef<"none" | "tokens" | "completed">("none");
+  const assistantTokenIdRef = useRef(0);
+  // The live STT bubble: deltas append to one id until the final transcript.
+  const userPartialIdRef = useRef<string | null>(null);
+  const userPartialSeqRef = useRef(0);
+  const userPartialTextRef = useRef("");
+  // After a final transcript, late deltas can still arrive for that turn. Keep
+  // the finalized live/final text so the first delta that does not continue it
+  // can start the next turn, without waiting for an unreliable start event.
+  const finalizedUserLiveRef = useRef("");
+  const finalizedUserTextRef = useRef("");
+  const userSourceRef = useRef<"none" | "partial" | "final">("none");
   // Timers that clear `isBotSpeaking`; cleared on teardown so none fires late.
   const botSpeakingTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
 
@@ -85,9 +109,10 @@ export function VoiceTestModal({
   const pingIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement | null>(null);
   const dialogRef = useRef<HTMLDivElement | null>(null);
-  // Auto-scroll transcript container
+  // Auto-scroll transcript container. Token updates arrive continuously, so
+  // snap to the newest line instead of restarting a smooth animation per token.
   useEffect(() => {
-    transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    transcriptEndRef.current?.scrollIntoView({ behavior: "auto" });
   }, [transcripts]);
 
   const getTranscriptLog = useCallback(() => {
@@ -96,6 +121,14 @@ export function VoiceTestModal({
   }, []);
 
   const appendTranscript = useCallback((role: TranscriptItem["role"], text: string, time: string) => {
+    if (role === "user") {
+      assistantSourceRef.current = "none";
+      userSourceRef.current = "final";
+      userPartialIdRef.current = null;
+      userPartialTextRef.current = "";
+      finalizedUserLiveRef.current = "";
+      finalizedUserTextRef.current = "";
+    }
     const entry = getTranscriptLog().append(role, text);
     if (!entry) return;
     // Consecutive spoken segments are one reply, so they share one bubble.
@@ -109,8 +142,87 @@ export function VoiceTestModal({
     );
   }, [getTranscriptLog]);
 
-  // Show the "speaking" badge for 3000ms after each bot transcript.
+  // Tokens bypass the dedupe log: repeated words are normal inside one reply.
+  const appendAssistantToken = useCallback((token: string, time: string) => {
+    assistantTokenIdRef.current += 1;
+    setTranscripts((prev) =>
+      appendAssistantTokenLine(prev, {
+        id: `assistant-token-${assistantTokenIdRef.current}`,
+        role: "assistant",
+        text: token,
+        time,
+        live: true,
+      })
+    );
+  }, []);
+
+  // Interim STT deltas grow one user bubble; they are not deduped because
+  // each delta is a new piece of the same utterance.
+  const appendUserPartial = useCallback((delta: string, time: string) => {
+    if (userSourceRef.current === "final") {
+      const decision = classifyUserDeltaAfterFinal(
+        finalizedUserLiveRef.current,
+        finalizedUserTextRef.current,
+        delta
+      );
+      finalizedUserLiveRef.current = decision.liveText;
+      if (decision.late) return;
+      // A delta that no longer continues the finalized text is the next turn.
+      finalizedUserTextRef.current = "";
+    }
+    userSourceRef.current = "partial";
+    userPartialTextRef.current += delta;
+    if (!userPartialIdRef.current) {
+      userPartialSeqRef.current += 1;
+      userPartialIdRef.current = `user-partial-${userPartialSeqRef.current}`;
+    }
+    const id = userPartialIdRef.current;
+    setTranscripts((prev) =>
+      appendUserPartialLine(finishLiveLine(prev, "assistant"), {
+        id,
+        role: "user",
+        text: delta,
+        time,
+        live: true,
+      })
+    );
+  }, []);
+
+  // The final user transcript replaces the live bubble instead of adding a
+  // second copy of the same utterance.
+  const finalizeUserTranscript = useCallback((text: string, time: string) => {
+    const finalText = text.trim();
+    const liveText = userPartialTextRef.current;
+    const entry = getTranscriptLog().append("user", finalText);
+    const partialId = userPartialIdRef.current;
+    userPartialIdRef.current = null;
+    userPartialTextRef.current = "";
+    finalizedUserLiveRef.current = liveText;
+    finalizedUserTextRef.current = finalText;
+    userSourceRef.current = "final";
+    assistantSourceRef.current = "none";
+    if (!entry && !partialId) return;
+
+    setTranscripts((prev) => {
+      const base = finishLiveLine(prev, "assistant");
+      if (partialId) {
+        const replaced = replaceTranscriptLine(base, partialId, entry?.text ?? finalText);
+        if (replaced) return replaced;
+      }
+      if (!entry) return base;
+      return appendTranscriptLine(base, {
+        id: entry.id,
+        role: "user",
+        text: entry.text,
+        time,
+      });
+    });
+  }, [getTranscriptLog]);
+
+  // Keep the "speaking" badge alive while tokens stream, then clear it once.
   const markBotSpeaking = useCallback(() => {
+    botSpeakingTimersRef.current.forEach((timer) => clearTimeout(timer));
+    botSpeakingTimersRef.current.clear();
     setIsBotSpeaking(true);
     const timer = setTimeout(() => {
       botSpeakingTimersRef.current.delete(timer);
@@ -145,6 +257,12 @@ export function VoiceTestModal({
       audioContextRef.current = null;
     }
     getTranscriptLog().reset();
+    assistantSourceRef.current = "none";
+    userSourceRef.current = "none";
+    userPartialIdRef.current = null;
+    userPartialTextRef.current = "";
+    finalizedUserLiveRef.current = "";
+    finalizedUserTextRef.current = "";
     setIsBotSpeaking(false);
     setAudioBlocked(false);
   }, [getTranscriptLog]);
@@ -230,24 +348,66 @@ export function VoiceTestModal({
 
   // Inbound WebRTC Data Channel message dispatcher
   const handleDataChannelMessage = useCallback((event: MessageEvent) => {
-    // The project sends one completed `transcript` message per spoken turn.
-    // Pipecat also sends the same turn as streamed `bot-llm-text` tokens and
-    // as `bot-transcription` / `bot-output` / `user-transcription`
-    // representations; rendering those too fragments and repeats the turn.
-    const transcript = transcriptFromDataChannel(event.data);
-    if (!transcript) return;
-
-    if (transcript.role === "assistant") {
-      markBotSpeaking();
-    }
-
     const now = new Date().toLocaleTimeString([], {
       hour: "2-digit",
       minute: "2-digit",
       second: "2-digit",
     });
-    appendTranscript(transcript.role, transcript.text, now);
-  }, [appendTranscript, markBotSpeaking]);
+
+    // The LLM's token stream is the realtime representation. Appending every
+    // token to one bubble shows the reply as it is generated, without the
+    // per-token fragments the old dialog created.
+    const token = assistantTokenFromDataChannel(event.data);
+    if (token !== null) {
+      if (assistantSourceRef.current === "completed") return;
+      assistantSourceRef.current = "tokens";
+      markBotSpeaking();
+      appendAssistantToken(token, now);
+      return;
+    }
+
+    // Interim STT deltas arrive while the user is still speaking. They grow
+    // one bubble; the final project transcript replaces it in place. The
+    // classifier in `appendUserPartial` also handles the trailing deltas that
+    // arrive after a final and the first delta of the next turn.
+    const partial = userPartialFromDataChannel(event.data);
+    if (partial !== null) {
+      appendUserPartial(partial, now);
+      return;
+    }
+
+    // `user-started-speaking` is deliberately not a turn boundary: the real
+    // realtime stream can emit it after the first delta, or even after the
+    // final transcript. Turn boundaries come from the deltas above.
+    const eventType = dataChannelEventType(event.data);
+    if (eventType === "bot-llm-stopped" || eventType === "bot-stopped-speaking") {
+      setTranscripts((prev) => finishLiveLine(prev, "assistant"));
+      return;
+    }
+
+    // The project's completed transcript is the final source for the user,
+    // and the assistant fallback when tokens are unavailable. Its assistant
+    // copy arrives only after TTS has spoken the sentence, so ignore it when
+    // the tokens already showed it.
+    const transcript = transcriptFromDataChannel(event.data);
+    if (!transcript) return;
+
+    if (transcript.role === "user") {
+      finalizeUserTranscript(transcript.text, now);
+      return;
+    }
+
+    if (assistantSourceRef.current === "tokens") return;
+    assistantSourceRef.current = "completed";
+    markBotSpeaking();
+    appendTranscript("assistant", transcript.text, now);
+  }, [
+    appendAssistantToken,
+    appendTranscript,
+    appendUserPartial,
+    finalizeUserTranscript,
+    markBotSpeaking,
+  ]);
 
   // Connect a single cancellable local voice session.
   const startSession = useCallback(async () => {
@@ -259,6 +419,12 @@ export function VoiceTestModal({
     setErrorMessage(null);
     setDuration(0);
     setTranscripts([]);
+    assistantSourceRef.current = "none";
+    userSourceRef.current = "none";
+    userPartialIdRef.current = null;
+    userPartialTextRef.current = "";
+    finalizedUserLiveRef.current = "";
+    finalizedUserTextRef.current = "";
     setAudioBlocked(false);
 
     const session = new VoiceSession({
@@ -381,6 +547,12 @@ export function VoiceTestModal({
 
   const handleClearTranscript = () => {
     getTranscriptLog().reset();
+    assistantSourceRef.current = "none";
+    userSourceRef.current = "none";
+    userPartialIdRef.current = null;
+    userPartialTextRef.current = "";
+    finalizedUserLiveRef.current = "";
+    finalizedUserTextRef.current = "";
     setTranscripts([]);
   };
 
@@ -658,6 +830,13 @@ export function VoiceTestModal({
                         }`}
                       >
                         {item.text}
+                        {item.live && (
+                          <span
+                            data-typing-caret="true"
+                            aria-hidden="true"
+                            className="ml-0.5 inline-block h-3 w-0.5 animate-pulse bg-current align-middle"
+                          />
+                        )}
                       </div>
                     </div>
                   ))}
