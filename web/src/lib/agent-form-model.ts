@@ -93,7 +93,11 @@ export function validateForm(
   if (!values.name.trim()) errors.name = "Name is required.";
   if (requireSlug) {
     const slug = values.slug.trim();
-    if (!slug || slugify(slug) !== slug) errors.slug = "Slug is required.";
+    if (!slug) {
+      errors.slug = "Slug is required.";
+    } else if (slugify(slug) !== slug) {
+      errors.slug = "Use lowercase letters, numbers and hyphens only.";
+    }
   }
   if (!values.persona_prompt.trim()) errors.persona = "Instructions are required.";
   return errors;

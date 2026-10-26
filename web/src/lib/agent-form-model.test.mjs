@@ -211,7 +211,9 @@ describe("validateForm", () => {
   });
 
   test("rejects a stored slug that slugify would change when slug is required", () => {
-    expect(validateForm({ ...form, slug: "Legacy Agent" })).toEqual({ slug: "Slug is required." });
+    expect(validateForm({ ...form, slug: "Legacy Agent" })).toEqual({
+      slug: "Use lowercase letters, numbers and hyphens only.",
+    });
   });
 
   test("skips slug validation when slug is not required", () => {
@@ -230,7 +232,9 @@ describe("validateForm", () => {
   });
 
   test("rejects a slug that slugify would change", () => {
-    expect(validateForm({ ...form, slug: "Bilingual Assistant!" })).toEqual({ slug: "Slug is required." });
+    expect(validateForm({ ...form, slug: "Bilingual Assistant!" })).toEqual({
+      slug: "Use lowercase letters, numbers and hyphens only.",
+    });
   });
 
   test("requires instructions", () => {
