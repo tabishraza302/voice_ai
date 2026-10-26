@@ -36,7 +36,7 @@ function createHarness(options = {}) {
   const offerResponse = options.offerResponse ?? { ok: true, json: async () => ({ pc_id: "pc-1", sdp: "remote-sdp", type: "answer" }) };
   const track = new FakeTrack();
   const stream = { getAudioTracks: () => [track], getTracks: () => [track] };
-  const fetcher = mock(async () => offerResponse);
+  const fetcher = options.fetcher ?? mock(async () => offerResponse);
   const peerConnectionFactory = mock((config) => new FakePeerConnection(config));
   const getUserMedia = options.getUserMedia ?? mock(async () => stream);
   const statuses = [];
@@ -107,6 +107,23 @@ describe("voice session lifecycle", () => {
     expect(track.stopped).toBe(true);
     expect(peer.channel.closed).toBe(true);
     expect(peer.closed).toBe(true);
+  });
+
+  test("calls the injected fetcher with the global receiver", async () => {
+    let receiver = null;
+    const response = { ok: true, json: async () => ({ pc_id: "pc-1", sdp: "remote-sdp", type: "answer" }) };
+    const harness = createHarness({
+      fetcher: function () {
+        receiver = this;
+        return Promise.resolve(response);
+      },
+    });
+
+    await harness.session.connect({ offerUrl: OFFER_URL, agentId: agent.id });
+
+    // Native browser fetch throws "Illegal invocation" when called with the
+    // dependencies object as its receiver.
+    expect(receiver).toBe(globalThis);
   });
 
   test("stops a microphone stream that resolves after the caller cancels", async () => {

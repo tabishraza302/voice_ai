@@ -106,7 +106,7 @@ export class VoiceSession {
       peerConnection.onicecandidate = async ({ candidate }) => {
         if (!candidate || !isCurrent() || !this.pcId) return;
         try {
-          await this.dependencies.fetcher(options.offerUrl, {
+          await this.request(options.offerUrl, {
             method: "PATCH",
             headers: { "Content-Type": "application/json" },
             signal: controller.signal,
@@ -131,7 +131,7 @@ export class VoiceSession {
       await this.waitForIceGathering(peerConnection, controller.signal, isCurrent);
       this.assertCurrent(isCurrent);
 
-      const response = await this.dependencies.fetcher(options.offerUrl, {
+      const response = await this.request(options.offerUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         signal: controller.signal,
@@ -184,6 +184,15 @@ export class VoiceSession {
     this.generation += 1;
     this.abortController?.abort();
     this.dispose();
+  }
+
+  /**
+   * Calls the injected fetch through the global receiver. A browser's native
+   * `fetch` throws "Illegal invocation" when invoked as a method of another
+   * object, which property-call syntax on `this.dependencies` would do.
+   */
+  private request(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+    return this.dependencies.fetcher.call(globalThis, input, init);
   }
 
   private sendMessage(message: unknown): boolean {
