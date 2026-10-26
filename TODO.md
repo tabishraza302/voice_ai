@@ -33,17 +33,25 @@ real session bug and supplies tested helpers for the fixes.
       payloads that never send slug/is_active, single dirty check, honest
       token-estimate label. Committed `de1607e`; 73 tests. Follow-up `32b37e7`
       reports a malformed slug as malformed instead of "required".
+- [x] Browser-only call bug found by the fake-media integration pass: native
+      `fetch` was invoked as a method of the dependencies object and threw
+      `Illegal invocation`, so every real WebRTC offer failed. Fixed in
+      `6c487eb` by calling it through `globalThis`, with a receiver test.
 - [x] Closeout — full web suite, build, Python suite, browser pass, commits.
-      Web: 73 pass across 7 files, 184 expectations; typecheck and production
+      Web: 74 pass across 7 files, 185 expectations; typecheck and production
       build (8/8 static pages) clean. Python: 214 passed, 5 skipped (PostgreSQL
       cases need `TEST_DATABASE_URL`), 2 upstream deprecation warnings. Browser
-      (Chrome headless against the dev server on `:3001`): all five routes
-      render with no console errors, no horizontal overflow at 390px, keyboard
-      focus shows a 2px solid `rgb(219, 161, 111)` ring with the accent border,
-      the speed hint reads `0.50x to 2.00x`, and the token badge reads
-      `~39 tokens (est.)`. Limits: no DOM component harness, so modal send
-      gating, scroll lock and audio teardown were verified by inspection; no
-      physical microphone, real STT recognition or speaker playback was used.
+      route pass (Chrome headless against the dev server on `:3001`): all five
+      routes render with no console errors, no horizontal overflow at 390px,
+      keyboard focus shows a 2px solid `rgb(219, 161, 111)` ring with the accent
+      border, the speed hint reads `0.50x to 2.00x`, and the token badge reads
+      `~39 tokens (est.)`. Browser call integration with Chrome's fake media
+      device: the modal reached `Connected`, locked body scroll, enabled the
+      input, sent a text turn (user bubble rendered, draft cleared, no error),
+      then closed with body scroll restored, focus returned to `Talk with
+      Agent`, and no console errors. Limits: no physical microphone, real STT
+      recognition or speaker playback was used; the send-failure branch was
+      verified by inspection and unit-level behavior only.
 
 ## Completed (prior pass)
 
