@@ -1,0 +1,134 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-26T18:45:15Z",
+  "title": "Design System: Voice AI Studio",
+  "extensions": {
+    "colorMeta": {
+      "background": {
+        "role": "neutral",
+        "displayName": "Warm Ink",
+        "tonalRamp": ["#14130f", "#1b1a16", "#25231e", "#35332b", "#48463c", "#686458", "#918c7c", "#f2ecdf"]
+      },
+      "surface": {
+        "role": "neutral",
+        "displayName": "Raised Ink",
+        "tonalRamp": ["#14130f", "#1b1a16", "#211f1a", "#25231e", "#35332b", "#48463c", "#686458", "#aea696"]
+      },
+      "surface-raised": {
+        "role": "neutral",
+        "displayName": "Control Ink",
+        "tonalRamp": ["#171611", "#25231e", "#2b2821", "#35332b", "#48463c", "#686458", "#918c7c", "#d8d1c2"]
+      },
+      "border": {
+        "role": "neutral",
+        "displayName": "Warm Divider",
+        "tonalRamp": ["#171611", "#25231e", "#35332b", "#474238", "#5b564b", "#736d61", "#938b7d", "#c9c1b2"]
+      },
+      "foreground": {
+        "role": "neutral",
+        "displayName": "Limestone",
+        "tonalRamp": ["#171611", "#25231e", "#3a372f", "#5b564b", "#736d61", "#938b7d", "#c9c1b2", "#f2ecdf"]
+      },
+      "muted": {
+        "role": "neutral",
+        "displayName": "Muted Limestone",
+        "tonalRamp": ["#171611", "#25231e", "#3a372f", "#5b564b", "#736d61", "#938b7d", "#aea696", "#f2ecdf"]
+      },
+      "accent": {
+        "role": "primary",
+        "displayName": "Oxidized Copper",
+        "tonalRamp": ["#251a12", "#372418", "#52331f", "#704728", "#8f5b33", "#aa6c3b", "#c98753", "#f4dec9"]
+      },
+      "on-accent": {
+        "role": "neutral",
+        "displayName": "Copper Ink",
+        "tonalRamp": ["#21170f", "#251a12", "#372418", "#52331f", "#704728", "#8f5b33", "#c98753", "#f4dec9"]
+      },
+      "accent-hover": {
+        "role": "primary",
+        "displayName": "Copper Light",
+        "tonalRamp": ["#251a12", "#372418", "#52331f", "#704728", "#8f5b33", "#aa6c3b", "#c98753", "#dba16f"]
+      },
+      "success": {
+        "role": "secondary",
+        "displayName": "Muted Moss",
+        "tonalRamp": ["#1a2117", "#222b1c", "#303c26", "#445333", "#5b6c43", "#748457", "#8f9f6f", "#e0e5d1"]
+      },
+      "error": {
+        "role": "tertiary",
+        "displayName": "Warm Rust",
+        "tonalRamp": ["#2d1715", "#431d1a", "#642a24", "#873b31", "#a64f42", "#bd6556", "#d28373", "#f5e2de"]
+      }
+    },
+    "typographyMeta": {
+      "body": { "displayName": "Body", "purpose": "Readable supporting and paragraph text." },
+      "label": { "displayName": "Control Label", "purpose": "Form labels and concise button text." }
+    },
+    "breakpoints": [
+      { "name": "sm", "value": "640px" },
+      { "name": "md", "value": "768px" },
+      { "name": "lg", "value": "1024px" },
+      { "name": "xl", "value": "1280px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Copper action for saving or starting the main task.",
+      "html": "<button class=\"ds-button-primary\" type=\"button\">Save changes</button>",
+      "css": ".ds-button-primary { display: inline-flex; min-height: 40px; align-items: center; justify-content: center; gap: 8px; padding: 8px 16px; border: 0; border-radius: 8px; background: var(--accent); color: #21170f; font: 600 14px/1.25 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; cursor: pointer; transition: background-color 150ms ease; } .ds-button-primary:hover { background: #dba16f; } .ds-button-primary:focus-visible { outline: 2px solid #dba16f; outline-offset: 2px; }"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "Warm raised control for secondary actions.",
+      "html": "<button class=\"ds-button-secondary\" type=\"button\">Cancel</button>",
+      "css": ".ds-button-secondary { display: inline-flex; min-height: 40px; align-items: center; justify-content: center; gap: 8px; padding: 8px 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-raised); color: var(--foreground); font: 500 14px/1.25 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; cursor: pointer; transition: background-color 150ms ease; } .ds-button-secondary:hover { background: #35332b; } .ds-button-secondary:focus-visible { outline: 2px solid #dba16f; outline-offset: 2px; }"
+    },
+    {
+      "name": "Text Field",
+      "kind": "input",
+      "refersTo": "field-control",
+      "description": "Dark, full-width field with a copper focus border.",
+      "html": "<label class=\"ds-field-label\" for=\"ds-name\">Agent name</label><input class=\"ds-field-control\" id=\"ds-name\" placeholder=\"Agent name\">",
+      "css": ".ds-field-label { display: block; margin-bottom: 6px; color: #c9c1b2; font: 500 14px/1.25 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; } .ds-field-control { display: block; width: 100%; padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--background); color: var(--foreground); font: 400 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; transition: border-color 150ms ease; } .ds-field-control::placeholder { color: #938b7d; } .ds-field-control:focus-visible { border-color: var(--accent); outline: 2px solid #dba16f; outline-offset: 2px; }"
+    },
+    {
+      "name": "Active Navigation Link",
+      "kind": "nav",
+      "refersTo": "navigation-active",
+      "description": "Selected workspace destination in the persistent desktop rail or mobile row.",
+      "html": "<nav class=\"ds-navigation\" aria-label=\"Main navigation\"><a class=\"ds-navigation-active\" href=\"#\" aria-current=\"page\">Overview</a></nav>",
+      "css": ".ds-navigation { display: flex; gap: 6px; } .ds-navigation-active { display: inline-flex; align-items: center; padding: 10px 14px; border: 1px solid #35332b; border-radius: 8px; background: var(--surface); color: #ebc19b; font: 500 14px/1.25 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; text-decoration: none; transition: background-color 150ms ease; } .ds-navigation-active:hover { background: #35332b; } .ds-navigation-active:focus-visible { outline: 2px solid #dba16f; outline-offset: 2px; }"
+    },
+    {
+      "name": "Surface",
+      "kind": "card",
+      "refersTo": "surface",
+      "description": "Subtle tonal panel for grouped state or list content.",
+      "html": "<section class=\"ds-surface\">Saved configuration</section>",
+      "css": ".ds-surface { padding: 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); color: var(--foreground); }"
+    }
+  ],
+  "narrative": {
+    "northStar": "Calm Local Operator Console",
+    "overview": "A calm, local operator console for configuring bilingual voice agents and testing saved configurations. Warm ink, limestone text, oxidized copper actions, and moss for confirmed active or successful state keep the workspace grounded. The layout favors clear task hierarchy, grouped settings, and truthful saved state over decoration.",
+    "keyCharacteristics": [
+      "Warm solid surfaces and restrained copper actions.",
+      "Grouped settings and list rows with clear save and selection actions.",
+      "Native controls, visible keyboard focus, and responsive navigation."
+    ],
+    "rules": [],
+    "dos": [
+      "Use actual saved configuration only; do not add placeholder latency, memory, readiness, or benchmark values.",
+      "Use associated labels, semantic headings and fieldsets, native controls, and visible keyboard focus."
+    ],
+    "donts": [
+      "Do not introduce remote fonts, assets, runtime services, or external runtime calls.",
+      "Do not imply a profile is live merely because it is selected."
+    ]
+  }
+}
