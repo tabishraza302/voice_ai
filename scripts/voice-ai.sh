@@ -28,6 +28,11 @@ PHOENIX_GRPC_PORT="${PHOENIX_GRPC_PORT:-6007}"
 PROMETHEUS_PORT="${PROMETHEUS_PORT:-9091}"
 GRAFANA_PORT="${GRAFANA_PORT:-3003}"
 COLLECTOR_PORT="${COLLECTOR_PORT:-9464}"
+POSTGRES_PORT="${POSTGRES_PORT:-5439}"
+CONFIGURED_WEB_PORT="$(grep -E '^[[:space:]]*(web_port|WEB_PORT)=' "$REPO_ROOT/.env" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '"\047[:space:]' || true)"
+WEB_PORT="${WEB_PORT:-${CONFIGURED_WEB_PORT:-3001}}"
+export WEB_PORT
+export POSTGRES_PORT
 
 RUN_DIR="$REPO_ROOT/data/run"
 LOG_DIR="$REPO_ROOT/logs"
@@ -36,7 +41,9 @@ PHOENIX_PID="$PHOENIX_DIR/phoenix.pid"
 PHOENIX_LOG="$LOG_DIR/phoenix.log"
 STT_LOG="$LOG_DIR/stt.log"
 AGENT_LOG="$LOG_DIR/agent.log"
-
+WEB_LOG="$LOG_DIR/web.log"
+WEB_PID="$RUN_DIR/web.pid"
+WEB_BIN="$REPO_ROOT/web/node_modules/next/dist/bin/next"
 OTHER_PROJECTS=(${OTHER_DOCKER_PROJECTS:-})
 PHOENIX_BIN="${PHOENIX_BIN:-$(command -v phoenix 2>/dev/null || echo "$HOME/.local/bin/phoenix")}"
 
@@ -46,6 +53,70 @@ log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m  ok\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m  --\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m  !!\033[0m %s\n' "$*" >&2; exit 1; }
+
+[[ "$WEB_PORT" =~ ^[0-9]+$ ]] && (( WEB_PORT >= 1 && WEB_PORT <= 65535 )) \
+  || die "WEB_PORT must be an integer between 1 and 65535"
+
+web_pid_is_owned() {
+  [ -f "$WEB_PID" ] || return 1
+  local pid started command recorded_started
+  IFS='|' read -r pid recorded_started _ < "$WEB_PID" || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  started="$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//')"
+  command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  [ -n "$started" ] && [ "$started" = "$recorded_started" ] || return 1
+  case "$command" in *"$WEB_BIN"*) return 0 ;; *) return 1 ;; esac
+}
+
+web_port_is_listening() {
+  lsof -nP -iTCP:"$WEB_PORT" -sTCP:LISTEN -t >/dev/null 2>&1
+}
+
+start_web_background() {
+  if web_pid_is_owned; then
+    ok "the web studio is already running (pid $(cut -d'|' -f1 "$WEB_PID"))"
+    return 0
+  fi
+  rm -f "$WEB_PID"
+  web_port_is_listening && die "port $WEB_PORT is already in use; refusing to start the web studio"
+  [ -x "$WEB_BIN" ] || die "Next.js is not installed in web/node_modules; run the web setup first"
+  log "starting the Next.js web studio on $WEB_PORT"
+  ( cd "$REPO_ROOT/web" && exec node "$WEB_BIN" dev --hostname 127.0.0.1 -p "$WEB_PORT" ) > "$WEB_LOG" 2>&1 &
+  local pid="$!" started attempt
+  for attempt in $(seq 1 10); do
+    started="$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//')"
+    [ -n "$started" ] && break
+    sleep 0.1
+  done
+  [ -n "$started" ] || die "could not record the web studio process"
+  printf '%s|%s|%s\n' "$pid" "$started" "$WEB_BIN" > "$WEB_PID"
+}
+
+stop_web() {
+  if ! web_pid_is_owned; then
+    rm -f "$WEB_PID"
+    warn "no project-owned web studio process is running"
+    return 0
+  fi
+  local pid
+  pid="$(cut -d'|' -f1 "$WEB_PID")"
+  kill "$pid" 2>/dev/null || true
+  rm -f "$WEB_PID"
+  ok "the project-owned web studio stopped"
+}
+
+wait_for_postgres() {
+  local attempt
+  for attempt in $(seq 1 30); do
+    if docker compose exec -T postgres pg_isready -U voice_ai -d voice_ai >/dev/null 2>&1; then
+      ok "PostgreSQL is ready"
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
 
 # Wait for an HTTP endpoint to answer. Readiness, not a sleep: the whole
 # point is that the agent never starts against a server that is not there.
@@ -168,6 +239,7 @@ cmd_obs_up() {
     || die "Grafana did not become healthy; docker compose logs grafana"
   wait_for "http://localhost:$COLLECTOR_PORT/metrics" "the collector's metrics exporter" 60 \
     || die "the collector did not come up; docker compose logs otel-collector"
+  wait_for_postgres || die "PostgreSQL did not become ready; docker compose logs postgres"
 }
 
 cmd_obs_down() {
@@ -206,11 +278,12 @@ cmd_run() {
 # --- the whole stack -------------------------------------------------------
 
 cmd_start() {
-  local background=false with_agent=true keep_others=false
+  local background=false with_agent=true keep_others=false with_web=false
   while [ $# -gt 0 ]; do
     case "$1" in
       --background) background=true; shift ;;
       --no-agent) with_agent=false; shift ;;
+      --web) with_web=true; shift ;;
       --keep-others) keep_others=true; shift ;;
       *) die "unknown option '$1'" ;;
     esac
@@ -240,6 +313,13 @@ cmd_start() {
     || die "Grafana did not become healthy; docker compose logs grafana"
   wait_for "http://localhost:$COLLECTOR_PORT/metrics" "the collector's metrics exporter" 60 \
     || die "the collector did not come up; docker compose logs otel-collector"
+  wait_for_postgres || die "PostgreSQL did not become ready; docker compose logs postgres"
+
+  # Web studio (if requested via --web)
+  if [ "$with_web" = true ]; then
+    start_web_background
+    wait_for "http://localhost:$WEB_PORT" "the web studio" 30 || warn "the web studio is still compiling; see $WEB_LOG"
+  fi
 
   # 4. The STT and TTS server. The agent talks to it, so it comes first.
   log "starting the mlx-audio server on $STT_PORT"
@@ -276,6 +356,14 @@ cmd_start() {
   exec uv run python -m bot.bot
 }
 
+
+cmd_web() {
+  log "starting the Next.js web studio on http://localhost:$WEB_PORT"
+  [ -x "$WEB_BIN" ] || die "Next.js is not installed in web/node_modules; run the web setup first"
+  web_port_is_listening && die "port $WEB_PORT is already in use; refusing to start the web studio"
+  cd "$REPO_ROOT/web"
+  exec node "$WEB_BIN" dev --hostname 127.0.0.1 -p "$WEB_PORT"
+}
 cmd_stop() {
   local start_others=false
   while [ $# -gt 0 ]; do
@@ -301,6 +389,8 @@ cmd_stop() {
     warn "the mlx-audio server was not running"
   fi
   rm -f "$RUN_DIR/stt.pid"
+  stop_web
+
 
   cmd_obs_down
 
@@ -315,6 +405,7 @@ cmd_stop() {
 cmd_summary() {
   cat <<EOF
 
+  Studio:     http://localhost:$WEB_PORT
   Agent:      http://localhost:$AGENT_PORT/client
   Phoenix:    http://localhost:$PHOENIX_PORT
   Grafana:    http://localhost:$GRAFANA_PORT
@@ -330,6 +421,8 @@ cmd_status() {
   printf 'prometheus %s\n' "$(curl -sf -o /dev/null -w '%{http_code}' "http://localhost:$PROMETHEUS_PORT/-/ready" 2>/dev/null || echo down)"
   printf 'stt server %s\n' "$(curl -sf -o /dev/null -w '%{http_code}' "http://127.0.0.1:$STT_PORT/v1/models" 2>/dev/null || echo down)"
   printf 'ollama     %s\n' "$(curl -sf -o /dev/null -w '%{http_code}' "http://localhost:11434/api/tags" 2>/dev/null || echo down)"
+  printf 'studio     %s\n' "$(curl -sf -o /dev/null -w '%{http_code}' "http://localhost:$WEB_PORT" 2>/dev/null || echo down)"
+  printf 'postgres   %s\n' "$(docker compose exec -T postgres pg_isready -U voice_ai -d voice_ai >/dev/null 2>&1 && echo 200 || echo down)"
   echo
   echo "containers:"
   docker compose ps --format '  {{.Name}}  {{.State}}  {{.Status}}' 2>/dev/null || true
@@ -352,6 +445,10 @@ cmd_turn_bench() { uv run python scripts/bench_turn.py "$@"; }
 cmd_llm_bench() { uv run python scripts/bench_llm_quant.py "$@"; }
 cmd_eval() {
   uv run python evals/wer_eval.py --languages en hi --models nemotron nemotron-8bit whisper
+}
+
+cmd_profile_bench() {
+  uv run python scripts/bench_agent_profiles.py
 }
 cmd_eval_scenarios() { uv run python -m pipecat.evals run evals/scenarios/; }
 cmd_smoke() { uv run python scripts/smoke_stt.py; }
@@ -384,6 +481,7 @@ Running it:
   start              Start everything, in order, waiting until each piece is ready
     --background       the agent runs in the background instead of the foreground
     --no-agent         everything except the agent
+    --web              start the Next.js web studio in the background too
     --keep-others      leave the other projects' stacks alone
   stop               Stop everything, in reverse
     --start-others     bring the other projects' stacks back up too
@@ -417,6 +515,7 @@ Measuring:
     --deadline SECS (0 = off)  --out FILE
   llm-bench          One LLM across the quantizations Ollama publishes
     --tags TAG...  --runs N
+  profile-bench      Six bounded local English/Hindi preset prompt checks
   eval               FLEURS WER/CER, per model and per normalization
   eval-scenarios     The behavioural evals (needs the agent running)
   warm               Pre-load the LLM into Ollama
@@ -429,6 +528,7 @@ Quality:
 Other local stacks (optional, via OTHER_DOCKER_PROJECTS env var):
   others stop        Stop specified container stacks
   others start       Start specified container stacks
+  web                Start the Next.js Web Studio on port 3001
 EOF
 }
 
@@ -443,6 +543,7 @@ main() {
     stop) cmd_stop "$@" ;;
     status) cmd_status "$@" ;;
     run) cmd_run "$@" ;;
+    web) cmd_web "$@" ;;
     run-eval) cmd_run "$@" ;;
     stt) cmd_stt "$@" ;;
     stt-model) cmd_stt_model "$@" ;;
@@ -461,6 +562,7 @@ main() {
     turn-bench) cmd_turn_bench "$@" ;;
     llm-bench) cmd_llm_bench "$@" ;;
     eval) cmd_eval "$@" ;;
+    profile-bench) cmd_profile_bench "$@" ;;
     eval-scenarios) cmd_eval_scenarios "$@" ;;
     warm) cmd_warm "$@" ;;
     smoke) cmd_smoke "$@" ;;
@@ -478,4 +580,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
