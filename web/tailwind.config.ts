@@ -1,0 +1,81 @@
+import type { Config } from "tailwindcss";
+
+const config: Config = {
+  content: [
+    "./src/pages/**/*.{js,ts,jsx,tsx,mdx}",
+    "./src/components/**/*.{js,ts,jsx,tsx,mdx}",
+    "./src/app/**/*.{js,ts,jsx,tsx,mdx}",
+  ],
+  darkMode: "class",
+  theme: {
+    extend: {
+      colors: {
+        background: "var(--background)",
+        foreground: "var(--foreground)",
+        ink: {
+          950: "#14130f",
+          900: "#1b1a16",
+          800: "#25231e",
+          700: "#35332b",
+          600: "#48463c",
+          500: "#686458",
+          400: "#918c7c",
+          300: "#bdb7a8",
+          200: "#d8d1c2",
+          100: "#f2ecdf",
+        },
+        limestone: {
+          950: "#171611",
+          900: "#25231e",
+          800: "#3a372f",
+          700: "#5b564b",
+          600: "#736d61",
+          500: "#938b7d",
+          400: "#aea696",
+          300: "#c9c1b2",
+          200: "#ded7c9",
+          100: "#f2ecdf",
+        },
+        copper: {
+          950: "#251a12",
+          900: "#372418",
+          800: "#52331f",
+          700: "#704728",
+          600: "#8f5b33",
+          500: "#aa6c3b",
+          400: "#c98753",
+          300: "#dba16f",
+          200: "#ebc19b",
+          100: "#f4dec9",
+        },
+        moss: {
+          950: "#1a2117",
+          900: "#222b1c",
+          800: "#303c26",
+          700: "#445333",
+          600: "#5b6c43",
+          500: "#748457",
+          400: "#8f9f6f",
+          300: "#aabb8a",
+          200: "#c6d0ad",
+          100: "#e0e5d1",
+        },
+        rust: {
+          950: "#2d1715",
+          900: "#431d1a",
+          800: "#642a24",
+          700: "#873b31",
+          600: "#a64f42",
+          500: "#bd6556",
+          400: "#d28373",
+          300: "#e0a69a",
+          200: "#ebc4bc",
+          100: "#f5e2de",
+        },
+      },
+    },
+  },
+  plugins: [require("tailwindcss-animate")],
+};
+
+export default config;
