@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import { api } from "@/lib/api-client";
 import { VoiceSession } from "@/lib/voice-session";
+import { TranscriptLog } from "@/lib/transcript-log";
 import type { Agent } from "@/types/agent";
 
 export interface TranscriptItem {
@@ -56,7 +57,6 @@ export function VoiceTestModal({
   const [duration, setDuration] = useState(0);
   const [textInput, setTextInput] = useState("");
   const [transcripts, setTranscripts] = useState<TranscriptItem[]>([]);
-  const [interimUserText, setInterimUserText] = useState("");
   const [isBotSpeaking, setIsBotSpeaking] = useState(false);
   const [audioBlocked, setAudioBlocked] = useState(false);
 
@@ -66,7 +66,10 @@ export function VoiceTestModal({
   onActivatedRef.current = onActivated;
   const isSessionStartingRef = useRef(false);
   const sessionGenerationRef = useRef(0);
-  const recentTranscriptRef = useRef<{ key: string; at: number } | null>(null);
+  // One dedupe log per mounted modal; reset when a call is torn down.
+  const transcriptLogRef = useRef<TranscriptLog | null>(null);
+  // Timers that clear `isBotSpeaking`; cleared on teardown so none fires late.
+  const botSpeakingTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
 
   const voiceSessionRef = useRef<VoiceSession | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -81,17 +84,30 @@ export function VoiceTestModal({
   // Auto-scroll transcript container
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [transcripts, interimUserText]);
+  }, [transcripts]);
+
+  const getTranscriptLog = useCallback(() => {
+    if (!transcriptLogRef.current) transcriptLogRef.current = new TranscriptLog();
+    return transcriptLogRef.current;
+  }, []);
 
   const appendTranscript = useCallback((role: TranscriptItem["role"], text: string, time: string) => {
-    const key = `${role}:${text}`;
-    const previous = recentTranscriptRef.current;
-    if (previous?.key === key && Date.now() - previous.at < 1200) return;
-    recentTranscriptRef.current = { key, at: Date.now() };
+    const entry = getTranscriptLog().append(role, text);
+    if (!entry) return;
     setTranscripts((prev) => [
       ...prev,
-      { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, role, text, time },
+      { id: entry.id, role: entry.role, text: entry.text, time },
     ]);
+  }, [getTranscriptLog]);
+
+  // Show the "speaking" badge for 3000ms after each bot transcript.
+  const markBotSpeaking = useCallback(() => {
+    setIsBotSpeaking(true);
+    const timer = setTimeout(() => {
+      botSpeakingTimersRef.current.delete(timer);
+      setIsBotSpeaking(false);
+    }, 3000);
+    botSpeakingTimersRef.current.add(timer);
   }, []);
 
   // Clean teardown helper
@@ -100,6 +116,7 @@ export function VoiceTestModal({
     isSessionStartingRef.current = false;
     voiceSessionRef.current?.close();
     voiceSessionRef.current = null;
+    if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
     if (animationFrameRef.current) {
       cancelAnimationFrame(animationFrameRef.current);
       animationFrameRef.current = null;
@@ -112,14 +129,16 @@ export function VoiceTestModal({
       clearInterval(pingIntervalRef.current);
       pingIntervalRef.current = null;
     }
+    botSpeakingTimersRef.current.forEach((timer) => clearTimeout(timer));
+    botSpeakingTimersRef.current.clear();
     if (audioContextRef.current && audioContextRef.current.state !== "closed") {
       audioContextRef.current.close().catch(() => {});
       audioContextRef.current = null;
     }
-    setInterimUserText("");
+    getTranscriptLog().reset();
     setIsBotSpeaking(false);
     setAudioBlocked(false);
-  }, []);
+  }, [getTranscriptLog]);
 
   const handleEnableAudio = useCallback(async () => {
     if (remoteAudioRef.current) {
@@ -225,11 +244,8 @@ export function VoiceTestModal({
             : "assistant";
 
         if (text) {
-          if (role === "user") {
-            setInterimUserText("");
-          } else {
-            setIsBotSpeaking(true);
-            setTimeout(() => setIsBotSpeaking(false), 3000);
+          if (role === "assistant") {
+            markBotSpeaking();
           }
 
           appendTranscript(role, text, now);
@@ -248,8 +264,7 @@ export function VoiceTestModal({
         }
 
         if (text) {
-          setIsBotSpeaking(true);
-          setTimeout(() => setIsBotSpeaking(false), 3000);
+          markBotSpeaking();
           appendTranscript("assistant", text, now);
         }
       } else if (
@@ -265,14 +280,13 @@ export function VoiceTestModal({
         }
 
         if (text) {
-          setInterimUserText("");
           appendTranscript("user", text, now);
         }
       }
     } catch {
       // Ignore non-JSON ping/binary messages
     }
-  }, [appendTranscript]);
+  }, [appendTranscript, markBotSpeaking]);
 
   // Connect a single cancellable local voice session.
   const startSession = useCallback(async () => {
@@ -284,7 +298,6 @@ export function VoiceTestModal({
     setErrorMessage(null);
     setDuration(0);
     setTranscripts([]);
-    setInterimUserText("");
     setAudioBlocked(false);
 
     const session = new VoiceSession({
@@ -369,10 +382,14 @@ export function VoiceTestModal({
       const previouslyFocused = document.activeElement instanceof HTMLElement
         ? document.activeElement
         : null;
+      // Lock the page behind the modal, remembering the exact inline value.
+      const previousBodyOverflow = document.body.style.overflow;
+      document.body.style.overflow = "hidden";
       requestAnimationFrame(() => dialogRef.current?.focus());
       startSessionRef.current();
       return () => {
         cleanupRef.current();
+        document.body.style.overflow = previousBodyOverflow;
         previouslyFocused?.focus();
       };
     } else {
@@ -402,8 +419,8 @@ export function VoiceTestModal({
   };
 
   const handleClearTranscript = () => {
+    getTranscriptLog().reset();
     setTranscripts([]);
-    setInterimUserText("");
   };
 
   const handleEndSession = () => {
@@ -413,8 +430,8 @@ export function VoiceTestModal({
   };
   const handleSendMessage = (e: React.FormEvent) => {
     e.preventDefault();
-    const text = textInput.trim();
-    if (!text) return;
+    const trimmed = textInput.trim();
+    if (!trimmed) return;
 
     const now = new Date().toLocaleTimeString([], {
       hour: "2-digit",
@@ -422,10 +439,13 @@ export function VoiceTestModal({
       second: "2-digit",
     });
 
-    appendTranscript("user", text, now);
-    setTextInput("");
+    if (!voiceSessionRef.current?.sendText(trimmed)) {
+      setErrorMessage("The call disconnected before the message was sent.");
+      return;
+    }
 
-    voiceSessionRef.current?.sendText(text);
+    appendTranscript("user", trimmed, now);
+    setTextInput("");
   };
 
 
@@ -467,15 +487,23 @@ export function VoiceTestModal({
         tabIndex={-1}
         onKeyDown={(event) => {
           if (event.key !== "Tab" || !dialogRef.current) return;
-          const focusable = dialogRef.current.querySelectorAll<HTMLElement>(
+          const dialog = dialogRef.current;
+          const focusable = dialog.querySelectorAll<HTMLElement>(
             'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
           );
           const first = focusable[0];
           const last = focusable[focusable.length - 1];
-          if (event.shiftKey && (document.activeElement === first || document.activeElement === dialogRef.current)) {
+          const active = document.activeElement;
+          if (!(active instanceof Node) || !dialog.contains(active)) {
+            // Focus escaped the dialog: pull it back to the first control.
+            event.preventDefault();
+            first?.focus();
+            return;
+          }
+          if (event.shiftKey && (active === first || active === dialog)) {
             event.preventDefault();
             last?.focus();
-          } else if (!event.shiftKey && document.activeElement === last) {
+          } else if (!event.shiftKey && active === last) {
             event.preventDefault();
             first?.focus();
           }
@@ -624,7 +652,7 @@ export function VoiceTestModal({
 
             {/* Transcript Messages Area */}
             <div className="min-h-[220px] max-h-[52vh] overflow-y-auto p-4 space-y-3 bg-ink-950/40 font-sans">
-              {transcripts.length === 0 && !interimUserText ? (
+              {transcripts.length === 0 ? (
                 <div className="h-full flex flex-col items-center justify-center text-center p-6 text-limestone-500 space-y-2">
                   <Mic className="w-8 h-8 text-limestone-600 animate-pulse" />
                   <p className="text-xs font-medium text-limestone-400">
@@ -672,19 +700,6 @@ export function VoiceTestModal({
                       </div>
                     </div>
                   ))}
-
-                  {/* Live interim user speech preview */}
-                  {interimUserText && (
-                    <div className="flex flex-col items-end gap-1">
-                      <div className="flex items-center gap-1 text-[10px] font-mono text-copper-400/80 px-1">
-                        <span className="w-1.5 h-1.5 rounded-full bg-copper-400 animate-ping" />
-                        Speaking now...
-                      </div>
-                      <div className="p-3 rounded-xl text-xs max-w-[85%] leading-relaxed bg-copper-950/40 border border-copper-500/20 text-copper-200 italic rounded-tr-sm">
-                        {interimUserText}
-                      </div>
-                    </div>
-                  )}
 
                   <div ref={transcriptEndRef} />
                 </>
