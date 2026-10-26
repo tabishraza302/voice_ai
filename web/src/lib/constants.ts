@@ -32,6 +32,11 @@ export const DEFAULT_CATALOG: ModelCatalog = {
       name: "Batch Nemotron 3.5 (Metal GPU)",
       description: "Batch HTTP transcription with language prompt conditioning",
     },
+    {
+      id: "mlx-whisper",
+      name: "Whisper Large v3 Turbo (Metal GPU)",
+      description: "In-process MLX Whisper transcription",
+    },
   ],
   tts_voices: [
     {
@@ -92,3 +97,9 @@ export const DEFAULT_CATALOG: ModelCatalog = {
     },
   ],
 };
+
+// Ranges mirror bot/agents/schemas.py (llm_temperature 0..2, llm_max_tokens
+// 1..4096, tts_speed 0.5..2.0). Do not narrow them to the editor's convenience.
+export const SPEED = { min: 0.5, max: 2.0, step: 0.05 } as const;
+export const TEMPERATURE = { min: 0, max: 2.0, step: 0.05 } as const;
+export const MAX_TOKENS = { min: 1, max: 4096, step: 1 } as const;

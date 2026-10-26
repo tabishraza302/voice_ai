@@ -36,13 +36,6 @@ export class VoiceSession {
     const isCurrent = () => generation === this.generation && !controller.signal.aborted;
 
     try {
-      if (!options.isActive && options.activate) {
-        this.dependencies.onStatus?.("activating");
-        const activated = await options.activate();
-        this.assertCurrent(isCurrent);
-        this.dependencies.onActivated?.(activated);
-      }
-
       this.dependencies.onStatus?.("requesting_media");
       let stream: MediaStream;
       try {
@@ -64,6 +57,13 @@ export class VoiceSession {
         throw new Error("Voice session connection was cancelled.");
       }
       this.localStream = stream;
+
+      if (!options.isActive && options.activate) {
+        this.dependencies.onStatus?.("activating");
+        const activated = await options.activate();
+        this.assertCurrent(isCurrent);
+        this.dependencies.onActivated?.(activated);
+      }
 
       this.dependencies.onStatus?.("connecting");
       const peerConnection = this.dependencies.createPeerConnection({ iceServers: [] });
@@ -162,8 +162,8 @@ export class VoiceSession {
     }
   }
 
-  sendText(text: string): void {
-    this.sendMessage({ type: "send-text", text });
+  sendText(text: string): boolean {
+    return this.sendMessage({ type: "send-text", text });
   }
 
   sendPing(): void {
@@ -186,9 +186,15 @@ export class VoiceSession {
     this.dispose();
   }
 
-  private sendMessage(message: unknown): void {
-    if (this.dataChannel?.readyState !== "open") return;
-    try { this.dataChannel.send(JSON.stringify(message)); } catch { /* the connection may close during a send */ }
+  private sendMessage(message: unknown): boolean {
+    if (this.dataChannel?.readyState !== "open") return false;
+    try {
+      this.dataChannel.send(JSON.stringify(message));
+      return true;
+    } catch {
+      // The connection may close between the readyState check and the send.
+      return false;
+    }
   }
 
   private assertCurrent(isCurrent: () => boolean): void {
