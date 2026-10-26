@@ -79,6 +79,69 @@ To stop the entire stack cleanly:
 scripts/voice-ai.sh stop
 ```
 
+### Local Agent Studio
+
+The optional browser studio and its `/api` endpoints are intended for one
+trusted user on the same machine. They have no sign-in, authorization, or
+multi-user isolation. Keep the Studio, agent API, and database bound to
+loopback. The API lets the browser edit local agent profiles and
+prompts. The browser sends the selected saved profile id with its WebRTC
+request, and that profile applies to that session only. Prebuilt clients with
+no profile id keep the measured `.env` settings. A control-page STT mode
+override takes precedence over a selected profile's STT choice.
+
+The studio uses the local PostgreSQL service started by Docker Compose. Install
+the web dependencies once, then start the studio alongside the stack:
+
+```bash
+cd web && bun install   # or: npm install
+cd ..
+scripts/voice-ai.sh start --web
+```
+
+Open [http://localhost:3001](http://localhost:3001). To run the studio alone,
+use `scripts/voice-ai.sh web`; `scripts/voice-ai.sh stop` stops only the studio
+process whose PID and command match this repository. If port 3001 is already
+in use, the script reports the conflict and leaves that process alone.
+Set `WEB_PORT=3010` before invoking the script to select another port; the
+agent and Studio use the same exported value for the CORS allowlist.
+The local management API is under `/api` (including `/api/agents`,
+`/api/prompts/base`, and `/api/catalog`); the runner's OpenAPI page is at
+`http://localhost:7860/docs`.
+
+PostgreSQL is published on loopback port 5439 by default. Set `POSTGRES_PORT`
+to move the Compose port, and set `DATABASE_URL` in `.env` to the same host
+port. The agent falls back to local SQLite when PostgreSQL is unavailable;
+its default location remains the existing `voice_ai.db` file. Set
+`SQLITE_DATABASE_URL` to choose another file location. The fallback is useful
+for a single local user, but its data is independent from PostgreSQL and does
+not synchronize automatically.
+
+The Studio, API, database, and preset prompts are new code paths; the published
+STT, TTS, memory, and turn-latency tables describe the original measured
+configuration. The profile prompt check below used the compiled built-in
+prompts with each preset's model parameters. It is six individual streamed
+requests, one per language and preset, with no warm-up or retries, against the
+already installed Qwen 3.5 4B through local Ollama. It ran on this Apple M5
+MacBook Air with 16 GB unified memory on 2026-10-26. First content and total
+time measure text generation only: they are neither percentiles nor speech
+latency, and include no STT or TTS. The reply text and run conditions are saved
+in ignored `data/measurements/agent_profiles.json`.
+
+| Built-in profile | Language | First content (s) | Total text (s) | Reply characters |
+|---|---:|---:|---:|---:|
+| Bilingual Assistant | English | 3.485 | 4.653 | 165 |
+| Bilingual Assistant | Hindi | 0.360 | 3.123 | 211 |
+| Tech Tutor | English | 0.349 | 1.842 | 240 |
+| Tech Tutor | Hindi | 0.263 | 2.450 | 184 |
+| Creative Storyteller | English | 0.266 | 1.913 | 249 |
+| Creative Storyteller | Hindi | 0.262 | 2.437 | 180 |
+
+To repeat the check after a prompt or profile change, run
+`scripts/voice-ai.sh profile-bench`. It makes six bounded English/Hindi local
+requests (one per preset and language), writes exact measurements under
+ignored `data/`, and refuses to download a model.
+
 ---
 
 ## Architecture & Data Flow
@@ -242,6 +305,8 @@ scripts/voice-ai.sh test          # Run full regression test suite
 | **Grafana** | Container | 3003 | Port 3003 chosen to avoid default port 3000 collisions. |
 | **`mlx-audio` Server** | Host | 8020 | Serves STT WebSocket & TTS endpoints on Metal GPU. |
 | **Ollama** | Host | 11434 | Standard Ollama inference port. |
+| **PostgreSQL** | Container | 5439 (configurable) | Local agent configuration; loopback only, with a SQLite fallback. |
+| **Studio/API** | Host | 3001 / 7860 `/api` | Optional single-user local management interface; no authentication. |
 
 ### The Metrics Contract
 
