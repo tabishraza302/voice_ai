@@ -20,6 +20,10 @@ import {
 import { api } from "@/lib/api-client";
 import { VoiceSession } from "@/lib/voice-session";
 import { TranscriptLog } from "@/lib/transcript-log";
+import {
+  appendTranscriptLine,
+  transcriptFromDataChannel,
+} from "@/lib/transcript-protocol";
 import type { Agent } from "@/types/agent";
 
 export interface TranscriptItem {
@@ -94,10 +98,15 @@ export function VoiceTestModal({
   const appendTranscript = useCallback((role: TranscriptItem["role"], text: string, time: string) => {
     const entry = getTranscriptLog().append(role, text);
     if (!entry) return;
-    setTranscripts((prev) => [
-      ...prev,
-      { id: entry.id, role: entry.role, text: entry.text, time },
-    ]);
+    // Consecutive spoken segments are one reply, so they share one bubble.
+    setTranscripts((prev) =>
+      appendTranscriptLine(prev, {
+        id: entry.id,
+        role: entry.role,
+        text: entry.text,
+        time,
+      })
+    );
   }, [getTranscriptLog]);
 
   // Show the "speaking" badge for 3000ms after each bot transcript.
@@ -221,71 +230,23 @@ export function VoiceTestModal({
 
   // Inbound WebRTC Data Channel message dispatcher
   const handleDataChannelMessage = useCallback((event: MessageEvent) => {
-    try {
-      if (typeof event.data !== "string") return;
-      const parsed: unknown = JSON.parse(event.data);
-      if (!parsed || typeof parsed !== "object") return;
+    // The project sends one completed `transcript` message per spoken turn.
+    // Pipecat also sends the same turn as streamed `bot-llm-text` tokens and
+    // as `bot-transcription` / `bot-output` / `user-transcription`
+    // representations; rendering those too fragments and repeats the turn.
+    const transcript = transcriptFromDataChannel(event.data);
+    if (!transcript) return;
 
-      const now = new Date().toLocaleTimeString([], {
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-      });
-
-      // Handle standard transcript messages from pipeline
-      if ("type" in parsed && parsed.type === "transcript") {
-        const text =
-          "text" in parsed && typeof parsed.text === "string"
-            ? parsed.text.trim()
-            : "";
-        const role =
-          "role" in parsed && parsed.role === "user"
-            ? "user"
-            : "assistant";
-
-        if (text) {
-          if (role === "assistant") {
-            markBotSpeaking();
-          }
-
-          appendTranscript(role, text, now);
-        }
-      } else if (
-        "type" in parsed &&
-        (parsed.type === "bot-transcription" ||
-          parsed.type === "bot-output" ||
-          parsed.type === "bot-llm-text")
-      ) {
-        let text = "";
-        if ("data" in parsed && parsed.data && typeof parsed.data === "object" && "text" in parsed.data && typeof parsed.data.text === "string") {
-          text = parsed.data.text.trim();
-        } else if ("text" in parsed && typeof parsed.text === "string") {
-          text = parsed.text.trim();
-        }
-
-        if (text) {
-          markBotSpeaking();
-          appendTranscript("assistant", text, now);
-        }
-      } else if (
-        "type" in parsed &&
-        (parsed.type === "user-transcription" ||
-          parsed.type === "user-llm-text")
-      ) {
-        let text = "";
-        if ("data" in parsed && parsed.data && typeof parsed.data === "object" && "text" in parsed.data && typeof parsed.data.text === "string") {
-          text = parsed.data.text.trim();
-        } else if ("text" in parsed && typeof parsed.text === "string") {
-          text = parsed.text.trim();
-        }
-
-        if (text) {
-          appendTranscript("user", text, now);
-        }
-      }
-    } catch {
-      // Ignore non-JSON ping/binary messages
+    if (transcript.role === "assistant") {
+      markBotSpeaking();
     }
+
+    const now = new Date().toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+    appendTranscript(transcript.role, transcript.text, now);
   }, [appendTranscript, markBotSpeaking]);
 
   // Connect a single cancellable local voice session.
