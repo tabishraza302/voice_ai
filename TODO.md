@@ -37,6 +37,20 @@ real session bug and supplies tested helpers for the fixes.
       `fetch` was invoked as a method of the dependencies object and threw
       `Illegal invocation`, so every real WebRTC offer failed. Fixed in
       `6c487eb` by calling it through `globalThis`, with a receiver test.
+- [x] B4 — call transcript fragments: raw data-channel capture showed one
+      assistant turn arriving as 23 `bot-llm-text` token messages plus
+      `bot-transcription`, `bot-output`, `user-input` and project `transcript`
+      duplicates, and the dialog rendered every representation. The dialog now
+      reads only the project's completed `transcript` messages and merges
+      consecutive assistant segments into one turn; a user line starts a new
+      turn. Committed `ee9c365`; 11 protocol tests added, full web suite 85 pass
+      across 8 files (222 expectations), typecheck and production build clean.
+      Browser fake-media call rendered exactly one user line and one merged
+      assistant reply, no token fragments, no duplicated reply, no console
+      errors. Limit: the model text can still contain a missing space inside a
+      single spoken segment (`youneed!`) because the backend forwarder emits
+      Pipecat's aggregated text as-is; this client-only pass does not rewrite
+      word boundaries.
 - [x] Closeout — full web suite, build, Python suite, browser pass, commits.
       Web: 74 pass across 7 files, 185 expectations; typecheck and production
       build (8/8 static pages) clean. Python: 214 passed, 5 skipped (PostgreSQL
