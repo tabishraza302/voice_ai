@@ -86,6 +86,21 @@ services:
         ipv4_address: 10.88.0.3
     mem_limit: 512m
 
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5439}:5432"
+    environment:
+      POSTGRES_DB: voice_ai
+      POSTGRES_USER: voice_ai
+      POSTGRES_PASSWORD: voice_ai
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      voice-ai-net:
+        ipv4_address: 10.88.0.5
+    mem_limit: 256m
+
 networks:
   # **Every address here is fixed, and every name is in /etc/hosts.**
   # Docker Desktop's embedded DNS on this machine intermittently takes
@@ -106,3 +121,4 @@ networks:
 
 volumes:
   grafana_data:
+  postgres_data:

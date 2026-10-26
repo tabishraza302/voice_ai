@@ -69,6 +69,10 @@ dependencies = [
     # too). It does pull torch through spacy-curated-transformers; that
     # is the cost of the MLX Kokoro path, not the ONNX one.
     "misaki[en]==0.9.4",
+    "sqlalchemy==2.0.38",
+    "asyncpg==0.30.0",
+    "aiosqlite==0.22.1",
+    "greenlet==3.5.6",
 ]
 
 [project.optional-dependencies]

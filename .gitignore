@@ -21,6 +21,9 @@ logs/
 # directory, not into logs/.
 *.eval.log
 
+*.db
+*.sqlite*
+
 # Evaluation harness and local fixtures
 evals/
 *.wav
@@ -29,7 +32,7 @@ evals/
 
 # Model caches
 .cache/
-models/
+/models/
 
 # macOS
 .DS_Store

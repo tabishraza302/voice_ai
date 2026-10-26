@@ -101,6 +101,13 @@ class Settings(BaseSettings):
         default="",
         validation_alias=AliasChoices("LLM_API_KEY", "OPENAI_KEY"),
     )
+    # Compiled or default system instruction passed to the LLM backend
+    system_instruction: str = SYSTEM_PROMPT
+
+    # Local agent configuration storage. The service falls back to SQLite
+    # if the loopback PostgreSQL database cannot be reached.
+    database_url: str = "postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai"
+    sqlite_database_url: str = "sqlite+aiosqlite:///voice_ai.db"
 
     # --- TTS layer -------------------------------------------------------
     # "mlx-audio" is the default, and it is a measured choice: the median
@@ -160,3 +167,12 @@ class Settings(BaseSettings):
     # the one latency knob to lower (0.6 is still better than 0.2) if the
     # README's published end-of-speech-to-bot number regresses.
     vad_stop_secs: float = 0.8
+
+    # These match Pipecat 1.13.0 defaults. Tune per deployment through .env;
+    # changing them can alter turn detection and requires a new measurement.
+    vad_min_volume: float = Field(default=0.6, ge=0.0, le=1.0)
+    vad_confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+
+    # Local browser Studio port. The launch script exports this same setting
+    # to both Next.js and the agent's CORS allowlist.
+    web_port: int = Field(default=3001, ge=1, le=65535)
