@@ -41,7 +41,7 @@ body {
   }
 
   .field-control::placeholder { color: #938b7d; }
-  .field-control:focus { border-color: var(--accent); outline: none; }
+  .field-control:focus { border-color: var(--accent); }
 
   .button-primary {
     @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50;

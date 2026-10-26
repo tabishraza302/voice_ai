@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { AlertCircle, Bot, Check, Copy, Plus, RefreshCw, SlidersHorizontal, Trash2 } from "lucide-react";
 import { api } from "@/lib/api-client";
@@ -11,16 +11,30 @@ export default function AgentsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
+  const requestIdRef = useRef(0);
+  const mountedRef = useRef(false);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const loadAgents = async () => {
+    const requestId = ++requestIdRef.current;
+    const isStale = () => requestId !== requestIdRef.current || !mountedRef.current;
     setLoading(true);
     setError(null);
     try {
-      setAgents(await api.getAgents());
+      const fetched = await api.getAgents();
+      if (isStale()) return;
+      setAgents(fetched);
     } catch (err: unknown) {
+      if (isStale()) return;
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      if (!isStale()) setLoading(false);
     }
   };
 
