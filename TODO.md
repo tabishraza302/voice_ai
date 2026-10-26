@@ -51,6 +51,36 @@ real session bug and supplies tested helpers for the fixes.
       single spoken segment (`youneed!`) because the backend forwarder emits
       Pipecat's aggregated text as-is; this client-only pass does not rewrite
       word boundaries.
+- [x] B5 — live transcript streaming: assistant tokens now grow one bubble
+      from `bot-llm-text`, and user speech grows one bubble from interim
+      `user-input` transcription deltas, each with a caret. The project's final
+      user `transcript` replaces the live bubble in place; duplicate
+      `user-transcription` / final `user-input` copies are ignored. Two real
+      ordering edges the synthetic replay missed: `user-started-speaking` can
+      arrive *after* the first STT delta and even after the final transcript, so
+      it cannot be a turn boundary. Late deltas are now classified by whether
+      they continue the finalized utterance's text toward its final copy; the
+      first non-continuing word starts the next turn. Verified on 2026-10-27
+      with the real realtime STT backend in headless Chrome, feeding locally
+      normalized FLEURS audio through a Web Audio microphone. One turn
+      (`en_us/0000.wav`, 10.56 s): 50 interim deltas, one user bubble that grew
+      before the final, caret visible while streaming, final transcript
+      replaced it in place and dropped the caret, trailing `.` and space
+      ignored, no console errors. Two turns (`0000.wav` then `0004.wav`,
+      10.56 s + 4.32 s): the second turn streamed from `Many` through 32 deltas
+      into one bubble, its final replaced it, both bubbles were exact matches,
+      and the start event arrived only after that final. Synthetic data-channel
+      pass: 15/15 checks. Real text-input pass: one turn and two turns rendered
+      whole replies with no fragments or duplicates; close restored scroll and
+      focus. Web suite 117 pass across 8 files (308 expectations); typecheck
+      clean; production build clean (8/8 static pages); Python suite 214 pass,
+      5 skipped (PostgreSQL cases need `TEST_DATABASE_URL`). Limit: the browser
+      used an injected audio stream, not a physical microphone; the real STT
+      server, VAD, interruption path and final transcripts were exercised
+      end-to-end.
+      One headless run hit a backend output-transport `error` mid-turn; after
+      the truncated final, the STT replayed that utterance's partials, so the
+      run was excluded from the passing measurement. The clean rerun passed.
 - [x] Closeout — full web suite, build, Python suite, browser pass, commits.
       Web: 74 pass across 7 files, 185 expectations; typecheck and production
       build (8/8 static pages) clean. Python: 214 passed, 5 skipped (PostgreSQL
