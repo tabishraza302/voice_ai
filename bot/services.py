@@ -185,7 +185,7 @@ def _llm_settings(settings: Settings) -> dict[str, Any]:
     """
     return {
         "model": settings.llm_model,
-        "system_instruction": SYSTEM_PROMPT,
+        "system_instruction": getattr(settings, "system_instruction", SYSTEM_PROMPT),
         "temperature": settings.llm_temperature,
         "max_tokens": settings.llm_max_tokens,
     }

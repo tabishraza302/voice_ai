@@ -7,6 +7,7 @@ and every default is documented in ``bot/config.py``.
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from bot.config import SYSTEM_PROMPT, Settings
 
@@ -26,6 +27,26 @@ def test_defaults():
     assert s.enable_tracing is True
     assert s.enable_metrics is True
     assert s.vad_stop_secs == 0.8
+    assert s.vad_min_volume == 0.6
+    assert s.vad_confidence == 0.7
+    assert s.sqlite_database_url == "sqlite+aiosqlite:///voice_ai.db"
+    assert s.web_port == 3001
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("vad_min_volume", -0.01),
+        ("vad_min_volume", 1.01),
+        ("vad_confidence", -0.01),
+        ("vad_confidence", 1.01),
+        ("web_port", 0),
+        ("web_port", 65536),
+    ],
+)
+def test_runtime_thresholds_and_web_port_reject_out_of_range_values(field, value):
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{field: value})
 
 
 def test_every_field_has_a_default():
@@ -55,6 +76,8 @@ def test_vad_analyzer_uses_the_configured_stop_window():
 
     analyzer = build_vad_analyzer(Settings(_env_file=None))
     assert analyzer.params.stop_secs == 0.8
+    assert analyzer.params.min_volume == 0.6
+    assert analyzer.params.confidence == 0.7
 
 
 def test_the_mlx_server_is_needed_by_either_layer():

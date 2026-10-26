@@ -36,7 +36,9 @@ from loguru import logger
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import STTUpdateSettingsFrame, TranscriptionFrame
+from pipecat.frames.frames import (
+    STTUpdateSettingsFrame,
+)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -51,7 +53,6 @@ from pipecat.turns.user_start.min_words_user_turn_start_strategy import (
 )
 from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
-from pipecat.utils.time import time_now_iso8601
 from pipecat.workers.runner import WorkerRunner
 
 from bot.config import Settings
@@ -59,6 +60,8 @@ from bot.context import ContextShapingProcessor
 from bot.control import apply_mode, mount_control
 from bot.language import parse_language_request
 from bot.observers import LatencyBridge, PrometheusObserver, mount_metrics
+from bot.session_settings import resolve_session_settings
+from bot.transcripts import BotTranscriptForwarder, UserTranscriptForwarder, queue_client_utterance
 from bot.pipeline import LanguageRoutingProcessor
 from bot.services import (
     build_llm,
@@ -135,7 +138,13 @@ def build_vad_analyzer(settings: Settings) -> SileroVADAnalyzer:
     Pipecat's 0.2 s default closed a real question at its first "uh";
     ``Settings.vad_stop_secs`` is the one place that window is set.
     """
-    return SileroVADAnalyzer(params=VADParams(stop_secs=settings.vad_stop_secs))
+    return SileroVADAnalyzer(
+        params=VADParams(
+            stop_secs=settings.vad_stop_secs,
+            confidence=settings.vad_confidence,
+            min_volume=settings.vad_min_volume,
+        )
+    )
 
 
 def _server_answers(root: str) -> bool:
@@ -285,6 +294,7 @@ async def _run_pipeline(transport, settings: Settings, runner_args=None) -> None
         [
             transport.input(),
             stt,
+            UserTranscriptForwarder(transport),
             user_aggregator,
             # Between the aggregator and the LLM: the history is rewritten
             # here, so the model never sees two user messages in a row.
@@ -293,6 +303,7 @@ async def _run_pipeline(transport, settings: Settings, runner_args=None) -> None
             router,
             tts,
             transport.output(),
+            BotTranscriptForwarder(transport),
             assistant_aggregator,
         ]
     )
@@ -359,17 +370,12 @@ def _register_app_message_handler(transport, pipeline, settings: Settings) -> No
                 # says so here. The session stays on its configured mode;
                 # the request is dropped and logged, not turned into a
                 # broken turn.
-                logger.warning(f"ignoring set_language: {exc}")
                 return
-            await pipeline.push_frame(STTUpdateSettingsFrame(delta=delta))
+            await pipeline.queue_frame(STTUpdateSettingsFrame(delta=delta))
             logger.info(f"STT language set to {language or 'auto'}")
             return
 
-        text = payload.get("text")
-        if text:
-            await pipeline.push_frame(
-                TranscriptionFrame(text, "client", time_now_iso8601())
-            )
+        await queue_client_utterance(payload, pipeline)
 
 
 def _parse_app_message(message: Any) -> dict[str, Any] | None:
@@ -389,10 +395,16 @@ def _parse_app_message(message: Any) -> dict[str, Any] | None:
 
 async def bot(runner_args) -> None:
     """The entrypoint the Pipecat dev runner discovers."""
-    # `apply_mode` resolves the override set on the control page against
-    # the .env default and pairs the model with the provider. It runs per
-    # session because the switch is allowed to change between sessions.
-    settings = apply_mode(Settings())
+    # Only Studio sessions that explicitly send an agent id receive a
+    # profile. The prebuilt runner stays on the measured .env configuration.
+    settings = Settings()
+    from bot.agents.service import apply_active_agent_to_settings
+    settings = await resolve_session_settings(
+        settings, getattr(runner_args, "body", None), apply_active_agent_to_settings
+    )
+    # An explicit process-wide control-page STT mode override takes
+    # precedence over a selected profile's STT provider.
+    settings = apply_mode(settings)
     logger.info(
         f"voice-ai starting: stt={settings.stt_provider}/{settings.stt_model} "
         f"llm={settings.llm_provider}/{settings.llm_model} "
@@ -461,6 +473,24 @@ def mount_observability(settings: Settings) -> None:
     mount_metrics(app, get_prometheus_observer(settings).registry)
     logger.info(f"prometheus metrics mounted at http://localhost:{settings.port}/metrics/")
 
+def mount_api(app, settings: Settings) -> None:
+    """Mount the multi-agent REST API and CORS middleware on the runner's app."""
+    from fastapi.middleware.cors import CORSMiddleware
+    from bot.api.router import create_api_router
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            f"http://localhost:{settings.web_port}",
+            f"http://127.0.0.1:{settings.web_port}",
+        ],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    app.include_router(create_api_router(settings), prefix="/api")
+    logger.info("multi-agent REST API mounted at /api")
+
 
 if __name__ == "__main__":
     import pipecat.runner.run as runner
@@ -478,6 +508,9 @@ if __name__ == "__main__":
     # the runner mounts its own "/" -> "/client/" redirect, so route
     # order puts this page first.
     mount_control(runner.app, settings)
+    # Mount the multi-agent REST API for web/
+    mount_api(runner.app, settings)
+
 
     # Mount the metrics endpoint before the runner starts serving.
     mount_observability(settings)
