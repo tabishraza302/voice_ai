@@ -20,6 +20,8 @@ import {
 import { api } from "@/lib/api-client";
 import { VoiceSession } from "@/lib/voice-session";
 import { TranscriptLog } from "@/lib/transcript-log";
+import { wallClockFromPerformance } from "@/lib/format";
+import { SpeechOnsetTracker } from "@/lib/speech-onset";
 import {
   appendAssistantTokenLine,
   appendTranscriptLine,
@@ -57,6 +59,14 @@ type ConnectionStatus =
   | "connected"
   | "disconnected"
   | "error";
+
+function clockTime(date: Date): string {
+  return date.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
 
 export function VoiceTestModal({
   agent,
@@ -120,6 +130,25 @@ export function VoiceTestModal({
     return transcriptLogRef.current;
   }, []);
 
+  // The dialog's clock source for a user turn. The STT text arrives late;
+  // the microphone energy rise is when the user actually started speaking.
+  const speechOnsetRef = useRef<SpeechOnsetTracker | null>(null);
+  const getSpeechOnsetTracker = useCallback(() => {
+    if (!speechOnsetRef.current) speechOnsetRef.current = new SpeechOnsetTracker();
+    return speechOnsetRef.current;
+  }, []);
+
+  /**
+   * The time to show for a new user bubble. Prefer the measured speech onset
+   * over the moment the STT text arrived; fall back to receipt time when no
+   * onset was observed (text input, a very quiet start, or a missed frame).
+   */
+  const userTurnTime = useCallback((receiptTime: string): string => {
+    const onset = getSpeechOnsetTracker().take();
+    if (onset === null) return receiptTime;
+    return clockTime(wallClockFromPerformance(onset, performance.now(), Date.now()));
+  }, [getSpeechOnsetTracker]);
+
   const appendTranscript = useCallback((role: TranscriptItem["role"], text: string, time: string) => {
     if (role === "user") {
       assistantSourceRef.current = "none";
@@ -172,21 +201,24 @@ export function VoiceTestModal({
     }
     userSourceRef.current = "partial";
     userPartialTextRef.current += delta;
-    if (!userPartialIdRef.current) {
+    let id = userPartialIdRef.current;
+    const startsTurn = id === null;
+    if (!id) {
       userPartialSeqRef.current += 1;
-      userPartialIdRef.current = `user-partial-${userPartialSeqRef.current}`;
+      id = `user-partial-${userPartialSeqRef.current}`;
+      userPartialIdRef.current = id;
     }
-    const id = userPartialIdRef.current;
+    const lineTime = startsTurn ? userTurnTime(time) : time;
     setTranscripts((prev) =>
       appendUserPartialLine(finishLiveLine(prev, "assistant"), {
         id,
         role: "user",
         text: delta,
-        time,
+        time: lineTime,
         live: true,
       })
     );
-  }, []);
+  }, [userTurnTime]);
 
   // The final user transcript replaces the live bubble instead of adding a
   // second copy of the same utterance.
@@ -195,13 +227,15 @@ export function VoiceTestModal({
     const liveText = userPartialTextRef.current;
     const entry = getTranscriptLog().append("user", finalText);
     const partialId = userPartialIdRef.current;
+    // A duplicate final must not consume the next turn's onset.
+    if (!entry && !partialId) return;
+    const lineTime = partialId ? time : userTurnTime(time);
     userPartialIdRef.current = null;
     userPartialTextRef.current = "";
     finalizedUserLiveRef.current = liveText;
     finalizedUserTextRef.current = finalText;
     userSourceRef.current = "final";
     assistantSourceRef.current = "none";
-    if (!entry && !partialId) return;
 
     setTranscripts((prev) => {
       const base = finishLiveLine(prev, "assistant");
@@ -214,10 +248,14 @@ export function VoiceTestModal({
         id: entry.id,
         role: "user",
         text: entry.text,
-        time,
+        time: lineTime,
       });
     });
-  }, [getTranscriptLog]);
+
+    // The final transcript is the end of this turn. Re-arm the onset clock so
+    // the next turn measures its own speech, not a pause in this one.
+    getSpeechOnsetTracker().reset();
+  }, [getSpeechOnsetTracker, getTranscriptLog, userTurnTime]);
 
   // Keep the "speaking" badge alive while tokens stream, then clear it once.
   const markBotSpeaking = useCallback(() => {
@@ -257,6 +295,7 @@ export function VoiceTestModal({
       audioContextRef.current = null;
     }
     getTranscriptLog().reset();
+    getSpeechOnsetTracker().reset();
     assistantSourceRef.current = "none";
     userSourceRef.current = "none";
     userPartialIdRef.current = null;
@@ -265,7 +304,7 @@ export function VoiceTestModal({
     finalizedUserTextRef.current = "";
     setIsBotSpeaking(false);
     setAudioBlocked(false);
-  }, [getTranscriptLog]);
+  }, [getSpeechOnsetTracker, getTranscriptLog]);
 
   const handleEnableAudio = useCallback(async () => {
     if (remoteAudioRef.current) {
@@ -315,9 +354,12 @@ export function VoiceTestModal({
         ctx.beginPath();
         const sliceWidth = width / bufferLength;
         let x = 0;
+        let sumSquares = 0;
 
         for (let i = 0; i < bufferLength; i++) {
           const v = timeArray[i] / 128.0;
+          const centered = v - 1;
+          sumSquares += centered * centered;
           const y = (v * height) / 2;
 
           if (i === 0) {
@@ -329,6 +371,12 @@ export function VoiceTestModal({
         }
 
         ctx.stroke();
+
+        // The dialog sends this same microphone stream. Its energy is the
+        // honest clock for "when the user started speaking"; the STT text can
+        // arrive a second later.
+        const rms = Math.sqrt(sumSquares / bufferLength);
+        getSpeechOnsetTracker().observe(rms, performance.now());
 
         // Ambient spectral glow bars at base
         const barWidth = (width / bufferLength) * 2.5;
@@ -343,16 +391,12 @@ export function VoiceTestModal({
 
       render();
     },
-    []
+    [getSpeechOnsetTracker]
   );
 
   // Inbound WebRTC Data Channel message dispatcher
   const handleDataChannelMessage = useCallback((event: MessageEvent) => {
-    const now = new Date().toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-    });
+    const now = clockTime(new Date());
 
     // The LLM's token stream is the realtime representation. Appending every
     // token to one bubble shows the reply as it is generated, without the
@@ -566,11 +610,7 @@ export function VoiceTestModal({
     const trimmed = textInput.trim();
     if (!trimmed) return;
 
-    const now = new Date().toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-    });
+    const now = clockTime(new Date());
 
     if (!voiceSessionRef.current?.sendText(trimmed)) {
       setErrorMessage("The call disconnected before the message was sent.");

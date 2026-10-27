@@ -99,7 +99,13 @@ cd ..
 scripts/voice-ai.sh start --web
 ```
 
-Open [http://localhost:3001](http://localhost:3001). To run the studio alone,
+Open [http://localhost:3001](http://localhost:3001). The in-call transcript
+streams each turn into one bubble and times it by what happened, not when the
+browser received the text: a user turn is stamped at the measured microphone
+onset (falling back to receipt time when no onset was observed), and an
+assistant turn at its first token. The final STT transcript replaces the live
+bubble in place, keeping that onset time, and re-arms the onset clock for the
+next turn. To run the studio alone,
 use `scripts/voice-ai.sh web`; `scripts/voice-ai.sh stop` stops only the studio
 process whose PID and command match this repository. If port 3001 is already
 in use, the script reports the conflict and leaves that process alone.
@@ -269,6 +275,44 @@ Evaluated over 40 FLEURS clips per language using OpenAI's standard `whisper-nor
 
 *Finding*: Nemotron is **5.0× more accurate on Hindi** (7.18 % vs 35.92 % WER), while Whisper is **1.7× more accurate on English** (4.98 % vs 8.56 % WER).
 
+### Streaming Lookahead (Latency vs Accuracy)
+
+The served Nemotron checkpoint declares a 13-frame right context, so its
+native encoder chunk is 1.12 s. That is the default everywhere in this
+deployment. The server's `--realtime-transcription-delay-ms` flag is silently
+ignored for this checkpoint (`model_type` is `nemotron_asr`, not
+`nemotron_asr_streaming`), so `STT_LOOKAHEAD_FRAMES` is the supported
+override; `scripts/stt_server.py` applies it to each `/v1/realtime` session,
+never to the loaded model, so the batch table above is unaffected.
+
+Measured on the same 40 FLEURS clips per language, mean per-clip WER/CER
+(not corpus-level — the paired interval below needs one score per clip):
+
+| Lookahead | Native chunk | en WER | en CER | hi WER | hi CER |
+|---:|---:|---:|---:|---:|---:|
+| **13 (default)** | 1.12 s | **9.28 %** | **5.50 %** | **7.95 %** | **4.85 %** |
+| 6 | 0.56 s | 10.07 % | 5.99 % | 8.13 % | 4.99 % |
+| 3 | 0.32 s | 10.74 % | 6.42 % | 8.90 % | 5.81 % |
+| 0 | 0.08 s | 11.84 % | 7.48 % | 9.57 % | 5.90 % |
+
+Halving the chunk makes partial text refresh twice as often. The measured
+13→6 difference is **+0.79 WER points on English** (95 % CI −0.56 … +2.31)
+and **+0.17 on Hindi** (−0.58 … +0.93), paired bootstrap over clips. Forty
+clips cannot resolve a difference that small, so this deployment keeps 13:
+the freshness gain is real, the accuracy case for paying for it is not yet
+measured, and lookahead 0 also collapses throughput (40 clips per language
+take ~9× longer than at 13: 239 s vs 28 s English, 307 s vs 34 s Hindi).
+Set `stt_lookahead_frames=6` in `.env` to opt in on a deployment
+that values partial-text latency more than the last fraction of a WER
+point. Reproduce with:
+
+```bash
+scripts/voice-ai.sh lookahead-bench --clips 40 --lookaheads 13,6,3,0
+```
+
+The command reads the cached FLEURS fixtures and refuses to run on fewer
+clips than requested; populate them first with `scripts/voice-ai.sh eval`.
+
 ### TTS Speed Comparison
 
 Time to first audio (TTFA) across five warm utterances:
@@ -285,6 +329,7 @@ Run the benchmark suite on your own hardware:
 scripts/voice-ai.sh memory        # Measure memory headroom & derive LLM tier
 scripts/voice-ai.sh bench         # Measure STT speed (batch)
 scripts/voice-ai.sh bench --realtime # Measure STT speed (streaming)
+scripts/voice-ai.sh lookahead-bench # Streaming WER/CER at 13, 6, 3 and 0 frames
 scripts/voice-ai.sh tts-bench     # Benchmark TTS backends
 scripts/voice-ai.sh turn-bench    # Measure end-to-end turn latency
 scripts/voice-ai.sh eval          # Run FLEURS WER/CER evaluation

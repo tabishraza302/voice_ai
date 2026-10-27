@@ -153,3 +153,89 @@ def test_start_web_and_stop_manage_only_the_project_process(tmp_path):
         time.sleep(0.05)
     else:
         pytest.fail("the project-owned web process survived CLI stop")
+
+
+def test_stt_command_launches_the_lookahead_wrapper_with_the_configured_value(
+    tmp_path,
+):
+    """The lookahead lives in .env and must reach the server process.
+
+    The wrapper is the only place the model context is changed, so the
+    launcher has to run it — and has to export the value, because the
+    wrapper reads the environment, not the shell's local variables.
+    """
+    repo = _isolated_repo(tmp_path)
+    (repo / "scripts/stt_server.py").write_text("placeholder")
+    (repo / ".env").write_text("STT_LOOKAHEAD_FRAMES=6\n")
+    capture = tmp_path / "launch.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "uv").write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$PWD" "$*" "${STT_LOOKAHEAD_FRAMES-<unset>}" > "$CAPTURE"\n'
+    )
+    (fake_bin / "uv").chmod(0o755)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "CAPTURE": str(capture),
+            "STT_PORT": "49189",
+        }
+    )
+    env.pop("STT_LOOKAHEAD_FRAMES", None)
+
+    result = subprocess.run(
+        [str(repo / "scripts/voice-ai.sh"), "stt"],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    workdir, command, lookahead = capture.read_text().splitlines()
+    assert workdir == str(repo)
+    assert command == (
+        "run python scripts/stt_server.py --host 127.0.0.1 --port 49189"
+    )
+    assert lookahead == "6"
+
+
+def test_lookahead_bench_command_forwards_arguments_to_the_benchmark(tmp_path):
+    repo = _isolated_repo(tmp_path)
+    (repo / "scripts/bench_stt_lookahead.py").write_text("placeholder")
+    capture = tmp_path / "launch.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "uv").write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$PWD" "$*" > "$CAPTURE"\n'
+    )
+    (fake_bin / "uv").chmod(0o755)
+    env = os.environ.copy()
+    env.update({"PATH": f"{fake_bin}:{env['PATH']}", "CAPTURE": str(capture)})
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/voice-ai.sh"),
+            "lookahead-bench",
+            "--clips",
+            "5",
+            "--lookaheads",
+            "13,6",
+        ],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    workdir, command = capture.read_text().splitlines()
+    assert workdir == str(repo)
+    assert command == (
+        "run python scripts/bench_stt_lookahead.py --clips 5 --lookaheads 13,6"
+    )

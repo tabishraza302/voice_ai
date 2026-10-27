@@ -31,7 +31,12 @@ COLLECTOR_PORT="${COLLECTOR_PORT:-9464}"
 POSTGRES_PORT="${POSTGRES_PORT:-5439}"
 CONFIGURED_WEB_PORT="$(grep -E '^[[:space:]]*(web_port|WEB_PORT)=' "$REPO_ROOT/.env" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '"\047[:space:]' || true)"
 WEB_PORT="${WEB_PORT:-${CONFIGURED_WEB_PORT:-3001}}"
+# The STT lookahead belongs to the model deployment, not the agent. A blank
+# value keeps the checkpoint's default; scripts/stt_server.py validates it.
+CONFIGURED_STT_LOOKAHEAD="$(grep -E '^[[:space:]]*(stt_lookahead_frames|STT_LOOKAHEAD_FRAMES)=' "$REPO_ROOT/.env" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '"\047[:space:]' || true)"
+STT_LOOKAHEAD_FRAMES="${STT_LOOKAHEAD_FRAMES:-$CONFIGURED_STT_LOOKAHEAD}"
 export WEB_PORT
+export STT_LOOKAHEAD_FRAMES
 export POSTGRES_PORT
 
 RUN_DIR="$REPO_ROOT/data/run"
@@ -255,7 +260,7 @@ cmd_obs_logs() {
 
 cmd_stt() {
   log "the mlx-audio server on $STT_PORT — Ctrl-C to stop"
-  exec uv run mlx_audio.server --host 127.0.0.1 --port "$STT_PORT"
+  exec uv run python scripts/stt_server.py --host 127.0.0.1 --port "$STT_PORT"
 }
 
 cmd_stt_model() {
@@ -326,7 +331,7 @@ cmd_start() {
   if curl -sf -o /dev/null "http://127.0.0.1:$STT_PORT/v1/models"; then
     ok "the mlx-audio server is already up"
   else
-    ( exec uv run mlx_audio.server --host 127.0.0.1 --port "$STT_PORT" ) \
+    ( exec uv run python scripts/stt_server.py --host 127.0.0.1 --port "$STT_PORT" ) \
       > "$STT_LOG" 2>&1 &
     echo $! > "$RUN_DIR/stt.pid"
     wait_for "http://127.0.0.1:$STT_PORT/v1/models" "the mlx-audio server" 180 \
@@ -382,8 +387,11 @@ cmd_stop() {
   fi
   rm -f "$RUN_DIR/agent.pid"
 
-  # The STT server, matched on the port it was given.
-  if pkill -f "mlx_audio.server --host 127.0.0.1 --port $STT_PORT" 2>/dev/null; then
+  # The STT server, matched on the port it was given. Both launchers are
+  # matched so a server started by hand before the wrapper existed still
+  # stops; whoever owns the port is the process this script started.
+  if pkill -f "scripts/stt_server.py --host 127.0.0.1 --port $STT_PORT" 2>/dev/null \
+    || pkill -f "mlx_audio.server --host 127.0.0.1 --port $STT_PORT" 2>/dev/null; then
     ok "the mlx-audio server stopped"
   else
     warn "the mlx-audio server was not running"
@@ -440,6 +448,7 @@ cmd_status() {
 cmd_memory() { bash scripts/memory_baseline.sh; }
 cmd_apply_tier() { uv run python scripts/apply_tier.py; }
 cmd_bench() { uv run python scripts/bench_stt.py --languages en hi "$@"; }
+cmd_lookahead_bench() { uv run python scripts/bench_stt_lookahead.py "$@"; }
 cmd_tts_bench() { uv run python scripts/bench_tts.py --backend "${1:-both}"; }
 cmd_turn_bench() { uv run python scripts/bench_turn.py "$@"; }
 cmd_llm_bench() { uv run python scripts/bench_llm_quant.py "$@"; }
@@ -508,6 +517,7 @@ Measuring:
   memory             The memory baseline, and the LLM tier it selects
   apply-tier         Write the measured tier and latency into .env.example
   bench              STT speed: real-time factor and time-to-final-transcript
+  lookahead-bench    Streaming WER/CER per lookahead (uses the eval fixtures)
   tts-bench          TTS speed: time to first audio, per backend
     kokoro | mlx-audio | both
   turn-bench         One turn, stage by stage: VAD, transcript, LLM, TTS
@@ -558,6 +568,7 @@ main() {
     memory) cmd_memory "$@" ;;
     apply-tier) cmd_apply_tier "$@" ;;
     bench) cmd_bench "$@" ;;
+    lookahead-bench) cmd_lookahead_bench "$@" ;;
     tts-bench) cmd_tts_bench "$@" ;;
     turn-bench) cmd_turn_bench "$@" ;;
     llm-bench) cmd_llm_bench "$@" ;;

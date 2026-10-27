@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { formatDuration } from "./format.ts";
+import { formatDuration, wallClockFromPerformance } from "./format.ts";
 
 describe("formatDuration", () => {
   test("formats sub-hour durations as minutes and seconds", () => {
@@ -27,5 +27,26 @@ describe("formatDuration", () => {
     expect(formatDuration(Number.NaN)).toBe("0:00");
     expect(formatDuration(Number.POSITIVE_INFINITY)).toBe("0:00");
     expect(formatDuration(Number.NEGATIVE_INFINITY)).toBe("0:00");
+  });
+});
+
+describe("wallClockFromPerformance", () => {
+  test("subtracts the age of the performance timestamp from the wall clock", () => {
+    const wall = wallClockFromPerformance(1000, 1500, 10_000);
+    expect(wall.getTime()).toBe(9500);
+  });
+
+  test("treats a future performance timestamp as now", () => {
+    expect(wallClockFromPerformance(1200, 1000, 10_000).getTime()).toBe(10_000);
+  });
+
+  test("keeps millisecond precision", () => {
+    expect(wallClockFromPerformance(1000, 1001.5, 20_000).getTime()).toBe(19_998);
+  });
+
+  test("falls back to now when a timestamp is not finite", () => {
+    expect(wallClockFromPerformance(Number.NaN, 1000, 10_000).getTime()).toBe(10_000);
+    expect(wallClockFromPerformance(0, Number.POSITIVE_INFINITY, 10_000).getTime()).toBe(10_000);
+    expect(wallClockFromPerformance(0, 1000, Number.NaN).getTime()).toBe(0);
   });
 });
