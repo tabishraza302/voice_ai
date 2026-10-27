@@ -97,6 +97,52 @@ real session bug and supplies tested helpers for the fixes.
       recognition or speaker playback was used; the send-failure branch was
       verified by inspection and unit-level behavior only.
 
+## Timing pass — speech-onset timestamps and STT lookahead (2026-10-27)
+
+The reported symptom was STT text arriving about 0.5 s after speech stopped,
+with LLM text nearly simultaneous, so both bubbles showed a receipt time.
+
+- [x] Root cause traced to the checkpoint, not the pipeline: the served
+      Nemotron checkpoint declares a 13-frame right context (13 × 80 ms =
+      1.04 s) and a 14-frame native chunk (1.12 s). mlx-audio's
+      `--realtime-transcription-delay-ms` is gated on
+      `nemotron_asr_streaming` and is silently ignored for this checkpoint.
+      Pipecat buffering and client rendering were ruled out.
+- [x] User timestamps now use the measured microphone speech onset
+      (`web/src/lib/speech-onset.ts`), falling back to receipt time when no
+      onset was observed; assistant timestamps keep first-token receipt time.
+      `replaceTranscriptLine` keeps the live bubble's original time when the
+      final transcript replaces it. Unit-tested.
+- [x] Review found two clock edges, both fixed test-first: a duplicate final
+      could consume the next turn's onset, and a pause longer than the release
+      window inside the same utterance could leave a stale onset for the next
+      turn. The tracker now stays consumed until the final transcript resets
+      it, and a duplicate final returns before taking an onset.
+- [x] `STT_LOOKAHEAD_FRAMES` added, validated against the checkpoint's
+      declared contexts, and applied by `scripts/stt_server.py` to each
+      `/v1/realtime` session only; the model default and the batch endpoint
+      are untouched.
+- [x] Streaming WER/CER measured on 40 FLEURS clips per language with
+      `scripts/bench_stt_lookahead.py` (also `scripts/voice-ai.sh
+      lookahead-bench`): lookahead 13 en 9.28 / 5.50, hi 7.95 / 4.85;
+      6 en 10.07 / 5.99, hi 8.13 / 4.99; 3 en 10.74 / 6.42, hi 8.90 / 5.81;
+      0 en 11.84 / 7.48, hi 9.57 / 5.90. Paired 13→6 difference: en +0.79
+      points (95 % CI −0.56 … +2.31), hi +0.17 (−0.58 … +0.93) — unresolved
+      at this sample size. The committed script reproduced the full table in
+      one run; lookahead 0 is ~9× slower than 13 (en 239 s vs 28 s, hi 307 s
+      vs 34 s).
+- [x] Decision: keep 13 as the default; 6 is documented opt-in in
+      `.env.example` and the README. No local `.env` override.
+- [x] Browser verification with the real realtime backend and an injected
+      Web Audio microphone: one 10.56 s FLEURS turn stamped the user bubble
+      972 ms before the first STT delta and 8.0 s before the final; one user
+      bubble grew, the final replaced it in place with the original time, one
+      assistant bubble grew, no duplicates, no console errors. Limit: one
+      turn; the multi-turn stale-onset edge is unit-tested.
+- [x] Final suites: web 131 pass across 9 files (354 expectations), typecheck
+      clean, production build clean (8/8 static pages), Python 266 pass,
+      5 skipped. Committed `db959d9`.
+
 ## Completed (prior pass)
 
 - [x] **Audit and preserve existing work — owner: parent.** Read repository
