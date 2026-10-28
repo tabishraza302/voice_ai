@@ -16,10 +16,15 @@ import numpy as np
 import pytest
 
 
-pytestmark = pytest.mark.skipif(
-    os.getenv("RUN_LIVE_VOICE") != "1",
-    reason="set RUN_LIVE_VOICE=1 to run the opt-in local SmallWebRTC acceptance test",
-)
+pytestmark = [pytest.mark.live_voice, pytest.mark.asyncio]
+
+
+@pytest.fixture(autouse=True)
+def _check_live_voice_prereq() -> None:
+    if os.getenv("RUN_LIVE_VOICE") != "1":
+        if os.environ.get("VERIFY_REQUIRED") == "1":
+            pytest.fail("required qualification prerequisite unavailable: RUN_LIVE_VOICE not set")
+        pytest.skip("set RUN_LIVE_VOICE=1 to run the opt-in local SmallWebRTC acceptance test")
 
 
 @pytest.mark.asyncio
@@ -29,7 +34,7 @@ async def test_local_voice_roundtrip_for_english_and_hindi() -> None:
     from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
     from aiortc.mediastreams import AudioStreamTrack
 
-    base_url = "http://127.0.0.1:7860"
+    base_url = os.environ.get("VOICE_AI_TEST_AGENT_URL", "http://127.0.0.1:7860")
     request_timeout = aiohttp.ClientTimeout(total=6)
     peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
     silent_input = AudioStreamTrack()

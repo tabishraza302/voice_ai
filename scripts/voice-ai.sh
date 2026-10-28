@@ -461,7 +461,22 @@ cmd_profile_bench() {
 }
 cmd_eval_scenarios() { uv run python -m pipecat.evals run evals/scenarios/; }
 cmd_smoke() { uv run python scripts/smoke_stt.py; }
-cmd_test() { uv run pytest; }
+cmd_test() { uv run pytest "$@"; }
+cmd_verify() {
+  exec uv run --frozen python "$REPO_ROOT/scripts/verify.py" "$@"
+}
+cmd_schema() {
+  local sub="${1:-}"
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    init)
+      exec uv run python -m platform_api.cli init-db "$@"
+      ;;
+    *)
+      die "usage: $0 schema init"
+      ;;
+  esac
+}
 
 cmd_warm() {
   local model
@@ -533,6 +548,8 @@ Measuring:
 Quality:
   smoke              Synthesise speech, transcribe it back
   test               The regression suite
+  verify             Strict qualification gates (prepare|unit|postgres|browser|voice|release)
+  schema             Schema management commands (schema init)
   clean              Remove the generated artifacts
 
 Other local stacks (optional, via OTHER_DOCKER_PROJECTS env var):
@@ -578,6 +595,8 @@ main() {
     warm) cmd_warm "$@" ;;
     smoke) cmd_smoke "$@" ;;
     test) cmd_test "$@" ;;
+    verify) cmd_verify "$@" ;;
+    schema) cmd_schema "$@" ;;
     clean) cmd_clean "$@" ;;
     others)
       case "${1:-}" in

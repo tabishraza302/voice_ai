@@ -1,0 +1,104 @@
+name: Verify
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - first-release-implementation
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Unit Verification
+    runs-on: macos-14
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.13"
+
+      - name: Install uv 0.11.25
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.25"
+          enable-cache: true
+
+      - name: Set up Bun 1.3.14
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Set up Node.js 24.15.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.15.0"
+
+      - name: Install frozen Python dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Install frozen web dependencies
+        working-directory: web
+        run: bun install --frozen-lockfile
+
+      - name: Run verify unit lane
+        run: ./scripts/voice-ai.sh verify unit
+
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-unit-evidence
+          path: data/verification/
+          retention-days: 14
+
+  postgres-browser:
+    name: PostgreSQL and Browser Verification
+    runs-on: [self-hosted, voice-ai-qualification]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.13"
+
+      - name: Install uv 0.11.25
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.25"
+          enable-cache: true
+
+      - name: Set up Bun 1.3.14
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Set up Node.js 24.15.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.15.0"
+
+      - name: Prepare verification environment and cached images
+        run: ./scripts/voice-ai.sh verify prepare
+
+      - name: Run verify postgres lane
+        run: ./scripts/voice-ai.sh verify postgres
+
+      - name: Run verify browser lane
+        run: ./scripts/voice-ai.sh verify browser
+
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-postgres-browser-evidence
+          path: data/verification/
+          retention-days: 14
