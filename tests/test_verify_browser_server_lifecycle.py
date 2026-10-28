@@ -185,3 +185,84 @@ def test_browser_server_lifecycle_safe_capture_and_cleanup(tmp_path: Path) -> No
 
     assert stat.S_IMODE(api_out.stat().st_mode) == 0o600
     assert stat.S_IMODE(api_err.stat().st_mode) == 0o600
+
+
+def test_generate_ephemeral_loopback_cert(tmp_path: Path) -> None:
+    """Ephemeral loopback TLS cert and key are created with 0o600 permissions and valid SANs."""
+    import ssl
+    from cryptography import x509
+    from tests.support.tls import generate_ephemeral_loopback_cert
+
+    cert_path = tmp_path / "cert.pem"
+    key_path = tmp_path / "key.pem"
+
+    generate_ephemeral_loopback_cert(cert_path, key_path)
+
+    assert cert_path.is_file()
+    assert key_path.is_file()
+    assert stat.S_IMODE(cert_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+
+    # Verify Subject Alternative Name contains 127.0.0.1 and localhost
+    cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+    san_ext = cert.extensions.get_extension_for_oid(x509.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
+    san_names = [str(name.value) for name in san_ext.value]
+    assert "127.0.0.1" in san_names
+    assert "localhost" in san_names
+
+    # Verify standard library SSLContext can load the chain without issue
+    ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
+
+
+def test_ingress_server_lifecycle_safe_capture_and_cleanup(tmp_path: Path) -> None:
+    """Ingress server logs: restrictive permissions, process exit, cleanup callback redaction."""
+    harness = VerificationHarness(repo_root=tmp_path)
+    ingress_out = harness.run_dir / "ingress_server.stdout.log"
+    ingress_err = harness.run_dir / "ingress_server.stderr.log"
+
+    out_f = _open_private_log(ingress_out)
+    err_f = _open_private_log(ingress_err)
+
+    secret_key = "ingress_secret_auth_token_9999"
+    harness.register_secret(secret_key)
+
+    harness.lifecycle.register_cleanup_callback(out_f.close)
+    harness.lifecycle.register_cleanup_callback(err_f.close)
+    harness.lifecycle.register_cleanup_callback(out_f.flush)
+    harness.lifecycle.register_cleanup_callback(err_f.flush)
+    harness.lifecycle.register_cleanup_callback(
+        lambda: _redact_persisted_file(ingress_out, explicit_secrets=harness.explicit_secrets)
+    )
+    harness.lifecycle.register_cleanup_callback(
+        lambda: _redact_persisted_file(ingress_err, explicit_secrets=harness.explicit_secrets)
+    )
+
+    child_code = (
+        "import sys, time\n"
+        f"print('INGRESS token={secret_key}', flush=True)\n"
+        "print('INGRESS_ERR password=ingress_leak_123', file=sys.stderr, flush=True)\n"
+        "while True:\n"
+        "    time.sleep(0.1)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", child_code],
+        stdout=out_f,
+        stderr=err_f,
+        start_new_session=True,
+    )
+    harness.lifecycle.register_process(proc, is_isolated_group=True)
+
+    time.sleep(0.3)
+    harness.lifecycle.cleanup()
+
+    assert not harness.lifecycle.cleanup_failed
+    out_text = ingress_out.read_text(encoding="utf-8")
+    err_text = ingress_err.read_text(encoding="utf-8")
+
+    assert secret_key not in out_text
+    assert "token=***" in out_text
+    assert "ingress_leak_123" not in err_text
+    assert "password=***" in err_text
+    assert stat.S_IMODE(ingress_out.stat().st_mode) == 0o600
+    assert stat.S_IMODE(ingress_err.stat().st_mode) == 0o600
