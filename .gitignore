@@ -37,5 +37,11 @@ evals/
 # macOS
 .DS_Store
 
-# Internal planning and local documentation
-docs/
+# Keep reviewed first-release contracts with their implementation.
+/docs/*
+!/docs/first-release/
+
+# Browser test output and credentials
+web/playwright-report/
+web/test-results/
+web/playwright/.auth/
