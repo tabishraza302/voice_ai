@@ -1,0 +1,248 @@
+# First-release conversation flow and adapter contract
+
+Status: proposed implementation contract, 2026-10-28. This specifies a first build; nothing here asserts a shipped engine or requires migration of old flow records. The master specification Part II remains the product intent. The JSON schemas beside this file make its illustrative graph executable without adding a second diagram representation. Both loan qualification and credit-card qualification use these primitives.
+
+## 1. Package boundary and proposed files
+
+Create the following application files when implementing this contract (they are **not created by this planning task**):
+
+- `bot/flow/__init__.py`: public, provider-neutral exports only.
+- `bot/flow/schemas.py`: strict authoring/executable models, conditions, field states, events, errors and limits.
+- `bot/flow/validation.py`: configured structural limits, cross-reference/type/graph checks, capability checks and diagnostics.
+- `bot/flow/compiler.py`: normalization, hashes, compiled prompt artifacts and deterministic message rendering.
+- `bot/flow/controller.py`: pure reducers, routing, capture/dependency invalidation, fragment manifests and completion.
+- `bot/flow/adapters.py`: protocols and capability records; no concrete model or transport imports.
+- `bot/flow/extraction.py`: optional pure, allowlisted deterministic extraction; no inference or provider import.
+- `bot/flow/tools.py`: tool-contract types and registry interface; no arbitrary customer code.
+- `bot/flow/qualification.py`: executable qualification harness contracts and report validation.
+- `tests/flow/test_validation.py`, `tests/flow/test_runtime.py`, `tests/flow/test_compilation.py`, `tests/flow/test_adapter_contract.py`, `tests/qualification/test_flow_adapter.py`: deterministic assertions specified below.
+- `tests/fixtures/flow/`: copy these planning fixtures into test data when implementation starts; generated audio and measurement results stay under ignored `data/`.
+- `platform_api/agents/schemas.py`, `platform_api/agents/validation.py`, `platform_api/agents/publishing.py`, `platform_api/testing/chat.py`: consume the shared package; control-plane endpoints authenticate and enforce ownership outside the pure controller. These are new control-plane modules, not amendments to local offline management semantics.
+- `bot/flow_runtime.py`: runner glue, session lock, provider event translation and playback-ledger persistence; imports the shared engine and service interfaces.
+- `bot/adapter_qualification.py`: provider/transport qualification runner behind the repository's measurement wrapper.
+
+Modify `bot/agents/schemas.py` to compose shared flow models into new agent configuration; preserve its existing provider settings and local route behavior. Modify `bot/agents/compiler.py` by calling its existing base/persona compiler from the shared compilation wrapper; preserve its variable escaping and strict-variable behavior. Shared `bot/flow` must not import `bot/agents` or SQLAlchemy. The wrapper compiles the existing system prompt first, then passes the resulting trusted-policy string and subordinate agent data to `bot/flow/compiler.py`. This keeps the dependency directed inward.
+
+Modify `bot/pipeline.py` only to install provider-neutral flow processing, and `bot/services.py`/`bot/language.py` only for registered adapter capabilities and existing language-routing interfaces. Concrete adapters live alongside their existing services, never in the pipeline. Modify `bot/transcripts.py` to emit distinct generated/queued/delivered projections with IDs; existing TTS text is not renamed to played. Modify `web/src/lib/transcript-protocol.ts` and `web/src/lib/voice-session.ts` for versioned event parsing, lifecycle IDs and qualified transport evidence. Modify the browser's actual audio-rendering integration only if the qualification spike proves an existing supported event sufficient. A custom media transport is not the default plan. Modify `scripts/voice-ai.sh` to expose `flow-qualify` once the runner exists; do not invent passing timing results in documentation. Update README measured tables only after relevant actual runs. Delete no existing application paths.
+
+The shared controller accepts data and returns commands/events; its reducer performs no network, model, database, filesystem or payment operation. A runner serializes reducer calls and persists required lifecycle/audit events. The API may validate/compile and run chat by importing `bot.flow`; importing that package must not initialize MLX, Ollama, TTS, STT or Pipecat. Integration tests must inspect import dependencies, in addition to preserving `tests/test_modularity.py` unchanged.
+
+## 2. Authoring, executable structure and publish checks
+
+`flow-authoring.schema.json` and `flow.schema.json` are standalone JSON Schema 2020-12 documents. Their discriminator is `schema_version: 1`; condition variants discriminate on `operator`; capture variants on `kind`. Every object forbids unknown properties. The fixture wrapper is test metadata; validate its `flow` member, never the wrapper, against these schemas.
+
+Save validates authoring structure and configured size bounds. It permits no steps, incomplete node properties, empty condition/capture placeholders `{}`, absent/empty transition target, dangling targets, contradictory prerequisites and cycles. A nonempty rule requires its known discriminator, though its other properties may be incomplete; a transition record requires `when`. An unknown operator, invalid discriminator value, wrong property type or unknown property fails save. Root `schema_version` is required; no parser coerces strings into integers or treats boolean as integer. Empty input in the editor becomes `{schema_version:1, steps:[]}`. A schema-valid incomplete draft returns successful save with executable diagnostics; it cannot start Chat Test, Voice Test, Flow QA execution or Publish. Read-only graph display and static QA remain available.
+
+Execution validates authoring first, fills only the documented defaults, validates executable structure, then runs semantic checks and mode-specific capability checks. All checks finish before installing a version. No partially compiled configuration becomes active. A diagnostic is `{code, path, message, severity: error|warning}` with an RFC6901 pointer into the submitted flow; sort by `(path, code, message)`. Errors block execution/publish; warnings do not. Fixtures' error arrays specify required errors, not the exhaustive order or count of derived errors.
+
+Semantic errors:
+
+1. `INCOMPLETE_FLOW`, `INCOMPLETE_STEP`, `INCOMPLETE_TRANSITION`: required execution properties missing, blank instruction/title, missing entry/exit or empty flow. The schema failure uses `SCHEMA_INVALID`; adapters may add these more useful subcodes.
+2. `DUPLICATE_STEP`, `DUPLICATE_FIELD`, `DUPLICATE_MESSAGE`: step IDs unique; a captured field has one owner node; message IDs unique within a node. IDs remain stable on rename and are not array indices. Total capture count is bounded across the graph.
+3. `MISSING_TARGET`, `UNKNOWN_FIELD`, `UNKNOWN_STEP`: all edge, predicate, welcome-question, action-map and template references exist. Welcome question targets `ask|collect`, must be the entry step, and must be eligible in initial state; a greeting question does not mark that node complete.
+4. `CONDITION_TYPE`: comparisons type-check against the capture. `eq/ne/in` require exact typed values; enum values belong to that enum; ordered comparisons apply only to integer/positive_integer. Reject bool-as-int and mixed `in` types. Each integer minimum must be <= maximum. `completed` is allowed only on transitions, means the source node, and cannot be a prerequisite. `step_completed` is a prerequisite or transition reference to a specific node. `all_applicable_required_fields_present` is allowed on summary prerequisites/transitions; it ignores speech/action completion and avoids a circular definition of successful summary.
+5. `INVALID_BRANCH`: ELSE is at most one, last, and cannot be the sole row; every non-end node has a normal outgoing row or an explicit finite fallback route. Capture nodes require at least one non-refusal route. The mandatory global exit is an `end`, has no prerequisites/transitions, and is reachable through the exit policy even if its normal graph edge is not taken. At least one authored normal path reaches an end. Unknown/refused branches must have either explicit handling or finite default fallback.
+6. `GRAPH_CYCLE`, `DEPENDENCY_CYCLE`, `UNREACHABLE_STEP`: first release rejects all authored transition cycles and capture/prerequisite dependency cycles. The finite internal clarification retry is the only v1 loop. Every node is reachable from entry by authored edges or is the designated global exit. Prerequisites on `step_completed` add dependency edges; field predicates add an owner-to-dependent edge; summary's aggregate adds all capture-owner dependencies. Ordering is never treated as a dependency. Extra orphan nodes block publish.
+7. `IMPOSSIBLE_PREREQUISITE`: conjunction cannot be true. The restricted atom language permits a deterministic satisfiability check: intersect state predicates and typed value domains per field, enum/boolean allowed sets, integer intervals plus equality/exclusion sets, string equalities/exclusions. A prerequisite list is AND; no executable expression strings, nested logical operators, regex supplied by customers, code or `eval`. Check reachable branch constraints and required downstream captures too. Diagnose contradictory ranges, impossible state/value pairs and branches that can never meet target prerequisites; an undecidable future extension must fail with `UNSUPPORTED_CONDITION`, not silently pass. An aggregate prerequisite cannot be placed on the owner of any capture it aggregates.
+8. `INVALID_NODE`: `ask|collect` have >=1 captures and no messages/action; `inform|summary|end` have >=1 controller-owned messages and no captures/action; `action` has a qualified action contract, optionally result captures, no speech messages. End sets `required:false`. A normal path cannot declare success while an applicable required capture or required eligible speech/action objective remains incomplete.
+9. `TEMPLATE_INVALID`, `TOOL_UNQUALIFIED`, `PLAYBACK_UNQUALIFIED`, `MODEL_UNQUALIFIED`: described below. A version can be executable in chat while Voice Test/deployment remains unavailable; publishing a deployment with voice enabled requires its qualified capability tuple.
+
+`OVERLAPPING_TRANSITIONS` warns when guards can be true together; `SHADOWED_TRANSITION` warns when a preceding guard always wins. Stored row order is the user's precedence. Static validator does not silently reorder rows or convert a warning to a second graph.
+
+## 3. Defaults, bounds and normalized graph
+
+The schema's maxima are v1 **wire-format ceilings**, selected product bounds, not measured throughput/memory claims. A deployment's versioned `FlowLimits` may tighten every limit and must re-derive runtime budgets from its own measurements. Return limit values with editor configuration so both client and API use the same limits. Raising a wire ceiling requires a schema-version change; tightening does not.
+
+Default product limits equal the wire ceilings unless configured lower: 128 steps; 128 total captured fields; 32 captures/node; 32 transitions/node; 16 prerequisites/node; 32 messages/node; 64 enum or `in` values; 64 ASCII characters per ID (`[a-z][a-z0-9_]{0,63}`); 128 characters/title/enum value; 8,192 Unicode scalar values/instruction/message; 2,048 characters/capture value; 32 tool mappings/direction; 5 maximum clarification attempts. Submitted flow body ceiling defaults to 262,144 UTF-8 bytes. Reject duplicate JSON object keys, invalid UTF-8, unpaired surrogates, NaN, Infinity and non-integer JSON number tokens. Maximum integer magnitude is 9,007,199,254,740,991 for lossless browser interoperability.
+
+Normalization inserts: `behavior={ordering:adaptive, allow_relevant_detours:true, capture_early_information:true, allow_corrections:true, clarification_attempts:2, allow_opt_out:true}` with partial behavior merged; `priority:100`, `required:true` except end requires explicit false; capture `required:true`, `confirmation:validated`, `allow_refusal:true`; string capture `max_length:512`; integer missing bounds -> safe-integer bounds; positive_integer missing maximum -> safe-integer maximum and minimum fixed 1; missing `fallback={action:clarify,max_attempts:<behavior.clarification_attempts>,on_exhausted:offer_exit}`. Required execution arrays and references are never invented. Missing optional `messages` on capture/action nodes becomes `[]`; missing optional welcome remains absent. Do not materialize an `action` or a welcome question. Existing explicit values override defaults.
+
+Runtime bounds belong to a separate versioned deployment profile, not customer graph authoring: `max_turns` default 100, `max_detours_per_objective` 3, `max_context_turns` 20, `max_context_utf8_bytes` 65,536, `max_proposal_bytes` 16,384, `max_field_updates_per_proposal` 32, `max_speech_fragment_chars` 1,024, `max_generation_fragments` 128, `max_pending_speech_bytes` 65,536, `max_adapter_events_per_generation` 1,024. These are product retention/resource bounds; select lower deployment values when required. Both bounded context limits apply; evict oldest complete turns and retain the latest user turn or reject overlarge input. Accepted user text remains capped at the currently implemented 4,000 characters unless separately changed and tested. Runtime timeouts, generation/token budgets, silence limits, queue deadlines and model concurrency have **no universal default in this flow contract**: the deployment must supply its measured values before admission. A failed qualification records actual measurements with environment/configuration; it never backfills an assumed latency claim.
+
+`allow_opt_out:false` suppresses the optional offer-to-skip, not an explicit user's stop/refusal or platform safety. `allow_refusal:false` means a refused value cannot satisfy normal completion, not permission to ask repeatedly after refusal. `allow_corrections:false` preserves existing confirmed facts and asks whether to restart/exit if challenged; it never falsely asserts an old value remains agreed. `capture_early_information:false` stores off-objective proposals only as candidates, asks confirmation when applicable, and never drops user text. Strict order changes scheduling, not field validity or safety. `required:false` exempts an objective/capture from success requirements; it may still be visited if the authored route selects it. Capture `confirmation:explicit` requires a separate clear user confirmation linked to the specific value and field; model confidence or model-proposed `confirmed` is insufficient.
+
+## 4. Canonical bytes and compilation identity
+
+`canonical_json_v1(value)` is a repository-defined, cross-language encoding with golden vectors, not a claim of a library's RFC8785 implementation. Its input is parsed strict JSON satisfying the constraints above; all object keys are schema-defined ASCII or valid IDs. Recursively sort object keys in ascending ASCII byte order, preserve every array order, use decimal integers without leading zeros or plus, and lowercase `true/false/null`. Encode strings as JSON with `"`, `\\`, `\b`, `\t`, `\n`, `\f`, `\r` for the corresponding characters, `\u00xx` with lowercase hex for remaining U+0000..U+001F, and literal Unicode scalar values otherwise; do not escape slash or normalize Unicode/newlines/whitespace inside values. Emit no spaces, BOM or final newline; UTF-8 bytes are the result. Finite negative zero parses as integer zero and encodes as `0`. JSON floating tokens, including `1.0` and `1e0`, fail before encoding.
+
+Hash is lowercase 64-digit SHA-256 hexadecimal over the exact preimage bytes below, where `+` is byte concatenation, `\0` a single zero byte, and constants ASCII:
+
+- `authoring_hash = SHA256(b'voice-ai/flow-authoring/v1\0' + canonical_json_v1(original_source_flow))`.
+- `flow_hash = SHA256(b'voice-ai/flow-normalized/v1\0' + canonical_json_v1(normalized_executable_flow))`.
+- Compile artifacts with `compiler_version='flow-compiler/1'`, `schema_version=1`, `canonicalization='canonical_json_v1'`, `flow_hash`, exact immutable policy revision/hash, exact base/persona compiled prompt hash, versioned knowledge/tool/adapter-qualification references, `limits_profile_hash`, compact index, ordered step fragments, locale-message templates and evaluator rubric. Hash this manifest (excluding its own hash) as `SHA256(b'voice-ai/flow-artifact/v1\0' + canonical_json_v1(manifest))` -> `artifact_hash`.
+
+Store original source, normalized graph and manifest in the immutable agent version. Save changes only the draft and authoring hash. Publish resolves every referenced revision atomically; unresolved or mutable provider/tool/knowledge aliases block publish. Operational credentials never enter the graph, prompt artifact or hashes. Per-session playback capabilities may reject admission even after publish (e.g. unqualified browser). Capability changes do not silently mutate an existing version.
+
+Compile once per version. Runtime builds context in memory from current validated state, bounded spoken/delivered history, compact graph and relevant step instructions; no graph regeneration, database round trip or second extraction inference just to build context. Preserve base/persona compiler escaping. Wrap user scripts, knowledge and messages as subordinate configuration/data; textual delimiters do not confer authority. Model output cannot grant permission, waive platform policy or commit billing/actions.
+
+Golden canonical assertion: object `{"b":2,"a":"नमस्ते"}` encodes as exact UTF-8 `{"a":"नमस्ते","b":2}`. Changing object key insertion order preserves hash; changing transition order, one Hindi character, a flag, locale message or policy revision changes the corresponding hash. Equivalent missing versus explicit defaults have different authoring hashes but identical normalized flow hashes. Fixtures include concrete expected hashes in `hash-vectors.json`.
+
+## 5. State, proposals and serialized updates
+
+The following are proposed typed interfaces, not existing runtime classes. Every envelope object rejects unknown keys. Internal events are validated at trust boundaries; Python implementation uses frozen dataclasses or Pydantic strict models with the same unions.
+
+```ts
+type Scalar = string | number | boolean; // number is a safe integer only
+type Applicability = 'applicable' | 'inapplicable' | 'unknown';
+type Evidence = { source_turn_id: string; quote: string };
+type Origin = { source_turn_id: string; generation_id: string;
+  committed_state_version: number; source: 'user_capture' | 'user_confirmation' | 'tool_result';
+  execution_id?: string };
+type FieldState =
+  | { status: 'unknown'; applicability: Applicability; invalidated_by?: string }
+  | { status: 'candidate'; applicability: Applicability; value: Scalar | null;
+      reason: 'ambiguous' | 'needs_confirmation' | 'uncertain_evidence' | 'dependency_unknown';
+      evidence: Evidence }
+  | { status: 'confirmed'; applicability: 'applicable'; value: Scalar; origin: Origin }
+  | { status: 'refused'; applicability: Applicability; origin: Origin };
+type CaptureUpdate =
+  | { op: 'propose'; field: string; value: Scalar; evidence: Evidence }
+  | { op: 'candidate'; field: string; value: Scalar | null;
+      reason: 'ambiguous' | 'needs_confirmation' | 'uncertain_evidence' | 'dependency_unknown'; evidence: Evidence }
+  | { op: 'refuse'; field: string; evidence: Evidence }
+  | { op: 'confirm'; field: string; candidate_state_version: number; evidence: Evidence };
+interface StateProposal {
+  proposal_id: string; session_id: string; turn_id: string; generation_id: string;
+  base_state_version: number; updates: CaptureUpdate[];
+}
+type StepStatus = 'pending' | 'active' | 'complete' | 'waived' | 'blocked';
+interface SessionState {
+  version: number; flow_hash: string; artifact_hash: string;
+  last_accepted_turn_id: string | null; generation_id: string | null;
+  fields: Record<string, FieldState>; steps: Record<string, StepStatus>;
+  active_step_id: string | null; resume_step_id: string | null;
+  locale: 'en' | 'hi'; outcome: 'in_progress' | 'completed' | 'partial' | 'aborted' | 'failed';
+  clarification_attempts: Record<string, number>; detour_counts: Record<string, number>;
+}
+```
+
+All fields initialize unknown, applicability is derived by evaluating their owner's prerequisites. A candidate value is explicitly non-authoritative, including null when no single value is proposed. An unknown has **no value property**. Confirmed/refused records never represent null; clearing is a controller invalidation, not a model update. Model proposals cannot change locale, outcome, step status, counters, active step, permission or action results. Locale changes come from the language router/explicit user selection and preserve business state. Hindi evidence remains Hindi; normalized enum keys remain stable ASCII. Decimal/currency/period interpretation must be explicit; never infer monthly/annual units from magnitude.
+
+For each accepted final user turn, under the per-session lock:
+
+1. Validate stable input ID/text/limits. Duplicate turn ID and identical text is idempotent; duplicate ID with different text fails `TURN_CONFLICT`. A turn ID is server-assigned monotonic sequence or server-mapped transport utterance ID, not a client ordering claim. Record source text once; interim STT is display-only and never a second accepted turn.
+2. Freeze prior playback ledger, cancel prior LLM/TTS/queued speech; mark prior generation cancelled. Increment state version, set new turn ID/generation ID, and build context from the latest committed state. Cancel cannot roll back committed captures or already-confirmed played fragments. Timeout/budget termination is serialized the same way.
+3. Accept a **complete**, bounded `StateProposal` only for current session/turn/generation and exact `base_state_version`. Proposal IDs deduplicate. Partial JSON and incomplete tool arguments never mutate state. Old version fails `STALE_STATE` without guessing a rebase; runner may revalidate a buffered proposal against fresh state only under a new proposal ID and current evidence, never replay an old-generation proposal. Reject the whole proposal atomically if any update fails; no prefix commit. Current-generation rejection permits a fixed clarification and diagnostics.
+4. Validate field ownership, type/range/enum, actual source turn and exact evidence substring; reject tool-result capture targets from model/user updates. Values need no LLM confidence threshold. For ordinary user-supplied facts `confirmation:validated` permits commit after these deterministic checks; this is data capture, not independently verified identity/income or action authorization. Ambiguous periods/currencies, contradictory values in a turn, uncertain STT, unsupported interpretation or `confirmation:explicit` remain candidates and require a linked clear user answer. Explicit confirmation atomically checks candidate value/version so a generic old 'yes' cannot confirm a new value. No automatic money/unit conversion without an authored, versioned rule.
+5. Compute updates in topological dependency order over the entire proposed batch. Early salary + employment + preference can become confirmed together. If dependencies are unknown, retain dependent proposed values as candidates. If dependencies are false, reject that value as inapplicable and retain only diagnostic/source history. When correction is allowed, a changed confirmed value invalidates dependent field/step/fragment manifests in the same commit. Recompute applicability; invalidate all descendants on any changed dependency, even if their guard remains true, then revalidate any replacement updates in this batch. Refusals are also invalidated if their question's meaning changed. Unrelated fields remain intact. Preserve audit records with old origin/value; they are not current confirmed state.
+6. Commit captures/refusals/candidates, dependency invalidations, derived step status, transition trace and incremented state version together. A complete proposal may commit before generation ends. An interruption after this commit preserves the facts; an interruption before it preserves only source text and already committed facts. No model prose or generated speech becomes input evidence.
+7. Route, build the controller-authorized speech plan, and emit commands. A chat commit or qualified played event advances only its own completion ledger; it never changes user facts. Stop/safety/credit shutdown preempts every fallback/message and emits one idempotent teardown command with outcome `aborted` (or `failed` on infrastructure error); no closing playback wait.
+
+`allow_corrections:false` and explicit confirmation are controller constraints, not instructions the model can override. A refusal is committed once and immediately resolves the current capture objective as waived/partial; choose its explicit refusal edge if true, otherwise global exit. Required capture remains unfulfilled. Never force repeated clarification of refusal. A user may later volunteer a replacement; with corrections allowed it is a new sourced update, not an implicit revocation.
+
+## 6. Deterministic routing, retries and completion
+
+Evaluate predicates to `TRUE|FALSE|UNKNOWN`. Comparisons require confirmed, applicable typed values; unknown/candidate/inapplicable -> UNKNOWN. Refused comparisons -> FALSE; `ne` does not convert refusal into a matching answer. Explicit `is_unknown/is_candidate/is_refused` inspect that state and return a boolean (a state predicate on an inapplicable field is FALSE). `is_present` is TRUE only for confirmed applicable values, UNKNOWN for unknown/candidate/applicability-unknown and FALSE for refused/inapplicable. Aggregate required-fields predicate is UNKNOWN while any required capture applicability or applicable value is unknown/candidate, FALSE if any applicable required capture is refused, otherwise TRUE. False applicability exempts a capture. Step completion predicates are FALSE for pending/active/waived/blocked and TRUE only for complete.
+
+Normal edges run only when their source completes; refusal handling is the explicit exception. Evaluate all explicit rows in stored order and select the **first TRUE**. Earlier UNKNOWN does not prevent a later TRUE winning; it does prevent ELSE. If no TRUE and any explicit UNKNOWN, clarify the earliest unknown dependency instead of evaluating ELSE. If all explicit guards are FALSE, select ELSE if present, otherwise node fallback. A `completed` row is TRUE only after the source completion event. First-match precedence is never replaced by node priority.
+
+For selected target with unmet prerequisites, compute transitive missing prerequisite owners, excluding inapplicable/waived objectives. Pick earliest eligible incomplete prerequisite by adaptive `(priority,id)`, or authored step-array order in strict mode. Do not try a later edge or ELSE. No eligible prerequisite -> `FLOW_BLOCKED`; record diagnostic and take finite global partial exit, not a spin or success. If target is already complete through early capture, repeatedly evaluate its edges in memory; visited-node guard and DAG bound prevent loops. Before choosing `end` with `completed` outcome, schedule remaining applicable required objectives using the same eligibility ordering. Explicit refusal/opt-out/fallback exits set `partial` and bypass successful-path requirements. The global exit remains reachable without its own prerequisite.
+
+`ask|collect` complete when every applicable capture on that node is confirmed, including captures acquired early. No applicable captures -> skip as inapplicable, never solicit them. They do not require that the corresponding question was spoken. A required node may still have optional captures; optional unknown captures do not block success once the node's required applicable captures are confirmed. To avoid a vacuous immediate completion, executable validation requires at least one required capture on `ask|collect`. Speech required by policy is an `inform` step, not a question's side effect.
+
+`inform|summary` complete only after the current controller-owned required message manifest is sealed and every required fragment is committed-delivered (chat) or confirmed-played (qualified voice). Completion is not user acknowledgment; ask an explicit capture if acknowledgment is required. `action` completes only after the exact registered, validated recorded operation result. `end` confirms closing fragments then requests idempotent teardown; final outcome is completed only if the successful-path check passed, otherwise partial. User stop may skip closing fragments.
+
+Fallback clarification attempts increment once per accepted, unsuccessful answer to that objective, not per STT partial, FAQ, generated question, parser retry or playback event. After `max_attempts` unsuccessful answers (zero means no retry), `end_partial` exits; `offer_exit` emits one fixed localized choice to continue/stop. An explicit continue resets attempts once for that objective; a second exhausted budget or an unclear answer to the offer exits partial. A silence deadline uses deployment configuration and exits without hanging. Runtime `max_turns` remains a hard finite bound. Refusal/stop bypass these retries. Persist `offer_exit_pending` and `continue_reset_used` per node as controller ledger flags (default false); they are not model flags or customer-configurable fields.
+
+A relevant FAQ detour saves `resume_step_id` without changing graph position. Only approved versioned knowledge can supply product facts; missing fees/rates are acknowledged as unavailable. No knowledge lookup/model evaluation is required per turn merely to advance flow. Detour count is bounded per objective; exhausted detours redirect to the current objective or offer exit. Out-of-scope answers redirect without new graph nodes. EN/HI language changes never reset retries, captures or completed messages.
+
+## 7. Speech manifests, single generation and safe fallbacks
+
+First release keeps output completion deterministic: `inform|summary|end` supply ordered `messages=[{id,en,hi}]`. Required meaning-bearing text comes from these authored, versioned templates; the controller renders them from a validated state snapshot. Model paraphrase is optional conversational text and does not replace required messages. This is a deliberate v1 restriction that makes omission, interruption and completion testable. Placeholders are exactly `{{field_id}}`, references must exist, no expressions/conditionals/functions. Render only confirmed values; inapplicable -> localized 'not applicable', unknown/candidate -> 'not confirmed', refused -> 'not provided'. Never render old invalidated income. Values are data, escaped/isolated from prompt structure. Summary must include the authored no-guarantee/required disclosure messages from the policy-approved template. Platform-mandatory disclosures cannot be removed by customer edits. Publication checks configured mandatory message IDs/text hashes and tool confirmation rules independently of LLM behavior.
+
+The controller creates a semantic fragment ledger keyed `(step_id, message_id, rendered_content_hash, dependency_fingerprint)`. A rendered message may split deterministically into <=1,024-character transport fragments at sentence/word boundaries with stable part indices; all parts are required. `required_fragment_ids` are fixed before enqueue; a seal cannot omit a planned part. Generation IDs identify playback attempts; semantic fragment identities allow preserving confirmed parts across interruption when content and dependency fingerprint are unchanged. Correction changes fingerprint and invalidates completion without deleting historical speech. Changing locale retains already-played semantics; remaining message parts use the newly selected locale, with a new localized manifest for unplayed parts. Exact welcome text is one separately tracked message emitted after READY; `question_step_id` reserves the pending objective so it is not asked twice if already delivered. Barge-in may answer that objective before greeting finishes.
+
+Preferred model adapter uses **one streaming generation** per accepted turn, with separate typed state proposal and speech events. Sideband is parsed/validated independently; JSON/tool metadata is never routed to TTS. No application wrapper pretends a provider supports this without qualification. Model speech before its complete proposal is buffered under the pending-speech limit. After proposal validation, bind speech to its validated-state version and controller-authorized active objective; stale buffered state-dependent speech is discarded and replaced by a fixed controller-rendered question/summary, not emitted optimistically. Never say an eligibility decision/action succeeded based on model prose. Tool/action result announcements come from validated results and templates. Any adapter without controllable separation or gating is unqualified for the preferred path.
+
+Conservative fallback still targets one normal generation: it streams ordinary natural language as **untrusted preview**, commits no fields from arbitrary prose, and authorizes only fixed controller-rendered task speech after any available deterministic user-text extraction. It may use one generation to propose low-risk FAQ wording, but only a policy-approved answer drawn from supplied knowledge is released; otherwise fixed 'I do not have that detail' plus the current question is spoken. The preview can be omitted from the UI. No mandatory second extraction model request is added. Fields unsupported by deterministic extraction remain unknown/candidate; typed explicit choices/confirmation in Chat Test and equivalent voice clarification can progress. Deployment must declare a qualified capture strategy that can complete every field/locale used by the flow; otherwise `MODEL_UNQUALIFIED` blocks that mode rather than shipping a permanently unfinishable conversation. The fallback's lower capture/FAQ capability is shown in model selection and test diagnostics.
+
+Selective strict validation may add a second inference only on an explicitly recorded ambiguous/consequential branch; gate all related speech, use published configured budgets, and measure this case separately. It is a correctness exception rather than the normal turn pipeline. Safe timeout behavior is a fixed clarification or partial exit; no speculative state/action.
+
+## 8. Adapter event interfaces and trust boundary
+
+These are internal normalized events. Map from pinned Pipecat/provider/RTVI events behind registered adapters. Reuse the existing ordered data channel for bounded versioned control messages if needed; avoid shipping a second media protocol without evidence that the existing transport cannot be adapted. UI display events may contain generated text but carry `delivery:'preview'`; they are never spoken history. No client-originated state proposal or raw `played` message directly reaches the reducer.
+
+```ts
+interface EventKey {
+  event_id: string; session_id: string; transport_epoch: string;
+  turn_id: string; generation_id: string;
+}
+type ModelEvent =
+ | (EventKey & {type:'speech_delta'; seq:number; text:string})
+ | (EventKey & {type:'state_proposal'; proposal:StateProposal})
+ | (EventKey & {type:'generation_sealed'; last_seq:number})
+ | (EventKey & {type:'generation_failed'; code:string});
+interface SpeechFragment extends EventKey {
+  fragment_id:string; semantic_fragment_id:string; step_id:string;
+  state_version:number; manifest_id:string; content_hash:string;
+  locale:'en'|'hi'; text:string; required:boolean;
+}
+type OutputEvent =
+ | (EventKey & {type:'fragment_generated'; fragment:SpeechFragment})
+ | (EventKey & {type:'fragment_queued'; manifest_id:string; fragment_id:string})
+ | (EventKey & {type:'fragment_played'; manifest_id:string; fragment_id:string;
+      content_hash:string; evidence_id:string; capability_report_hash:string})
+ | (EventKey & {type:'chat_committed'; manifest_id:string; fragment_id:string;
+      message_id:string; durable_delivery_id:string})
+ | (EventKey & {type:'output_cancelled'; cancellation_id:string;
+      discarded_fragment_ids:string[]});
+interface CancelCommand extends EventKey {
+  type:'cancel_generation'; cancellation_id:string;
+  reason:'barge_in'|'user_stop'|'credit'|'safety'|'timeout'|'disconnect';
+}
+interface AdapterCapabilities {
+  adapter_id:string; adapter_version:string; model_revision:string;
+  metadata:'separate_stream'|'complete_tool'|'none';
+  speech_gating:boolean; cancel_generation:boolean;
+  playback:'qualified_fragment_completion'|'unqualified';
+  locales:('en'|'hi')[]; report_hash:string;
+}
+```
+
+Event IDs deduplicate; per-generation `seq` is contiguous starting at 0. Out-of-order/duplicate model deltas are buffered within configured bounds; missing sequences at seal fail generation without completion. Required TTS fragment ordering follows manifest part order, regardless of model text event order. Every event checks current session, connection/transport epoch, generation, manifest and content hash, and ledger legality. `fragment_played` requires prior queued fragment and a still-current generation; duplicate is a no-op. No unknown ID, prior connection, client-forged hash, old generation or unsealed manifest completes a step. Only the trusted transport adapter can produce normalized played evidence, with qualified evidence recorded in a bounded ledger. This is operational delivery evidence, not proof that a human heard/understood it or financial authorization.
+
+For chat, `chat_committed` means the runner durably committed the complete assistant message and its transcript projection for that chat session; it does not mean a browser sent a render callback. This durable chat delivery is the documented corresponding completion event. A preview token or unfinished write cannot complete a message. A disconnected browser can retrieve the committed message, and a failed durable commit leaves the objective incomplete.
+
+Cancellation acquires the same session lock as playback/state commits. Capture and played events committed before cancellation survive. All events observed after cancellation for that generation are rejected, even if an adapter says audio might have played earlier. Cancel flushes synthesis and transport/browser queued audio; if flushing cannot be guaranteed, terminate the voice transport so old statements cannot continue during a corrected answer. Semantic completion may conservatively remain unknown for a final part played without an observed pre-cancel receipt; resume/clarify rather than claiming completion. A cancel receipt is not itself proof that earlier audio played. Record generated, queued, played/delivered and cancelled text separately. Future LLM history contains only accepted user turns and confirmed-delivered assistant fragments, in commit order, without generated-but-unplayed text. Render previews separately in the browser.
+
+`bot/transcripts.py` presently forwards `TTSTextFrame`; `transcript-protocol.ts` also parses generated `bot-llm-text` tokens and anonymous completed transcript messages, and `voice-session.ts` opens an ordered channel without playback acknowledgments. None binds speaker rendering to generation + fragment IDs; TTSTextFrame establishes at most a TTS-stage event. It cannot satisfy this contract's played gate. Do not upgrade its label without qualifying the transport.
+
+## 9. Runnable model/playback capability qualification gate
+
+Implementation must add `scripts/voice-ai.sh flow-qualify --profile <versioned-json> --output data/flow-qualification/<run-id>/report.json` and its underlying `bot.adapter_qualification` runner. This command is a **planned test protocol**, not an already available script and not a result reported by this document. First implement harness and adapter spike before promising reliable voice completion or choosing a browser acknowledgment design.
+
+A qualification profile supplies pinned model/service/adapter/Pipecat/browser/OS versions, flow hash, EN/HI samples, selected audio output, exact deployment timeouts/budgets, metadata strategy and transport evidence strategy. It enumerates browser/device/network combinations actually supported. Use deterministic fake adapters first, then the real end-to-end path with a controlled synthetic audio sink/loopback capture, emitted fragment markers, raw event capture and cancellation injection. Synthetic test audio is local, ignored data; local_offline tests disable network and external STUN/TURN. An audio element `ended` event is not meaningful for an endless live WebRTC stream; `bot-stopped-speaking`, sender buffer drain, TTS completion and a data-channel ACK must each be tested against actual rendered audio before adoption.
+
+Run each deterministic scenario at every legal event boundary, with fixed scheduler seeds and profile-specified repeated real-playback trials. Harness exits nonzero on any correctness failure, missing evidence, unsupported scenario or configured budget violation; no warning-only qualification. Required scenarios:
+
+1. Normal EN and HI: two distinctive required fragments plus optional tail. Assert separate speech/metadata events, zero metadata bytes in synthesized text, typed valid state, contiguous IDs, one generation, required fragments present in captured rendered output before normalized played evidence is accepted. Measure time-to-first-model-token, first audible sample, proposal commit, last audible sample and step completion separately; report conditions and actual percentiles without asserting a universal target.
+2. Gate adversarial model speech before metadata, malformed/truncated/oversized/duplicate/unknown-field metadata, sequence gaps, wrong proposal version, two contradictory captures and injection to bypass a prerequisite. Assert no unsafe utterance released, no partial capture commit, safe fallback/clarification, no hidden extra normal-path generation.
+3. Barge-in before queue, mid-first-fragment, between required fragments, after final audio before receipt, after receipt before reducer commit, and while a new turn's correction commits. Assert precise ledger preservation, late events ignored, no premature completion, remaining objective resumed, cancelled audio flush/transport close behavior observed at output sink. If markers cannot be aligned to rendered audio, fail qualification.
+4. Delay/duplicate/reorder/drop playback/control messages; disconnect/reconnect with new transport epoch; forge unknown fragment/hash/capability report; autoplay blocked, paused/suspended output, no remote track, muted element/output path and deliberate output stall. No played evidence may be fabricated by server synthesis or client ACK. A browser cannot measure whether physical volume was audible; report rendered-sample semantics and that limit explicitly. If the chosen adapter cannot distinguish its required successful render boundary in these tests, it remains unqualified.
+5. Stop/credit/safety cancellation during every required message, parser error, TTS failure, output overflow and action-result announcement. Assert finite termination, one teardown request and no successful path marked completed by shutdown.
+6. Chat durable-commit failure/retry/disconnect and duplicate delivery callbacks. Replay the same sourced state proposals in chat and qualified voice; assert identical captures, node transitions and outcome, differing only in delivery ledger.
+7. Credit-card and loan full-path runs, early three-field answers, self-employed correction invalidating salary, refusal, missing knowledge, explicit confirmation, both ordering modes and EN↔HI switches. Every field must be capturable under the advertised mode/locale/fallback, and the qualification report lists any unsupported combination rather than silently accepting it.
+
+Report includes `protocol_version:1`, immutable capability tuple, profile hash, source revision, fixture/input hashes, per-case pass/fail and trace IDs, actual latency/resource measurements and configured budgets, raw evidence references, `playback_boundary_description`, limitations, and resulting report hash. `playback='qualified_fragment_completion'` is permitted only if all required cases pass for that exact tuple and existing media path yields adequately correlated evidence. A mocked/fake pass qualifies reducer semantics only; it cannot qualify real voice playback. Model qualification independently proves state extraction and safe gating; passing playback does not qualify a model.
+
+Start with existing transport event correlation, not a new PCM-over-data-channel protocol. If the existing path cannot yield reliable per-fragment rendering evidence, admission returns `PLAYBACK_UNQUALIFIED`; no voice flow silently substitutes TTS text or timers. Chat remains executable, draft/static QA remains available, and the affected voice deployment cannot publish/admit sessions until a separately documented, tested completion protocol passes this gate. This is a concrete release blocker to resolve in the adapter spike, not a claim that the current transport already supports the feature. A fixed wait, ASR silence or generic user 'yes' does not certify required disclosure delivery. The support matrix must display this boundary to the operator.
+
+## 10. Allowlisted actions and release assertions
+
+The first-build registry is empty by default. A customer can save an action-shaped draft but cannot execute/publish it until a code-registered tool contract exists. Each tool definition pins `tool_id`, version, JSON Schema2020-12 input/result schemas, required roles/scopes, field bindings, `confirmation_policy=explicit_user|none`, `idempotency_scope`, finite retry policy, timeout configuration key, resumable-status lookup, expected failure types and compensation/manual-recovery procedure. Consequential operations require explicit user confirmation over exact validated arguments and operation hash; receipt of audio/chat output never counts as consent. Model-generated tool names/arguments cannot bypass allowlist, ownership or wallet checks. Registered `none` confirmation is restricted to nonconsequential read-only operations by code policy.
+
+Controller emits `RequestAction(execution_id, tool_contract_hash, input_hash, validated_arguments, confirmation_record_id)` only after all gates pass. Runner records request durably before invocation, deduplicates by stable execution ID, verifies returned execution ID/schema and records validated result before reducer completion. Unknown outcome after timeout queries the same execution ID; it never creates a new payment/order ID. Model cannot supply result captures. Failed actions take registered finite retry/partial exit; missing contracts and unqualified tool modes block publish.
+
+Acceptance for implementing this contract:
+
+- Both schemas pass JSON Schema2020-12 `check_schema`; every graph fixture's authoring/executable structural result equals its declared expected value. Pure artifact validation is insufficient to claim the not-yet-built semantic controller passes.
+- Semantic validator detects every declared semantic error; overlap fixture remains executable with a warning. Reordering overlap rows changes selection; changing priority does not.
+- Controller executes every assertion in `controller-and-adapter-cases.json`, plus full EN/HI card and loan paths, false/unknown prerequisite handling, bounded retry/offer-exit and inapplicable captures. No normal end before all required eligible objectives complete.
+- Hash vectors match byte-for-byte in Python and TypeScript; schema parsing is strict; source key reorder is hash-invariant and edge reorder is hash-sensitive.
+- Fuzz bounded metadata, IDs, event order, cancellation race boundaries, state versions and typed conditions; every rejected event preserves authoritative state, every completion has an accepted evidence chain. This is a behavioral property test, not a test that mirrors implementation helpers.
+- Chat and voice share reducer/compiler fixtures; existing test suite and modularity tests pass unchanged. Qualified real adapter reports exist for every advertised combination; unqualified voice admission demonstrably fails safe.
+- Run the relevant actual memory/bench/eval scripts when implementation changes models/prompts/latency paths, then update README with machine/model/corpus/deployment conditions. This planning-only artifact validation changes none of those measurements.
+
+## Public Python operation names
+
+The implementation plan fixes the exported pure function names: `validate_authoring`, `normalize_executable`, `validate_executable`, `compile_flow`, and `reduce_event`. Its Shared interface decisions block gives their inputs/outputs. These names are implementation targets, not classes/functions already present. `Reduction` returns state, commands and diagnostics; private helper organization is unrestricted.
