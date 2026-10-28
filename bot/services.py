@@ -85,6 +85,22 @@ def build_stt_mlx_audio(settings: Settings) -> STTService:
     )
 
 
+def validate_stt_language(settings: Settings) -> None:
+    """Validate that the configured STT provider supports the configured language.
+
+    The realtime backend accepts model, format and turn-detection only — no
+    language — so a pinned ``stt_language`` is refused rather than sent and
+    ignored. Use ``mlx-audio`` when the language must be pinned.
+    """
+    if settings.stt_provider == "mlx-audio-realtime" and _parse_language(settings.stt_language) is not None:
+        raise ValueError(
+            "stt_provider=mlx-audio-realtime has no language switch: "
+            "/v1/realtime takes model, format and turn_detection only. "
+            "Set stt_language=auto, or use stt_provider=mlx-audio, whose "
+            "Nemotron prompt conditioning does take one."
+        )
+
+
 def build_stt_mlx_audio_realtime(settings: Settings) -> STTService:
     """Nemotron over the local server's ``/v1/realtime`` WebSocket.
 
@@ -94,14 +110,7 @@ def build_stt_mlx_audio_realtime(settings: Settings) -> STTService:
     language — so a pinned ``stt_language`` is refused here rather than
     sent and ignored. Use ``mlx-audio`` when the language must be pinned.
     """
-    if _parse_language(settings.stt_language) is not None:
-        raise ValueError(
-            "stt_provider=mlx-audio-realtime has no language switch: "
-            "/v1/realtime takes model, format and turn_detection only. "
-            "Set stt_language=auto, or use stt_provider=mlx-audio, whose "
-            "Nemotron prompt conditioning does take one."
-        )
-
+    validate_stt_language(settings)
     settings = resolve_models(settings)
     return LocalMlxRealtimeSTTService(
         model=settings.stt_model,

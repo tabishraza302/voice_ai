@@ -160,6 +160,23 @@ def test_runner_host_rejects_non_loopback_and_wildcard(rejected_host):
     assert "unauthenticated local management routes" in str(excinfo.value)
 
 
+def test_runner_cli_host_cannot_bypass_the_loopback_guard():
+    """The dev runner's --host is the final bind address, not a suggestion."""
+    from bot.bot import _LoopbackBindParser
+
+    parser = _LoopbackBindParser(add_help=False)
+    parser.add_argument("--host", default="localhost")
+    parser.add_argument("--port", type=int, default=7860)
+
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(["--host", "0.0.0.0"])
+    assert excinfo.value.code == 2
+
+    parsed = parser.parse_args(["--host", "127.0.0.1", "--port", "9001"])
+    assert parsed.host == "127.0.0.1"
+    assert parsed.port == 9001
+
+
 @pytest.mark.parametrize(
     "valid_url,expected",
     [

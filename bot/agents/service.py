@@ -283,8 +283,7 @@ async def apply_active_agent_to_settings(
 ):
     """Resolve the active or requested agent profile and apply it to session Settings."""
     from bot.db.session import get_session_factory
-    from bot.services import resolve_models
-
+    from bot.services import resolve_models, validate_stt_language
     async def _resolve_with_session(sess: AsyncSession):
         service = AgentService(sess)
         await service.seed_default_presets()
@@ -310,8 +309,9 @@ async def apply_active_agent_to_settings(
         updated.tts_voice_en = agent.tts_voice_en
         updated.tts_voice_hi = agent.tts_voice_hi
         updated.tts_speed = agent.tts_speed
-        return resolve_models(updated)
-
+        resolved = resolve_models(updated)
+        validate_stt_language(resolved)
+        return resolved
     if session is not None:
         return await _resolve_with_session(session)
 
@@ -322,6 +322,8 @@ async def apply_active_agent_to_settings(
     except AgentNotFoundError:
         raise
     except SQLAlchemyError as exc:
+        if agent_id:
+            raise
         logger.warning(
             "Failed resolving agent configuration from database (%s); using default settings",
             type(exc).__name__,
