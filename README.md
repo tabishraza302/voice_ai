@@ -113,7 +113,9 @@ Set `WEB_PORT=3010` before invoking the script to select another port; the
 agent and Studio use the same exported value for the CORS allowlist.
 The local management API is under `/api` (including `/api/agents`,
 `/api/prompts/base`, and `/api/catalog`); the runner's OpenAPI page is at
-`http://localhost:7860/docs`.
+`http://localhost:7860/docs`. The runner's `host` setting is restricted to
+`localhost` or a literal loopback IP because management endpoints have no
+authentication.
 
 PostgreSQL is published on loopback port 5439 by default. Set `POSTGRES_PORT`
 to move the Compose port, and set `DATABASE_URL` in `.env` to the same host

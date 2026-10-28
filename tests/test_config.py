@@ -31,7 +31,7 @@ def test_defaults():
     assert s.vad_confidence == 0.7
     assert s.sqlite_database_url == "sqlite+aiosqlite:///voice_ai.db"
     assert s.web_port == 3001
-
+    assert s.host == "localhost"
 
 @pytest.mark.parametrize(
     "field,value",
@@ -120,3 +120,40 @@ def test_system_prompt_is_shared_and_says_no_markdown():
     assert "read aloud" in SYSTEM_PROMPT
     assert "Never use emoji" in SYSTEM_PROMPT
     assert "markdown" in SYSTEM_PROMPT.lower()
+
+
+@pytest.mark.parametrize(
+    "allowed_host",
+    [
+        "localhost",
+        "LOCALHOST",
+        "127.0.0.1",
+        "127.0.0.2",
+        "::1",
+    ],
+)
+def test_runner_host_allows_literal_loopback(allowed_host):
+    s = Settings(_env_file=None, host=allowed_host)
+    assert s.host == allowed_host
+
+
+@pytest.mark.parametrize(
+    "rejected_host",
+    [
+        "0.0.0.0",
+        "::",
+        "[::]",
+        "[::1]",
+        "192.168.1.100",
+        "10.0.0.5",
+        "0.0.0.0.nip.io",
+        "local.test",
+        "example.com",
+        "",
+        "   ",
+    ],
+)
+def test_runner_host_rejects_non_loopback_and_wildcard(rejected_host):
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None, host=rejected_host)
+    assert "unauthenticated local management routes" in str(excinfo.value)

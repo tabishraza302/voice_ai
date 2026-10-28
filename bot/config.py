@@ -12,7 +12,8 @@ built by per-backend routers (see ``bot/language.py``).
 
 from __future__ import annotations
 
-from pydantic import AliasChoices, Field
+import ipaddress
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # The bot's behaviour, in one place. Shared by every LLM backend so that
@@ -150,6 +151,31 @@ class Settings(BaseSettings):
     # --- Server ----------------------------------------------------------
     host: str = "localhost"
     port: int = 7860
+
+    @field_validator("host")
+    @classmethod
+    def validate_host_is_literal_loopback(cls, value: str) -> str:
+        """Fail closed unless the host is a literal loopback address or localhost.
+
+        Management routes (/api, /, /settings, /metrics) are unauthenticated in this
+        local air-gapped system. Binding to wildcards, non-loopback addresses, or
+        arbitrary domain names without DNS lookups is strictly forbidden.
+        """
+        if not isinstance(value, str):
+            raise ValueError("host must be a string")
+        candidate = value.strip()
+        if candidate.lower() == "localhost":
+            return candidate
+        try:
+            parsed = ipaddress.ip_address(candidate)
+            if parsed.is_loopback:
+                return candidate
+        except ValueError:
+            pass
+        raise ValueError(
+            f"host {value!r} is not allowed: unauthenticated local management routes "
+            "must only bind to localhost or a literal loopback IP (127.0.0.1, ::1)"
+        )
 
     # --- Measured behaviour ----------------------------------------------
     # P99 latency from end-of-speech to final transcript, in seconds.
