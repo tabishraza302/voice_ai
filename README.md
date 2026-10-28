@@ -86,10 +86,13 @@ trusted user on the same machine. They have no sign-in, authorization, or
 multi-user isolation. Keep the Studio, agent API, and database bound to
 loopback. The API lets the browser edit local agent profiles and
 prompts. The browser sends the selected saved profile id with its WebRTC
-request, and that profile applies to that session only. Prebuilt clients with
-no profile id keep the measured `.env` settings. A control-page STT mode
-override takes precedence over a selected profile's STT choice.
-
+request, and that profile applies to that session only. Explicitly requesting
+an unavailable or deleted profile id fails the session request instead of
+falling back to a different profile. Prebuilt clients with no profile id keep
+the measured `.env` settings. The studio indicates when a profile's selected
+LLM model is unavailable in the local catalog. A control-page STT mode
+override takes precedence over a selected profile's STT choice. In-call text
+turns sent from the client are limited to 4,000 Unicode characters.
 The studio uses the local PostgreSQL service started by Docker Compose. Install
 the web dependencies once, then start the studio alongside the stack:
 
@@ -113,9 +116,9 @@ Set `WEB_PORT=3010` before invoking the script to select another port; the
 agent and Studio use the same exported value for the CORS allowlist.
 The local management API is under `/api` (including `/api/agents`,
 `/api/prompts/base`, and `/api/catalog`); the runner's OpenAPI page is at
-`http://localhost:7860/docs`. The runner's `host` setting is restricted to
-`localhost` or a literal loopback IP because management endpoints have no
-authentication.
+`http://localhost:7860/docs`. The runner's `--host` setting must stay
+`localhost` or a literal loopback IP (such as `127.0.0.1` or `::1`) because
+management endpoints have no authentication.
 
 PostgreSQL is published on loopback port 5439 by default. Set `POSTGRES_PORT`
 to move the Compose port, and set `DATABASE_URL` in `.env` to the same host
