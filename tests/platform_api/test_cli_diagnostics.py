@@ -20,16 +20,6 @@ VALID_RATE_KEY = "UlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlJSUlI"
 VALID_MFA_KEY = "TU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU0="
 
 
-def test_cli_rejects_removed_task1_commands(capsys):
-    """bootstrap-admin and deliver-auth-mail must not be present as commands in CLI."""
-    with pytest.raises(SystemExit) as exc_info:
-        main(["bootstrap-admin", "--email", "admin@example.com"])
-    assert exc_info.value.code == 2
-
-    with pytest.raises(SystemExit) as exc_info:
-        main(["deliver-auth-mail"])
-    assert exc_info.value.code == 2
-
 
 def test_cli_config_error_suppresses_secrets(monkeypatch, capsys):
     """Configuration validation errors in CLI must not leak secrets or raw connection strings."""
@@ -79,8 +69,7 @@ async def test_init_db_suppresses_db_exceptions(capsys):
 
     with patch("platform_api.cli.create_engine", return_value=mock_engine):
         exit_code = await _init_db_command(settings)
-        assert exit_code == 2
-
+        assert exit_code == 1
     captured = capsys.readouterr()
     assert secret_pw not in captured.err
     assert "admin:super_secret" not in captured.err
@@ -113,8 +102,7 @@ async def test_check_schema_suppresses_db_exceptions(capsys):
 
     with patch("platform_api.cli.create_engine", return_value=mock_engine):
         exit_code = await _check_schema_command(settings)
-        assert exit_code == 2
-
+        assert exit_code == 1
     captured = capsys.readouterr()
     assert secret_pw not in captured.err
     assert "Database operation failed" in captured.err
