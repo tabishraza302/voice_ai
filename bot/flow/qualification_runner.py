@@ -572,6 +572,7 @@ def execute_contract_scenarios(
     has_real_model = bool(
         model_obs is not None
         and model_obs.connected
+        and model_obs.revision_pinned
         and model_obs.metadata_strategy in ("separate_stream", "complete_tool")
         and model_obs.error_handling_verified
         and model_obs.server_cancellation_verified
@@ -666,10 +667,11 @@ def execute_contract_scenarios(
         canonical_meas = {"reducer_duration_us": canonicalize_measurement(elapsed_us)}
 
         if reducer_ok:
-            # Reducer orchestration is not voice qualification. Even when the
-            # model/transport observations look clean, no scenario has produced
-            # per-scenario rendered-audio evidence, so the scenario stays
-            # unsupported rather than being promoted to PASSED by a flag.
+            # Reducer orchestration is not voice qualification. Model and
+            # transport observation flags are not per-scenario rendered-audio
+            # evidence, so a reducer pass can never be promoted to PASSED by
+            # them. Each scenario stays UNSUPPORTED until a real runner
+            # supplies bound, per-scenario render evidence.
             scenario_passed = False
             scenario_status = "UNSUPPORTED"
             gap_reasons = []
@@ -1036,6 +1038,7 @@ async def run_qualification(
     has_real_model = bool(
         model_obs is not None
         and model_obs.connected
+        and model_obs.revision_pinned
         and model_obs.metadata_strategy in ("separate_stream", "complete_tool")
         and model_obs.error_handling_verified
         and model_obs.server_cancellation_verified
