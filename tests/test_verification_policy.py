@@ -227,3 +227,13 @@ def test_redact_secrets() -> None:
     assert "secret123" not in sanitized
     assert "myuser:***@" in sanitized
     assert "token=***" in sanitized
+
+
+def test_redact_secrets_preserves_json_with_url_and_email() -> None:
+    json_text = '{"baseURL": "http://127.0.0.1:58714", "user": "admin-1793188841897@example.com"}'
+    sanitized = redact_secrets(json_text)
+    assert sanitized == json_text
+    with_creds = '{"db": "postgresql://myuser:supersecret@127.0.0.1:5432/db"}'
+    masked = redact_secrets(with_creds)
+    assert "supersecret" not in masked
+    assert "postgresql://myuser:***@127.0.0.1:5432/db" in masked
