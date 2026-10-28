@@ -55,7 +55,7 @@ def redact_secrets(text: str) -> str:
         return ""
     # Redact postgres and http/https credentials
     sanitized = re.sub(
-        r"([a-zA-Z0-9+._-]+://[^:]+:)([^@]+)(@)",
+        r"([a-zA-Z0-9+._-]+://[^:/?#@\s\"';]+:)([^/?#@\s\"';]+)(@)",
         r"\1***\3",
         text,
     )
