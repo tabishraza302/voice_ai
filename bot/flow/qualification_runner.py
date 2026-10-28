@@ -192,11 +192,14 @@ class QualificationReport(BaseModel):
     overall_status: Literal["supported", "unsupported"]
     task_2_complete: bool = False
     status_summary: str
+    qualification_scope: Literal["none", "reducer_orchestration_only"] = "none"
     model_observation: ProbeObservation | None = None
     transport_observation: dict[str, Any] | None = None
     capability_report: CapabilityReport | None = None
     contract_scenarios: list[ContractScenarioResult] = Field(default_factory=list)
     scenarios: list[ScenarioResult] = Field(default_factory=list)
+    advertised_configurations: list[dict[str, Any]] = Field(default_factory=list)
+    unsupported_configurations: list[dict[str, Any]] = Field(default_factory=list)
     unsupported_reasons: list[str] = Field(default_factory=list)
     missing_evidence: list[str] = Field(default_factory=list)
     flow_runtime_verified: bool = False
@@ -570,7 +573,7 @@ def execute_contract_scenarios(
         model_obs is not None
         and model_obs.connected
         and model_obs.metadata_strategy in ("separate_stream", "complete_tool")
-        and model_obs.speech_gating_verified
+        and model_obs.error_handling_verified
         and model_obs.server_cancellation_verified
         and not model_obs.unsupported_reasons
     )
@@ -663,23 +666,25 @@ def execute_contract_scenarios(
         canonical_meas = {"reducer_duration_us": canonicalize_measurement(elapsed_us)}
 
         if reducer_ok:
-            if has_real_playback and has_real_model:
-                scenario_passed = True
-                scenario_status = "PASSED"
-                scenario_msg = ""
-            else:
-                scenario_passed = False
-                scenario_status = "UNSUPPORTED"
-                gap_reasons = []
-                if not has_real_playback:
-                    gap_reasons.append("audio render sink evidence (element render ack) missing")
-                if not has_real_model:
-                    gap_reasons.append("real model stream separation / cancellation proof missing")
-                scenario_msg = (
-                    f"Scenario {defn.number} ({defn.name}): Executable reducer scenario verified, "
-                    f"but real voice playback qualification is unsupported: {'; '.join(gap_reasons)}; "
-                    "reducer-only simulation does not qualify voice playback."
-                )
+            # Reducer orchestration is not voice qualification. Even when the
+            # model/transport observations look clean, no scenario has produced
+            # per-scenario rendered-audio evidence, so the scenario stays
+            # unsupported rather than being promoted to PASSED by a flag.
+            scenario_passed = False
+            scenario_status = "UNSUPPORTED"
+            gap_reasons = []
+            if not has_real_playback:
+                gap_reasons.append("audio render sink evidence (element render ack) missing")
+            if not has_real_model:
+                gap_reasons.append("real model stream separation / cancellation proof missing")
+            gap_reasons.append(
+                "no per-scenario real audio/render evidence was executed"
+            )
+            scenario_msg = (
+                f"Scenario {defn.number} ({defn.name}): Executable reducer scenario verified, "
+                f"but real voice playback qualification is unsupported: {'; '.join(gap_reasons)}; "
+                "reducer-only simulation does not qualify voice playback."
+            )
         else:
             scenario_passed = False
             scenario_status = "FAILED"
@@ -1032,7 +1037,7 @@ async def run_qualification(
         model_obs is not None
         and model_obs.connected
         and model_obs.metadata_strategy in ("separate_stream", "complete_tool")
-        and model_obs.speech_gating_verified
+        and model_obs.error_handling_verified
         and model_obs.server_cancellation_verified
         and not model_obs.unsupported_reasons
     )
@@ -1046,6 +1051,78 @@ async def run_qualification(
     )
     overall_status: Literal["supported", "unsupported"] = "supported" if all_passed else "unsupported"
     task_2_complete = all_passed
+
+    # Record every probed tuple explicitly. A tuple is advertised only when all
+    # seven required scenario classes passed for it; a diagnostic probe alone
+    # never populates this list.
+    unsupported_configurations: list[dict[str, Any]] = []
+    scenario_gap = "All seven required qualification scenarios have not been executed."
+
+    if model_obs is not None:
+        model_reasons = list(model_obs.unsupported_reasons)
+        if not model_obs.connected:
+            model_reasons.append("Model connection could not be established.")
+        if not model_obs.revision_pinned:
+            model_reasons.append("Model revision is not pinned to a full sha256 digest.")
+        if model_obs.metadata_strategy == "none":
+            model_reasons.append("No verified typed state-proposal separation.")
+        if not model_obs.server_cancellation_verified:
+            model_reasons.append("Server-side generation cancellation was not verified.")
+        if not has_real_playback or not has_real_model:
+            model_reasons.append(scenario_gap)
+        if not all_passed:
+            unsupported_configurations.append(
+                {
+                    "kind": "model",
+                    "endpoint": model_obs.base_url,
+                    "model": model_obs.configured_model,
+                    "model_revision": model_obs.pinned_model_revision,
+                    "metadata": model_obs.metadata_strategy,
+                    "speech_gating": (
+                        model_obs.supports_separate_stream
+                        or model_obs.supports_complete_tool
+                    ),
+                    "cancel_generation": model_obs.server_cancellation_verified,
+                    "advertised": False,
+                    "reasons": model_reasons,
+                }
+            )
+
+    if transport_res is not None and not all_passed:
+        transport_reasons = list(transport_res.evidence.unsupported_reasons)
+        transport_reasons.append(scenario_gap)
+        unsupported_configurations.append(
+            {
+                "kind": "transport",
+                "endpoint": transport_endpoint,
+                "adapter_id": transport_res.evidence.adapter_id,
+                "playback": transport_res.playback_capability,
+                "advertised": False,
+                "reasons": transport_reasons,
+            }
+        )
+
+    advertised_configurations: list[dict[str, Any]] = []
+    if all_passed:
+        # This branch is unreachable while the transport probe reports
+        # unqualified playback; keep the shape explicit for a future real
+        # scenario runner that can actually satisfy the gate.
+        advertised_configurations.append(
+            {
+                "kind": "model+transport",
+                "model": model_obs.configured_model if model_obs else None,
+                "model_revision": (
+                    model_obs.pinned_model_revision if model_obs else None
+                ),
+                "adapter_id": (
+                    transport_res.evidence.adapter_id if transport_res else None
+                ),
+                "playback": (
+                    transport_res.playback_capability if transport_res else None
+                ),
+            }
+        )
+
     if all_passed:
         summary = "All 7 contract qualification scenarios passed with verified real model and playback evidence."
     else:
@@ -1053,18 +1130,24 @@ async def run_qualification(
             "UNSUPPORTED: Task 2 is incomplete. Real qualification requires independent "
             "empirical evidence for model protocol separation, bound physical/browser transport "
             "rendering acknowledgements, and all 7 executed scenario classes defined in flow-contract.md §9. "
-            "Reducer-only simulations or mock passes do not satisfy voice qualification."
+            "Reducer-only simulations or mock passes do not satisfy voice qualification. "
+            "No configuration is advertised."
         )
 
     return QualificationReport(
         overall_status=overall_status,
         task_2_complete=task_2_complete,
         status_summary=summary,
+        qualification_scope=(
+            "reducer_orchestration_only" if flow_runtime_verified else "none"
+        ),
         model_observation=model_obs,
         transport_observation=transport_obs_dict,
         capability_report=capability_rep,
         contract_scenarios=contract_scenarios,
         scenarios=scenarios,
+        advertised_configurations=advertised_configurations,
+        unsupported_configurations=unsupported_configurations,
         unsupported_reasons=unsupported_reasons,
         missing_evidence=missing_evidence,
         flow_runtime_verified=flow_runtime_verified,
