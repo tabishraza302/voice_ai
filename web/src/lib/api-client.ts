@@ -21,9 +21,14 @@ export class ApiClient {
   getBaseUrl(): string {
     return this.baseUrl;
   }
-
+  isLocalClient(): boolean {
+    return true;
+  }
 
   private async request<T>(endpoint: string, options?: RequestInit): Promise<T> {
+    if (process.env.NEXT_PUBLIC_APP_MODE === "saas") {
+      throw new Error("Local management ApiClient cannot be called in SaaS mode");
+    }
     const url = `${this.baseUrl}${endpoint.startsWith("/") ? endpoint : `/${endpoint}`}`;
     const headers = {
       "Content-Type": "application/json",
