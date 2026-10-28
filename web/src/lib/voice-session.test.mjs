@@ -4,6 +4,7 @@ import { VoiceSession } from "./voice-session.ts";
 const sessions = new Set();
 
 class FakeTrack {
+  enabled = true;
   stopped = false;
   stop() { this.stopped = true; }
 }
@@ -16,16 +17,27 @@ class FakePeerConnection {
   tracks = [];
   transceivers = [];
   channel = {
-    readyState: "open",
+    readyState: "connecting",
     closed: false,
     sent: [],
+    onopen: null,
     close() { this.closed = true; this.readyState = "closed"; },
     send(message) { this.sent.push(message); },
   };
   constructor(config) { this.config = config; sessions.add(this); }
   addTrack(track) { this.tracks.push(track); }
   addTransceiver(kind, options) { this.transceivers.push({ kind, options }); }
-  createDataChannel(label, options) { this.channel.label = label; this.channel.options = options; return this.channel; }
+  createDataChannel(label, options) {
+    this.channel.label = label;
+    this.channel.options = options;
+    queueMicrotask(() => {
+      if (!this.channel.closed) {
+        this.channel.readyState = "open";
+        this.channel.onopen?.();
+      }
+    });
+    return this.channel;
+  }
   async createOffer() { return { sdp: "local-sdp", type: "offer" }; }
   async setLocalDescription(description) { this.localDescription = description; }
   async setRemoteDescription(description) { this.remoteDescription = description; }
@@ -239,23 +251,70 @@ describe("sendText", () => {
     expect(harness.session.sendText("hello")).toBe(false);
   });
 
-  test("returns true and sends the text message on an open channel", async () => {
+});
+
+describe("mute management", () => {
+  test("starts unmuted by default and signals enabled track status on open", async () => {
     const harness = createHarness();
     await harness.session.connect({ offerUrl: OFFER_URL, agentId: agent.id });
     const channel = harness.channel();
 
-    expect(harness.session.sendText("hello")).toBe(true);
-    expect(channel.sent).toEqual([JSON.stringify({ type: "send-text", text: "hello" })]);
+    expect(harness.session.isMuted()).toBe(false);
+    expect(harness.track.enabled).toBe(true);
+    expect(channel.sent).toContain(
+      JSON.stringify({
+        type: "signalling",
+        message: { type: "trackStatus", receiver_index: 0, enabled: true },
+      })
+    );
   });
 
-  test("returns false without throwing on a closed channel", async () => {
+  test("preserves muted state set before media is connected", async () => {
+    const harness = createHarness();
+    harness.session.setMuted(true);
+    expect(harness.session.isMuted()).toBe(true);
+
+    await harness.session.connect({ offerUrl: OFFER_URL, agentId: agent.id });
+    const channel = harness.channel();
+
+    expect(harness.track.enabled).toBe(false);
+    expect(channel.sent).toContain(
+      JSON.stringify({
+        type: "signalling",
+        message: { type: "trackStatus", receiver_index: 0, enabled: false },
+      })
+    );
+    expect(channel.sent).not.toContain(
+      JSON.stringify({
+        type: "signalling",
+        message: { type: "trackStatus", receiver_index: 0, enabled: true },
+      })
+    );
+  });
+
+  test("toggles track enabled and sends signalling on active connection", async () => {
     const harness = createHarness();
     await harness.session.connect({ offerUrl: OFFER_URL, agentId: agent.id });
     const channel = harness.channel();
-    channel.readyState = "closed";
 
-    expect(harness.session.sendText("hello")).toBe(false);
-    expect(() => harness.session.sendText("again")).not.toThrow();
-    expect(channel.sent).toEqual([]);
+    harness.session.setMuted(true);
+    expect(harness.session.isMuted()).toBe(true);
+    expect(harness.track.enabled).toBe(false);
+    expect(channel.sent.at(-1)).toBe(
+      JSON.stringify({
+        type: "signalling",
+        message: { type: "trackStatus", receiver_index: 0, enabled: false },
+      })
+    );
+
+    harness.session.setMuted(false);
+    expect(harness.session.isMuted()).toBe(false);
+    expect(harness.track.enabled).toBe(true);
+    expect(channel.sent.at(-1)).toBe(
+      JSON.stringify({
+        type: "signalling",
+        message: { type: "trackStatus", receiver_index: 0, enabled: true },
+      })
+    );
   });
 });
