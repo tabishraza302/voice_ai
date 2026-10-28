@@ -1,0 +1,45 @@
+{
+  "fixture_version": 1,
+  "canonicalization": "canonical_json_v1",
+  "vectors": [
+    {
+      "id": "hindi-key-order",
+      "input": {
+        "b": 2,
+        "a": "नमस्ते"
+      },
+      "canonical_utf8": "{\"a\":\"नमस्ते\",\"b\":2}",
+      "authoring_sha256": "86a59ee4e8e95543e0d6de3561eace0f4857c627b84297ef1c9d0e8786e3a606"
+    },
+    {
+      "id": "control-escapes",
+      "input": {
+        "s": "quote\" slash/ backslash\\ tab\t line\n"
+      },
+      "canonical_utf8": "{\"s\":\"quote\\\" slash/ backslash\\\\ tab\\t line\\n\"}",
+      "authoring_sha256": "5719955a57b1c299f2d5a57f0600c85aca57e3a1b06eacd057f8348326d0d07f"
+    },
+    {
+      "id": "ordered-array",
+      "input": {
+        "transitions": [
+          "first",
+          "second"
+        ]
+      },
+      "canonical_utf8": "{\"transitions\":[\"first\",\"second\"]}",
+      "authoring_sha256": "9621f27ffbe2512d3ab368d830a80f2b19acedbcde436d4684e7d5844a371133"
+    },
+    {
+      "id": "safe-integers",
+      "input": {
+        "negative": -9007199254740991,
+        "zero": 0,
+        "positive": 9007199254740991
+      },
+      "canonical_utf8": "{\"negative\":-9007199254740991,\"positive\":9007199254740991,\"zero\":0}",
+      "authoring_sha256": "61481e80007eee69b3f6402d96643e3360e1be317f1dcffb9d18c132851da4bf"
+    }
+  ],
+  "scope": "Canonical encoding and source/authoring hashes only; normalized compiler manifests require the planned compiler tests."
+}
