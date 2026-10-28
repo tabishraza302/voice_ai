@@ -1338,56 +1338,151 @@ class TestContractReviewerInvariants:
             CapabilityReport,
             ScenarioResult,
             validate_capability_report,
+            REQUIRED_SCENARIO_CLASSES,
         )
 
-        # 1. Report with failing scenario produces QUALIFICATION_FAILED
+        all_7_cases = [
+            ScenarioResult(
+                scenario_id=f"sc_{sc_class}",
+                scenario_class=sc_class,
+                passed=True,
+                measurements={"latency_ms": 12, "buffer_drain_ms": 4},
+                raw_evidence={"trace_id": f"tr_{sc_class}", "audio_sha256": "abc123"},
+            )
+            for sc_class in REQUIRED_SCENARIO_CLASSES
+        ]
+
+        valid_report = CapabilityReport(
+            protocol_version=1,
+            adapter_id="webrtc_browser_transport",
+            adapter_version="1.0.0",
+            model_revision="pinned/qwen-3.5",
+            metadata="separate_stream",
+            speech_gating=True,
+            cancel_generation=True,
+            playback="qualified_fragment_completion",
+            locales=["en", "hi"],
+            profile_hash="a" * 64,
+            source_revision="git_rev_12345",
+            fixture_hashes={"valid_card": "f" * 64},
+            cases=all_7_cases,
+            measurements={"p95_ttft_ms": 120, "p99_playback_ms": 300},
+            budgets={"max_ttft_ms": 500, "max_playback_ms": 1000},
+            raw_evidence={"run_id": "qual_run_01", "pcap_evidence": "packet_capture_ref"},
+            playback_boundary_description="WebRTC data-channel correlated render ack",
+            limitations=["Requires Chrome 120+"],
+        )
+        valid_dump = valid_report.model_dump()
+        valid_dump["report_hash"] = valid_report.compute_hash()
+
+        # 1. Fully compliant report with all 7 groups passes with 0 diagnostics
+        diags_valid = validate_capability_report(valid_dump)
+        assert len(diags_valid) == 0
+
+        # 1b. Qualified playback without recorded configured budgets is incomplete
+        no_budget_report = valid_report.model_copy(update={"budgets": {}})
+        no_budget_dump = no_budget_report.model_dump()
+        no_budget_dump["report_hash"] = no_budget_report.compute_hash()
+        diags_no_budget = validate_capability_report(no_budget_dump)
+        assert any(
+            d.code == "QUALIFICATION_INCOMPLETE" and d.path == "/budgets"
+            for d in diags_no_budget
+        )
+
+        # 1c. protocol_version is an integer discriminator, never a boolean
+        bool_version_dump = dict(valid_dump)
+        bool_version_dump["protocol_version"] = True
+        diags_bool_version = validate_capability_report(bool_version_dump)
+        assert any(
+            d.code == "QUALIFICATION_INVALID" and d.path == "/protocol_version"
+            for d in diags_bool_version
+        )
+
+        # 1d. report_hash must be lowercase 64-hex
+        upper_hash_dump = dict(valid_dump)
+        upper_hash_dump["report_hash"] = valid_dump["report_hash"].upper()
+        diags_upper_hash = validate_capability_report(upper_hash_dump)
+        assert any(
+            d.code == "QUALIFICATION_INVALID" and d.path == "/report_hash"
+            for d in diags_upper_hash
+        )
+
+        # 2. Tampered report produces QUALIFICATION_HASH_MISMATCH
+        tampered_dump = dict(valid_dump)
+        tampered_dump["model_revision"] = "forged/tampered_revision"
+        diags_tampered = validate_capability_report(tampered_dump)
+        assert any(d.code == "QUALIFICATION_HASH_MISMATCH" for d in diags_tampered)
+
+        # 3. Missing or empty report_hash produces QUALIFICATION_INVALID
+        no_hash_dump = dict(valid_dump)
+        no_hash_dump.pop("report_hash", None)
+        diags_no_hash = validate_capability_report(no_hash_dump)
+        assert any(d.code == "QUALIFICATION_INVALID" and d.path == "/report_hash" for d in diags_no_hash)
+
+        # 4. Missing required measurements or raw evidence produces QUALIFICATION_INVALID
+        no_evidence_dump = dict(valid_dump)
+        no_evidence_dump["raw_evidence"] = {}
+        no_evidence_dump["report_hash"] = CapabilityReport(**no_evidence_dump).compute_hash()
+        diags_no_evidence = validate_capability_report(no_evidence_dump)
+        assert any(d.code == "QUALIFICATION_INVALID" and d.path == "/raw_evidence" for d in diags_no_evidence)
+
+        # 5. Omitting any of the 7 mandatory scenario groups produces QUALIFICATION_INCOMPLETE
+        for omitted_class in REQUIRED_SCENARIO_CLASSES:
+            subset_cases = [c for c in all_7_cases if c.scenario_class != omitted_class]
+            inc_report = valid_report.model_copy(update={"cases": subset_cases})
+            inc_dump = inc_report.model_dump()
+            inc_dump["report_hash"] = inc_report.compute_hash()
+            diags_inc = validate_capability_report(inc_dump)
+            assert any(d.code == "QUALIFICATION_INCOMPLETE" and omitted_class in d.message for d in diags_inc)
+
+        # 6. Failing scenario produces QUALIFICATION_FAILED
         failing_cases = [
-            ScenarioResult(scenario_id="s1", scenario_class="normal_en_hi", passed=False, error_message="STT failure"),
-            ScenarioResult(scenario_id="s2", scenario_class="barge_in", passed=True),
-            ScenarioResult(scenario_id="s3", scenario_class="correction", passed=True),
-            ScenarioResult(scenario_id="s4", scenario_class="refusal", passed=True),
+            ScenarioResult(
+                scenario_id="sc_fail",
+                scenario_class="normal_en_hi",
+                passed=False,
+                error_message="Transport audio stall detected",
+                measurements={"packet_loss_permille": 500},
+            ),
+            *[c for c in all_7_cases if c.scenario_class != "normal_en_hi"],
         ]
-        failing_report = CapabilityReport(
-            protocol_version=1,
-            adapter_id="fail_adapter",
-            adapter_version="1.0.0",
-            model_revision="pinned/1",
-            metadata="separate_stream",
-            speech_gating=True,
-            cancel_generation=True,
-            playback="qualified_fragment_completion",
-            locales=["en"],
-            profile_hash="profile_hash_fail",
-            source_revision="rev_1",
-            cases=failing_cases,
-            playback_boundary_description="Failing test",
-        )
-        diags = validate_capability_report(failing_report.model_dump())
-        codes = [d.code for d in diags]
-        assert "QUALIFICATION_FAILED" in codes
+        fail_report = valid_report.model_copy(update={"cases": failing_cases})
+        fail_dump = fail_report.model_dump()
+        fail_dump["report_hash"] = fail_report.compute_hash()
+        diags_fail = validate_capability_report(fail_dump)
+        assert any(d.code == "QUALIFICATION_FAILED" for d in diags_fail)
 
-        # 2. Report missing required scenario produces QUALIFICATION_INCOMPLETE
-        incomplete_cases = [
-            ScenarioResult(scenario_id="s1", scenario_class="normal_en_hi", passed=True),
-        ]
-        incomplete_report = CapabilityReport(
-            protocol_version=1,
-            adapter_id="inc_adapter",
-            adapter_version="1.0.0",
-            model_revision="pinned/1",
-            metadata="separate_stream",
-            speech_gating=True,
-            cancel_generation=True,
-            playback="qualified_fragment_completion",
-            locales=["en"],
-            profile_hash="profile_hash_inc",
-            source_revision="rev_1",
-            cases=incomplete_cases,
-            playback_boundary_description="Incomplete test",
-        )
-        diags2 = validate_capability_report(incomplete_report.model_dump())
-        codes2 = [d.code for d in diags2]
-        assert "QUALIFICATION_INCOMPLETE" in codes2
+        # 7. Float measurements are strictly rejected before compute_hash (prevents float serialization)
+        from bot.flow.qualification import canonicalize_measurement
+        assert canonicalize_measurement(12.5) == "12.5"
+        assert canonicalize_measurement(100) == 100
+        assert canonicalize_measurement("45.125") == "45.125"
+        # Exact expansion, not a fixed-precision round trip.
+        assert canonicalize_measurement(1e-10) == "0.0000000001"
+        assert canonicalize_measurement(1.2345678901234567) == "1.2345678901234567"
+        assert canonicalize_measurement(-0.0) == "0"
+        with pytest.raises(ValueError, match="Boolean"):
+            canonicalize_measurement(True)
+        with pytest.raises(ValueError, match="NaN"):
+            canonicalize_measurement(float("nan"))
+
+        with pytest.raises(ValidationError):
+            CapabilityReport(**{**valid_dump, "measurements": {"latency": 12.5}})
+
+        with pytest.raises(ValidationError):
+            ScenarioResult(scenario_id="s1", scenario_class="normal_en_hi", passed=True, measurements={"latency": 12.5})
+
+        # Raw dictionary with float measurement fails report validation
+        float_dump = dict(valid_dump)
+        float_dump["measurements"] = {"latency_ms": 12.5}
+        diags_float = validate_capability_report(float_dump)
+        assert any(d.code == "QUALIFICATION_INVALID" and d.path == "/measurements/latency_ms" for d in diags_float)
+
+        # Decimal string measurements (e.g. from canonicalize_measurement) compute hash and validate cleanly
+        dec_report = valid_report.model_copy(update={"measurements": {"p95_ttft_ms": canonicalize_measurement(120.5), "drain_ms": "4.25"}})
+        dec_dump = dec_report.model_dump()
+        dec_dump["report_hash"] = dec_report.compute_hash()
+        assert len(validate_capability_report(dec_dump)) == 0
 
     def test_version_bound_candidate_confirmation_with_stale_yes(self) -> None:
         with open(FIXTURES_DIR / "valid-credit-card-en-hi.json", "r", encoding="utf-8") as f:
