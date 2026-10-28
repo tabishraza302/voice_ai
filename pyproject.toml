@@ -61,6 +61,12 @@ dependencies = [
     "psutil==7.1.3",
     # Settings.
     "pydantic-settings==2.12.0",
+    # Direct control-plane dependencies, already selected in the lockfile.
+    "fastapi==0.141.1",
+    "uvicorn==0.54.0",
+    "pydantic==2.14.1",
+    "email-validator==2.3.0",
+    "cryptography==50.0.2",
     # Text processing for the mlx-audio Kokoro TTS model. mlx-audio's
     # Kokoro pipeline raises ImportError without it, which made the
     # `tts_provider=mlx-audio` swap unusable. The `en` extra is what
@@ -84,6 +90,8 @@ swaps = [
 dev = [
     "pytest==9.0.1",
     "pytest-asyncio==1.3.0",
+    "httpx==0.28.1",
+    "jsonschema==4.26.0",
     # What `python -m pipecat.evals` (the eval harness) needs. The
     # `cli` extra would also work but pulls ruff, chromadb and
     # kubernetes; these four are what the eval command actually
