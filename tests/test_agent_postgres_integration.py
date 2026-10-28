@@ -15,13 +15,19 @@ from bot.db.base import Base
 from bot.db.seeds.presets import DEFAULT_BASE_PROMPT
 import bot.db.models  # noqa: F401
 
+pytestmark = [pytest.mark.postgres, pytest.mark.asyncio]
+
 
 @pytest_asyncio.fixture
 async def postgres_schema():
     database_url = os.environ.get("TEST_DATABASE_URL")
     if not database_url:
+        if os.environ.get("VERIFY_REQUIRED") == "1":
+            pytest.fail("required qualification prerequisite unavailable: TEST_DATABASE_URL not set")
         pytest.skip("set TEST_DATABASE_URL to run PostgreSQL integration tests")
 
+    if "sqlite" in database_url.lower():
+        raise ValueError("SQLite fallback is forbidden for PostgreSQL integration tests")
     schema = f"voice_ai_test_{uuid.uuid4().hex}"
     admin_engine = create_async_engine(database_url)
     async with admin_engine.begin() as connection:

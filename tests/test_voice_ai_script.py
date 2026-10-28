@@ -132,6 +132,11 @@ def test_start_web_and_stop_manage_only_the_project_process(tmp_path):
     )
     assert started.returncode == 0, started.stderr or started.stdout
     web_pid = int((repo / "data/run/web.pid").read_text().split("|", 1)[0])
+    # Await launch.txt generation by the background node process using event/condition polling
+    for _ in range(50):
+        if capture.is_file() and capture.stat().st_size > 0:
+            break
+        time.sleep(0.05)
     assert capture.read_text().splitlines()[0] == str(repo / "web")
 
     stopped = subprocess.run(
@@ -239,3 +244,101 @@ def test_lookahead_bench_command_forwards_arguments_to_the_benchmark(tmp_path):
     assert command == (
         "run python scripts/bench_stt_lookahead.py --clips 5 --lookaheads 13,6"
     )
+
+
+def test_current_test_subcommand_still_invokes_pytest(tmp_path):
+    """Preserve existing test command dispatch to pytest with repository arguments."""
+    repo = _isolated_repo(tmp_path)
+    capture = tmp_path / "launch.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "uv").write_text(
+        "#!/bin/sh\nprintf '%s\\n%s\\n' \"$PWD\" \"$*\" > \"$CAPTURE\"\n"
+    )
+    (fake_bin / "uv").chmod(0o755)
+    env = os.environ.copy()
+    env.update({"PATH": f"{fake_bin}:{env['PATH']}", "CAPTURE": str(capture)})
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/voice-ai.sh"),
+            "test",
+            "-k",
+            "fast",
+        ],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    workdir, command = capture.read_text().splitlines()
+    assert workdir == str(repo)
+    assert command == "run pytest -k fast"
+
+
+def test_verify_subcommand_invokes_verify_script_with_frozen(tmp_path):
+    """Verification commands must invoke scripts/verify.py with --frozen."""
+    repo = _isolated_repo(tmp_path)
+    capture = tmp_path / "launch.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "uv").write_text(
+        "#!/bin/sh\nprintf '%s\\n%s\\n' \"$PWD\" \"$*\" > \"$CAPTURE\"\n"
+    )
+    (fake_bin / "uv").chmod(0o755)
+    env = os.environ.copy()
+    env.update({"PATH": f"{fake_bin}:{env['PATH']}", "CAPTURE": str(capture)})
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/voice-ai.sh"),
+            "verify",
+            "unit",
+        ],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    workdir, command = capture.read_text().splitlines()
+    assert workdir == str(repo)
+    assert command.startswith("run --frozen python ")
+    assert command.endswith("scripts/verify.py unit")
+
+
+def test_schema_init_subcommand_invokes_platform_api_cli(tmp_path):
+    """scripts/voice-ai.sh schema init dispatches to platform_api.cli init-db."""
+    repo = _isolated_repo(tmp_path)
+    capture = tmp_path / "launch.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "uv").write_text(
+        "#!/bin/sh\nprintf '%s\\n%s\\n' \"$PWD\" \"$*\" > \"$CAPTURE\"\n"
+    )
+    (fake_bin / "uv").chmod(0o755)
+    env = os.environ.copy()
+    env.update({"PATH": f"{fake_bin}:{env['PATH']}", "CAPTURE": str(capture)})
+
+    result = subprocess.run(
+        [
+            str(repo / "scripts/voice-ai.sh"),
+            "schema",
+            "init",
+        ],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    workdir, command = capture.read_text().splitlines()
+    assert workdir == str(repo)
+    assert command == "run python -m platform_api.cli init-db"
