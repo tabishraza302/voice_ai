@@ -432,9 +432,25 @@ This project integrates open models and tools with the following upstream licens
 
 ```
 bot/            The agent: Pipecat pipeline, service factories, language routing, observers
+platform_api/   Platform control plane: account identity, wallet accounting, schema lifecycle
 evals/          FLEURS WER/CER quality evaluation harness & scenario tests
 scripts/        Management script (voice-ai.sh), benchmarks, tier calculation
 tests/          Pytest regression suite (modularity, observers, pipeline, config)
 observability/  Collector configuration, Prometheus scrape rules, alert definitions, Grafana provisioning
 data/           Local benchmark outputs and database state (gitignored)
+```
+
+---
+
+## Platform Control Plane Entrypoints
+
+```bash
+# Initialize fresh platform database schema
+uv run python -m platform_api.cli init-db
+
+# Verify database schema matches platform metadata
+uv run python -m platform_api.cli check-schema
+
+# Start platform API server
+uv run uvicorn platform_api.app:create_app --factory --host 127.0.0.1 --port 8000
 ```
