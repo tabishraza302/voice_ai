@@ -15,6 +15,7 @@ from bot.flow.qualification_runner import (
     QualificationReport,
     build_contract_scenario_results,
     build_unexecuted_scenarios,
+    execute_contract_scenarios,
     main_async,
     parse_args,
     run_qualification,
@@ -405,3 +406,26 @@ async def test_main_async_with_profile_populates_endpoints(tmp_path):
         assert code == 1
         mock_model_probe.assert_awaited_once()
         mock_trans_probe.assert_awaited_once()
+
+
+def test_execute_contract_scenarios_runs_all_seven_and_reports_unsupported_without_playback():
+    """Executable scenario verification runs all 7 scenarios across reducer boundary and reports unsupported."""
+    c_res, s_res, unsupported, missing = execute_contract_scenarios()
+    assert len(c_res) == 7
+    assert len(s_res) == 7
+    assert all(not c.passed for c in c_res)
+    assert all(not s.passed for s in s_res)
+    assert all(c.status == "UNSUPPORTED" for c in c_res)
+    # All 7 scenarios have empirical execution duration in canonical integers
+    for c in c_res:
+        assert "reducer_duration_us" in c.measurements
+        assert isinstance(c.measurements["reducer_duration_us"], int)
+        assert c.measurements["reducer_duration_us"] >= 0
+        assert "real voice playback qualification is unsupported" in c.error_message
+    for s in s_res:
+        assert "reducer_duration_us" in s.measurements
+        assert s.raw_evidence.get("reducer_verified") is True
+        assert s.raw_evidence.get("has_real_playback") is False
+    assert len(missing) > 0
+
+

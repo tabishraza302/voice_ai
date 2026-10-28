@@ -6,6 +6,7 @@ Registered under the pytest 'qualification' marker per verification-plan.md §4 
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -16,6 +17,7 @@ from bot.adapter_qualification import (
     QualificationReport,
     build_contract_scenario_results,
     build_unexecuted_scenarios,
+    execute_contract_scenarios,
     main_async,
     run_qualification,
 )
@@ -24,6 +26,15 @@ from bot.flow.schemas import AdapterCapabilities
 from bot.flow.transport_probe import TransportProbeEvidence, TransportProbeResult
 
 pytestmark = pytest.mark.qualification
+
+
+def test_voice_ai_script_exposes_flow_qualify_command():
+    """flow-contract §9 requires the documented script entrypoint, not just a module."""
+    script = Path(__file__).resolve().parents[2] / "scripts" / "voice-ai.sh"
+    text = script.read_text(encoding="utf-8")
+    assert "cmd_flow_qualify()" in text
+    assert "flow-qualify) cmd_flow_qualify" in text
+    assert "python -m bot.adapter_qualification" in text
 
 
 @pytest.mark.asyncio
@@ -159,3 +170,18 @@ async def test_adapter_qualification_unadapted_transport_produces_unqualified_pl
         assert report.transport_observation is not None
         assert report.transport_observation["playback_capability"] == "unqualified"
         assert len(report.missing_evidence) > 0
+
+
+@pytest.mark.asyncio
+async def test_adapter_qualification_executes_scenarios_unsupported_without_playback():
+    """run_qualification executes genuine scenario verification and reports unsupported without playback."""
+    report = await run_qualification()
+    assert report.overall_status == "unsupported"
+    assert report.task_2_complete is False
+    assert len(report.contract_scenarios) == 7
+    for res in report.contract_scenarios:
+        assert res.passed is False
+        assert res.status == "UNSUPPORTED"
+        assert "reducer_duration_us" in res.measurements
+        assert isinstance(res.measurements["reducer_duration_us"], int)
+        assert len(res.error_message) > 0
