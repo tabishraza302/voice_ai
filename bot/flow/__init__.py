@@ -37,9 +37,11 @@ from bot.flow.extraction import (
     is_stop_text,
 )
 from bot.flow.qualification import (
+    CanonicalMeasurement,
     CapabilityReport,
     ScenarioClass,
     ScenarioResult,
+    canonicalize_measurement,
     validate_capability_report,
 )
 from bot.flow.schemas import (
@@ -52,6 +54,7 @@ from bot.flow.schemas import (
     CandidateCaptureUpdate,
     CandidateFieldState,
     CandidateReason,
+    CaptureUpdate,
     ChatCommittedOutputEvent,
     CompiledFlow,
     ConfirmCaptureUpdate,
@@ -139,11 +142,12 @@ __all__ = [
     "is_stop_text",
     "is_user_stop_text",
     # Qualification
+    "CanonicalMeasurement",
     "CapabilityReport",
     "ScenarioClass",
     "ScenarioResult",
+    "canonicalize_measurement",
     "validate_capability_report",
-    # Tools
     "ToolContract",
     "ToolRegistry",
     # Schemas
