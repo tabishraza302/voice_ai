@@ -24,6 +24,85 @@ export interface AgentFormErrors {
 const MAX_SLUG_LENGTH = 64;
 const FALLBACK_SLUG = "voice-agent";
 
+export const DEFAULT_NEW_AGENT_FORM: AgentFormValues = {
+  name: "New Voice Agent",
+  slug: "new-voice-agent",
+  description: "",
+  persona_prompt:
+    "You are a friendly, knowledgeable, and quick voice assistant. Respond with brevity and natural speech rhythm.",
+  llm_model: "qwen3.5:4b",
+  llm_temperature: 0.6,
+  llm_reasoning_effort: "none",
+  llm_max_tokens: 256,
+  stt_provider: "mlx-audio-realtime",
+  tts_voice_en: "af_heart",
+  tts_voice_hi: "hf_alpha",
+  tts_speed: 1.0,
+};
+
+export function defaultAgentFormValues(catalog?: {
+  llm_models?: Array<{ id: string }>;
+  stt_providers?: Array<{ id: string }>;
+  tts_voices?: Array<{ id: string; language: "en" | "hi" }>;
+}): AgentFormValues {
+  const firstModel = catalog?.llm_models?.[0]?.id;
+  const firstStt = catalog?.stt_providers?.[0]?.id;
+  const firstEnVoice = catalog?.tts_voices?.find((v) => v.language === "en")?.id;
+  const firstHiVoice = catalog?.tts_voices?.find((v) => v.language === "hi")?.id;
+
+  return {
+    ...DEFAULT_NEW_AGENT_FORM,
+    llm_model: firstModel ?? DEFAULT_NEW_AGENT_FORM.llm_model,
+    stt_provider: firstStt ?? DEFAULT_NEW_AGENT_FORM.stt_provider,
+    tts_voice_en: firstEnVoice ?? DEFAULT_NEW_AGENT_FORM.tts_voice_en,
+    tts_voice_hi: firstHiVoice ?? DEFAULT_NEW_AGENT_FORM.tts_voice_hi,
+  };
+}
+
+export function resolveModelOptions(
+  selectedModel: string,
+  catalogModels: Array<{ id: string; name: string }>
+): Array<{ id: string; name: string; isUnavailable?: boolean }> {
+  const inCatalog = catalogModels.some((m) => m.id === selectedModel);
+  if (!selectedModel || inCatalog) {
+    return catalogModels;
+  }
+  return [
+    {
+      id: selectedModel,
+      name: `${selectedModel} (unavailable)`,
+      isUnavailable: true,
+    },
+    ...catalogModels,
+  ];
+}
+export function reconcileCatalogSelection({
+  currentModel,
+  initialModel,
+  modelTouched,
+  catalogModels,
+}: {
+  currentModel: string;
+  initialModel: string;
+  modelTouched: boolean;
+  catalogModels?: Array<{ id: string }>;
+}): string {
+  // Once explicitly selected or touched by user, preserve the user choice.
+  if (modelTouched) {
+    return currentModel;
+  }
+  // If catalog is empty or includes current selection, keep it.
+  if (!catalogModels?.length || catalogModels.some((m) => m.id === currentModel)) {
+    return currentModel;
+  }
+  // If model is untouched and matches the initial default, update to first catalog model.
+  if (currentModel === initialModel) {
+    return catalogModels[0].id;
+  }
+  return currentModel;
+}
+
+
 export function slugify(value: string): string {
   return (
     value

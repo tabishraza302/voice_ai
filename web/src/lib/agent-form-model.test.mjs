@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
+  DEFAULT_NEW_AGENT_FORM,
+  defaultAgentFormValues,
   formFromAgent,
   isDirty,
+  reconcileCatalogSelection,
+  resolveModelOptions,
   slugify,
   toCreatePayload,
   toUpdatePayload,
@@ -82,6 +86,111 @@ describe("formFromAgent", () => {
 
     expect(values.llm_reasoning_effort).toBe("");
     expect(values.description).toBe("");
+  });
+});
+
+describe("defaultAgentFormValues", () => {
+  test("falls back to default initial values when catalog is empty or undefined", () => {
+    const emptyDefaults = defaultAgentFormValues();
+    expect(emptyDefaults.llm_model).toBe(DEFAULT_NEW_AGENT_FORM.llm_model);
+    expect(emptyDefaults.stt_provider).toBe(DEFAULT_NEW_AGENT_FORM.stt_provider);
+    expect(emptyDefaults.tts_voice_en).toBe(DEFAULT_NEW_AGENT_FORM.tts_voice_en);
+    expect(emptyDefaults.tts_voice_hi).toBe(DEFAULT_NEW_AGENT_FORM.tts_voice_hi);
+  });
+
+  test("picks the first available model from the catalog", () => {
+    const customCatalog = {
+      llm_models: [
+        { id: "gemma3:4b", name: "Gemma 3 4B" },
+        { id: "qwen2.5:3b", name: "Qwen 2.5 3B" },
+      ],
+      stt_providers: [{ id: "mlx-whisper", name: "Whisper" }],
+      tts_voices: [
+        { id: "af_bella", language: "en" },
+        { id: "hf_beta", language: "hi" },
+      ],
+    };
+    const values = defaultAgentFormValues(customCatalog);
+    expect(values.llm_model).toBe("gemma3:4b");
+    expect(values.stt_provider).toBe("mlx-whisper");
+    expect(values.tts_voice_en).toBe("af_bella");
+    expect(values.tts_voice_hi).toBe("hf_beta");
+  });
+});
+
+describe("resolveModelOptions", () => {
+  const catalogModels = [
+    { id: "gemma3:4b", name: "Gemma 3 4B" },
+    { id: "qwen2.5:3b", name: "Qwen 2.5 3B" },
+  ];
+
+  test("returns catalog models unchanged when selected model is in catalog", () => {
+    const options = resolveModelOptions("gemma3:4b", catalogModels);
+    expect(options).toEqual(catalogModels);
+  });
+
+  test("prepends an unavailable option when selected model is not in catalog", () => {
+    const options = resolveModelOptions("qwen3.5:4b", catalogModels);
+    expect(options).toHaveLength(3);
+    expect(options[0]).toEqual({
+      id: "qwen3.5:4b",
+      name: "qwen3.5:4b (unavailable)",
+      isUnavailable: true,
+    });
+    expect(options.slice(1)).toEqual(catalogModels);
+  });
+
+  test("handles empty selected model gracefully", () => {
+    const options = resolveModelOptions("", catalogModels);
+    expect(options).toEqual(catalogModels);
+  });
+});
+
+describe("reconcileCatalogSelection", () => {
+  const remoteModels = [
+    { id: "gemma3:4b", name: "Gemma 3 4B" },
+    { id: "qwen2.5:3b", name: "Qwen 2.5 3B" },
+  ];
+
+  test("auto-updates untouched initial default model when missing from remote catalog", () => {
+    const model = reconcileCatalogSelection({
+      currentModel: "qwen3.5:4b",
+      initialModel: "qwen3.5:4b",
+      modelTouched: false,
+      catalogModels: remoteModels,
+    });
+    expect(model).toBe("gemma3:4b");
+  });
+
+  test("preserves explicit manual selection when delayed catalog resolves", () => {
+    // User manually selected a model while catalog request was in flight
+    const model = reconcileCatalogSelection({
+      currentModel: "custom-ollama:8b",
+      initialModel: "qwen3.5:4b",
+      modelTouched: true,
+      catalogModels: remoteModels,
+    });
+    expect(model).toBe("custom-ollama:8b");
+  });
+
+  test("preserves manual selection even if it was picked from an initial list and not in remote", () => {
+    const model = reconcileCatalogSelection({
+      currentModel: "qwen3.5:4b",
+      initialModel: "qwen3.5:4b",
+      modelTouched: true,
+      catalogModels: remoteModels,
+    });
+    expect(model).toBe("qwen3.5:4b");
+  });
+
+  test("keeps current model if it already exists in remote catalog", () => {
+    const model = reconcileCatalogSelection({
+      currentModel: "qwen2.5:3b",
+      initialModel: "qwen3.5:4b",
+      modelTouched: false,
+      catalogModels: remoteModels,
+    });
+    expect(model).toBe("qwen2.5:3b");
   });
 });
 
