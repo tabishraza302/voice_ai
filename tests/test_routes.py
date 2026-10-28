@@ -34,7 +34,7 @@ async def api_client():
     app.include_router(router, prefix="/api")
     app.dependency_overrides[get_db_session] = override_get_db_session
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1:7860") as client:
         yield client
 
     await engine.dispose()

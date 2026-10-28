@@ -34,6 +34,7 @@ from fastapi import Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from bot.config import Settings
+from bot.local_guard import mount_local_state_guard
 from bot.services import resolve_models
 
 BATCH_PROVIDER = "mlx-audio"
@@ -156,6 +157,7 @@ def mount_control(app, settings: Settings) -> None:
     they shadow its index and the rest of its assets keep being served
     by the mount underneath.
     """
+    mount_local_state_guard(app, settings)
 
     def page(note: str = "", status_code: int = 200) -> HTMLResponse:
         effective = effective_provider(settings)

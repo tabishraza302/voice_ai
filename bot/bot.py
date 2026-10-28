@@ -640,7 +640,9 @@ def mount_api(app, settings: Settings) -> None:
     """Mount the multi-agent REST API and CORS middleware on the runner's app."""
     from fastapi.middleware.cors import CORSMiddleware
     from bot.api.router import create_api_router
+    from bot.local_guard import mount_local_state_guard
 
+    mount_local_state_guard(app, settings)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[

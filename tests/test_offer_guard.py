@@ -68,7 +68,7 @@ def test_offer_preflight_rejects_malformed_agent_id(monkeypatch):
 
     settings = Settings(_env_file=None, web_port=3000)
     app = _create_test_app(settings, profile_resolver=unused_resolver)
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1:7860")
 
     response = client.post(
         "/api/offer",
@@ -90,7 +90,7 @@ def test_offer_preflight_rejects_missing_agent_id_with_404(monkeypatch):
 
     settings = Settings(_env_file=None, web_port=3000)
     app = _create_test_app(settings, profile_resolver=mock_resolver)
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1:7860")
 
     response = client.post(
         "/api/offer",
@@ -112,7 +112,7 @@ def test_offer_preflight_reports_storage_fallback_as_unavailable_not_deleted(mon
 
     settings = Settings(_env_file=None, web_port=3000)
     app = _create_test_app(settings, profile_resolver=mock_resolver)
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1:7860")
 
     response = client.post(
         "/api/offer",
@@ -136,7 +136,7 @@ def test_offer_preflight_fails_closed_on_database_error(monkeypatch):
 
     settings = Settings(_env_file=None, web_port=3000)
     app = _create_test_app(settings, profile_resolver=mock_resolver)
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1:7860")
 
     response = client.post(
         "/api/offer",
@@ -162,7 +162,7 @@ def test_offer_preflight_rejects_incompatible_realtime_pinned_language(monkeypat
 
     settings = Settings(_env_file=None, web_port=3000)
     app = _create_test_app(settings, profile_resolver=mock_resolver)
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1:7860")
 
     response = client.post(
         "/api/offer",
@@ -191,7 +191,7 @@ def test_offer_preflight_catches_language_incompatibility_introduced_by_apply_mo
     monkeypatch.setattr("bot.agents.service.apply_active_agent_to_settings", batch_profile_resolver)
 
     app = _create_test_app(settings, profile_resolver=batch_profile_resolver)
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1:7860")
 
     response = client.post(
         "/api/offer",
@@ -219,7 +219,7 @@ def test_offer_preflight_preserves_baseline_legacy_client(monkeypatch):
         return {"sdp": "legacy-answer-sdp", "type": "answer", "pc_id": "pc-legacy"}
 
     app = _create_test_app(settings, profile_resolver=baseline_resolver, mock_offer_handler=mock_offer_handler)
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1:7860")
 
     response = client.post(
         "/api/offer",
@@ -240,7 +240,7 @@ def test_offer_proxy_route_preflight(monkeypatch):
 
     settings = Settings(_env_file=None, web_port=3000)
     app = _create_test_app(settings, profile_resolver=mock_resolver)
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1:7860")
 
     response = client.post(
         "/sessions/sess-123/api/offer",
@@ -261,7 +261,7 @@ def test_start_route_preflight(monkeypatch):
 
     settings = Settings(_env_file=None, web_port=3000)
     app = _create_test_app(settings, profile_resolver=mock_resolver)
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1:7860")
 
     response = client.post(
         "/start",
@@ -273,7 +273,7 @@ def test_start_route_preflight(monkeypatch):
 
 
 def test_cors_headers_omitted_for_disallowed_origin(monkeypatch):
-    """Error responses do not leak CORS headers to unauthorized origins."""
+    """A foreign Origin is rejected before preflight, with no CORS headers."""
     async def unused_resolver(s, agent_id=None):
         raise AssertionError("Resolver should not be reached for malformed agent_id")
 
@@ -281,7 +281,7 @@ def test_cors_headers_omitted_for_disallowed_origin(monkeypatch):
 
     settings = Settings(_env_file=None, web_port=3000)
     app = _create_test_app(settings, profile_resolver=unused_resolver)
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1:7860")
 
     response = client.post(
         "/api/offer",
@@ -289,7 +289,7 @@ def test_cors_headers_omitted_for_disallowed_origin(monkeypatch):
         json={"sdp": "offer-sdp", "type": "offer", "request_data": {"agent_id": "  "}},
     )
 
-    assert response.status_code == 400
+    assert response.status_code == 403
     assert "access-control-allow-origin" not in response.headers
 
 

@@ -8,7 +8,7 @@ from bot.config import Settings
 def test_api_allows_the_configured_local_studio_origin_only():
     app = FastAPI()
     mount_api(app, Settings(_env_file=None, web_port=3201))
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://127.0.0.1:7860")
 
     allowed = client.options(
         "/api/catalog",
