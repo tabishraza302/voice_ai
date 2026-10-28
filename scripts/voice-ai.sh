@@ -462,6 +462,12 @@ cmd_profile_bench() {
 cmd_eval_scenarios() { uv run python -m pipecat.evals run evals/scenarios/; }
 cmd_smoke() { uv run python scripts/smoke_stt.py; }
 cmd_test() { uv run pytest "$@"; }
+cmd_flow_qualify() {
+  # Diagnostic model/playback qualification report. Exits nonzero unless the
+  # exact tuple has real, per-scenario rendered-audio evidence; a reducer-only
+  # or mocked pass never qualifies voice playback.
+  exec uv run --frozen python -m bot.adapter_qualification "$@"
+}
 cmd_verify() {
   exec uv run --frozen python "$REPO_ROOT/scripts/verify.py" "$@"
 }
@@ -548,6 +554,9 @@ Measuring:
 Quality:
   smoke              Synthesise speech, transcribe it back
   test               The regression suite
+  flow-qualify       Diagnostic model/playback qualification report
+    --profile FILE   Versioned qualification profile JSON
+    --output FILE    Write the JSON report (exits nonzero unless fully qualified)
   verify             Strict qualification gates (prepare|unit|postgres|browser|voice|release)
   schema             Schema management commands (schema init)
   clean              Remove the generated artifacts
@@ -595,6 +604,7 @@ main() {
     warm) cmd_warm "$@" ;;
     smoke) cmd_smoke "$@" ;;
     test) cmd_test "$@" ;;
+    flow-qualify) cmd_flow_qualify "$@" ;;
     verify) cmd_verify "$@" ;;
     schema) cmd_schema "$@" ;;
     clean) cmd_clean "$@" ;;
