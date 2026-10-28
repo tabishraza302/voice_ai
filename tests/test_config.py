@@ -10,6 +10,7 @@ import pytest
 from pydantic import ValidationError
 
 from bot.config import SYSTEM_PROMPT, Settings
+from tests.test_voice_live_integration import validate_loopback_base_url
 
 
 def test_defaults():
@@ -157,3 +158,35 @@ def test_runner_host_rejects_non_loopback_and_wildcard(rejected_host):
     with pytest.raises(ValidationError) as excinfo:
         Settings(_env_file=None, host=rejected_host)
     assert "unauthenticated local management routes" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "valid_url,expected",
+    [
+        ("http://127.0.0.1:7860", "http://127.0.0.1:7860"),
+        ("http://127.0.0.1:7860/", "http://127.0.0.1:7860"),
+        ("http://localhost:8000", "http://localhost:8000"),
+        ("http://127.0.0.2:9000", "http://127.0.0.2:9000"),
+        ("http://[::1]:7860", "http://[::1]:7860"),
+        ("https://127.0.0.1:8443", "https://127.0.0.1:8443"),
+    ],
+)
+def test_voice_live_endpoint_validation_accepts_loopback(valid_url, expected):
+    assert validate_loopback_base_url(valid_url) == expected
+
+
+@pytest.mark.parametrize(
+    "invalid_url",
+    [
+        "ftp://127.0.0.1:7860",
+        "http://example.com:7860",
+        "http://192.168.1.50:7860",
+        "http://10.0.0.1:7860",
+        "http://0.0.0.0:7860",
+        "http://8.8.8.8:7860",
+        "not-a-url",
+    ],
+)
+def test_voice_live_endpoint_validation_rejects_non_loopback(invalid_url):
+    with pytest.raises(ValueError):
+        validate_loopback_base_url(invalid_url)

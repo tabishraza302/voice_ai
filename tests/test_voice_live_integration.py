@@ -3,17 +3,38 @@
 Run explicitly with ``RUN_LIVE_VOICE=1 uv run pytest -s tests/test_voice_live_integration.py``.
 The test uses a silent synthetic microphone track and sends benign text turns
 over the same ``chat`` data channel as the Studio client. It never captures a
-real microphone or plays audio through a device.
+real microphone or plays audio through a device, so it tests WebRTC data channels,
+agent responses, and received remote audio output; it does not qualify real input speech.
 """
 
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import os
+from urllib.parse import urlparse
 
 import numpy as np
 import pytest
+
+
+def validate_loopback_base_url(url: str) -> str:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"Endpoint URL scheme must be http or https, got {parsed.scheme!r}")
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError(f"Endpoint URL missing hostname: {url!r}")
+    if hostname == "localhost":
+        return url.rstrip("/")
+    try:
+        ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        raise ValueError(f"Non-loopback hostname rejected for live voice acceptance test: {hostname!r}") from None
+    if not ip.is_loopback:
+        raise ValueError(f"Non-loopback IP address rejected for live voice acceptance test: {hostname!r}")
+    return url.rstrip("/")
 
 
 pytestmark = pytest.mark.skipif(
@@ -29,7 +50,9 @@ async def test_local_voice_roundtrip_for_english_and_hindi() -> None:
     from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
     from aiortc.mediastreams import AudioStreamTrack
 
-    base_url = "http://127.0.0.1:7860"
+    base_url = validate_loopback_base_url(
+        os.getenv("VOICE_TEST_ENDPOINT", "http://127.0.0.1:7860")
+    )
     request_timeout = aiohttp.ClientTimeout(total=6)
     peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
     silent_input = AudioStreamTrack()
