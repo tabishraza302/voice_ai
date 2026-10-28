@@ -39,6 +39,7 @@ from tests.support.qualification import (
     redact_secrets,
     require_gate,
 )
+from tests.support.tls import generate_ephemeral_loopback_cert
 
 
 def is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
@@ -185,7 +186,9 @@ class LifecycleManager:
 
         # 1. Terminate and reap owned child processes first so they cannot append output
         current_pgid = os.getpgrp()
-        for proc, isolated in self.owned_processes:
+        processes = list(self.owned_processes)
+        self.owned_processes.clear()
+        for proc, isolated in processes:
             try:
                 if proc.poll() is None:
                     if isolated:
@@ -203,7 +206,7 @@ class LifecycleManager:
                 errors.append(e)
 
         time.sleep(0.5)
-        for proc, isolated in self.owned_processes:
+        for proc, isolated in processes:
             try:
                 if proc.poll() is None:
                     if isolated:
@@ -222,20 +225,26 @@ class LifecycleManager:
                 errors.append(e)
 
         # 2. Run custom callbacks in reverse order (flushing, closing handles, post-exit redaction)
-        for cb in reversed(self.cleanup_callbacks):
+        callbacks = list(reversed(self.cleanup_callbacks))
+        self.cleanup_callbacks.clear()
+        for cb in callbacks:
             try:
                 cb()
             except Exception as e:
                 errors.append(e)
         # 3. Drop owned databases
-        for admin_url, db_name, run_token in self.owned_databases:
+        databases = list(self.owned_databases)
+        self.owned_databases.clear()
+        for admin_url, db_name, run_token in databases:
             try:
                 _drop_database(admin_url, db_name, run_token=run_token)
             except Exception as e:
                 errors.append(e)
 
         # 4. Tear down owned docker compose projects
-        for project_name, compose_file in self.owned_compose_projects:
+        compose_projects = list(self.owned_compose_projects)
+        self.owned_compose_projects.clear()
+        for project_name, compose_file in compose_projects:
             try:
                 subprocess.run(
                     [
@@ -256,7 +265,6 @@ class LifecycleManager:
                 )
             except Exception as e:
                 errors.append(e)
-
         if errors:
             self.cleanup_failed = True
             msg = "; ".join(str(e) for e in errors)
@@ -954,219 +962,606 @@ class VerificationHarness:
             return self.write_result(target_gates=["postgres_gate"])
         return 0 if postgres_passed else 1
 
-    def browser(self, standalone: bool = True) -> int:
-        print("==> Running verify browser lane...")
-        self.write_manifest()
+    def _run_browser_dev(self) -> GateCounts:
+        admin_url, platform_url, legacy_url = self.provision_disposable_postgres()
+        api_port = allocate_loopback_port(preferred_port=None)
+        web_port = allocate_loopback_port(preferred_port=None)
+
+        csrf_key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
+        rate_key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
+        mfa_key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
+        self.register_secret(csrf_key)
+        self.register_secret(rate_key)
+        self.register_secret(mfa_key)
+        self.register_secret(admin_url)
+        self.register_secret(platform_url)
+        self.register_secret(legacy_url)
+        self.register_secret(self.run_token)
+
+        mail_dir = self.run_dir / "auth_mail_dev"
+        mail_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+        def _cleanup_mail_dir() -> None:
+            if mail_dir.exists():
+                import shutil
+                try:
+                    shutil.rmtree(mail_dir)
+                except Exception as e:
+                    raise RuntimeError(f"failed to remove ephemeral mail directory {mail_dir}: {e}") from e
+
+        self.lifecycle.register_cleanup_callback(_cleanup_mail_dir)
+
+        schema_init_cmd = [
+            "uv",
+            "run",
+            "--frozen",
+            "python",
+            "-m",
+            "platform_api.cli",
+            "init-db",
+        ]
+        schema_init_env = {
+            "PLATFORM_DATABASE_URL": platform_url,
+            "PLATFORM_TEST_DATABASE_ADMIN_URL": admin_url,
+            "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.run_token,
+            "_VERIFY_RUN_OWNERSHIP_TOKEN": self.run_token,
+            "PLATFORM_AUTH_CSRF_KEY": csrf_key,
+            "PLATFORM_AUTH_RATE_KEY": rate_key,
+            "PLATFORM_AUTH_MFA_KEY": mfa_key,
+            "PLATFORM_AUTH_MAIL_DIR": str(mail_dir),
+            "PLATFORM_AUTH_MAIL_MODE": "file",
+        }
+        init_rc, init_out, init_err = self.run_cmd("browser_schema_init_dev", schema_init_cmd, env=schema_init_env)
+        if init_rc != 0:
+            raise RuntimeError(f"failed to initialize platform schema before dev browser tests: {redact_secrets(init_err or init_out)}")
+
+        api_cmd = [
+            "uv",
+            "run",
+            "--frozen",
+            "python",
+            "-m",
+            "uvicorn",
+            "platform_api.app:create_app",
+            "--factory",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(api_port),
+        ]
+        api_env = {
+            "PLATFORM_DATABASE_URL": platform_url,
+            "PLATFORM_TEST_DATABASE_ADMIN_URL": admin_url,
+            "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.run_token,
+            "_VERIFY_RUN_OWNERSHIP_TOKEN": self.run_token,
+            "PLATFORM_HOST": "127.0.0.1",
+            "PLATFORM_PORT": str(api_port),
+            "PLATFORM_WEB_ORIGIN": f"http://127.0.0.1:{web_port}",
+            "PLATFORM_ALLOWED_HOSTS": '["127.0.0.1", "localhost"]',
+            "PLATFORM_AUTH_CSRF_KEY": csrf_key,
+            "PLATFORM_AUTH_RATE_KEY": rate_key,
+            "PLATFORM_AUTH_MFA_KEY": mfa_key,
+            "PLATFORM_AUTH_MAIL_DIR": str(mail_dir),
+            "PLATFORM_AUTH_MAIL_MODE": "file",
+            "PLATFORM_ENV": "development",
+            "PLATFORM_COOKIE_SECURE": "false",
+            "PLATFORM_SESSION_COOKIE_NAME": "platform_dev_session",
+        }
+
+        api_stdout_path = self.run_dir / "api_server_dev.stdout.log"
+        api_stderr_path = self.run_dir / "api_server_dev.stderr.log"
+        api_log_out = _open_private_log(api_stdout_path)
+        api_log_err = _open_private_log(api_stderr_path)
+        self.lifecycle.register_cleanup_callback(api_log_out.close)
+        self.lifecycle.register_cleanup_callback(api_log_err.close)
+        self.lifecycle.register_cleanup_callback(api_log_out.flush)
+        self.lifecycle.register_cleanup_callback(api_log_err.flush)
+        self.lifecycle.register_cleanup_callback(lambda: _redact_persisted_file(api_stdout_path, explicit_secrets=self.explicit_secrets))
+        self.lifecycle.register_cleanup_callback(lambda: _redact_persisted_file(api_stderr_path, explicit_secrets=self.explicit_secrets))
+
+        api_proc = subprocess.Popen(
+            api_cmd,
+            cwd=self.repo_root,
+            env=self._build_sanitized_env(api_env),
+            stdout=api_log_out,
+            stderr=api_log_err,
+            start_new_session=True,
+        )
+        self.lifecycle.register_process(api_proc, is_isolated_group=True)
+
+        api_ready = False
+        for _ in range(30):
+            if api_proc.poll() is not None:
+                raise RuntimeError(f"dev control-plane API exited early with code {api_proc.returncode}")
+            try:
+                req = urllib.request.Request(f"http://127.0.0.1:{api_port}/health/live")
+                with urllib.request.urlopen(req, timeout=1.0) as resp:
+                    if resp.status == 200:
+                        api_ready = True
+                        break
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        if not api_ready:
+            raise RuntimeError(f"dev control-plane API server failed to respond on http://127.0.0.1:{api_port}/health/live within 15s")
+
+        web_dir = self.repo_root / "web"
+        next_bin = web_dir / "node_modules" / "next" / "dist" / "bin" / "next"
+        if not next_bin.is_file():
+            raise RuntimeError(f"next binary missing at {next_bin}")
+
+        web_bld_cmd = ["bun", "run", "build"]
+        web_bld_env = {
+            "NEXT_PUBLIC_APP_MODE": "saas",
+            "NEXT_PUBLIC_PLATFORM_API_URL": f"http://127.0.0.1:{api_port}/api/v1",
+            "NODE_ENV": "production",
+        }
+        bld_rc, bld_out, bld_err = self.run_cmd("browser_web_build_dev", web_bld_cmd, cwd=web_dir, env=web_bld_env)
+        if bld_rc != 0:
+            raise RuntimeError(f"failed to build web studio for dev browser gate: {redact_secrets(bld_err or bld_out)}")
+
+        if not (web_dir / ".next").is_dir():
+            raise RuntimeError(
+                "Built production web studio missing at web/.next; verify browser requires a built production server, refusing next dev fallback"
+            )
+
+        web_cmd = ["node", str(next_bin), "start", "-H", "127.0.0.1", "-p", str(web_port)]
+        web_env = {
+            "PORT": str(web_port),
+            "HOST": "127.0.0.1",
+            "NODE_ENV": "production",
+            "NEXT_PUBLIC_APP_MODE": "saas",
+            "NEXT_PUBLIC_PLATFORM_API_URL": f"http://127.0.0.1:{api_port}/api/v1",
+        }
+        web_stdout_path = self.run_dir / "web_server_dev.stdout.log"
+        web_stderr_path = self.run_dir / "web_server_dev.stderr.log"
+        web_log_out = _open_private_log(web_stdout_path)
+        web_log_err = _open_private_log(web_stderr_path)
+        self.lifecycle.register_cleanup_callback(web_log_out.close)
+        self.lifecycle.register_cleanup_callback(web_log_err.close)
+        self.lifecycle.register_cleanup_callback(web_log_out.flush)
+        self.lifecycle.register_cleanup_callback(web_log_err.flush)
+        self.lifecycle.register_cleanup_callback(lambda: _redact_persisted_file(web_stdout_path, explicit_secrets=self.explicit_secrets))
+        self.lifecycle.register_cleanup_callback(lambda: _redact_persisted_file(web_stderr_path, explicit_secrets=self.explicit_secrets))
+
+        web_proc = subprocess.Popen(
+            web_cmd,
+            cwd=web_dir,
+            env=self._build_sanitized_env(web_env),
+            stdout=web_log_out,
+            stderr=web_log_err,
+            start_new_session=True,
+        )
+        self.lifecycle.register_process(web_proc, is_isolated_group=True)
+
+        web_ready = False
+        for _ in range(40):
+            if web_proc.poll() is not None:
+                raise RuntimeError(f"web studio server exited early with code {web_proc.returncode}")
+            try:
+                req = urllib.request.Request(f"http://127.0.0.1:{web_port}/")
+                with urllib.request.urlopen(req, timeout=1.0) as resp:
+                    if resp.status in (200, 301, 302, 307, 308):
+                        web_ready = True
+                        break
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        if not web_ready:
+            raise RuntimeError(f"web studio server failed to respond on http://127.0.0.1:{web_port}/ within 20s")
+
+        playwright_json = self.run_dir / "playwright_dev.json"
+        cmd = [
+            "bun",
+            "run",
+            "test:e2e",
+            "e2e/auth-journeys.spec.ts",
+            "--project=chromium",
+            "--reporter=json",
+        ]
+        env = {
+            "PLATFORM_DATABASE_URL": platform_url,
+            "PLATFORM_TEST_DATABASE_ADMIN_URL": admin_url,
+            "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.run_token,
+            "_VERIFY_RUN_OWNERSHIP_TOKEN": self.run_token,
+            "PLATFORM_AUTH_CSRF_KEY": csrf_key,
+            "PLATFORM_AUTH_RATE_KEY": rate_key,
+            "PLATFORM_AUTH_MFA_KEY": mfa_key,
+            "PLATFORM_AUTH_MAIL_DIR": str(mail_dir),
+            "PLATFORM_AUTH_MAIL_MODE": "file",
+            "NEXT_PUBLIC_APP_MODE": "saas",
+            "NEXT_PUBLIC_PLATFORM_API_URL": f"http://127.0.0.1:{api_port}/api/v1",
+            "PLAYWRIGHT_BASE_URL": f"http://127.0.0.1:{web_port}",
+            "PLAYWRIGHT_JSON_OUTPUT_NAME": str(playwright_json),
+        }
+        rc, out, err = self.run_cmd("browser_dev_tests", cmd, cwd=web_dir, env=env)
+        self.lifecycle.register_cleanup_callback(
+            lambda: _redact_persisted_file(playwright_json, explicit_secrets=self.explicit_secrets)
+            if playwright_json.is_file()
+            else None
+        )
+
         try:
-            try:
-                admin_url, platform_url, legacy_url = self.provision_disposable_postgres()
-            except Exception as e:
-                self.results["browser_gate"] = {"status": "failed", "reason": redact_secrets(str(e))}
-                if standalone:
-                    return self.write_result(target_gates=["browser_gate"])
-                return 1
+            if rc != 0:
+                raise ValueError(f"dev playwright exited with code {rc}: {redact_secrets(err or out)}")
+            counts = parse_playwright_json(playwright_json)
+            return counts
+        finally:
+            self.lifecycle.cleanup()
 
-            # Allocate dynamic loopback ports for API and Web child servers
-            api_port = allocate_loopback_port(preferred_port=None)
-            web_port = allocate_loopback_port(preferred_port=None)
+    def _run_browser_tls_ingress(self) -> GateCounts:
+        admin_url, platform_url, legacy_url = self.provision_disposable_postgres()
+        api_port = allocate_loopback_port(preferred_port=None)
+        web_port = allocate_loopback_port(preferred_port=None)
+        ingress_port = allocate_loopback_port(preferred_port=None)
 
-            # Generate three independent valid ephemeral keys (Fernet for MFA, 32-byte base64url for CSRF and rate limit)
-            csrf_key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
-            rate_key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
-            mfa_key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
-            self.register_secret(csrf_key)
-            self.register_secret(rate_key)
-            self.register_secret(mfa_key)
-            self.register_secret(admin_url)
-            self.register_secret(platform_url)
-            self.register_secret(legacy_url)
-            self.register_secret(self.run_token)
-            # Initialize platform schema before starting application
-            schema_init_cmd = [
-                "uv",
-                "run",
-                "--frozen",
-                "python",
-                "-m",
-                "platform_api.cli",
-                "init-db",
-            ]
-            schema_init_env = {
-                "PLATFORM_DATABASE_URL": platform_url,
-                "PLATFORM_TEST_DATABASE_ADMIN_URL": admin_url,
-                "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.run_token,
-                "_VERIFY_RUN_OWNERSHIP_TOKEN": self.run_token,
-                "PLATFORM_AUTH_CSRF_KEY": csrf_key,
-                "PLATFORM_AUTH_RATE_KEY": rate_key,
-                "PLATFORM_AUTH_MFA_KEY": mfa_key,
-            }
-            init_rc, init_out, init_err = self.run_cmd("browser_schema_init", schema_init_cmd, env=schema_init_env)
-            if init_rc != 0:
-                raise RuntimeError(f"failed to initialize platform schema before browser tests: {redact_secrets(init_err or init_out)}")
+        csrf_key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
+        rate_key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
+        mfa_key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")
+        self.register_secret(csrf_key)
+        self.register_secret(rate_key)
+        self.register_secret(mfa_key)
+        self.register_secret(admin_url)
+        self.register_secret(platform_url)
+        self.register_secret(legacy_url)
+        self.register_secret(self.run_token)
 
-            # Start owned control-plane API server with temporary explicit settings
-            api_cmd = [
-                "uv",
-                "run",
-                "--frozen",
-                "python",
-                "-m",
-                "uvicorn",
-                "platform_api.app:create_app",
-                "--factory",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(api_port),
-            ]
-            api_env = {
-                "PLATFORM_DATABASE_URL": platform_url,
-                "PLATFORM_TEST_DATABASE_ADMIN_URL": admin_url,
-                "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.run_token,
-                "_VERIFY_RUN_OWNERSHIP_TOKEN": self.run_token,
-                "PLATFORM_HOST": "127.0.0.1",
-                "PLATFORM_PORT": str(api_port),
-                "PLATFORM_WEB_ORIGIN": f"http://127.0.0.1:{web_port}",
-                "PLATFORM_ALLOWED_HOSTS": '["127.0.0.1", "localhost"]',
-                "PLATFORM_AUTH_CSRF_KEY": csrf_key,
-                "PLATFORM_AUTH_RATE_KEY": rate_key,
-                "PLATFORM_AUTH_MFA_KEY": mfa_key,
-                "PLATFORM_ENV": "development",
-                "PLATFORM_COOKIE_SECURE": "false",
-            }
+        mail_dir = self.run_dir / "auth_mail_tls"
+        mail_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 
-            api_stdout_path = self.run_dir / "api_server.stdout.log"
-            api_stderr_path = self.run_dir / "api_server.stderr.log"
-            api_log_out = _open_private_log(api_stdout_path)
-            api_log_err = _open_private_log(api_stderr_path)
-            self.lifecycle.register_cleanup_callback(api_log_out.close)
-            self.lifecycle.register_cleanup_callback(api_log_err.close)
-            self.lifecycle.register_cleanup_callback(api_log_out.flush)
-            self.lifecycle.register_cleanup_callback(api_log_err.flush)
-            self.lifecycle.register_cleanup_callback(lambda: _redact_persisted_file(api_stdout_path, explicit_secrets=self.explicit_secrets))
-            self.lifecycle.register_cleanup_callback(lambda: _redact_persisted_file(api_stderr_path, explicit_secrets=self.explicit_secrets))
-
-            api_proc = subprocess.Popen(
-                api_cmd,
-                cwd=self.repo_root,
-                env=self._build_sanitized_env(api_env),
-                stdout=api_log_out,
-                stderr=api_log_err,
-                start_new_session=True,
-            )
-            self.lifecycle.register_process(api_proc, is_isolated_group=True)
-
-            # Verify API server HTTP endpoint (not merely is_port_in_use)
-            import urllib.request
-            api_ready = False
-            for _ in range(30):
-                if api_proc.poll() is not None:
-                    raise RuntimeError(f"control-plane API exited early with code {api_proc.returncode}")
+        def _cleanup_mail_dir() -> None:
+            if mail_dir.exists():
+                import shutil
                 try:
-                    req = urllib.request.Request(f"http://127.0.0.1:{api_port}/health/live")
-                    with urllib.request.urlopen(req, timeout=1.0) as resp:
-                        if resp.status == 200:
-                            api_ready = True
-                            break
+                    shutil.rmtree(mail_dir)
+                except Exception as e:
+                    raise RuntimeError(f"failed to remove ephemeral mail directory {mail_dir}: {e}") from e
+
+        self.lifecycle.register_cleanup_callback(_cleanup_mail_dir)
+
+        # Generate ephemeral loopback TLS certificate without modifying system trust
+        cert_path = self.run_dir / "tls_cert.pem"
+        key_path = self.run_dir / "tls_key.pem"
+        generate_ephemeral_loopback_cert(cert_path, key_path)
+        try:
+            key_text = key_path.read_text(encoding="utf-8")
+            self.register_secret(key_text)
+        except Exception:
+            pass
+
+        def _cleanup_tls_files() -> None:
+            for p in (cert_path, key_path):
+                try:
+                    if p.is_file():
+                        p.unlink()
                 except Exception:
                     pass
-                time.sleep(0.5)
 
-            if not api_ready:
-                raise RuntimeError(f"control-plane API server failed to respond on http://127.0.0.1:{api_port}/health/live within 15s")
+        self.lifecycle.register_cleanup_callback(_cleanup_tls_files)
 
-            # Start owned Web Studio child server (enforce frozen production build; bind -H 127.0.0.1)
-            web_dir = self.repo_root / "web"
-            next_bin = web_dir / "node_modules" / "next" / "dist" / "bin" / "next"
-            if not next_bin.is_file():
-                raise RuntimeError(f"next binary missing at {next_bin}")
+        schema_init_cmd = [
+            "uv",
+            "run",
+            "--frozen",
+            "python",
+            "-m",
+            "platform_api.cli",
+            "init-db",
+        ]
+        schema_init_env = {
+            "PLATFORM_DATABASE_URL": platform_url,
+            "PLATFORM_TEST_DATABASE_ADMIN_URL": admin_url,
+            "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.run_token,
+            "_VERIFY_RUN_OWNERSHIP_TOKEN": self.run_token,
+            "PLATFORM_AUTH_CSRF_KEY": csrf_key,
+            "PLATFORM_AUTH_RATE_KEY": rate_key,
+            "PLATFORM_AUTH_MFA_KEY": mfa_key,
+            "PLATFORM_AUTH_MAIL_DIR": str(mail_dir),
+            "PLATFORM_AUTH_MAIL_MODE": "file",
+        }
+        init_rc, init_out, init_err = self.run_cmd("browser_schema_init_tls", schema_init_cmd, env=schema_init_env)
+        if init_rc != 0:
+            raise RuntimeError(f"failed to initialize platform schema before TLS browser tests: {redact_secrets(init_err or init_out)}")
 
-            if not (web_dir / ".next").is_dir():
-                raise RuntimeError(
-                    "Built production web studio missing at web/.next; verify browser requires a built production server, refusing next dev fallback"
+        # Start control-plane API server with production cookie semantics
+        api_cmd = [
+            "uv",
+            "run",
+            "--frozen",
+            "python",
+            "-m",
+            "uvicorn",
+            "platform_api.app:create_app",
+            "--factory",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(api_port),
+        ]
+        api_env = {
+            "PLATFORM_DATABASE_URL": platform_url,
+            "PLATFORM_TEST_DATABASE_ADMIN_URL": admin_url,
+            "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.run_token,
+            "_VERIFY_RUN_OWNERSHIP_TOKEN": self.run_token,
+            "PLATFORM_HOST": "127.0.0.1",
+            "PLATFORM_PORT": str(api_port),
+            "PLATFORM_WEB_ORIGIN": f"https://127.0.0.1:{ingress_port}",
+            "PLATFORM_ALLOWED_HOSTS": '["127.0.0.1", "localhost"]',
+            "PLATFORM_AUTH_CSRF_KEY": csrf_key,
+            "PLATFORM_AUTH_RATE_KEY": rate_key,
+            "PLATFORM_AUTH_MFA_KEY": mfa_key,
+            "PLATFORM_AUTH_MAIL_DIR": str(mail_dir),
+            "PLATFORM_AUTH_MAIL_MODE": "file",
+            "PLATFORM_ENV": "development",
+            "PLATFORM_COOKIE_SECURE": "true",
+            "PLATFORM_SESSION_COOKIE_NAME": "__Host-platform_session",
+            "PLATFORM_TRUSTED_PROXY_CIDRS": '["127.0.0.1/32"]',
+        }
+
+        api_stdout_path = self.run_dir / "api_server_tls.stdout.log"
+        api_stderr_path = self.run_dir / "api_server_tls.stderr.log"
+        api_log_out = _open_private_log(api_stdout_path)
+        api_log_err = _open_private_log(api_stderr_path)
+        self.lifecycle.register_cleanup_callback(api_log_out.close)
+        self.lifecycle.register_cleanup_callback(api_log_err.close)
+        self.lifecycle.register_cleanup_callback(api_log_out.flush)
+        self.lifecycle.register_cleanup_callback(api_log_err.flush)
+        self.lifecycle.register_cleanup_callback(lambda: _redact_persisted_file(api_stdout_path, explicit_secrets=self.explicit_secrets))
+        self.lifecycle.register_cleanup_callback(lambda: _redact_persisted_file(api_stderr_path, explicit_secrets=self.explicit_secrets))
+
+        api_proc = subprocess.Popen(
+            api_cmd,
+            cwd=self.repo_root,
+            env=self._build_sanitized_env(api_env),
+            stdout=api_log_out,
+            stderr=api_log_err,
+            start_new_session=True,
+        )
+        self.lifecycle.register_process(api_proc, is_isolated_group=True)
+
+        api_ready = False
+        for _ in range(30):
+            if api_proc.poll() is not None:
+                raise RuntimeError(f"TLS control-plane API exited early with code {api_proc.returncode}")
+            try:
+                req = urllib.request.Request(f"http://127.0.0.1:{api_port}/health/live")
+                with urllib.request.urlopen(req, timeout=1.0) as resp:
+                    if resp.status == 200:
+                        api_ready = True
+                        break
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        if not api_ready:
+            raise RuntimeError(f"TLS control-plane API server failed to respond on http://127.0.0.1:{api_port}/health/live within 15s")
+
+        web_dir = self.repo_root / "web"
+        next_bin = web_dir / "node_modules" / "next" / "dist" / "bin" / "next"
+        if not next_bin.is_file():
+            raise RuntimeError(f"next binary missing at {next_bin}")
+
+        # Build Next.js web studio configured for same-origin /api/v1 routing
+        web_bld_cmd = ["bun", "run", "build"]
+        web_bld_env = {
+            "NEXT_PUBLIC_APP_MODE": "saas",
+            "NEXT_PUBLIC_PLATFORM_API_URL": "/api/v1",
+            "NODE_ENV": "production",
+        }
+        bld_rc, bld_out, bld_err = self.run_cmd("browser_web_build_tls", web_bld_cmd, cwd=web_dir, env=web_bld_env)
+        if bld_rc != 0:
+            raise RuntimeError(f"failed to build web studio for TLS browser gate: {redact_secrets(bld_err or bld_out)}")
+
+        if not (web_dir / ".next").is_dir():
+            raise RuntimeError(
+                "Built production web studio missing at web/.next; verify browser requires a built production server, refusing next dev fallback"
+            )
+
+        web_cmd = ["node", str(next_bin), "start", "-H", "127.0.0.1", "-p", str(web_port)]
+        web_env = {
+            "PORT": str(web_port),
+            "HOST": "127.0.0.1",
+            "NODE_ENV": "production",
+            "NEXT_PUBLIC_APP_MODE": "saas",
+            "NEXT_PUBLIC_PLATFORM_API_URL": "/api/v1",
+        }
+        web_stdout_path = self.run_dir / "web_server_tls.stdout.log"
+        web_stderr_path = self.run_dir / "web_server_tls.stderr.log"
+        web_log_out = _open_private_log(web_stdout_path)
+        web_log_err = _open_private_log(web_stderr_path)
+        self.lifecycle.register_cleanup_callback(web_log_out.close)
+        self.lifecycle.register_cleanup_callback(web_log_err.close)
+        self.lifecycle.register_cleanup_callback(web_log_out.flush)
+        self.lifecycle.register_cleanup_callback(web_log_err.flush)
+        self.lifecycle.register_cleanup_callback(lambda: _redact_persisted_file(web_stdout_path, explicit_secrets=self.explicit_secrets))
+        self.lifecycle.register_cleanup_callback(lambda: _redact_persisted_file(web_stderr_path, explicit_secrets=self.explicit_secrets))
+
+        web_proc = subprocess.Popen(
+            web_cmd,
+            cwd=web_dir,
+            env=self._build_sanitized_env(web_env),
+            stdout=web_log_out,
+            stderr=web_log_err,
+            start_new_session=True,
+        )
+        self.lifecycle.register_process(web_proc, is_isolated_group=True)
+
+        web_ready = False
+        for _ in range(40):
+            if web_proc.poll() is not None:
+                raise RuntimeError(f"web studio server exited early with code {web_proc.returncode}")
+            try:
+                req = urllib.request.Request(f"http://127.0.0.1:{web_port}/")
+                with urllib.request.urlopen(req, timeout=1.0) as resp:
+                    if resp.status in (200, 301, 302, 307, 308):
+                        web_ready = True
+                        break
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        if not web_ready:
+            raise RuntimeError(f"web studio server failed to respond on http://127.0.0.1:{web_port}/ within 20s")
+
+        # Start owned loopback HTTPS ingress proxy
+        ingress_cmd = [
+            "bun",
+            "run",
+            str(self.repo_root / "tests" / "support" / "https_ingress.ts"),
+            "--port",
+            str(ingress_port),
+            "--api",
+            f"http://127.0.0.1:{api_port}",
+            "--web",
+            f"http://127.0.0.1:{web_port}",
+            "--cert",
+            str(cert_path),
+            "--key",
+            str(key_path),
+        ]
+        ingress_stdout_path = self.run_dir / "ingress_server.stdout.log"
+        ingress_stderr_path = self.run_dir / "ingress_server.stderr.log"
+        ingress_log_out = _open_private_log(ingress_stdout_path)
+        ingress_log_err = _open_private_log(ingress_stderr_path)
+        self.lifecycle.register_cleanup_callback(ingress_log_out.close)
+        self.lifecycle.register_cleanup_callback(ingress_log_err.close)
+        self.lifecycle.register_cleanup_callback(ingress_log_out.flush)
+        self.lifecycle.register_cleanup_callback(ingress_log_err.flush)
+        self.lifecycle.register_cleanup_callback(lambda: _redact_persisted_file(ingress_stdout_path, explicit_secrets=self.explicit_secrets))
+        self.lifecycle.register_cleanup_callback(lambda: _redact_persisted_file(ingress_stderr_path, explicit_secrets=self.explicit_secrets))
+
+        ingress_proc = subprocess.Popen(
+            ingress_cmd,
+            cwd=self.repo_root,
+            env=self._build_sanitized_env({}),
+            stdout=ingress_log_out,
+            stderr=ingress_log_err,
+            start_new_session=True,
+        )
+        self.lifecycle.register_process(ingress_proc, is_isolated_group=True)
+
+        # Verify HTTPS Ingress endpoint
+        import ssl
+        ingress_ready = False
+        ssl_ctx = ssl._create_unverified_context()
+        for _ in range(40):
+            if ingress_proc.poll() is not None:
+                raise RuntimeError(f"HTTPS ingress proxy exited early with code {ingress_proc.returncode}")
+            try:
+                req = urllib.request.Request(f"https://127.0.0.1:{ingress_port}/health/ingress")
+                with urllib.request.urlopen(req, timeout=1.0, context=ssl_ctx) as resp:
+                    if resp.status == 200:
+                        ingress_ready = True
+                        break
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        if not ingress_ready:
+            raise RuntimeError(
+                f"HTTPS ingress proxy failed to respond on https://127.0.0.1:{ingress_port}/health/ingress within 20s"
+            )
+
+        # Run TLS Playwright journeys
+        playwright_json = self.run_dir / "playwright_tls.json"
+        cmd = [
+            "bun",
+            "run",
+            "test:e2e",
+            "e2e/tls-ingress.spec.ts",
+            "--project=chromium",
+            "--reporter=json",
+        ]
+        env = {
+            "PLATFORM_DATABASE_URL": platform_url,
+            "PLATFORM_TEST_DATABASE_ADMIN_URL": admin_url,
+            "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.run_token,
+            "_VERIFY_RUN_OWNERSHIP_TOKEN": self.run_token,
+            "PLATFORM_AUTH_CSRF_KEY": csrf_key,
+            "PLATFORM_AUTH_RATE_KEY": rate_key,
+            "PLATFORM_AUTH_MFA_KEY": mfa_key,
+            "PLATFORM_AUTH_MAIL_DIR": str(mail_dir),
+            "PLATFORM_AUTH_MAIL_MODE": "file",
+            "NEXT_PUBLIC_APP_MODE": "saas",
+            "NEXT_PUBLIC_PLATFORM_API_URL": "/api/v1",
+            "PLAYWRIGHT_BASE_URL": f"https://127.0.0.1:{ingress_port}",
+            "PLAYWRIGHT_JSON_OUTPUT_NAME": str(playwright_json),
+        }
+        rc, out, err = self.run_cmd("browser_tls_tests", cmd, cwd=web_dir, env=env)
+        self.lifecycle.register_cleanup_callback(
+            lambda: _redact_persisted_file(playwright_json, explicit_secrets=self.explicit_secrets)
+            if playwright_json.is_file()
+            else None
+        )
+
+        try:
+            if rc != 0:
+                raise ValueError(f"TLS playwright exited with code {rc}: {redact_secrets(err or out)}")
+            counts = parse_playwright_json(playwright_json)
+            return counts
+        finally:
+            self.lifecycle.cleanup()
+
+    def browser(self, mode: str = "all", standalone: bool = True) -> int:
+        print(f"==> Running verify browser lane (mode={mode})...")
+        self.write_manifest()
+        if mode not in ("all", "tls", "dev"):
+            raise ValueError(f"unknown browser verification mode: {mode}")
+
+        dev_counts: GateCounts | None = None
+        tls_counts: GateCounts | None = None
+
+        try:
+            if mode in ("all", "dev"):
+                print("--> Executing development split-port browser journey...")
+                dev_counts = self._run_browser_dev()
+                require_gate(dev_counts)
+
+            if mode in ("all", "tls"):
+                print("--> Executing TLS production-like ingress browser journey...")
+                tls_counts = self._run_browser_tls_ingress()
+                require_gate(tls_counts)
+
+            # Combine counts for gate reporting
+            if dev_counts and tls_counts:
+                combined_counts = GateCounts(
+                    collected=dev_counts.collected + tls_counts.collected,
+                    passed=dev_counts.passed + tls_counts.passed,
+                    failed=dev_counts.failed + tls_counts.failed,
+                    errors=dev_counts.errors + tls_counts.errors,
+                    skipped=dev_counts.skipped + tls_counts.skipped,
+                    xfailed=dev_counts.xfailed + tls_counts.xfailed,
+                    xpassed=dev_counts.xpassed + tls_counts.xpassed,
                 )
-
-            web_cmd = ["node", str(next_bin), "start", "-H", "127.0.0.1", "-p", str(web_port)]
-            web_env = {
-                "PORT": str(web_port),
-                "HOST": "127.0.0.1",
-                "NODE_ENV": "production",
-            }
-
-            web_stdout_path = self.run_dir / "web_server.stdout.log"
-            web_stderr_path = self.run_dir / "web_server.stderr.log"
-            web_log_out = _open_private_log(web_stdout_path)
-            web_log_err = _open_private_log(web_stderr_path)
-            self.lifecycle.register_cleanup_callback(web_log_out.close)
-            self.lifecycle.register_cleanup_callback(web_log_err.close)
-            self.lifecycle.register_cleanup_callback(web_log_out.flush)
-            self.lifecycle.register_cleanup_callback(web_log_err.flush)
-            self.lifecycle.register_cleanup_callback(lambda: _redact_persisted_file(web_stdout_path, explicit_secrets=self.explicit_secrets))
-            self.lifecycle.register_cleanup_callback(lambda: _redact_persisted_file(web_stderr_path, explicit_secrets=self.explicit_secrets))
-
-            web_proc = subprocess.Popen(
-                web_cmd,
-                cwd=web_dir,
-                env=self._build_sanitized_env(web_env),
-                stdout=web_log_out,
-                stderr=web_log_err,
-                start_new_session=True,
-            )
-            self.lifecycle.register_process(web_proc, is_isolated_group=True)
-
-            # Verify Web Studio HTTP endpoint
-            web_ready = False
-            for _ in range(40):
-                if web_proc.poll() is not None:
-                    raise RuntimeError(f"web studio server exited early with code {web_proc.returncode}")
-                try:
-                    req = urllib.request.Request(f"http://127.0.0.1:{web_port}/")
-                    with urllib.request.urlopen(req, timeout=1.0) as resp:
-                        if resp.status in (200, 301, 302, 307, 308):
-                            web_ready = True
-                            break
-                except Exception:
-                    pass
-                time.sleep(0.5)
-
-            if not web_ready:
-                raise RuntimeError(f"web studio server failed to respond on http://127.0.0.1:{web_port}/ within 20s")
-
-            # Run Playwright tests against the live owned servers
-            playwright_json = self.run_dir / "playwright.json"
-            browser_trace_dir = self.run_dir / "browser"
-            browser_trace_dir.mkdir(parents=True, exist_ok=True)
-            cmd = [
-                "bun",
-                "run",
-                "test:e2e",
-                "--project=chromium",
-                "--reporter=json",
-            ]
-            env = {
-                "PLATFORM_DATABASE_URL": platform_url,
-                "PLATFORM_TEST_DATABASE_ADMIN_URL": admin_url,
-                "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.run_token,
-                "_VERIFY_RUN_OWNERSHIP_TOKEN": self.run_token,
-                "PLAYWRIGHT_BASE_URL": f"http://127.0.0.1:{web_port}",
-                "PLAYWRIGHT_JSON_OUTPUT": str(playwright_json),
-            }
-            rc, out, err = self.run_cmd("browser_tests", cmd, cwd=web_dir, env=env)
-
-            try:
-                if rc != 0:
-                    raise ValueError(f"playwright exited with code {rc}: {redact_secrets(err or out)}")
-                playwright_counts = parse_playwright_json(playwright_json)
-                require_gate(playwright_counts)
-                if playwright_counts.collected == 0 or playwright_counts.passed == 0:
-                    raise ValueError("zero browser tests collected")
-            except Exception as e:
-                self.results["browser_gate"] = {"status": "failed", "reason": redact_secrets(str(e))}
+            elif tls_counts:
+                combined_counts = tls_counts
+            elif dev_counts:
+                combined_counts = dev_counts
             else:
-                self.results["browser_gate"] = {
-                    "status": "passed",
-                    "counts": playwright_counts.__dict__,
+                raise ValueError("no browser tests executed")
+
+            require_gate(combined_counts)
+            if combined_counts.collected == 0 or combined_counts.passed == 0:
+                raise ValueError("zero browser tests collected")
+
+            playwright_json = self.run_dir / "playwright.json"
+            merged_stats = {
+                "stats": {
+                    "expected": combined_counts.passed,
+                    "unexpected": combined_counts.failed,
+                    "flaky": 0,
+                    "skipped": combined_counts.skipped,
                 }
+            }
+            playwright_json.write_text(json.dumps(merged_stats, indent=2), encoding="utf-8")
+            _redact_persisted_file(playwright_json, explicit_secrets=self.explicit_secrets)
+
+            self.results["browser_gate"] = {
+                "status": "passed",
+                "counts": combined_counts.__dict__,
+            }
         except Exception as e:
             self.results["browser_gate"] = {"status": "failed", "reason": redact_secrets(str(e))}
         finally:
@@ -1180,6 +1575,16 @@ class VerificationHarness:
                 self.run_dir / "api_server.stderr.log",
                 self.run_dir / "web_server.stdout.log",
                 self.run_dir / "web_server.stderr.log",
+                self.run_dir / "api_server_dev.stdout.log",
+                self.run_dir / "api_server_dev.stderr.log",
+                self.run_dir / "web_server_dev.stdout.log",
+                self.run_dir / "web_server_dev.stderr.log",
+                self.run_dir / "api_server_tls.stdout.log",
+                self.run_dir / "api_server_tls.stderr.log",
+                self.run_dir / "web_server_tls.stdout.log",
+                self.run_dir / "web_server_tls.stderr.log",
+                self.run_dir / "ingress_server.stdout.log",
+                self.run_dir / "ingress_server.stderr.log",
             ):
                 try:
                     _redact_persisted_file(log_p, explicit_secrets=self.explicit_secrets)
@@ -1358,7 +1763,13 @@ def main() -> None:
     subparsers.add_parser("postgres", help="Run PostgreSQL integration tests")
 
     # browser
-    subparsers.add_parser("browser", help="Run Playwright browser journeys")
+    browser_parser = subparsers.add_parser("browser", help="Run Playwright browser journeys")
+    browser_parser.add_argument(
+        "--mode",
+        choices=["all", "tls", "dev"],
+        default="all",
+        help="Browser qualification mode: all (dev split-port + TLS production ingress), tls, dev",
+    )
 
     # voice
     voice_parser = subparsers.add_parser("voice", help="Run voice qualification")
@@ -1396,7 +1807,7 @@ def main() -> None:
     elif args.subcommand == "postgres":
         sys.exit(harness.postgres())
     elif args.subcommand == "browser":
-        sys.exit(harness.browser())
+        sys.exit(harness.browser(mode=args.mode))
     elif args.subcommand == "voice":
         sys.exit(harness.voice(profile=args.profile, config=args.config))
     elif args.subcommand == "release":

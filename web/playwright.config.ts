@@ -18,13 +18,14 @@ export default defineConfig({
   retries: 0,
   workers: 1,
   reporter: [
-    ['json', { outputFile: process.env.PLAYWRIGHT_JSON_OUTPUT || 'playwright.json' }],
+    ['json', { outputFile: process.env.PLAYWRIGHT_JSON_OUTPUT_NAME || 'playwright.json' }],
     ['list'],
   ],
   use: {
     baseURL: process.env.PLAYWRIGHT_BASE_URL || 'http://127.0.0.1:3001',
     trace: 'retain-on-failure',
     video: 'off',
+    ignoreHTTPSErrors: true,
   },
   projects: [
     {
