@@ -28,7 +28,8 @@ def test_web_command_launches_next_in_the_web_project_directory(tmp_path):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     (fake_bin / "node").write_text(
-        "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$*\" > \"$CAPTURE\"\n"
+        "#!/bin/sh\n"
+        'printf \'%s\\n\' "$PWD" "$*" "${NEXT_TELEMETRY_DISABLED-<unset>}" > "$CAPTURE"\n'
     )
     (fake_bin / "node").chmod(0o755)
     (fake_bin / "lsof").write_text("#!/bin/sh\nexit 1\n")
@@ -36,6 +37,7 @@ def test_web_command_launches_next_in_the_web_project_directory(tmp_path):
     env = os.environ.copy()
     env.update({"PATH": f"{fake_bin}:{env['PATH']}", "CAPTURE": str(capture)})
     env.pop("WEB_PORT", None)
+    env.pop("NEXT_TELEMETRY_DISABLED", None)
 
     result = subprocess.run(
         [str(repo / "scripts/voice-ai.sh"), "web"],
@@ -50,6 +52,7 @@ def test_web_command_launches_next_in_the_web_project_directory(tmp_path):
     assert lines[0] == str(repo / "web")
     assert lines[1].startswith(f"{next_bin} dev")
     assert lines[1].endswith("-p 49187")
+    assert lines[2] == "1"
 
 
 def test_stop_leaves_an_unrelated_process_with_a_reused_web_pid_alone(tmp_path):
@@ -97,7 +100,8 @@ def test_start_web_and_stop_manage_only_the_project_process(tmp_path):
     next_bin.write_text("placeholder")
     next_bin.chmod(0o755)
     (fake_bin / "node").write_text(
-        "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$*\" > \"$CAPTURE\"\n"
+        "#!/bin/sh\n"
+        'printf \'%s\\n\' "$PWD" "$*" "${NEXT_TELEMETRY_DISABLED-<unset>}" > "$CAPTURE"\n'
         "trap 'kill \"$child\" 2>/dev/null; wait \"$child\" 2>/dev/null; exit 0' TERM\n"
         "while :; do sleep 1 & child=$!; wait \"$child\"; done\n"
     )
@@ -121,6 +125,7 @@ def test_start_web_and_stop_manage_only_the_project_process(tmp_path):
             "WEB_PORT": "49188",
         }
     )
+    env.pop("NEXT_TELEMETRY_DISABLED", None)
 
     started = subprocess.run(
         [str(repo / "scripts/voice-ai.sh"), "start", "--no-agent", "--web"],
@@ -132,7 +137,9 @@ def test_start_web_and_stop_manage_only_the_project_process(tmp_path):
     )
     assert started.returncode == 0, started.stderr or started.stdout
     web_pid = int((repo / "data/run/web.pid").read_text().split("|", 1)[0])
-    assert capture.read_text().splitlines()[0] == str(repo / "web")
+    lines = capture.read_text().splitlines()
+    assert lines[0] == str(repo / "web")
+    assert lines[2] == "1"
 
     stopped = subprocess.run(
         [str(repo / "scripts/voice-ai.sh"), "stop"],
@@ -239,3 +246,155 @@ def test_lookahead_bench_command_forwards_arguments_to_the_benchmark(tmp_path):
     assert command == (
         "run python scripts/bench_stt_lookahead.py --clips 5 --lookaheads 13,6"
     )
+
+
+def test_start_allows_sqlite_fallback_when_postgres_is_unavailable(tmp_path):
+    repo = _isolated_repo(tmp_path)
+    capture = tmp_path / "launch.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "sleep").write_text("#!/bin/sh\nexit 0\n")
+    (fake_bin / "lsof").write_text("#!/bin/sh\nexit 1\n")
+    (fake_bin / "curl").write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        f'  *7860*)\n'
+        f'    for _ in $(seq 1 50); do\n'
+        f'      if [ -s "{capture}" ]; then exit 0; fi\n'
+        f'      /bin/sleep 0.05\n'
+        f'    done\n'
+        f'    [ -s "{capture}" ]\n'
+        f'    ;;\n'
+        f'  *)\n'
+        f'    exit 0\n'
+        f'    ;;\n'
+        f'esac\n'
+    )
+    (fake_bin / "docker").write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "compose" ] && [ "$2" = "exec" ]; then exit 1; fi\n'
+        "exit 0\n"
+    )
+    (fake_bin / "uv").write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$PWD" "$*" >> "$CAPTURE"\n'
+    )
+    phoenix = fake_bin / "phoenix"
+    phoenix.write_text("#!/bin/sh\nexec sleep 60\n")
+    for command in ("sleep", "lsof", "curl", "docker", "uv", "phoenix"):
+        (fake_bin / command).chmod(0o755)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "PHOENIX_BIN": str(phoenix),
+            "CAPTURE": str(capture),
+        }
+    )
+
+    try:
+        started = subprocess.run(
+            [str(repo / "scripts/voice-ai.sh"), "start", "--background"],
+            cwd=repo,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        assert started.returncode == 0, started.stderr or started.stdout
+        assert "PostgreSQL is unavailable; falling back to SQLite" in (
+            started.stdout + started.stderr
+        )
+        commands = capture.read_text().splitlines()
+        assert any("python -m bot.bot" in line for line in commands)
+    finally:
+        phoenix_pid_file = repo / "data/phoenix/phoenix.pid"
+        if phoenix_pid_file.exists():
+            try:
+                pid = int(phoenix_pid_file.read_text().strip())
+                os.kill(pid, 15)
+            except (ValueError, ProcessLookupError):
+                pass
+        agent_pid_file = repo / "data/run/agent.pid"
+        if agent_pid_file.exists():
+            try:
+                pid = int(agent_pid_file.read_text().strip())
+                os.kill(pid, 15)
+            except (ValueError, ProcessLookupError):
+                pass
+
+
+def test_start_aborts_when_prometheus_is_unavailable(tmp_path):
+    repo = _isolated_repo(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    time_file = tmp_path / "time_counter.txt"
+    time_file.write_text("1000\n")
+    (fake_bin / "date").write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        '  *+%s*)\n'
+        '    if [ -f "$ADVANCE_TIME" ]; then\n'
+        f'      current=$(cat "{time_file}" 2>/dev/null || echo 1000)\n'
+        f'      next=$((current + 65))\n'
+        f'      printf "%s\\n" "$next" > "{time_file}"\n'
+        '      printf "%s\\n" "$current"\n'
+        '    else\n'
+        '      printf "1000\\n"\n'
+        '    fi\n'
+        '    ;;\n'
+        '  *)\n'
+        '    printf "1000\\n"\n'
+        '    ;;\n'
+        'esac\n'
+    )
+    advance_flag = tmp_path / "advance_time"
+    (fake_bin / "sleep").write_text("#!/bin/sh\nexit 0\n")
+    (fake_bin / "lsof").write_text("#!/bin/sh\nexit 1\n")
+    (fake_bin / "curl").write_text(
+        "#!/bin/sh\n"
+        f'case "$*" in\n'
+        f'  *9091*)\n'
+        f'    touch "{advance_flag}"\n'
+        f'    exit 1\n'
+        f'    ;;\n'
+        f'  *)\n'
+        f'    exit 0\n'
+        f'    ;;\n'
+        f'esac\n'
+    )
+    (fake_bin / "docker").write_text("#!/bin/sh\nexit 0\n")
+    phoenix = fake_bin / "phoenix"
+    phoenix.write_text("#!/bin/sh\nexec sleep 60\n")
+    for command in ("date", "sleep", "lsof", "curl", "docker", "phoenix"):
+        (fake_bin / command).chmod(0o755)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "PHOENIX_BIN": str(phoenix),
+            "ADVANCE_TIME": str(advance_flag),
+        }
+    )
+
+    try:
+        started = subprocess.run(
+            [str(repo / "scripts/voice-ai.sh"), "start", "--no-agent"],
+            cwd=repo,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        assert started.returncode != 0
+        assert "Prometheus did not become ready" in (started.stdout + started.stderr)
+    finally:
+        phoenix_pid_file = repo / "data/phoenix/phoenix.pid"
+        if phoenix_pid_file.exists():
+            try:
+                pid = int(phoenix_pid_file.read_text().strip())
+                os.kill(pid, 15)
+            except (ValueError, ProcessLookupError):
+                pass

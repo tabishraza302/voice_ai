@@ -87,6 +87,7 @@ start_web_background() {
   web_port_is_listening && die "port $WEB_PORT is already in use; refusing to start the web studio"
   [ -x "$WEB_BIN" ] || die "Next.js is not installed in web/node_modules; run the web setup first"
   log "starting the Next.js web studio on $WEB_PORT"
+  export NEXT_TELEMETRY_DISABLED=1
   ( cd "$REPO_ROOT/web" && exec node "$WEB_BIN" dev --hostname 127.0.0.1 -p "$WEB_PORT" ) > "$WEB_LOG" 2>&1 &
   local pid="$!" started attempt
   for attempt in $(seq 1 10); do
@@ -318,7 +319,7 @@ cmd_start() {
     || die "Grafana did not become healthy; docker compose logs grafana"
   wait_for "http://localhost:$COLLECTOR_PORT/metrics" "the collector's metrics exporter" 60 \
     || die "the collector did not come up; docker compose logs otel-collector"
-  wait_for_postgres || die "PostgreSQL did not become ready; docker compose logs postgres"
+  wait_for_postgres || warn "PostgreSQL is unavailable; falling back to SQLite for local agent data (docker compose logs postgres)"
 
   # Web studio (if requested via --web)
   if [ "$with_web" = true ]; then
@@ -367,6 +368,7 @@ cmd_web() {
   [ -x "$WEB_BIN" ] || die "Next.js is not installed in web/node_modules; run the web setup first"
   web_port_is_listening && die "port $WEB_PORT is already in use; refusing to start the web studio"
   cd "$REPO_ROOT/web"
+  export NEXT_TELEMETRY_DISABLED=1
   exec node "$WEB_BIN" dev --hostname 127.0.0.1 -p "$WEB_PORT"
 }
 cmd_stop() {
