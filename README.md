@@ -454,3 +454,87 @@ uv run python -m platform_api.cli check-schema
 # Start platform API server
 uv run uvicorn platform_api.app:create_app --factory --host 127.0.0.1 --port 8000
 ```
+
+---
+
+## Conversation Flow Engine (Pure Compiler & Reducer)
+
+The conversation flow engine in `bot.flow` provides deterministic state machine execution and compiler validation without database, network, GPU, or provider imports.
+
+### Pure Compiler and Reducer Usage
+
+```python
+import json
+from bot.flow import (
+    compile_flow,
+    initial_session_state,
+    reduce_event,
+    UserTurnAcceptedEvent,
+    StateProposalModelEvent,
+    StateProposal,
+    ProposeCaptureUpdate,
+    Evidence,
+)
+
+# 1. Load authored or normalized flow JSON
+with open("tests/fixtures/flow/valid-credit-card-en-hi.json", "r", encoding="utf-8") as f:
+    flow_dict = json.load(f)["flow"]
+
+# 2. Compile once per version into an immutable CompiledFlow artifact
+compiled = compile_flow(flow_dict, policy="You are a qualification assistant.")
+
+# 3. Initialize pure SessionState bound to a non-empty session ID
+state = initial_session_state(compiled, session_id="sess_demo_1")
+
+# 4. Accept a user turn under the per-session lock
+turn_event = UserTurnAcceptedEvent(
+    event_id="evt_turn_1",
+    session_id="sess_demo_1",
+    transport_epoch="epoch_1",
+    turn_id="turn_1",
+    generation_id="gen_1",
+    text="I am salaried and earn INR 80000 monthly.",
+)
+reduction = reduce_event(compiled, state, turn_event)
+state = reduction.state
+
+# 5. Reduce structured model proposals with exact evidence substring verification
+proposal = StateProposal(
+    proposal_id="prop_1",
+    session_id="sess_demo_1",
+    turn_id="turn_1",
+    generation_id="gen_1",
+    base_state_version=state.version,
+    updates=[
+        ProposeCaptureUpdate(
+            field="employment_type",
+            value="salaried",
+            evidence=Evidence(source_turn_id="turn_1", quote="salaried"),
+        ),
+    ],
+)
+reduction = reduce_event(
+    compiled,
+    state,
+    StateProposalModelEvent(
+        event_id="evt_prop_1",
+        session_id="sess_demo_1",
+        transport_epoch="epoch_1",
+        turn_id="turn_1",
+        generation_id="gen_1",
+        proposal=proposal,
+    ),
+)
+state = reduction.state
+# reduction.commands contains controller-owned manifests or actions
+# reduction.diagnostics contains any validation warnings or errors
+```
+
+### Current Scope and Voice Qualification Status
+
+Currently, only the pure graph schemas, compiler, and in-memory event reducer exist in `bot.flow`. Runtime persistence, end-to-end chat runners, and voice adapter integration are incomplete implementation plan targets (Tasks 3–6).
+
+- **Default flows reject voice playback**: Flows compiled without an explicit `AdapterCapabilities` object default to `playback_mode="unqualified"`, rejecting all `fragment_played` events and preventing unverified voice completion.
+- **Capabilities object alone is not qualification proof**: Supplying an `AdapterCapabilities` instance to the compiler changes manifest metadata, but does not constitute empirical verification. Actual voice transport qualification requires genuine browser loopback transport evidence and data-channel acknowledgments, which are not yet implemented.
+- **Durable chat runner is incomplete**: The reducer defines pure contracts for `chat_committed` events with required durable delivery IDs, but durable runner persistence and platform chat integration remain incomplete future tasks.
+- **Registered actions fail closed**: Flows with action steps currently also fail closed until the durable execution, user confirmation, and result validation lifecycle is implemented.
