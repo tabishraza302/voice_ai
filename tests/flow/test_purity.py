@@ -52,6 +52,12 @@ class TestImportPurity:
         )
         assert result.returncode == 0, f"Purity check failed:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
 
+    def test_every_declared_public_export_resolves(self) -> None:
+        import bot.flow as flow
+
+        missing = [name for name in flow.__all__ if not hasattr(flow, name)]
+        assert missing == [], f"__all__ names without an object: {missing}"
+
 
 class TestReducerPurity:
     """Verify that reduce_event is purely functional and deterministic with zero side effects."""
