@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from bot.db.models import Agent, BasePrompt, PromptRevision
 from bot.db.seeds.presets import DEFAULT_BASE_PROMPT, DEFAULT_PRESET_AGENTS
+from bot.db.session import StorageUnavailableError, storage_state
 from bot.agents.schemas import AgentCreate, AgentUpdate, BasePromptUpdate
 from bot.agents.compiler import compile_system_prompt
 
@@ -285,6 +286,14 @@ async def apply_active_agent_to_settings(
     from bot.db.session import get_session_factory
     from bot.services import resolve_models, validate_stt_language
     async def _resolve_with_session(sess: AsyncSession):
+        if agent_id and storage_state()["fallback"]:
+            # The requested profile may live in PostgreSQL. Reading the
+            # fallback SQLite file and reporting "not found" would claim
+            # the agent was deleted when the database is merely down.
+            raise StorageUnavailableError(
+                "requested agent profile cannot be resolved while storage is "
+                "the local SQLite fallback"
+            )
         service = AgentService(sess)
         await service.seed_default_presets()
         if agent_id:

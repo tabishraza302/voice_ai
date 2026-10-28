@@ -8,6 +8,7 @@ from sqlalchemy.pool import StaticPool
 from bot.api.router import create_api_router
 from bot.config import Settings
 from bot.db.base import Base
+from bot.db import session as db_session
 from bot.db.session import get_db_session
 import bot.db.models  # noqa: F401
 
@@ -37,6 +38,20 @@ async def api_client():
         yield client
 
     await engine.dispose()
+
+def test_storage_endpoint_reports_the_backend_without_credentials(api_client, monkeypatch):
+    monkeypatch.setattr(db_session, "_is_sqlite", True)
+    monkeypatch.setattr(db_session, "_fallback_active", True)
+
+    res = api_client.get("/api/storage")
+
+    assert res.status_code == 200
+    assert res.json() == {"backend": "sqlite", "fallback": True}
+    body = res.text.lower()
+    assert "postgresql" not in body
+    assert "sqlite://" not in body
+    assert "password" not in body
+
 
 def test_list_agents(api_client):
     res = api_client.get("/api/agents")

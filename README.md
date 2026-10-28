@@ -122,11 +122,18 @@ management endpoints have no authentication.
 
 PostgreSQL is published on loopback port 5439 by default. Set `POSTGRES_PORT`
 to move the Compose port, and set `DATABASE_URL` in `.env` to the same host
-port. The agent falls back to local SQLite when PostgreSQL is unavailable;
-its default location remains the existing `voice_ai.db` file. Set
-`SQLITE_DATABASE_URL` to choose another file location. The fallback is useful
-for a single local user, but its data is independent from PostgreSQL and does
-not synchronize automatically.
+port. A configured PostgreSQL failure fails closed by default: the agent
+refuses to start rather than silently writing to a different store. If a
+local-only SQLite store is acceptable, set `ALLOW_SQLITE_FALLBACK=1`; its
+default location remains the existing `voice_ai.db` file, and
+`SQLITE_DATABASE_URL` chooses another. `GET /api/storage` reports
+`{"backend": "postgres"|"sqlite", "fallback": bool}` without exposing URLs or
+credentials. While the fallback is active, a session that requests a saved
+agent profile is rejected with 503 because that profile may exist only in
+PostgreSQL. The fallback's data is independent from PostgreSQL and does not
+synchronize automatically; `scripts/voice-ai.sh start` sets
+`ALLOW_SQLITE_FALLBACK=1` explicitly and prints a warning when it chooses to
+continue without PostgreSQL.
 
 The Studio, API, database, and preset prompts are new code paths; the published
 STT, TTS, memory, and turn-latency tables describe the original measured

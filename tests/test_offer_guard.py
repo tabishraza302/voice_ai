@@ -17,6 +17,7 @@ from bot.bot import (
     mount_offer_guard,
 )
 from bot.config import Settings
+from bot.db.session import StorageUnavailableError
 
 
 @pytest.fixture(autouse=True)
@@ -99,6 +100,30 @@ def test_offer_preflight_rejects_missing_agent_id_with_404(monkeypatch):
 
     assert response.status_code == 404
     assert "not found" in response.json().get("detail", "").lower()
+    assert response.headers.get("access-control-allow-origin") == "http://localhost:3000"
+
+
+def test_offer_preflight_reports_storage_fallback_as_unavailable_not_deleted(monkeypatch):
+    """An explicit profile on the SQLite fallback returns 503, not 404."""
+    async def mock_resolver(s, agent_id):
+        raise StorageUnavailableError("requested profile is not available from fallback")
+
+    monkeypatch.setattr("bot.agents.service.apply_active_agent_to_settings", mock_resolver)
+
+    settings = Settings(_env_file=None, web_port=3000)
+    app = _create_test_app(settings, profile_resolver=mock_resolver)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/offer",
+        headers={"Origin": "http://localhost:3000"},
+        json={"sdp": "offer-sdp", "type": "offer", "request_data": {"agent_id": "saved-agent"}},
+    )
+
+    assert response.status_code == 503
+    detail = response.json().get("detail", "").lower()
+    assert "storage" in detail
+    assert "deleted" not in detail
     assert response.headers.get("access-control-allow-origin") == "http://localhost:3000"
 
 

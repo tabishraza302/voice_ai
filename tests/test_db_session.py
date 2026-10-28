@@ -13,6 +13,7 @@ async def test_concurrent_initialization_reuses_one_engine(monkeypatch):
     previous_factory = db_session._session_factory
     previous_url = getattr(db_session, "_engine_url", None)
     previous_requested_url = getattr(db_session, "_requested_url", None)
+    previous_fallback = getattr(db_session, "_fallback_active", False)
     db_session._engine = None
     db_session._session_factory = None
     create_engine = db_session.create_async_engine
@@ -39,6 +40,7 @@ async def test_concurrent_initialization_reuses_one_engine(monkeypatch):
         db_session._session_factory = previous_factory
         db_session._engine_url = previous_url
         db_session._requested_url = previous_requested_url
+        db_session._fallback_active = previous_fallback
 
 
 @pytest.mark.asyncio
@@ -64,10 +66,12 @@ async def test_schema_upgrade_preserves_existing_rows_and_adds_constraints(tmp_p
     old_factory = db_session._session_factory
     old_engine_url = db_session._engine_url
     old_requested_url = db_session._requested_url
+    old_fallback = db_session._fallback_active
     db_session._engine = None
     db_session._session_factory = None
     db_session._engine_url = None
     db_session._requested_url = None
+    db_session._fallback_active = False
     try:
         upgraded = await db_session.init_engine(database_url)
         async with upgraded.connect() as connection:
@@ -91,48 +95,85 @@ async def test_schema_upgrade_preserves_existing_rows_and_adds_constraints(tmp_p
         db_session._session_factory = old_factory
         db_session._engine_url = old_engine_url
         db_session._requested_url = old_requested_url
+        db_session._fallback_active = old_fallback
+
+
+def _reset_engine_state(monkeypatch):
+    monkeypatch.setattr(db_session, "_engine", None)
+    monkeypatch.setattr(db_session, "_session_factory", None)
+    monkeypatch.setattr(db_session, "_engine_url", None)
+    monkeypatch.setattr(db_session, "_requested_url", None)
+    monkeypatch.setattr(db_session, "_is_sqlite", False)
+    monkeypatch.setattr(db_session, "_fallback_active", False)
+
+
+def _failing_postgres_engine(real_create_engine, attempts):
+    class FailingConnection:
+        async def __aenter__(self):
+            attempts.append("postgres")
+            raise ConnectionRefusedError("Simulated PostgreSQL connection failure")
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    class FailingEngine:
+        def connect(self):
+            return FailingConnection()
+
+        async def dispose(self):
+            pass
+
+    def create(target_url, *args, **kwargs):
+        if "postgresql" in str(target_url):
+            return FailingEngine()
+        return real_create_engine(target_url, *args, **kwargs)
+
+    return create
+
+
+@pytest.mark.asyncio
+async def test_postgres_failure_fails_closed_by_default(monkeypatch, tmp_path):
+    _reset_engine_state(monkeypatch)
+    monkeypatch.setattr(db_session, "ALLOW_SQLITE_FALLBACK", False)
+    monkeypatch.setattr(db_session, "SQLITE_FALLBACK_URL", f"sqlite+aiosqlite:///{tmp_path / 'never.db'}")
+    attempts = []
+    monkeypatch.setattr(
+        db_session,
+        "create_async_engine",
+        _failing_postgres_engine(db_session.create_async_engine, attempts),
+    )
+
+    with pytest.raises(ConnectionRefusedError):
+        await db_session.init_engine()
+
+    assert attempts == ["postgres"]
+    assert db_session._engine is None
+    assert db_session._session_factory is None
+    assert db_session.storage_state() == {"backend": "postgres", "fallback": False}
 
 
 @pytest.mark.asyncio
 async def test_init_engine_falls_back_to_sqlite_when_postgres_fails(monkeypatch, tmp_path):
-    old_engine = db_session._engine
-    old_factory = db_session._session_factory
-    old_engine_url = db_session._engine_url
-    old_requested_url = db_session._requested_url
-    old_is_sqlite = db_session._is_sqlite
+    _reset_engine_state(monkeypatch)
     sqlite_path = tmp_path / "fallback.db"
     fallback_url = f"sqlite+aiosqlite:///{sqlite_path}"
 
-    real_create_engine = db_session.create_async_engine
-
-    def mock_create_async_engine(target_url, *args, **kwargs):
-        if "postgresql" in str(target_url):
-            class FailingConnection:
-                async def __aenter__(self):
-                    raise ConnectionRefusedError("Simulated PostgreSQL connection failure")
-                async def __aexit__(self, exc_type, exc_val, exc_tb):
-                    pass
-
-            class FailingEngine:
-                def connect(self):
-                    return FailingConnection()
-                async def dispose(self):
-                    pass
-
-            return FailingEngine()
-        return real_create_engine(target_url, *args, **kwargs)
-
-    monkeypatch.setattr(db_session, "create_async_engine", mock_create_async_engine)
+    attempts = []
+    monkeypatch.setattr(db_session, "ALLOW_SQLITE_FALLBACK", True)
     monkeypatch.setattr(db_session, "SQLITE_FALLBACK_URL", fallback_url)
-    db_session._engine = None
-    db_session._session_factory = None
-    db_session._engine_url = None
-    db_session._requested_url = None
-    db_session._is_sqlite = False
+    monkeypatch.setattr(
+        db_session,
+        "create_async_engine",
+        _failing_postgres_engine(db_session.create_async_engine, attempts),
+    )
 
     try:
         engine = await db_session.init_engine()
         assert engine is not None
+        assert db_session.storage_state() == {"backend": "sqlite", "fallback": True}
+        # The fallback engine is recorded as the store actually opened, not
+        # as if PostgreSQL had answered.
+        assert db_session._requested_url == fallback_url
 
         # Verify schema tables were created on the real SQLite fallback database
         async with engine.connect() as conn:
@@ -173,8 +214,30 @@ async def test_init_engine_falls_back_to_sqlite_when_postgres_fails(monkeypatch,
     finally:
         if db_session._engine is not None:
             await db_session._engine.dispose()
-        db_session._engine = old_engine
-        db_session._session_factory = old_factory
-        db_session._engine_url = old_engine_url
-        db_session._requested_url = old_requested_url
-        db_session._is_sqlite = old_is_sqlite
+
+
+@pytest.mark.asyncio
+async def test_repeated_init_retries_postgres_instead_of_reusing_fallback(monkeypatch, tmp_path):
+    _reset_engine_state(monkeypatch)
+    monkeypatch.setattr(db_session, "ALLOW_SQLITE_FALLBACK", True)
+    monkeypatch.setattr(db_session, "SQLITE_FALLBACK_URL", f"sqlite+aiosqlite:///{tmp_path / 'retry.db'}")
+    attempts = []
+    monkeypatch.setattr(
+        db_session,
+        "create_async_engine",
+        _failing_postgres_engine(db_session.create_async_engine, attempts),
+    )
+
+    try:
+        await db_session.init_engine()
+        assert db_session.storage_state()["fallback"] is True
+        assert attempts == ["postgres"]
+
+        # A second default init must not return the fallback as if it were
+        # the configured database: it retries PostgreSQL.
+        await db_session.init_engine()
+        assert attempts == ["postgres", "postgres"]
+        assert db_session.storage_state() == {"backend": "sqlite", "fallback": True}
+    finally:
+        if db_session._engine is not None:
+            await db_session._engine.dispose()

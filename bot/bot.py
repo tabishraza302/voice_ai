@@ -464,6 +464,8 @@ def mount_offer_guard(
     from starlette.requests import Request
     from starlette.responses import JSONResponse
     from sqlalchemy.exc import SQLAlchemyError
+    from bot.agents.service import AgentNotFoundError
+    from bot.db.session import StorageUnavailableError
 
     allowed_origins = {
         f"http://localhost:{settings.web_port}",
@@ -505,7 +507,20 @@ def mount_offer_guard(
                     else:
                         client_detail = "Invalid session configuration request."
                     return JSONResponse(status_code=400, content={"detail": client_detail}, headers=headers)
-                except LookupError as exc:
+                except StorageUnavailableError as exc:
+                    logger.warning(f"WebRTC offer preflight could not reach agent storage: {exc}")
+                    return JSONResponse(
+                        status_code=503,
+                        content={
+                            "detail": (
+                                "Agent storage is unavailable: PostgreSQL is not reachable "
+                                "and the local SQLite fallback cannot verify saved agent profiles. "
+                                "Reconnect PostgreSQL and try again."
+                            )
+                        },
+                        headers=headers,
+                    )
+                except AgentNotFoundError as exc:
                     logger.warning(f"WebRTC offer preflight rejected missing agent: {exc}")
                     return JSONResponse(
                         status_code=404,

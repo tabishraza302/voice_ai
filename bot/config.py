@@ -105,10 +105,16 @@ class Settings(BaseSettings):
     # Compiled or default system instruction passed to the LLM backend
     system_instruction: str = SYSTEM_PROMPT
 
-    # Local agent configuration storage. The service falls back to SQLite
-    # if the loopback PostgreSQL database cannot be reached.
+    # Local agent configuration storage. A configured PostgreSQL database
+    # that cannot be reached is a startup failure by default: silently
+    # writing agent edits to a different store makes them disappear when
+    # PostgreSQL comes back. A deployment that deliberately accepts a
+    # local-only SQLite store must opt in with ALLOW_SQLITE_FALLBACK=1;
+    # /api/storage then reports the fallback, and sessions that request a
+    # saved agent profile fail with 503 instead of reading the wrong store.
     database_url: str = "postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai"
     sqlite_database_url: str = "sqlite+aiosqlite:///voice_ai.db"
+    allow_sqlite_fallback: bool = False
 
     # --- TTS layer -------------------------------------------------------
     # "mlx-audio" is the default, and it is a measured choice: the median

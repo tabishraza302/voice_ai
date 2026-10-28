@@ -12,6 +12,10 @@ logger = logging.getLogger(__name__)
 _database_settings = Settings()
 POSTGRES_URL = _database_settings.database_url
 SQLITE_FALLBACK_URL = _database_settings.sqlite_database_url
+# Off unless the deployment explicitly opts in. A configured PostgreSQL
+# failure must fail closed: writing agent edits to SQLite while PostgreSQL
+# is down makes them invisible when PostgreSQL returns.
+ALLOW_SQLITE_FALLBACK = _database_settings.allow_sqlite_fallback
 
 # Global engine and sessionmaker holders
 _engine = None
@@ -19,7 +23,29 @@ _session_factory = None
 _is_sqlite = False
 _engine_url: str | None = None
 _requested_url: str | None = None
+_fallback_active = False
 _init_locks: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+class StorageUnavailableError(RuntimeError):
+    """A requested durable storage capability is not available.
+
+    Raised when a caller asks for a saved agent profile while the process
+    is serving from the explicit SQLite fallback. The profile may exist in
+    PostgreSQL, so answering from the fallback would be a lie.
+    """
+
+
+def storage_state() -> dict[str, object]:
+    """The backend this process is actually serving from.
+
+    Deliberately carries no URL, host, user or credential: this is served
+    by the unauthenticated local API.
+    """
+    return {
+        "backend": "sqlite" if _is_sqlite else "postgres",
+        "fallback": _fallback_active,
+    }
 
 
 def _init_lock_for_loop() -> asyncio.Lock:
@@ -44,12 +70,23 @@ def _create_local_indexes(connection):
 
 
 async def init_engine(url: str | None = None):
-    global _engine, _session_factory, _is_sqlite, _engine_url, _requested_url
+    global _engine, _session_factory, _is_sqlite, _engine_url, _requested_url, _fallback_active
     requested_url = url or POSTGRES_URL
     target_url = requested_url
-    allow_fallback = url is None and target_url == POSTGRES_URL
+    # Only the implicit default URL may fall back, and only when the
+    # deployment opted in. An explicit URL always means exactly that URL.
+    allow_fallback = url is None and target_url == POSTGRES_URL and ALLOW_SQLITE_FALLBACK
     async with _init_lock_for_loop():
-        if _engine is not None and _session_factory is not None and _requested_url == requested_url:
+        # A fallback engine is never reused as if it satisfied a request for
+        # PostgreSQL: _requested_url records the store actually opened, so
+        # the next init_engine() retries the configured database. An explicit
+        # SQLite request also replaces a fallback engine and clears the flag.
+        if (
+            _engine is not None
+            and _session_factory is not None
+            and _requested_url == requested_url
+            and not _fallback_active
+        ):
             return _engine
 
         engine = create_async_engine(target_url, echo=False)
@@ -59,9 +96,19 @@ async def init_engine(url: str | None = None):
         except Exception as exc:
             await engine.dispose()
             if not allow_fallback:
-                logger.error("Database initialization failed for explicitly configured storage (%s)", type(exc).__name__)
+                logger.error(
+                    "Database initialization failed for configured storage (%s); "
+                    "refusing to switch stores. Set ALLOW_SQLITE_FALLBACK=1 only "
+                    "if a local-only SQLite store is acceptable.",
+                    type(exc).__name__,
+                )
                 raise
-            logger.warning("Configured database unavailable (%s); falling back to local SQLite.", type(exc).__name__)
+            logger.warning(
+                "Configured database unavailable (%s); ALLOW_SQLITE_FALLBACK=1 is set, "
+                "falling back to local SQLite. Agent edits made now will not appear "
+                "in PostgreSQL.",
+                type(exc).__name__,
+            )
             target_url = SQLITE_FALLBACK_URL
             engine = create_async_engine(target_url, echo=False)
             try:
@@ -85,12 +132,19 @@ async def init_engine(url: str | None = None):
         previous = _engine
         _engine = engine
         _engine_url = target_url
-        _requested_url = requested_url
+        # Record the store actually opened. If this is the fallback, a later
+        # default init_engine() sees SQLite here and retries PostgreSQL.
+        _requested_url = target_url
         _is_sqlite = "sqlite" in target_url
+        _fallback_active = allow_fallback and target_url == SQLITE_FALLBACK_URL
         _session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
         if previous is not None and previous is not engine:
             await previous.dispose()
-        logger.info("Database initialized (%s)", "SQLite" if _is_sqlite else "PostgreSQL")
+        logger.info(
+            "Database initialized (%s%s)",
+            "SQLite" if _is_sqlite else "PostgreSQL",
+            ", fallback" if _fallback_active else "",
+        )
         return engine
 
 

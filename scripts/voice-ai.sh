@@ -319,7 +319,15 @@ cmd_start() {
     || die "Grafana did not become healthy; docker compose logs grafana"
   wait_for "http://localhost:$COLLECTOR_PORT/metrics" "the collector's metrics exporter" 60 \
     || die "the collector did not come up; docker compose logs otel-collector"
-  wait_for_postgres || warn "PostgreSQL is unavailable; falling back to SQLite for local agent data (docker compose logs postgres)"
+  if ! wait_for_postgres; then
+    # The agent no longer falls back implicitly: a configured PostgreSQL
+    # failure fails closed. This script is deliberately choosing a
+    # local-only store for this launch, so it must say so out loud and
+    # hand the agent an explicit opt-in.
+    export ALLOW_SQLITE_FALLBACK=1
+    warn "PostgreSQL is unavailable; falling back to SQLite for local agent data (docker compose logs postgres)"
+    warn "WARNING: ALLOW_SQLITE_FALLBACK=1. Agent edits now go to the local SQLite file and will NOT appear in PostgreSQL."
+  fi
 
   # Web studio (if requested via --web)
   if [ "$with_web" = true ]; then

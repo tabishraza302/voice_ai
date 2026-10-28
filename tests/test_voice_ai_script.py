@@ -277,7 +277,7 @@ def test_start_allows_sqlite_fallback_when_postgres_is_unavailable(tmp_path):
     )
     (fake_bin / "uv").write_text(
         "#!/bin/sh\n"
-        'printf "%s\\n" "$PWD" "$*" >> "$CAPTURE"\n'
+        'printf "%s\\n" "$PWD" "$*" "${ALLOW_SQLITE_FALLBACK-<unset>}" >> "$CAPTURE"\n'
     )
     phoenix = fake_bin / "phoenix"
     phoenix.write_text("#!/bin/sh\nexec sleep 60\n")
@@ -303,11 +303,14 @@ def test_start_allows_sqlite_fallback_when_postgres_is_unavailable(tmp_path):
         )
 
         assert started.returncode == 0, started.stderr or started.stdout
-        assert "PostgreSQL is unavailable; falling back to SQLite" in (
-            started.stdout + started.stderr
-        )
+        output = started.stdout + started.stderr
+        assert "PostgreSQL is unavailable; falling back to SQLite" in output
+        assert "ALLOW_SQLITE_FALLBACK=1" in output
+        assert "will NOT appear in PostgreSQL" in output
         commands = capture.read_text().splitlines()
-        assert any("python -m bot.bot" in line for line in commands)
+        agent_command = next(line for line in commands if "python -m bot.bot" in line)
+        assert agent_command is not None
+        assert "1" in commands[commands.index(agent_command) + 1]
     finally:
         phoenix_pid_file = repo / "data/phoenix/phoenix.pid"
         if phoenix_pid_file.exists():
