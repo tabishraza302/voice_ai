@@ -86,6 +86,7 @@ async def create_test_user_session(
             updated_at=now,
         )
         session.add(user)
+        await session.flush()
         _, secret = await create_authenticated_session(
             session, settings, user=user, client_ip="127.0.0.1", user_agent="Test", now=now
         )
