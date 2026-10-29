@@ -105,3 +105,61 @@ async def test_implicit_latest_with_registry_port_normalizes_final_segment_only(
     settings = Settings(_env_file=None, llm_model="registry.example:5000/org/model")
 
     await validate_llm_model_available(settings)
+
+
+@pytest.mark.asyncio
+async def test_library_namespace_compares_equal_to_bare_name(monkeypatch):
+    """Configured 'library/qwen3.5:4b' matches catalog 'qwen3.5:4b' and vice versa."""
+    async def catalog(settings, *, timeout=2.0):
+        return {"qwen3.5:4b"}
+
+    monkeypatch.setattr("bot.services.fetch_local_llm_models", catalog)
+    settings = Settings(_env_file=None, llm_model="library/qwen3.5:4b")
+    await validate_llm_model_available(settings)
+
+
+@pytest.mark.asyncio
+async def test_default_registry_prefix_compares_equal_to_bare_name(monkeypatch):
+    """Configured 'registry.ollama.ai/library/qwen3.5:4b' matches catalog 'qwen3.5:4b'."""
+    async def catalog(settings, *, timeout=2.0):
+        return {"qwen3.5:4b"}
+
+    monkeypatch.setattr("bot.services.fetch_local_llm_models", catalog)
+    settings = Settings(_env_file=None, llm_model="registry.ollama.ai/library/qwen3.5:4b")
+    await validate_llm_model_available(settings)
+
+
+@pytest.mark.asyncio
+async def test_custom_namespace_does_not_collapse_to_default_library(monkeypatch):
+    """'custom/qwen3.5:4b' does not match 'qwen3.5:4b'."""
+    async def catalog(settings, *, timeout=2.0):
+        return {"qwen3.5:4b"}
+
+    monkeypatch.setattr("bot.services.fetch_local_llm_models", catalog)
+    settings = Settings(_env_file=None, llm_model="custom/qwen3.5:4b")
+    with pytest.raises(LlmModelNotAvailableError, match="is not installed"):
+        await validate_llm_model_available(settings)
+
+
+@pytest.mark.asyncio
+async def test_non_default_registry_host_and_port_do_not_collapse(monkeypatch):
+    """Registry host/port must be preserved and distinct."""
+    async def catalog(settings, *, timeout=2.0):
+        return {"registry.example:5000/org/model:v1"}
+
+    monkeypatch.setattr("bot.services.fetch_local_llm_models", catalog)
+
+    # Different port must not match
+    settings_diff_port = Settings(_env_file=None, llm_model="registry.example:5001/org/model:v1")
+    with pytest.raises(LlmModelNotAvailableError, match="is not installed"):
+        await validate_llm_model_available(settings_diff_port)
+
+    # Different tag must not match
+    settings_diff_tag = Settings(_env_file=None, llm_model="registry.example:5000/org/model:v2")
+    with pytest.raises(LlmModelNotAvailableError, match="is not installed"):
+        await validate_llm_model_available(settings_diff_tag)
+
+    # Omitting registry must not match non-default registry
+    settings_no_registry = Settings(_env_file=None, llm_model="org/model:v1")
+    with pytest.raises(LlmModelNotAvailableError, match="is not installed"):
+        await validate_llm_model_available(settings_no_registry)

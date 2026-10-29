@@ -78,6 +78,7 @@ def build_stt_mlx_audio(settings: Settings) -> STTService:
     `language is not None` assertion — see ``bot/stt_service.py`` for the
     other two upstream mismatches it fixes.
     """
+    settings = resolve_models(settings)
     language = _parse_language(settings.stt_language)
     return LocalMlxSTTService(
         model=settings.stt_model,
@@ -111,15 +112,45 @@ def local_llm_tags_url(settings: Settings) -> str | None:
     return f"{parsed.scheme}://{parsed.netloc}/api/tags"
 
 
+def _cut_last(s: str, sep: str) -> tuple[str, str, bool]:
+    idx = s.rfind(sep)
+    if idx >= 0:
+        return s[:idx], s[idx + len(sep):], True
+    return s, "", False
+
+
 def _normalize_ollama_model_name(name: str) -> str:
-    """Normalize an Ollama model name so implicit and explicit :latest compare equal.
+    """Normalize an Ollama model name into canonical host/namespace/model:tag format.
 
-    Registry ports (e.g. registry.example:5000/name) put a colon in earlier path
-    segments; only the final path segment carries the optional model tag.
+    Follows Ollama's `types/model/name.go` rules:
+    - Tag is extracted after the last ':' if after the last '/'.
+    - Model is extracted after the last '/'.
+    - Namespace is extracted after the next last '/'.
+    - Preceding part is registry host (stripping optional 'scheme://' prefix).
+    - Defaults: host 'registry.ollama.ai', namespace 'library', tag 'latest'.
     """
-    final_segment = name.rsplit("/", 1)[-1]
-    return f"{name}:latest" if ":" not in final_segment else name
+    s = name.strip()
+    tag = ""
+    if s.rfind(":") > s.rfind("/"):
+        s, tag, _ = _cut_last(s, ":")
 
+    s, model, promised = _cut_last(s, "/")
+    if not promised:
+        host = "registry.ollama.ai"
+        namespace = "library"
+        model = s
+    else:
+        s, namespace, promised = _cut_last(s, "/")
+        if not promised:
+            host = "registry.ollama.ai"
+            namespace = s
+        else:
+            scheme, sep, rest = s.partition("://")
+            host = (rest if sep else scheme) or "registry.ollama.ai"
+            namespace = namespace or "library"
+
+    final_tag = tag or "latest"
+    return f"{host.lower()}/{namespace.lower()}/{model.lower()}:{final_tag.lower()}"
 
 async def fetch_local_llm_models(
     settings: Settings, *, timeout: float = 2.0
@@ -216,7 +247,7 @@ def resolve_models(settings: Settings) -> Settings:
     """
     if settings.stt_provider == "mlx-whisper" and settings.stt_model == NEMOTRON_MODEL:
         settings.stt_model = WHISPER_MODEL
-    if settings.stt_provider == "mlx-audio-realtime" and settings.stt_model == WHISPER_MODEL:
+    if settings.stt_provider in ("mlx-audio-realtime", "mlx-audio") and settings.stt_model == WHISPER_MODEL:
         # The realtime endpoint serves any streaming checkpoint, but
         # whisper-large-v3-turbo is not one: it would fail at load with
         # "does not support streaming". Nemotron is the streaming model
@@ -439,6 +470,7 @@ def build_voice_router(settings: Settings) -> VoiceRouter:
 
 def build_stt_language_router(settings: Settings) -> SttLanguageRouter:
     """Build the STT language router that matches the configured provider."""
+    settings = resolve_models(settings)
     return select_stt_language_router(settings)
 
 

@@ -137,7 +137,9 @@ exist only in PostgreSQL; later storage requests retry PostgreSQL. The fallback
 data is independent and does not synchronize automatically;
 `scripts/voice-ai.sh start` sets
 `ALLOW_SQLITE_FALLBACK=1` explicitly and prints a warning when it chooses to
-continue without PostgreSQL.
+continue without PostgreSQL. An explicit `ALLOW_SQLITE_FALLBACK=0` (or
+`false`/`no`/`off`) in the environment or `.env` is honored: the script leaves
+it alone and the agent fails closed instead.
 
 The Studio, API, database, and preset prompts are new code paths; the published
 STT, TTS, memory, and turn-latency tables describe the original measured
@@ -218,11 +220,16 @@ STT, TTS, and LLM backends are selected entirely by configuration without touchi
 | Layer | Default | Swap to | Real Cost / Tradeoff | When to Use |
 |---|---|---|---|---|
 | **STT** | `mlx-audio-realtime` + Nemotron 3.5 ASR 0.6B | `mlx-whisper` + `whisper-large-v3-turbo` | Weights: 1.28 GB → 1.61 GB. FLEURS WER: **Hindi 7.18 % → 35.92 %**, English 8.56 % → 4.98 %. | When English precision is primary and Hindi is secondary. |
-| **STT** | `mlx-audio-realtime` + Nemotron 3.5 ASR 0.6B | `mlx-audio` + Nemotron 3.5 ASR 0.6B | Batch HTTP endpoint (`/v1/audio/transcriptions`) instead of WebSocket: TTFS p50/p99 increases from 0.89s/0.99s to 0.94s/1.06s (en) and 1.00s/1.45s to 1.26s/1.80s (hi). Supports explicit language pinning (`stt_language=en|hi`). | When mid-session language pinning or explicit locale overrides are required. |
+| **STT** | `mlx-audio-realtime` + Nemotron 3.5 ASR 0.6B | `mlx-audio` + Nemotron 3.5 ASR 0.6B | Batch HTTP endpoint (`/v1/audio/transcriptions`) instead of WebSocket: TTFS p50/p99 0.843s/0.993s (en) and 1.022s/1.724s (hi). Supports explicit language pinning (`stt_language=en|hi`). | When mid-session language pinning or explicit locale overrides are required. |
 | **TTS** | `mlx-audio` + `Kokoro-82M-4bit` (Metal) | `kokoro` (in-process ONNX CPU) | Time to first audio: **0.28 s vs 0.71 s** (p50). In-process ONNX adds 0.48 GB to agent process but eliminates dependency on `mlx-audio` server. | When running without the local HTTP server or optimizing process boundaries. |
 | **LLM** | `ollama` + `qwen3.5:4b` | `ollama` + `gemma3:4b` | Gemma 3 is non-thinking, so it needs no reasoning policy; the memory baseline measured it at 2.62 GB resident. | When running in a tighter memory tier or preferring Gemma 3 Devanagari styling. |
 | **LLM** | `ollama` | `openai-compatible` + llama.cpp / vLLM / LM Studio | Alternative local inference runtime. | When deploying with non-Ollama runtimes. |
 | **LLM** | `ollama` + `qwen3.5:4b` | `openai-compatible` + Cloud API (`gpt-5.4-mini`) | Requires a network, so it breaks the air-gapped property. Not measured against the local default. | When testing cloud frontier model reasoning capabilities. |
+
+Batch TTFS was remeasured on the Apple M5 MacBook Air (16 GB unified memory)
+on 2026-10-29 with `scripts/voice-ai.sh bench`, using cached FLEURS clips and a
+local isolated speech server: 9 English and 10 Hindi measured clips, after one
+English warm-up. These small-sample timings are not deployment budgets.
 
 To swap backends, edit `.env`:
 ```bash

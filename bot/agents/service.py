@@ -318,6 +318,7 @@ async def apply_active_agent_to_settings(
         updated.tts_voice_en = agent.tts_voice_en
         updated.tts_voice_hi = agent.tts_voice_hi
         updated.tts_speed = agent.tts_speed
+        updated = resolve_models(updated)
         try:
             from bot.control import apply_mode
             updated = apply_mode(updated)

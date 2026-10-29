@@ -151,3 +151,119 @@ async def test_apply_active_agent_allows_realtime_preset_when_batch_mode_overrid
     )
     assert resolved.stt_provider == "mlx-audio"
     assert resolved.stt_language == "hi"
+
+
+@pytest.mark.asyncio
+async def test_apply_active_agent_realtime_with_batch_override_swaps_whisper_to_nemotron(
+    integration_session, monkeypatch
+):
+    service = AgentService(integration_session)
+    await service.seed_default_presets()
+    from bot.agents.schemas import AgentCreate
+    from bot.services import (
+        NEMOTRON_MODEL,
+        WHISPER_MODEL,
+        build_stt,
+        build_stt_language_router,
+    )
+    from bot.stt_service import LocalMlxSTTService
+    from bot.language import Language, NemotronSttLanguageRouter
+
+    agent = await service.create_agent(
+        AgentCreate(
+            slug="realtime-streamer",
+            name="Realtime Streamer",
+            persona_prompt="You stream fast answers.",
+            llm_model="qwen3.5:4b",
+            stt_provider="mlx-audio-realtime",
+        )
+    )
+
+    from bot import control
+    monkeypatch.setattr(control, "effective_provider", lambda s: "mlx-audio")
+
+    settings = Settings(_env_file=None, stt_provider="mlx-whisper", stt_model=WHISPER_MODEL)
+    resolved = await apply_active_agent_to_settings(
+        settings, session=integration_session, agent_id=agent.id
+    )
+
+    assert resolved.stt_provider == "mlx-audio"
+    assert resolved.stt_model == NEMOTRON_MODEL
+
+    stt_svc = build_stt(resolved)
+    assert isinstance(stt_svc, LocalMlxSTTService)
+    assert stt_svc._settings.model == NEMOTRON_MODEL
+
+    stt_router = build_stt_language_router(resolved)
+    assert isinstance(stt_router, NemotronSttLanguageRouter)
+    assert stt_router.delta_for(Language.EN).model == NEMOTRON_MODEL
+
+
+@pytest.mark.asyncio
+async def test_apply_active_agent_preserves_explicit_custom_stt_model_under_override(
+    integration_session, monkeypatch
+):
+    service = AgentService(integration_session)
+    await service.seed_default_presets()
+    from bot.agents.schemas import AgentCreate
+    from bot.services import build_stt, build_stt_language_router
+    from bot.stt_service import LocalMlxSTTService
+    from bot.language import Language, NemotronSttLanguageRouter
+
+    agent = await service.create_agent(
+        AgentCreate(
+            slug="realtime-custom",
+            name="Realtime Custom",
+            persona_prompt="You stream custom answers.",
+            llm_model="qwen3.5:4b",
+            stt_provider="mlx-audio-realtime",
+        )
+    )
+
+    from bot import control
+    monkeypatch.setattr(control, "effective_provider", lambda s: "mlx-audio")
+
+    custom_model = "custom-org/whisper-large-v3-finetuned"
+    settings = Settings(_env_file=None, stt_provider="mlx-whisper", stt_model=custom_model)
+    resolved = await apply_active_agent_to_settings(
+        settings, session=integration_session, agent_id=agent.id
+    )
+
+    assert resolved.stt_provider == "mlx-audio"
+    assert resolved.stt_model == custom_model
+
+    stt_svc = build_stt(resolved)
+    assert isinstance(stt_svc, LocalMlxSTTService)
+    assert stt_svc._settings.model == custom_model
+
+    stt_router = build_stt_language_router(resolved)
+    assert isinstance(stt_router, NemotronSttLanguageRouter)
+    assert stt_router.delta_for(Language.EN).model == custom_model
+
+
+@pytest.mark.asyncio
+async def test_apply_active_agent_realtime_without_override_swaps_whisper_to_nemotron(
+    integration_session,
+):
+    service = AgentService(integration_session)
+    await service.seed_default_presets()
+    from bot.agents.schemas import AgentCreate
+    from bot.services import NEMOTRON_MODEL, WHISPER_MODEL
+
+    agent = await service.create_agent(
+        AgentCreate(
+            slug="realtime-no-override",
+            name="Realtime No Override",
+            persona_prompt="You stream fast answers.",
+            llm_model="qwen3.5:4b",
+            stt_provider="mlx-audio-realtime",
+        )
+    )
+
+    settings = Settings(_env_file=None, stt_provider="mlx-whisper", stt_model=WHISPER_MODEL)
+    resolved = await apply_active_agent_to_settings(
+        settings, session=integration_session, agent_id=agent.id
+    )
+
+    assert resolved.stt_provider == "mlx-audio-realtime"
+    assert resolved.stt_model == NEMOTRON_MODEL
