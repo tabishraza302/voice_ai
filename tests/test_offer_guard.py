@@ -18,6 +18,7 @@ from bot.bot import (
 )
 from bot.config import Settings
 from bot.db.session import StorageUnavailableError
+from bot.services import LlmModelNotAvailableError, SttLanguageNotSupportedError
 
 
 @pytest.fixture(autouse=True)
@@ -127,6 +128,29 @@ def test_offer_preflight_reports_storage_fallback_as_unavailable_not_deleted(mon
     assert response.headers.get("access-control-allow-origin") == "http://localhost:3000"
 
 
+def test_offer_preflight_reports_uninstalled_model_as_unavailable(monkeypatch):
+    """A model the local server does not list returns 503 before the call starts."""
+    async def mock_resolver(s, agent_id):
+        raise LlmModelNotAvailableError("llm_model 'missing:1b' is not installed")
+
+    monkeypatch.setattr("bot.agents.service.apply_active_agent_to_settings", mock_resolver)
+
+    settings = Settings(_env_file=None, web_port=3000)
+    app = _create_test_app(settings, profile_resolver=mock_resolver)
+    client = TestClient(app, base_url="http://127.0.0.1:7860")
+
+    response = client.post(
+        "/api/offer",
+        headers={"Origin": "http://localhost:3000"},
+        json={"sdp": "offer-sdp", "type": "offer", "request_data": {"agent_id": "saved-agent"}},
+    )
+
+    assert response.status_code == 503
+    detail = response.json().get("detail", "").lower()
+    assert "model" in detail
+    assert "unavailable" in detail
+
+
 def test_offer_preflight_fails_closed_on_database_error(monkeypatch):
     """Database storage failure returns HTTP 500 Internal Server Error without falling back."""
     async def mock_resolver(s, agent_id):
@@ -152,7 +176,7 @@ def test_offer_preflight_fails_closed_on_database_error(monkeypatch):
 def test_offer_preflight_rejects_incompatible_realtime_pinned_language(monkeypatch):
     """Incompatible realtime STT + pinned non-auto language returns HTTP 400 Bad Request."""
     async def mock_resolver(s, agent_id):
-        raise ValueError(
+        raise SttLanguageNotSupportedError(
             "stt_provider=mlx-audio-realtime has no language switch: "
             "/v1/realtime takes model, format and turn_detection only. "
             "Set stt_language=auto, or use stt_provider=mlx-audio"
@@ -271,6 +295,72 @@ def test_start_route_preflight(monkeypatch):
 
     assert response.status_code == 404
 
+
+def test_offer_preflight_rejects_top_level_agent_id(monkeypatch):
+    """Top-level agent_id in /api/offer payload is rejected with 400 Bad Request."""
+    async def unused_resolver(s, agent_id=None):
+        raise AssertionError("Resolver should not be reached when payload structure is invalid")
+
+    monkeypatch.setattr("bot.agents.service.apply_active_agent_to_settings", unused_resolver)
+
+    settings = Settings(_env_file=None, web_port=3000)
+    app = _create_test_app(settings, profile_resolver=unused_resolver)
+    client = TestClient(app, base_url="http://127.0.0.1:7860")
+
+    response = client.post(
+        "/api/offer",
+        headers={"Origin": "http://localhost:3000"},
+        json={"sdp": "offer-sdp", "type": "offer", "agent_id": "profile-1"},
+    )
+
+    assert response.status_code == 400
+    assert "agent_id must be sent inside request_data" in response.json().get("detail", "")
+
+
+def test_offer_preflight_rejects_body_field_in_offer_route(monkeypatch):
+    """agent_id inside body on /api/offer route is rejected with 400 Bad Request."""
+    async def unused_resolver(s, agent_id=None):
+        raise AssertionError("Resolver should not be reached when body field is used for offer")
+
+    monkeypatch.setattr("bot.agents.service.apply_active_agent_to_settings", unused_resolver)
+
+    settings = Settings(_env_file=None, web_port=3000)
+    app = _create_test_app(settings, profile_resolver=unused_resolver)
+    client = TestClient(app, base_url="http://127.0.0.1:7860")
+
+    response = client.post(
+        "/api/offer",
+        headers={"Origin": "http://localhost:3000"},
+        json={"sdp": "offer-sdp", "type": "offer", "body": {"agent_id": "profile-1"}},
+    )
+
+    assert response.status_code == 400
+    detail = response.json().get("detail", "")
+    assert "agent_id must be sent inside request_data for /api/offer" in detail
+    assert "not inside body" in detail
+
+
+def test_start_preflight_rejects_request_data_field_in_start_route(monkeypatch):
+    """agent_id inside request_data on /start route is rejected with 400 Bad Request."""
+    async def unused_resolver(s, agent_id=None):
+        raise AssertionError("Resolver should not be reached when request_data field is used for start")
+
+    monkeypatch.setattr("bot.agents.service.apply_active_agent_to_settings", unused_resolver)
+
+    settings = Settings(_env_file=None, web_port=3000)
+    app = _create_test_app(settings, profile_resolver=unused_resolver)
+    client = TestClient(app, base_url="http://127.0.0.1:7860")
+
+    response = client.post(
+        "/start",
+        headers={"Origin": "http://localhost:3000"},
+        json={"transport": "webrtc", "request_data": {"agent_id": "profile-1"}},
+    )
+
+    assert response.status_code == 400
+    detail = response.json().get("detail", "")
+    assert "agent_id must be sent inside body for /start" in detail
+    assert "not inside request_data" in detail
 
 def test_cors_headers_omitted_for_disallowed_origin(monkeypatch):
     """A foreign Origin is rejected before preflight, with no CORS headers."""

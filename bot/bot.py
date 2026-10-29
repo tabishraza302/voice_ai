@@ -61,10 +61,12 @@ from bot.context import ContextShapingProcessor
 from bot.control import apply_mode, mount_control
 from bot.language import parse_language_request
 from bot.observers import LatencyBridge, PrometheusObserver, mount_metrics
-from bot.session_settings import resolve_session_settings
+from bot.session_settings import InvalidAgentIdError, resolve_session_settings
 from bot.transcripts import BotTranscriptForwarder, UserTranscriptForwarder, queue_client_utterance
 from bot.pipeline import LanguageRoutingProcessor
 from bot.services import (
+    LlmModelNotAvailableError,
+    SttLanguageNotSupportedError,
     build_llm,
     build_stt,
     build_stt_language_router,
@@ -412,17 +414,41 @@ async def close_peer_connection(connection: Any) -> None:
         logger.warning(f"Failed to cleanly disconnect WebRTC peer: {exc}")
 
 
-def extract_session_body(data: Any) -> dict[str, Any] | None:
-    """Extract session configuration body from an offer or start payload."""
+class InvalidSessionBodyError(ValueError):
+    """The session payload put configuration where the runner cannot read it."""
+
+
+def extract_session_body(data: Any, *, source: str) -> dict[str, Any] | None:
+    """Extract the session body from the route-correct field.
+
+    Pipecat reads ``request_data`` on ``/api/offer`` and ``body`` on
+    ``/start``; a top-level ``agent_id`` is accepted by neither. Similarly,
+    sending ``agent_id`` in ``request_data`` to ``/start`` or in ``body`` to
+    ``/api/offer`` is ignored by the runner and causes the bot to silently
+    fall back to the default profile. Reject wrong nested fields as well as
+    top-level ``agent_id``.
+    """
+    if source not in {"offer", "start"}:
+        raise ValueError(f"unknown session body source {source!r}")
     if not isinstance(data, dict):
         return None
-    if isinstance(data.get("request_data"), dict):
-        return data["request_data"]
-    if isinstance(data.get("body"), dict):
-        return data["body"]
     if "agent_id" in data:
-        return data
-    return None
+        raise InvalidSessionBodyError(
+            "agent_id must be sent inside request_data for /api/offer "
+            "or inside body for /start, not at the top level"
+        )
+    wrong_field = "body" if source == "offer" else "request_data"
+    wrong_nested = data.get(wrong_field)
+    if isinstance(wrong_nested, dict) and "agent_id" in wrong_nested:
+        correct_field = "request_data" if source == "offer" else "body"
+        route_name = "/api/offer" if source == "offer" else "/start"
+        raise InvalidSessionBodyError(
+            f"agent_id must be sent inside {correct_field} for {route_name}, "
+            f"not inside {wrong_field}"
+        )
+    field = "request_data" if source == "offer" else "body"
+    nested = data.get(field)
+    return nested if isinstance(nested, dict) else None
 
 
 async def preflight_session_settings(
@@ -487,26 +513,47 @@ def mount_offer_guard(
                     body_bytes = await request.body()
                     if body_bytes:
                         data = json.loads(body_bytes)
-                        session_body = extract_session_body(data)
+                        source = "start" if request.url.path == "/start" else "offer"
+                        session_body = extract_session_body(data, source=source)
                         if session_body and "agent_id" in session_body:
                             await preflight_session_settings(
                                 session_body, settings, profile_resolver=profile_resolver
                             )
                 except json.JSONDecodeError:
                     pass
-                except ValueError as exc:
-                    logger.warning(f"WebRTC offer preflight rejected invalid request: {exc}")
-                    detail = str(exc)
-                    if "language" in detail.lower() or "realtime" in detail.lower():
-                        client_detail = (
-                            "Incompatible speech recognition settings: mlx-audio-realtime does not support "
-                            "pinned languages. Set language to auto or switch speech recognition to mlx-audio."
-                        )
-                    elif "agent_id" in detail.lower():
-                        client_detail = "Invalid agent ID: request body agent_id must be a nonblank string of at most 128 characters."
-                    else:
-                        client_detail = "Invalid session configuration request."
-                    return JSONResponse(status_code=400, content={"detail": client_detail}, headers=headers)
+                except InvalidSessionBodyError as exc:
+                    logger.warning(f"WebRTC offer preflight rejected misplaced session body: {exc}")
+                    return JSONResponse(
+                        status_code=400,
+                        content={"detail": str(exc)},
+                        headers=headers,
+                    )
+                except InvalidAgentIdError as exc:
+                    logger.warning(f"WebRTC offer preflight rejected invalid agent id: {exc}")
+                    return JSONResponse(
+                        status_code=400,
+                        content={"detail": f"Invalid agent ID: {exc}"},
+                        headers=headers,
+                    )
+                except SttLanguageNotSupportedError as exc:
+                    logger.warning(f"WebRTC offer preflight rejected incompatible STT settings: {exc}")
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "detail": (
+                                "Incompatible speech recognition settings: mlx-audio-realtime does not support "
+                                "pinned languages. Set language to auto or switch speech recognition to mlx-audio."
+                            )
+                        },
+                        headers=headers,
+                    )
+                except LlmModelNotAvailableError as exc:
+                    logger.warning(f"WebRTC offer preflight rejected unavailable LLM model: {exc}")
+                    return JSONResponse(
+                        status_code=503,
+                        content={"detail": f"Selected language model is unavailable: {exc}"},
+                        headers=headers,
+                    )
                 except StorageUnavailableError as exc:
                     logger.warning(f"WebRTC offer preflight could not reach agent storage: {exc}")
                     return JSONResponse(
@@ -534,8 +581,8 @@ def mount_offer_guard(
                         content={"detail": "Database error: Unable to load agent configuration."},
                         headers=headers,
                     )
-                except Exception as exc:
-                    logger.error(f"WebRTC offer preflight failed: {exc}")
+                except Exception:
+                    logger.exception("WebRTC offer preflight failed unexpectedly")
                     return JSONResponse(
                         status_code=500,
                         content={"detail": "Voice session initialization failed: The server encountered an unexpected error configuring the session."},

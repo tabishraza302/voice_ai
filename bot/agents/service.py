@@ -284,7 +284,7 @@ async def apply_active_agent_to_settings(
 ):
     """Resolve the active or requested agent profile and apply it to session Settings."""
     from bot.db.session import get_session_factory
-    from bot.services import resolve_models, validate_stt_language
+    from bot.services import resolve_models, validate_llm_model_available, validate_stt_language
     async def _resolve_with_session(sess: AsyncSession):
         if agent_id and storage_state()["fallback"]:
             # The requested profile may live in PostgreSQL. Reading the
@@ -318,8 +318,14 @@ async def apply_active_agent_to_settings(
         updated.tts_voice_en = agent.tts_voice_en
         updated.tts_voice_hi = agent.tts_voice_hi
         updated.tts_speed = agent.tts_speed
+        try:
+            from bot.control import apply_mode
+            updated = apply_mode(updated)
+        except ImportError:
+            pass
         resolved = resolve_models(updated)
         validate_stt_language(resolved)
+        await validate_llm_model_available(resolved)
         return resolved
     if session is not None:
         return await _resolve_with_session(session)

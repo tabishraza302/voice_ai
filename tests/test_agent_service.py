@@ -188,7 +188,11 @@ async def test_base_prompt_revisions(async_session: AsyncSession):
     assert updated_base.prompt_text == "New updated base prompt content"
     assert updated_base.version == 2
 
-    # Check revisions
+    # Check revisions: newest first, and the newest must be the v2 update.
     revisions = await service.get_base_prompt_revisions()
     assert len(revisions) >= 1
-    assert revisions[0].prompt_text == orig_text or revisions[0].prompt_text == "New updated base prompt content"
+    assert revisions[0].version == 2
+    assert revisions[0].prompt_text == "New updated base prompt content"
+    assert revisions[0].change_reason == "Sharpen conversational boundaries"
+    # The seed revision still records the original text at v1.
+    assert any(revision.prompt_text == orig_text for revision in revisions)

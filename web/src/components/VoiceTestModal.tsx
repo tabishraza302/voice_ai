@@ -98,7 +98,7 @@ export function VoiceTestModal({
 }: VoiceTestModalProps) {
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [isMuted, setIsMuted] = useState(readInitialMuteState);
+  const [isMuted, setIsMuted] = useState(false);
   const [duration, setDuration] = useState(0);
   const [textInput, setTextInput] = useState("");
   const [textInputError, setTextInputError] = useState<string | null>(null);
@@ -112,6 +112,13 @@ export function VoiceTestModal({
   onActivatedRef.current = onActivated;
   const isMutedRef = useRef(isMuted);
   isMutedRef.current = isMuted;
+
+  // Read the persisted preference after mount. Reading storage in the state
+  // initializer makes the server render (false) and a muted client render
+  // (true) disagree, which React reports as a hydration mismatch.
+  useEffect(() => {
+    setIsMuted(readInitialMuteState());
+  }, []);
   const isSessionStartingRef = useRef(false);
   const sessionGenerationRef = useRef(0);
   // One dedupe log per mounted modal; reset when a call is torn down.
