@@ -25,6 +25,8 @@ from platform_api.agents.config import DEFAULT_AGENT_CONFIG_MAX_BYTES
 from platform_api.agents.routes import router as agents_router
 from platform_api.generation.routes import router as generation_router
 from platform_api.generation.service import generation_worker_loop
+from platform_api.qa.routes import router as qa_router
+from platform_api.qa.worker import qa_worker_loop
 from platform_api.model_client import OpenAICompatibleModelClient
 from platform_api.auth.errors import (
     PlatformError,
@@ -167,6 +169,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.catalog = None
     app.state.generation_worker_task = None
     app.state.generation_job_tasks = {}
+    app.state.qa_worker_task = None
+    app.state.qa_job_tasks = {}
 
     engine = create_engine(settings)
     session_factory = get_session_factory(engine)
@@ -174,6 +178,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.session_factory = session_factory
     created_model_client = False
     worker_task: asyncio.Task[None] | None = None
+    qa_worker_task: asyncio.Task[None] | None = None
 
     try:
         app.state.catalog = load_catalog(settings.catalog_path)
@@ -208,14 +213,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 name="platform-generation-worker",
             )
             app.state.generation_worker_task = worker_task
+        if (
+            settings.enable_qa
+            and app.state.schema_ready
+            and not getattr(app.state, "disable_qa_worker", False)
+        ):
+            qa_worker_task = asyncio.create_task(
+                qa_worker_loop(app),
+                name="platform-flow-qa-worker",
+            )
+            app.state.qa_worker_task = qa_worker_task
 
         yield
     finally:
         if worker_task is not None:
             worker_task.cancel()
             await asyncio.gather(worker_task, return_exceptions=True)
+        if qa_worker_task is not None:
+            qa_worker_task.cancel()
+            await asyncio.gather(qa_worker_task, return_exceptions=True)
         app.state.generation_worker_task = None
         app.state.generation_job_tasks = {}
+        app.state.qa_worker_task = None
+        app.state.qa_job_tasks = {}
 
         if created_model_client:
             await app.state.model_client.aclose()
@@ -242,6 +262,8 @@ def create_app(settings: PlatformSettings | None = None) -> FastAPI:
     app.state.model_client = None
     app.state.generation_worker_task = None
     app.state.generation_job_tasks = {}
+    app.state.qa_worker_task = None
+    app.state.qa_job_tasks = {}
     app.state.deployment_identity = None
     app.state.catalog = None
 
@@ -318,6 +340,7 @@ def create_app(settings: PlatformSettings | None = None) -> FastAPI:
     api_v1.include_router(generation_router)
     api_v1.include_router(chat_test_router)
     api_v1.include_router(session_history_router)
+    api_v1.include_router(qa_router)
 
     app.include_router(api_v1)
     # Mount internal routes under /internal
