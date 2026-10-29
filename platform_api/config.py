@@ -502,6 +502,18 @@ class PlatformSettings(BaseSettings):
     generation_job_max_age_seconds: int = Field(default=3600, ge=60, le=86400)
     generation_worker_poll_seconds: float = Field(default=0.5, ge=0.05, le=10)
     generation_poll_after_seconds: int = Field(default=2, ge=1, le=30)
+    qa_max_scenarios: int = Field(default=64, ge=1, le=64)
+    qa_max_token_budget: int = Field(default=4096, ge=64, le=4096)
+    qa_daily_token_budget: int = Field(default=16384, ge=64)
+    qa_global_daily_token_budget: int = Field(default=65536, ge=64)
+    qa_max_queued_jobs: int = Field(default=32, ge=1, le=10000)
+    qa_max_running_jobs: int = Field(default=1, ge=1, le=32)
+    qa_max_active_jobs_per_user: int = Field(default=2, ge=1, le=100)
+    qa_max_turns: int = Field(default=24, ge=1, le=50)
+    qa_job_timeout_seconds: int = Field(default=180, ge=1, le=900)
+    qa_job_max_age_seconds: int = Field(default=3600, ge=60, le=86400)
+    qa_worker_poll_seconds: float = Field(default=0.5, ge=0.05, le=10)
+    qa_poll_after_seconds: int = Field(default=2, ge=1, le=30)
 
 
     # --- Schema and Catalog ---------------------------------------------------
@@ -972,6 +984,21 @@ class PlatformSettings(BaseSettings):
         if self.enable_generation and self.generation_llm_base_url is None:
             raise ValueError(
                 "PLATFORM_GENERATION_LLM_BASE_URL is required when generation is enabled."
+            )
+        if self.enable_qa and self.runtime_llm_base_url is None:
+            raise ValueError(
+                "PLATFORM_RUNTIME_LLM_BASE_URL is required when Flow QA is enabled."
+            )
+        if self.enable_qa and self.generation_llm_base_url is None:
+            raise ValueError(
+                "PLATFORM_GENERATION_LLM_BASE_URL is required when Flow QA is enabled."
+            )
+        if (
+            self.enable_qa
+            and self.generation_llm_timeout_seconds > self.qa_job_timeout_seconds
+        ):
+            raise ValueError(
+                "generation_llm_timeout_seconds cannot exceed qa_job_timeout_seconds."
             )
         if self.generation_llm_timeout_seconds > self.generation_job_timeout_seconds:
             raise ValueError(
