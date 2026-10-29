@@ -36,6 +36,7 @@ from bot.flow.qualification import (
     ScenarioResult,
     canonicalize_measurement,
 )
+from bot.flow.schemas import AdapterCapabilities
 
 
 def is_loopback_host(host: str) -> bool:
