@@ -4,20 +4,12 @@ import { useEffect } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { useAuth } from "@/lib/auth-state";
 import {
-  AlertTriangle,
-  ArrowRight,
   Bot,
   KeyRound,
-  Layers,
   Loader2,
   Lock,
   ScrollText,
-  Settings,
-  Shield,
   ShieldAlert,
-  ShieldCheck,
-  User,
-  Users,
 } from "lucide-react";
 import Link from "next/link";
 
@@ -30,7 +22,7 @@ const AUTH_ROUTES = [
 ];
 
 export function ModeGuard({ children }: { children: React.ReactNode }) {
-  const { state, isLocalMode, appMode } = useAuth();
+  const { state, isLocalMode } = useAuth();
   const router = useRouter();
   const pathname = usePathname();
 
@@ -178,165 +170,18 @@ export function ModeGuard({ children }: { children: React.ReactNode }) {
       );
     }
 
-    // Explicit mode isolation: Local studio agents and playground pages are disabled in SaaS
-    if (
-      pathname === "/agents" ||
-      pathname.startsWith("/agents/") ||
-      pathname === "/playground"
-    ) {
+    // Voice Playground stays local-only; platform customers use the pinned text Chat Test.
+    if (pathname === "/playground") {
       return (
-        <div className="surface p-8 max-w-2xl mx-auto space-y-4 border-ink-800 text-center">
-          <Bot className="w-10 h-10 text-limestone-500 mx-auto" />
-          <h2 className="text-xl font-bold text-white">
-            Local Studio Isolated
-          </h2>
-          <p className="text-sm text-limestone-400 leading-relaxed">
-            Local agent management routes (<code className="text-copper-300">/api/agents</code>, <code className="text-copper-300">/api/prompts</code>) are loopback-only and are disabled in SaaS mode. Cloud agent flows and runner sessions are managed through authenticated platform APIs.
+        <div className="surface mx-auto max-w-2xl space-y-4 p-8 text-center">
+          <Bot className="mx-auto h-10 w-10 text-copper-300" />
+          <h2 className="text-xl font-semibold text-limestone-100">Voice Playground is local-only</h2>
+          <p className="text-sm leading-6 text-limestone-400">
+            Open an agent workspace to test a text conversation against its saved draft or published version.
           </p>
-          <div className="pt-2 flex justify-center gap-3">
-            <Link href="/" className="button-secondary">
-              Back to Overview
-            </Link>
-            <Link href="/settings" className="button-primary">
-              Account Settings
-            </Link>
-          </div>
-        </div>
-      );
-    }
-
-    // Overview root (/) in SaaS mode: render Customer Dashboard without calling local ApiClient
-    if (pathname === "/") {
-      return (
-        <div className="space-y-8 max-w-5xl">
-          <header className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 border-b border-ink-800 pb-5">
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="px-2 py-0.5 rounded text-[11px] font-semibold bg-copper-950 text-copper-300 border border-copper-800 uppercase tracking-wider">
-                  SaaS Mode
-                </span>
-                <span className="text-xs text-limestone-400">
-                  Isolated Platform Control Plane
-                </span>
-              </div>
-              <h1 className="text-2xl font-bold text-white mt-1">
-                Welcome, {user.display_name}
-              </h1>
-            </div>
-            <Link
-              href="/settings"
-              className="button-secondary text-xs self-start sm:self-auto inline-flex items-center gap-2"
-            >
-              <Settings className="w-3.5 h-3.5" />
-              Settings
-            </Link>
-          </header>
-
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <div className="surface p-5 space-y-2 border-ink-800 bg-ink-900/60">
-              <div className="flex items-center justify-between text-xs text-limestone-400">
-                <span className="font-medium">Account Role</span>
-                <span className="px-2 py-0.5 rounded text-[10px] font-semibold uppercase bg-ink-800 text-limestone-200">
-                  {user.role}
-                </span>
-              </div>
-              <div className="text-lg font-bold text-white">{user.email}</div>
-              <div className="text-xs text-limestone-500">
-                Verified: {new Date(user.email_verified_at).toLocaleDateString()}
-              </div>
-            </div>
-
-            <div className="surface p-5 space-y-2 border-ink-800 bg-ink-900/60">
-              <div className="flex items-center justify-between text-xs text-limestone-400">
-                <span className="font-medium">Preferences</span>
-                <span className="text-[11px] text-limestone-300">
-                  {user.preferred_language.toUpperCase()}
-                </span>
-              </div>
-              <div className="text-lg font-bold text-white">{user.timezone}</div>
-              <div className="text-xs text-limestone-500">
-                Low balance alerts: {user.low_balance_notifications ? "On" : "Off"}
-              </div>
-            </div>
-
-            <div className="surface p-5 space-y-2 border-ink-800 bg-ink-900/60">
-              <div className="flex items-center justify-between text-xs text-limestone-400">
-                <span className="font-medium">Security</span>
-                {user.mfa_enabled ? (
-                  <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-moss-950 text-moss-300 border border-moss-800 flex items-center gap-1">
-                    <ShieldCheck className="w-3 h-3" />
-                    MFA Enabled
-                  </span>
-                ) : (
-                  <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-ink-800 text-limestone-400">
-                    Standard
-                  </span>
-                )}
-              </div>
-              <div className="text-lg font-bold text-white">Active Session</div>
-              <div className="text-xs text-limestone-500">
-                CSRF-protected opaque cookie session
-              </div>
-            </div>
-          </div>
-
-          {/* Administrator shortcuts if admin */}
-          {user.role === "admin" && (
-            <section className="space-y-4">
-              <div className="flex items-center gap-2">
-                <Shield className="w-5 h-5 text-copper-400" />
-                <h2 className="text-base font-semibold text-white">
-                  Administrator Console
-                </h2>
-              </div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <Link
-                  href="/admin/users"
-                  className="surface p-5 border-ink-800 hover:border-copper-700/60 transition-all flex items-center justify-between group"
-                >
-                  <div className="space-y-1">
-                    <div className="flex items-center gap-2 text-sm font-semibold text-white">
-                      <Users className="w-4 h-4 text-copper-400" />
-                      User Accounts
-                    </div>
-                    <p className="text-xs text-limestone-400">
-                      Inspect, suspend, or restore platform accounts
-                    </p>
-                  </div>
-                  <ArrowRight className="w-4 h-4 text-limestone-500 group-hover:text-copper-300 transition-colors" />
-                </Link>
-
-                <Link
-                  href="/admin/settings"
-                  className="surface p-5 border-ink-800 hover:border-copper-700/60 transition-all flex items-center justify-between group"
-                >
-                  <div className="space-y-1">
-                    <div className="flex items-center gap-2 text-sm font-semibold text-white">
-                      <ShieldCheck className="w-4 h-4 text-copper-400" />
-                      Admin Security
-                    </div>
-                    <p className="text-xs text-limestone-400">
-                      Configure two-factor TOTP factors and step-up authorization
-                    </p>
-                  </div>
-                  <ArrowRight className="w-4 h-4 text-limestone-500 group-hover:text-copper-300 transition-colors" />
-                </Link>
-              </div>
-            </section>
-          )}
-
-          {/* Mode Isolation Notice */}
-          <div className="surface p-4 border-ink-800 bg-ink-900/40 text-xs text-limestone-400 flex items-start gap-3">
-            <Layers className="w-4 h-4 text-copper-400 shrink-0 mt-0.5" />
-            <div className="space-y-1">
-              <span className="font-medium text-limestone-200 block">
-                Local Studio Isolation Active
-              </span>
-              <span>
-                You are currently in SaaS mode. The local machine agent studio endpoints (<code className="text-copper-300 bg-ink-950 px-1 py-0.5 rounded font-mono text-[11px]">http://localhost:7860/api</code>) are never called from this interface.
-              </span>
-            </div>
-          </div>
+          <Link href="/agents" className="button-primary mx-auto">
+            Open agents
+          </Link>
         </div>
       );
     }

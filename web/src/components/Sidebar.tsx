@@ -37,7 +37,6 @@ export function Sidebar() {
     : [
         { href: "/", label: "Overview", icon: Layers },
         { href: "/agents", label: "Agents", icon: Bot },
-        { href: "/playground", label: "Call test", icon: Mic2 },
         { href: "/settings", label: "Settings", icon: Settings },
       ];
 
