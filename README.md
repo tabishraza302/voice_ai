@@ -58,7 +58,7 @@ Fetches the STT, TTS, and LLM model checkpoints locally. The demo runs entirely 
 ```bash
 scripts/voice-ai.sh start
 ```
-Brings up Phoenix on the host, the container stack (OpenTelemetry Collector, Prometheus, Grafana), the local `mlx-audio` server, and the voice agent, verifying readiness at each stage.
+Brings up the container stack (OpenTelemetry Collector, Prometheus, Grafana, PostgreSQL), Phoenix on the host, the local `mlx-audio` server, and the voice agent, verifying readiness at each stage.
 
 ### 4. Talk to the Agent
 Open **http://localhost:7860/client** in your browser. Speak in English or Hindi; the agent detects the language and responds in the same language.
@@ -122,25 +122,17 @@ The local management API is under `/api` (including `/api/agents`,
 `localhost` or a literal loopback IP (such as `127.0.0.1` or `::1`) because
 management endpoints have no authentication.
 
-PostgreSQL is published on loopback port 5439 by default. Set `POSTGRES_PORT`
-to move the Compose port, and set `DATABASE_URL` in `.env` to the same host
-port. A configured PostgreSQL failure fails closed by default: storage
-requests fail rather than silently writing to a different store. Storage is
-initialized on first use, so the server can start before a connection attempt.
-If a local-only SQLite store is acceptable, set `ALLOW_SQLITE_FALLBACK=1`; its
-default location remains the existing `voice_ai.db` file, and
-`SQLITE_DATABASE_URL` chooses another. `GET /api/storage` reports
-`{"backend": "uninitialized"|"postgres"|"sqlite", "fallback": bool}` without
-exposing URLs or credentials. While the fallback is active, a session that
-requests a saved agent profile is rejected with 503 because that profile may
-exist only in PostgreSQL; later storage requests retry PostgreSQL. The fallback
-data is independent and does not synchronize automatically;
-`scripts/voice-ai.sh start` sets
-`ALLOW_SQLITE_FALLBACK=1` explicitly and prints a warning when it chooses to
-continue without PostgreSQL. An explicit `ALLOW_SQLITE_FALLBACK=0` (or
-`false`/`no`/`off`) in the environment or `.env` is honored: the script leaves
-it alone and the agent fails closed instead.
-
+PostgreSQL is the single runtime database for the project (including Arize Phoenix).
+It is published on loopback port 5439 by default. Set `POSTGRES_PORT` to move the
+Compose port, and set `DATABASE_URL` in `.env` to the same host port.
+PostgreSQL is required: there is no SQLite fallback mode. If PostgreSQL is unavailable,
+`scripts/voice-ai.sh start` and storage requests fail loudly rather than silently
+writing to a temporary store. Storage is initialized on first use, so the server
+can start before a connection attempt. `GET /api/storage` reports
+`{"backend": "uninitialized"|"postgres"}` without exposing URLs or credentials.
+Phoenix connects to the same configured PostgreSQL database using schema isolation
+(`PHOENIX_SQL_DATABASE_SCHEMA=phoenix`), preventing table and migration collisions
+with agent storage.
 The Studio, API, database, and preset prompts are new code paths; the published
 STT, TTS, memory, and turn-latency tables describe the original measured
 configuration. The profile prompt check below used the compiled built-in
@@ -356,8 +348,16 @@ scripts/voice-ai.sh lookahead-bench # Streaming WER/CER at 13, 6, 3 and 0 frames
 scripts/voice-ai.sh tts-bench     # Benchmark TTS backends
 scripts/voice-ai.sh turn-bench    # Measure end-to-end turn latency
 scripts/voice-ai.sh eval          # Run FLEURS WER/CER evaluation
-scripts/voice-ai.sh test          # Run full regression test suite
+scripts/voice-ai.sh test          # Run the regression suite
 ```
+
+PostgreSQL integration tests require an owned disposable cluster. Set
+`TEST_DATABASE_URL` to its async PostgreSQL URL and
+`TEST_DATABASE_OWNERSHIP_TOKEN` to a secret token stored in
+`public._verification_cluster_ownership(token)` on that cluster. Tests create
+and drop temporary schemas only after checking the token. Without
+`TEST_DATABASE_URL`, those tests are skipped; never point them at a live
+database.
 
 ---
 
@@ -373,7 +373,7 @@ scripts/voice-ai.sh test          # Run full regression test suite
 | **Grafana** | Container | 3003 | Port 3003 chosen to avoid default port 3000 collisions. |
 | **`mlx-audio` Server** | Host | 8020 | Serves STT WebSocket & TTS endpoints on Metal GPU. |
 | **Ollama** | Host | 11434 | Standard Ollama inference port. |
-| **PostgreSQL** | Container | 5439 (configurable) | Local agent configuration; loopback only, with a SQLite fallback. |
+| **PostgreSQL** | Container | 5439 (configurable) | Single runtime database for agent configuration and Phoenix traces; loopback only. |
 | **Studio/API** | Host | 3001 / 7860 `/api` | Optional single-user local management interface; no authentication. |
 
 ### The Metrics Contract

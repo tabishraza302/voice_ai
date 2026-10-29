@@ -15,16 +15,15 @@ def _isolated_repo(tmp_path):
     (repo / "scripts").mkdir(parents=True)
     (repo / "web/node_modules/next/dist/bin").mkdir(parents=True)
     shutil.copy2(SCRIPT, repo / "scripts/voice-ai.sh")
+    if (ROOT / "bot").exists() and not (repo / "bot").exists():
+        os.symlink(ROOT / "bot", repo / "bot")
+    if (ROOT / ".venv").exists() and not (repo / ".venv").exists():
+        os.symlink(ROOT / ".venv", repo / ".venv")
     return repo
 
 
 def _start_with_postgres_down(tmp_path, dotenv=None, extra_env=None):
-    """An isolated repo whose PostgreSQL readiness check always fails.
-
-    The fake ``uv`` records each launch's working directory, arguments and
-    inherited ``ALLOW_SQLITE_FALLBACK`` value, so a test can see exactly
-    what the script handed the agent.
-    """
+    """An isolated repo whose PostgreSQL readiness check always fails."""
     repo = _isolated_repo(tmp_path)
     if dotenv is not None:
         (repo / ".env").write_text(dotenv)
@@ -55,7 +54,7 @@ def _start_with_postgres_down(tmp_path, dotenv=None, extra_env=None):
     )
     (fake_bin / "uv").write_text(
         "#!/bin/sh\n"
-        'printf "%s\\n" "$PWD" "$*" "${ALLOW_SQLITE_FALLBACK-<unset>}" >> "$CAPTURE"\n'
+        'printf "%s\\n" "$PWD" "$*" >> "$CAPTURE"\n'
     )
     phoenix = fake_bin / "phoenix"
     phoenix.write_text("#!/bin/sh\nexec sleep 60\n")
@@ -75,14 +74,6 @@ def _start_with_postgres_down(tmp_path, dotenv=None, extra_env=None):
         env.update(extra_env)
     return repo, capture, env
 
-
-def _agent_fallback_value(capture):
-    """The ALLOW_SQLITE_FALLBACK the script handed the agent process."""
-    commands = capture.read_text().splitlines()
-    agent_index = next(
-        index for index, line in enumerate(commands) if "python -m bot.bot" in line
-    )
-    return commands[agent_index + 1]
 
 
 def _terminate_pid_file(pid_file):
@@ -324,7 +315,7 @@ def test_lookahead_bench_command_forwards_arguments_to_the_benchmark(tmp_path):
     )
 
 
-def test_start_allows_sqlite_fallback_when_postgres_is_unavailable(tmp_path):
+def test_start_aborts_when_postgres_is_unavailable(tmp_path):
     repo, capture, env = _start_with_postgres_down(tmp_path)
 
     try:
@@ -337,207 +328,156 @@ def test_start_allows_sqlite_fallback_when_postgres_is_unavailable(tmp_path):
             timeout=10,
         )
 
-        assert started.returncode == 0, started.stderr or started.stdout
+        assert started.returncode != 0
         output = started.stdout + started.stderr
-        assert "PostgreSQL is unavailable; falling back to SQLite" in output
-        assert "ALLOW_SQLITE_FALLBACK=1" in output
-        assert "will NOT appear in PostgreSQL" in output
-        assert _agent_fallback_value(capture) == "1"
+        assert "PostgreSQL did not become ready" in output
+        assert "falling back to SQLite" not in output
+        assert "ALLOW_SQLITE_FALLBACK" not in output
+        assert not capture.exists() or "python -m bot.bot" not in capture.read_text()
     finally:
         _terminate_pid_file(repo / "data/phoenix/phoenix.pid")
         _terminate_pid_file(repo / "data/run/agent.pid")
 
-
-@pytest.mark.parametrize("value", ["0", "false", "off"])
-def test_start_honors_an_environment_opt_out_of_sqlite_fallback(tmp_path, value):
-    """An explicit opt-out survives `start`, even when PostgreSQL is down.
-
-    The fallback is the script's choice, not the deployment's. When the
-    deployment says 0, the script may not silently turn it back into 1.
-    """
-    repo, capture, env = _start_with_postgres_down(
-        tmp_path, extra_env={"ALLOW_SQLITE_FALLBACK": value}
+def test_launcher_default_database_url_uses_asyncpg_scheme(tmp_path):
+    repo = _isolated_repo(tmp_path)
+    capture = tmp_path / "launch.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "uv").write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$DATABASE_URL" > "$CAPTURE"\n'
     )
+    (fake_bin / "uv").chmod(0o755)
+    env = os.environ.copy()
+    env.update({"PATH": f"{fake_bin}:{env['PATH']}", "CAPTURE": str(capture)})
+    env.pop("DATABASE_URL", None)
+    env.pop("database_url", None)
+    env.pop("POSTGRES_PORT", None)
 
-    try:
-        started = subprocess.run(
-            [str(repo / "scripts/voice-ai.sh"), "start", "--background"],
-            cwd=repo,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-
-        assert started.returncode == 0, started.stderr or started.stdout
-        output = started.stdout + started.stderr
-        assert "falling back to SQLite" not in output
-        assert "ALLOW_SQLITE_FALLBACK is disabled" in output
-        assert _agent_fallback_value(capture) == value
-    finally:
-        _terminate_pid_file(repo / "data/phoenix/phoenix.pid")
-        _terminate_pid_file(repo / "data/run/agent.pid")
-
-
-@pytest.mark.parametrize("key", ["ALLOW_SQLITE_FALLBACK", "allow_sqlite_fallback"])
-def test_start_honors_a_dot_env_opt_out_of_sqlite_fallback(tmp_path, key):
-    """`.env` is where the agent itself reads the setting, so it counts too."""
-    repo, capture, env = _start_with_postgres_down(tmp_path, dotenv=f"{key}=0\n")
-
-    try:
-        started = subprocess.run(
-            [str(repo / "scripts/voice-ai.sh"), "start", "--background"],
-            cwd=repo,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-
-        assert started.returncode == 0, started.stderr or started.stdout
-        output = started.stdout + started.stderr
-        assert "falling back to SQLite" not in output
-        assert "ALLOW_SQLITE_FALLBACK is disabled" in output
-        # The script does not invent a value here: the agent reads .env
-        # itself. What matters is that it was not handed 1.
-        assert _agent_fallback_value(capture) in {"<unset>", "0"}
-    finally:
-        _terminate_pid_file(repo / "data/phoenix/phoenix.pid")
-        _terminate_pid_file(repo / "data/run/agent.pid")
-
-
-@pytest.mark.parametrize(
-    ("dotenv_line", "expected_captured"),
-    [
-        ("Allow_Sqlite_Fallback=0\n", {"<unset>", "0"}),
-        ("Allow_SQLite_Fallback=false\n", {"<unset>", "false"}),
-        ("ALLOW_sqlite_FALLBACK=off\n", {"<unset>", "off"}),
-        ("export ALLOW_SQLITE_FALLBACK=0\n", {"<unset>", "0"}),
-        ("  export   Allow_Sqlite_Fallback   =   0\n", {"<unset>", "0"}),
-        ("ALLOW_SQLITE_FALLBACK = 0 # inline comment\n", {"<unset>", "0"}),
-        ("Allow_Sqlite_Fallback='false' # comment with single quotes\n", {"<unset>", "false"}),
-        ('export Allow_SQLite_Fallback="off" # double quotes\n', {"<unset>", "off"}),
-    ],
-)
-def test_start_honors_dotenv_mixed_case_export_and_comments(
-    tmp_path, dotenv_line, expected_captured
-):
-    """Dotenv syntax variants (mixed-case keys, export, spaces, comments) must opt out."""
-    repo, capture, env = _start_with_postgres_down(tmp_path, dotenv=dotenv_line)
-
-    try:
-        started = subprocess.run(
-            [str(repo / "scripts/voice-ai.sh"), "start", "--background"],
-            cwd=repo,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-
-        assert started.returncode == 0, started.stderr or started.stdout
-        output = started.stdout + started.stderr
-        assert "falling back to SQLite" not in output
-        assert "ALLOW_SQLITE_FALLBACK=1" not in output
-        assert "ALLOW_SQLITE_FALLBACK is disabled" in output
-        assert _agent_fallback_value(capture) in expected_captured
-    finally:
-        _terminate_pid_file(repo / "data/phoenix/phoenix.pid")
-        _terminate_pid_file(repo / "data/run/agent.pid")
-
-
-@pytest.mark.parametrize(
-    "invalid_val",
-    ["invalid", "banana", "2", "maybe", ""],
-)
-def test_start_refuses_fallback_on_invalid_environment_value(tmp_path, invalid_val):
-    """An invalid explicit environment setting must fail closed, not convert to opt-in."""
-    repo, capture, env = _start_with_postgres_down(
-        tmp_path, extra_env={"ALLOW_SQLITE_FALLBACK": invalid_val}
+    result = subprocess.run(
+        [str(repo / "scripts/voice-ai.sh"), "run"],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
     )
-
-    try:
-        started = subprocess.run(
-            [str(repo / "scripts/voice-ai.sh"), "start", "--background"],
-            cwd=repo,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-
-        assert started.returncode == 0, started.stderr or started.stdout
-        output = started.stdout + started.stderr
-        assert "falling back to SQLite" not in output
-        assert "ALLOW_SQLITE_FALLBACK=1" not in output
-        assert "ALLOW_SQLITE_FALLBACK is invalid" in output
-        assert _agent_fallback_value(capture) == invalid_val
-    finally:
-        _terminate_pid_file(repo / "data/phoenix/phoenix.pid")
-        _terminate_pid_file(repo / "data/run/agent.pid")
+    assert result.returncode == 0, result.stderr or result.stdout
+    captured_url = capture.read_text().strip()
+    assert captured_url == "postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai"
 
 
-@pytest.mark.parametrize(
-    "dotenv_line",
-    [
-        "ALLOW_SQLITE_FALLBACK=invalid\n",
-        "Allow_Sqlite_Fallback=banana # comment\n",
-        "export allow_sqlite_fallback = 2\n",
-        "ALLOW_SQLITE_FALLBACK=\n",
-    ],
-)
-def test_start_refuses_fallback_on_invalid_dotenv_value(tmp_path, dotenv_line):
-    """An invalid explicit .env setting must fail closed, not convert to opt-in."""
-    repo, capture, env = _start_with_postgres_down(tmp_path, dotenv=dotenv_line)
-
-    try:
-        started = subprocess.run(
-            [str(repo / "scripts/voice-ai.sh"), "start", "--background"],
-            cwd=repo,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-
-        assert started.returncode == 0, started.stderr or started.stdout
-        output = started.stdout + started.stderr
-        assert "falling back to SQLite" not in output
-        assert "ALLOW_SQLITE_FALLBACK=1" not in output
-        assert "ALLOW_SQLITE_FALLBACK is invalid" in output
-        assert _agent_fallback_value(capture) != "1"
-    finally:
-        _terminate_pid_file(repo / "data/phoenix/phoenix.pid")
-        _terminate_pid_file(repo / "data/run/agent.pid")
-
-
-def test_start_environment_takes_precedence_over_dotenv(tmp_path):
-    """Environment setting overrides conflicting .env setting."""
-    # .env opts in (1), but environment opts out (0): environment wins
-    repo, capture, env = _start_with_postgres_down(
-        tmp_path,
-        dotenv="Allow_Sqlite_Fallback=1\n",
-        extra_env={"ALLOW_SQLITE_FALLBACK": "0"},
+def test_launcher_database_url_precedence_environment_over_dotenv(tmp_path):
+    repo = _isolated_repo(tmp_path)
+    (repo / ".env").write_text(
+        "database_url=postgresql+asyncpg://dotenv-user:pass@127.0.0.1:5432/dotenv_db\n"
     )
+    capture = tmp_path / "launch.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "uv").write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$DATABASE_URL" > "$CAPTURE"\n'
+    )
+    (fake_bin / "uv").chmod(0o755)
+    env = os.environ.copy()
+    env.update({
+        "PATH": f"{fake_bin}:{env['PATH']}",
+        "CAPTURE": str(capture),
+        "database_url": "postgresql+asyncpg://env-user:pass@127.0.0.1:5432/env_db",
+    })
+    env.pop("DATABASE_URL", None)
+
+    result = subprocess.run(
+        [str(repo / "scripts/voice-ai.sh"), "run"],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    captured_url = capture.read_text().strip()
+    assert captured_url == "postgresql+asyncpg://env-user:pass@127.0.0.1:5432/env_db"
+
+
+def test_launcher_database_url_precedence_dotenv_over_default(tmp_path):
+    repo = _isolated_repo(tmp_path)
+    (repo / ".env").write_text(
+        "DATABASE_URL=postgresql+asyncpg://dotenv-user:pass@127.0.0.1:5432/dotenv_db\n"
+    )
+    capture = tmp_path / "launch.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "uv").write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$DATABASE_URL" > "$CAPTURE"\n'
+    )
+    (fake_bin / "uv").chmod(0o755)
+    env = os.environ.copy()
+    env.update({"PATH": f"{fake_bin}:{env['PATH']}", "CAPTURE": str(capture)})
+    env.pop("DATABASE_URL", None)
+    env.pop("database_url", None)
+
+    result = subprocess.run(
+        [str(repo / "scripts/voice-ai.sh"), "run"],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    captured_url = capture.read_text().strip()
+    assert captured_url == "postgresql+asyncpg://dotenv-user:pass@127.0.0.1:5432/dotenv_db"
+
+
+def test_phoenix_receives_database_url_with_driver_conversion(tmp_path):
+    repo = _isolated_repo(tmp_path)
+    (repo / ".env").write_text(
+        "DATABASE_URL=postgresql+asyncpg://voice_ai:secret@127.0.0.1:5439/voice_ai\n"
+    )
+    capture = tmp_path / "phoenix_env.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "curl").write_text(
+        "#!/bin/sh\n"
+        'for _ in $(seq 1 50); do\n'
+        '  if [ -s "$CAPTURE" ]; then exit 0; fi\n'
+        '  sleep 0.05\n'
+        'done\n'
+        'exit 1\n'
+    )
+    (fake_bin / "phoenix").write_text(
+        "#!/bin/sh\n"
+        'printf "URL=%s\\nSCHEMA=%s\\n" "$PHOENIX_SQL_DATABASE_URL" "$PHOENIX_SQL_DATABASE_SCHEMA" > "$CAPTURE"\n'
+        "exec sleep 60\n"
+    )
+    for command in ("curl", "phoenix"):
+        (fake_bin / command).chmod(0o755)
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "CAPTURE": str(capture),
+            "PHOENIX_BIN": str(fake_bin / "phoenix"),
+        }
+    )
+    env.pop("DATABASE_URL", None)
+    env.pop("database_url", None)
+
     try:
-        started = subprocess.run(
-            [str(repo / "scripts/voice-ai.sh"), "start", "--background"],
+        result = subprocess.run(
+            [str(repo / "scripts/voice-ai.sh"), "phoenix"],
             cwd=repo,
             env=env,
             capture_output=True,
             text=True,
             timeout=10,
         )
-        assert started.returncode == 0, started.stderr or started.stdout
-        output = started.stdout + started.stderr
-        assert "falling back to SQLite" not in output
-        assert "ALLOW_SQLITE_FALLBACK=1" not in output
-        assert "ALLOW_SQLITE_FALLBACK is disabled" in output
-        assert _agent_fallback_value(capture) == "0"
+        assert result.returncode == 0, result.stderr or result.stdout
+        content = capture.read_text()
+        assert "URL=postgresql://voice_ai:secret@127.0.0.1:5439/voice_ai" in content
+        assert "SCHEMA=phoenix" in content
     finally:
         _terminate_pid_file(repo / "data/phoenix/phoenix.pid")
-        _terminate_pid_file(repo / "data/run/agent.pid")
-
 
 def test_start_aborts_when_prometheus_is_unavailable(tmp_path):
     repo = _isolated_repo(tmp_path)

@@ -11,7 +11,8 @@
 #   scripts/voice-ai.sh status        # what is running, and where
 #   scripts/voice-ai.sh help         # the full list
 #
-# The order of `start` matters: Phoenix on the host, then the container stack,
+# The order of `start` matters: the container stack (including PostgreSQL),
+# then Phoenix on the host (which stores traces in PostgreSQL),
 # then the STT server, then the agent (which needs the STT server).
 set -euo pipefail
 
@@ -28,88 +29,60 @@ PHOENIX_GRPC_PORT="${PHOENIX_GRPC_PORT:-6007}"
 PROMETHEUS_PORT="${PROMETHEUS_PORT:-9091}"
 GRAFANA_PORT="${GRAFANA_PORT:-3003}"
 COLLECTOR_PORT="${COLLECTOR_PORT:-9464}"
-POSTGRES_PORT="${POSTGRES_PORT:-5439}"
+CONFIGURED_POSTGRES_PORT="$(grep -E '^[[:space:]]*(postgres_port|POSTGRES_PORT)=' "$REPO_ROOT/.env" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '"\047[:space:]' || true)"
+POSTGRES_PORT="${POSTGRES_PORT:-${CONFIGURED_POSTGRES_PORT:-5439}}"
 CONFIGURED_WEB_PORT="$(grep -E '^[[:space:]]*(web_port|WEB_PORT)=' "$REPO_ROOT/.env" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '"\047[:space:]' || true)"
 WEB_PORT="${WEB_PORT:-${CONFIGURED_WEB_PORT:-3001}}"
 # The STT lookahead belongs to the model deployment, not the agent. A blank
 # value keeps the checkpoint's default; scripts/stt_server.py validates it.
 CONFIGURED_STT_LOOKAHEAD="$(grep -E '^[[:space:]]*(stt_lookahead_frames|STT_LOOKAHEAD_FRAMES)=' "$REPO_ROOT/.env" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '"\047[:space:]' || true)"
 STT_LOOKAHEAD_FRAMES="${STT_LOOKAHEAD_FRAMES:-$CONFIGURED_STT_LOOKAHEAD}"
-# Parse a variable from a .env file, handling mixed-case keys, optional
-# 'export', spaces around '=', quotes, and inline comments.
-parse_dotenv_setting() {
-  local file="$1"
-  local target_key="$2"
-  [ -f "$file" ] || return 1
-  awk -v target="$target_key" '
-    BEGIN { found = 0; val = "" }
-    {
-      line = $0
-      sub(/^[[:space:]]+/, "", line)
-      if (line == "" || substr(line, 1, 1) == "#") next
-      if (line ~ /^export[[:space:]]+/) {
-        sub(/^export[[:space:]]+/, "", line)
-      }
-      eq_idx = index(line, "=")
-      if (eq_idx == 0) next
-      k = substr(line, 1, eq_idx - 1)
-      v = substr(line, eq_idx + 1)
-      sub(/[[:space:]]+$/, "", k)
-      if (tolower(k) != tolower(target)) next
-      sub(/^[[:space:]]+/, "", v)
-      first_char = substr(v, 1, 1)
-      if (first_char == "\"" || first_char == "\x27") {
-        rest = substr(v, 2)
-        q_idx = index(rest, first_char)
-        if (q_idx > 0) {
-          val = substr(rest, 1, q_idx - 1)
-        } else {
-          val = rest
-        }
-      } else {
-        if (substr(v, 1, 1) == "#") {
-          v = ""
-        } else {
-          sub(/[[:space:]]+#.*$/, "", v)
-        }
-        sub(/[[:space:]]+$/, "", v)
-        val = v
-      }
-      found = 1
-    }
-    END {
-      if (found) {
-        print val
-        exit 0
-      }
-      exit 1
-    }
-  ' "$file"
-}
-
-# The agent's opt-in to its local SQLite store. `start` may choose that
-# store when PostgreSQL is unavailable, but an explicit setting — in the
-# environment or .env — wins over the script's choice. Environment variables
-# take precedence over .env definitions.
-CONFIGURED_ALLOW_SQLITE_FALLBACK=""
-DOTENV_HAS_FALLBACK=0
-if [ -f "$REPO_ROOT/.env" ] && CONFIGURED_ALLOW_SQLITE_FALLBACK="$(parse_dotenv_setting "$REPO_ROOT/.env" "allow_sqlite_fallback")"; then
-  DOTENV_HAS_FALLBACK=1
-fi
-
-if [ -n "${ALLOW_SQLITE_FALLBACK+x}" ]; then
-  ALLOW_SQLITE_FALLBACK_EXPLICIT=1
-elif [ "$DOTENV_HAS_FALLBACK" -eq 1 ]; then
-  ALLOW_SQLITE_FALLBACK="$CONFIGURED_ALLOW_SQLITE_FALLBACK"
-  ALLOW_SQLITE_FALLBACK_EXPLICIT=1
-else
-  ALLOW_SQLITE_FALLBACK=""
-  ALLOW_SQLITE_FALLBACK_EXPLICIT=0
-fi
 export WEB_PORT
 export STT_LOOKAHEAD_FRAMES
 export POSTGRES_PORT
 
+DATABASE_URL_RESOLVED=0
+
+# Lazily resolve and validate DATABASE_URL exactly once using the project's
+# actual Settings. Fails loudly on any validation or import error.
+ensure_database_url() {
+  [ "$DATABASE_URL_RESOLVED" -eq 1 ] && return 0
+
+  local py_bin=""
+  if [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+    py_bin="$REPO_ROOT/.venv/bin/python"
+  elif [ -x "$REPO_ROOT/.venv/bin/python3" ]; then
+    py_bin="$REPO_ROOT/.venv/bin/python3"
+  elif command -v python3 >/dev/null 2>&1; then
+    py_bin="python3"
+  elif command -v python >/dev/null 2>&1; then
+    py_bin="python"
+  fi
+
+  [ -n "$py_bin" ] || die "Python is not available; run '$0 install' first"
+
+  local output
+  if ! output="$("$py_bin" -c '
+import sys, os
+from urllib.parse import urlsplit, urlunsplit
+from bot.config import Settings
+
+s = Settings()
+if "database_url" in s.model_fields_set:
+    print(s.database_url)
+else:
+    port = os.environ.get("POSTGRES_PORT", "5439")
+    parts = urlsplit(s.database_url)
+    netloc = f"voice_ai:voice_ai@127.0.0.1:{port}"
+    print(urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment)))
+  ' 2>/dev/null)"; then
+    die "Failed to validate database settings; check DATABASE_URL and the installed dependencies"
+  fi
+
+  DATABASE_URL="$output"
+  export DATABASE_URL
+  DATABASE_URL_RESOLVED=1
+}
 RUN_DIR="$REPO_ROOT/data/run"
 LOG_DIR="$REPO_ROOT/logs"
 PHOENIX_DIR="$REPO_ROOT/data/phoenix"
@@ -129,22 +102,6 @@ log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m  ok\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m  --\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m  !!\033[0m %s\n' "$*" >&2; exit 1; }
-
-# Pydantic parses these spellings as false for ALLOW_SQLITE_FALLBACK. The
-# script must agree with the agent it launches about what an opt-out is.
-sqlite_fallback_disabled() {
-  case "$(printf '%s' "$ALLOW_SQLITE_FALLBACK" | tr -d '"\047[:space:]' | tr '[:upper:]' '[:lower:]')" in
-    0|false|f|no|n|off) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-sqlite_fallback_enabled() {
-  case "$(printf '%s' "$ALLOW_SQLITE_FALLBACK" | tr -d '"\047[:space:]' | tr '[:upper:]' '[:lower:]')" in
-    1|true|t|yes|y|on) return 0 ;;
-    *) return 1 ;;
-  esac
-}
 
 [[ "$WEB_PORT" =~ ^[0-9]+$ ]] && (( WEB_PORT >= 1 && WEB_PORT <= 65535 )) \
   || die "WEB_PORT must be an integer between 1 and 65535"
@@ -239,11 +196,18 @@ cmd_install() {
   log "installing the dependencies"
   uv sync --extra dev
   # Phoenix runs on the host, in its own tool environment, so the
-  # collector can reach it. Skip it if it is already there.
+  # collector can reach it. Install with PostgreSQL driver support ([pg]).
   if command -v phoenix >/dev/null 2>&1 || [ -x "$HOME/.local/bin/phoenix" ]; then
-    ok "arize-phoenix already installed"
+    local py_bin
+    py_bin="$(head -n 1 "$PHOENIX_BIN" 2>/dev/null | sed 's/^#!//' | awk '{print $1}')"
+    if [ -x "$py_bin" ] && "$py_bin" -c "import asyncpg" >/dev/null 2>&1; then
+      ok "arize-phoenix already installed with postgres support"
+    else
+      log "updating arize-phoenix with postgres support ([pg])"
+      uv tool install --force "arize-phoenix[pg]==20.23.0"
+    fi
   else
-    uv tool install "arize-phoenix==20.23.0"
+    uv tool install "arize-phoenix[pg]==20.23.0"
   fi
 }
 
@@ -295,13 +259,18 @@ cmd_others_start() {
 # --- observability ---------------------------------------------------------
 
 cmd_phoenix() {
+  ensure_database_url
   mkdir -p "$PHOENIX_DIR" "$(dirname "$PHOENIX_LOG")"
   if [ -f "$PHOENIX_PID" ] && kill -0 "$(cat "$PHOENIX_PID")" 2>/dev/null; then
     ok "Phoenix already running (pid $(cat "$PHOENIX_PID"))"
   else
     log "starting Phoenix on port $PHOENIX_PORT"
+    local phoenix_db_url="$DATABASE_URL"
+    phoenix_db_url="${phoenix_db_url/#postgresql+asyncpg:\/\//postgresql://}"
+    phoenix_db_url="${phoenix_db_url/#postgres+asyncpg:\/\//postgresql://}"
     PHOENIX_WORKING_DIR="$PHOENIX_DIR" \
-    PHOENIX_SQL_DATABASE_URL="sqlite:///$PHOENIX_DIR/phoenix.db" \
+    PHOENIX_SQL_DATABASE_URL="$phoenix_db_url" \
+    PHOENIX_SQL_DATABASE_SCHEMA="phoenix" \
     PHOENIX_ALLOW_EXTERNAL_RESOURCES=false \
     PHOENIX_TELEMETRY_ENABLED=false \
     PHOENIX_HOST=0.0.0.0 \
@@ -323,7 +292,7 @@ cmd_phoenix_down() {
 }
 
 cmd_obs_up() {
-  cmd_phoenix
+  ensure_database_url
   log "starting the observability stack"
   docker compose up -d
   wait_for "http://localhost:$PROMETHEUS_PORT/-/ready" "Prometheus" 60 \
@@ -333,6 +302,8 @@ cmd_obs_up() {
   wait_for "http://localhost:$COLLECTOR_PORT/metrics" "the collector's metrics exporter" 60 \
     || die "the collector did not come up; docker compose logs otel-collector"
   wait_for_postgres || die "PostgreSQL did not become ready; docker compose logs postgres"
+  log "starting Phoenix"
+  cmd_phoenix
 }
 
 cmd_obs_down() {
@@ -364,6 +335,7 @@ cmd_stt_unload() {
 }
 
 cmd_run() {
+  ensure_database_url
   log "the agent on $AGENT_PORT — Ctrl-C to stop"
   exec uv run python -m bot.bot
 }
@@ -371,6 +343,7 @@ cmd_run() {
 # --- the whole stack -------------------------------------------------------
 
 cmd_start() {
+  ensure_database_url
   local background=false with_agent=true keep_others=false with_web=false
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -393,11 +366,7 @@ cmd_start() {
       cmd_others_stop
     fi
   fi
-  # 2. Phoenix, on the host.
-  log "starting Phoenix"
-  cmd_phoenix
-
-  # 3. The observability stack.
+  # 2. The observability container stack (including PostgreSQL).
   log "starting the observability stack"
   docker compose up -d
   wait_for "http://localhost:$PROMETHEUS_PORT/-/ready" "Prometheus" 60 \
@@ -406,28 +375,12 @@ cmd_start() {
     || die "Grafana did not become healthy; docker compose logs grafana"
   wait_for "http://localhost:$COLLECTOR_PORT/metrics" "the collector's metrics exporter" 60 \
     || die "the collector did not come up; docker compose logs otel-collector"
-  if ! wait_for_postgres; then
-    # The agent no longer falls back implicitly: a configured PostgreSQL
-    # failure fails closed. This script is deliberately choosing a
-    # local-only store for this launch, so it must say so out loud and
-    # hand the agent an explicit opt-in. An explicit setting (opt-out
-    # or invalid), however, belongs to the deployment and must not be overwritten here.
-    if [ "$ALLOW_SQLITE_FALLBACK_EXPLICIT" -eq 1 ]; then
-      if sqlite_fallback_disabled; then
-        warn "PostgreSQL is unavailable; ALLOW_SQLITE_FALLBACK is disabled, so the agent will fail closed instead of using SQLite (docker compose logs postgres)"
-      elif sqlite_fallback_enabled; then
-        export ALLOW_SQLITE_FALLBACK=1
-        warn "PostgreSQL is unavailable; falling back to SQLite for local agent data (docker compose logs postgres)"
-        warn "WARNING: ALLOW_SQLITE_FALLBACK=1. Agent edits now go to the local SQLite file and will NOT appear in PostgreSQL."
-      else
-        warn "PostgreSQL is unavailable; ALLOW_SQLITE_FALLBACK is invalid ('$ALLOW_SQLITE_FALLBACK'), so the agent will fail closed instead of using SQLite (docker compose logs postgres)"
-      fi
-    else
-      export ALLOW_SQLITE_FALLBACK=1
-      warn "PostgreSQL is unavailable; falling back to SQLite for local agent data (docker compose logs postgres)"
-      warn "WARNING: ALLOW_SQLITE_FALLBACK=1. Agent edits now go to the local SQLite file and will NOT appear in PostgreSQL."
-    fi
-  fi
+  wait_for_postgres || die "PostgreSQL did not become ready; docker compose logs postgres"
+
+  # 3. Phoenix, on the host (connects to PostgreSQL).
+  log "starting Phoenix"
+  cmd_phoenix
+
 
   # Web studio (if requested via --web)
   if [ "$with_web" = true ]; then
