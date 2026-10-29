@@ -199,6 +199,23 @@ def test_drop_database_refuses_unowned_database() -> None:
     with pytest.raises(ValueError, match="Refusing to drop unowned"):
         _drop_database("postgresql://admin@127.0.0.1:5432/postgres", "production_voice_ai")
 
+def test_drop_database_requires_ownership_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cleanup must never contact PostgreSQL if the owner token is absent."""
+    import scripts.verify as verify
+
+    def unexpected_connection(*args, **kwargs):
+        raise AssertionError("database cleanup ran without an ownership token")
+
+    monkeypatch.setattr(verify.subprocess, "run", unexpected_connection)
+    with pytest.raises(PermissionError, match="ownership token"):
+        verify._drop_database(
+            "postgresql://admin@127.0.0.1:5432/postgres",
+            "platform_verify_0123456789ab_abcdef012345",
+        )
+
+
+
+
 def test_run_cmd_sanitizes_ambient_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     """run_cmd must strip ambient database credentials and secret tokens from child process env."""
     import json
@@ -265,6 +282,53 @@ def test_refuses_arbitrary_remote_production_cluster_without_ownership_marker() 
     has_marker = asyncio.run(_check_cluster_ownership_token(mock_conn, "arbitrary-token-1234"))
     assert has_marker is False, "cluster lacking _verification_cluster_ownership table must fail check"
 
+def test_test_database_ownership_matches_the_supplied_marker_without_leaking_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ownership checks accept any matching marker row and hide tokens on failure."""
+    import asyncio
+    import traceback
+    from tests.support.postgres import verify_test_cluster_ownership
+
+    expected = "owner-secret-that-must-not-be-logged"
+    markers = {"stale-owner-secret", expected}
+
+    class Result:
+        def __init__(self, matched: bool):
+            self.matched = matched
+
+        def scalar_one(self) -> bool:
+            return self.matched
+
+    class Connection:
+        async def execute(self, statement, parameters=None):
+            token = (parameters or {}).get("token")
+            return Result(token in markers)
+
+    connection = Connection()
+    monkeypatch.setenv("TEST_DATABASE_OWNERSHIP_TOKEN", expected)
+    asyncio.run(verify_test_cluster_ownership(connection))
+
+    mismatch = "missing-owner-secret"
+    monkeypatch.setenv("TEST_DATABASE_OWNERSHIP_TOKEN", mismatch)
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(verify_test_cluster_ownership(connection))
+    assert expected not in str(exc_info.value)
+    assert mismatch not in str(exc_info.value)
+
+    class BrokenConnection:
+        async def execute(self, statement, parameters=None):
+            raise RuntimeError(expected)
+
+    monkeypatch.setenv("TEST_DATABASE_OWNERSHIP_TOKEN", expected)
+    with pytest.raises(RuntimeError) as query_error:
+        asyncio.run(verify_test_cluster_ownership(BrokenConnection()))
+    formatted_error = "".join(traceback.format_exception(query_error.value))
+    assert expected not in formatted_error
+
+
+
+
 def test_bounded_database_identifiers_stay_within_postgres_limit() -> None:
     """Generated test database identifiers must strictly respect PostgreSQL's 63-byte limit."""
     import uuid
@@ -287,6 +351,74 @@ def test_external_admin_url_requires_preestablished_ownership_token(monkeypatch:
     harness = VerificationHarness(REPO_ROOT)
     with pytest.raises(ValueError, match="requires a pre-established ownership token"):
         harness.provision_disposable_postgres()
+
+
+def test_external_admin_url_requires_asyncpg_driver(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Reject sync PostgreSQL URLs before any verifier subprocess can contact the cluster."""
+    import scripts.verify as verify
+
+    monkeypatch.setenv(
+        "PLATFORM_TEST_DATABASE_ADMIN_URL",
+        "postgresql://admin:secret@127.0.0.1:5432/postgres",
+    )
+    monkeypatch.setenv("PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN", "owned-cluster-token")
+    monkeypatch.delenv("VERIFY_ARTIFACT_DIR", raising=False)
+
+    def unexpected_connection(*args, **kwargs):
+        raise AssertionError("invalid admin URL reached a PostgreSQL subprocess")
+
+    monkeypatch.setattr(verify.subprocess, "run", unexpected_connection)
+    harness = verify.VerificationHarness(tmp_path)
+    with pytest.raises(ValueError, match="asyncpg"):
+        harness.provision_disposable_postgres()
+
+
+def test_external_admin_keeps_opaque_owner_token_out_of_database_names(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """External ownership secrets stay intact while generated database names remain bounded."""
+    import json
+    import re
+    from types import SimpleNamespace
+    import scripts.verify as verify
+
+    ownership_token = "owner-secret-not-lowercase-hex-and-longer-than-twelve"
+    monkeypatch.setenv(
+        "PLATFORM_TEST_DATABASE_ADMIN_URL",
+        "postgresql+asyncpg://admin:secret@127.0.0.1:5432/verification_admin?sslmode=require",
+    )
+    monkeypatch.setenv("PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN", ownership_token)
+    monkeypatch.delenv("_VERIFY_RUN_OWNERSHIP_TOKEN", raising=False)
+    calls: list[dict[str, str]] = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(json.loads(kwargs["input"]))
+        return SimpleNamespace(returncode=0, stdout="PostgreSQL 16", stderr="")
+
+    monkeypatch.setattr(verify.subprocess, "run", fake_run)
+    harness = verify.VerificationHarness(tmp_path)
+
+    admin_url, _, _ = harness.provision_disposable_postgres()
+
+    assert admin_url.endswith("/postgres?sslmode=require")
+    assert harness.ownership_token == ownership_token
+    assert all(call.get("token") == ownership_token for call in calls if "token" in call)
+    assert os.environ["PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN"] == ownership_token
+    assert len(harness.lifecycle.owned_databases) == 2
+    for admin_url, db_name, token in harness.lifecycle.owned_databases:
+        assert admin_url.endswith("/postgres?sslmode=require")
+        assert token == ownership_token
+        assert re.fullmatch(
+            r"(?:platform|legacy)_verify_[a-f0-9]{12}_[a-f0-9]{12}",
+            db_name,
+        )
+        assert ownership_token not in db_name
+
+
 
 
 def test_release_sequencing_stops_at_failing_lane_and_records_pending_not_run(tmp_path: Path) -> None:

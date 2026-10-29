@@ -35,9 +35,9 @@ import bot.db.models  # noqa: F401
 
 
 
-async def _check_cluster_ownership_token(conn: Any, token: str) -> bool:
+async def _check_cluster_ownership_token(conn: Any, ownership_token: str) -> bool:
     """Verify that the PostgreSQL cluster has the run-owned verification token marker."""
-    if not token or not token.strip():
+    if not ownership_token or not ownership_token.strip():
         return False
     try:
         table_exists = await conn.scalar(
@@ -54,11 +54,11 @@ async def _check_cluster_ownership_token(conn: Any, token: str) -> bool:
         has_token = await conn.scalar(
             text(
                 "SELECT EXISTS ("
-                "  SELECT 1 FROM _verification_cluster_ownership "
+                "  SELECT 1 FROM public._verification_cluster_ownership "
                 "  WHERE token = :token"
                 ")"
             ),
-            {"token": token},
+            {"token": ownership_token},
         )
         return bool(has_token)
     except Exception:
@@ -100,6 +100,7 @@ class FreshPostgres:
     async def initialize(
         self,
         *,
+        schema: str = "platform",
         expected_version: str = "platform-v1",
         metadata_hash: str | None = None,
     ) -> None:
@@ -112,6 +113,7 @@ class FreshPostgres:
 
         await initialize_schema(
             self.engine,
+            schema=schema,
             expected_version=expected_version,
             metadata_hash=metadata_hash,
         )
@@ -121,12 +123,12 @@ class FreshPostgres:
 @pytest_asyncio.fixture
 async def fresh_pg() -> FreshPostgres:
     admin_url_env = os.environ.get("PLATFORM_TEST_DATABASE_ADMIN_URL")
-    run_token = (
+    ownership_token = (
         os.environ.get("PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN")
         or os.environ.get("_VERIFY_RUN_OWNERSHIP_TOKEN")
     )
 
-    if not admin_url_env or not run_token:
+    if not admin_url_env or not ownership_token or not ownership_token.strip():
         if os.environ.get("VERIFY_REQUIRED") == "1":
             pytest.fail(
                 "required qualification prerequisite unavailable: "
@@ -142,7 +144,7 @@ async def fresh_pg() -> FreshPostgres:
 
     # Verify cluster ownership marker before creating database
     async with admin_engine.connect() as conn:
-        has_marker = await _check_cluster_ownership_token(conn, run_token)
+        has_marker = await _check_cluster_ownership_token(conn, ownership_token)
         if not has_marker:
             await admin_engine.dispose()
             raise PermissionError(
@@ -150,8 +152,8 @@ async def fresh_pg() -> FreshPostgres:
                 "refusing database operations on unowned cluster"
             )
 
-    bounded_token = run_token[:12]
-    db_name = f"platform_verify_{bounded_token}_{uuid.uuid4().hex[:12]}"
+    database_id = uuid.uuid4().hex[:12]
+    db_name = f"platform_verify_{database_id}_{uuid.uuid4().hex[:12]}"
     assert len(db_name) <= 63, f"database name {db_name} exceeds PostgreSQL 63-byte limit"
     target_url = _build_database_url(admin_url, db_name)
 
@@ -169,13 +171,13 @@ async def fresh_pg() -> FreshPostgres:
             async with admin_engine.connect() as conn:
                 # Terminate any lingering connections to this test database
                 # Verify cluster ownership marker before dropping database
-                has_marker = await _check_cluster_ownership_token(conn, run_token)
+                has_marker = await _check_cluster_ownership_token(conn, ownership_token)
                 if not has_marker:
                     raise PermissionError(
                         "Cluster failed ownership verification on teardown: missing valid run ownership token marker; refusing drop"
                     )
 
-                assert db_name.startswith(f"platform_verify_{bounded_token}_"), f"refusing to drop unowned database {db_name}"
+                assert db_name.startswith(f"platform_verify_{database_id}_"), f"refusing to drop unowned database {db_name}"
                 await conn.execute(
                     text(
                         f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
@@ -196,7 +198,7 @@ async def verify_test_cluster_ownership(connection) -> None:
     Requires TEST_DATABASE_OWNERSHIP_TOKEN to be explicitly set in the environment.
     """
     expected_token = os.environ.get("TEST_DATABASE_OWNERSHIP_TOKEN")
-    if not expected_token:
+    if not expected_token or not expected_token.strip():
         raise RuntimeError(
             "TEST_DATABASE_OWNERSHIP_TOKEN must be set in the environment to verify "
             "test cluster ownership; refusing to run tests."
@@ -204,18 +206,25 @@ async def verify_test_cluster_ownership(connection) -> None:
 
     try:
         result = await connection.execute(
-            text("SELECT token FROM public._verification_cluster_ownership LIMIT 1")
+            text(
+                "SELECT EXISTS ("
+                "  SELECT 1 FROM public._verification_cluster_ownership "
+                "  WHERE token = :token"
+                ")"
+            ),
+            {"token": expected_token},
         )
-        token = result.scalar_one_or_none()
-    except Exception as exc:
+        has_token = bool(result.scalar_one())
+    except Exception:
         raise RuntimeError(
             "Refusing to run tests: target PostgreSQL cluster lacks "
             "public._verification_cluster_ownership marker."
-        ) from exc
+        ) from None
 
-    if token != expected_token:
+    if not has_token:
         raise RuntimeError(
-            f"Refusing to run tests: cluster ownership token mismatch ({token!r} != {expected_token!r})."
+            "Refusing to run tests: target PostgreSQL cluster ownership token does not match "
+            "public._verification_cluster_ownership."
         )
 
 

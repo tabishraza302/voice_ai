@@ -136,7 +136,7 @@ class LifecycleManager:
     def __init__(self) -> None:
         self.owned_processes: list[tuple[subprocess.Popen[Any], bool]] = []
         self.owned_compose_projects: list[tuple[str, Path]] = []
-        self.owned_databases: list[tuple[str, str, str | None]] = []  # (admin_url, db_name, run_token)
+        self.owned_databases: list[tuple[str, str, str | None]] = []  # (admin_url, db_name, ownership_token)
         self.cleanup_callbacks: list[Callable[[], None]] = []
         self.cleanup_failed = False
         self._installed_signals = False
@@ -175,8 +175,8 @@ class LifecycleManager:
     def register_compose_project(self, project_name: str, compose_file: Path) -> None:
         self.owned_compose_projects.append((project_name, compose_file))
 
-    def register_database(self, admin_url: str, db_name: str, run_token: str | None = None) -> None:
-        self.owned_databases.append((admin_url, db_name, run_token))
+    def register_database(self, admin_url: str, db_name: str, ownership_token: str | None = None) -> None:
+        self.owned_databases.append((admin_url, db_name, ownership_token))
 
     def register_cleanup_callback(self, cb: Callable[[], None]) -> None:
         self.cleanup_callbacks.append(cb)
@@ -235,9 +235,9 @@ class LifecycleManager:
         # 3. Drop owned databases
         databases = list(self.owned_databases)
         self.owned_databases.clear()
-        for admin_url, db_name, run_token in databases:
+        for admin_url, db_name, ownership_token in databases:
             try:
-                _drop_database(admin_url, db_name, run_token=run_token)
+                _drop_database(admin_url, db_name, ownership_token=ownership_token)
             except Exception as e:
                 errors.append(e)
 
@@ -271,26 +271,27 @@ class LifecycleManager:
             raise RuntimeError(f"verifier cleanup failed: {msg}")
 
 
-def _drop_database(admin_url: str, db_name: str, run_token: str | None = None) -> None:
-    """Drop test database using asyncpg with credentials passed via stdin and verified token."""
+def _drop_database(admin_url: str, db_name: str, ownership_token: str | None = None) -> None:
+    """Drop a test database only after verifying its exact public ownership marker."""
     clean_url = re.sub(r"\+asyncpg", "", admin_url)
     if not re.match(r"^(platform|legacy)_verify_[a-f0-9]{8,16}_[a-f0-9]{8,16}$", db_name) or len(db_name) > 63:
         raise ValueError(f"Refusing to drop unowned or invalid database: {db_name}")
-    input_payload = json.dumps({"url": clean_url, "db": db_name, "token": run_token})
+    if not ownership_token or not ownership_token.strip():
+        raise PermissionError("Refusing to drop a database without a valid ownership token")
+    input_payload = json.dumps({"url": clean_url, "db": db_name, "token": ownership_token})
     code = (
         "import asyncio, sys, json, asyncpg\n"
         "async def drop():\n"
         "    data = json.loads(sys.stdin.read())\n"
         "    conn = await asyncpg.connect(data['url'])\n"
-        "    token = data.get('token')\n"
-        "    if token:\n"
-        "        has_marker = await conn.fetchval(\n"
-        "            'SELECT EXISTS (SELECT 1 FROM _verification_cluster_ownership WHERE token = $1);',\n"
-        "            token,\n"
-        "        )\n"
-        "        if not has_marker:\n"
-        "            await conn.close()\n"
-        "            sys.exit(3)\n"
+        "    ownership_token = data['token']\n"
+        "    has_marker = await conn.fetchval(\n"
+        "        'SELECT EXISTS (SELECT 1 FROM public._verification_cluster_ownership WHERE token = $1);',\n"
+        "        ownership_token,\n"
+        "    )\n"
+        "    if not has_marker:\n"
+        "        await conn.close()\n"
+        "        sys.exit(3)\n"
         "    await conn.execute(\n"
         "        'SELECT pg_terminate_backend(pid) FROM pg_stat_activity '\n"
         "        'WHERE datname = $1 AND pid <> pg_backend_pid();',\n"
@@ -718,30 +719,29 @@ class VerificationHarness:
         if admin_url_env:
             if "sqlite" in admin_url_env.lower():
                 raise ValueError("SQLite fallback is forbidden for PostgreSQL admin URL")
-            pre_established_token = (
+            ownership_token = (
                 os.environ.get("PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN")
                 or os.environ.get("_VERIFY_RUN_OWNERSHIP_TOKEN")
             )
-            if not pre_established_token:
+            if not ownership_token or not ownership_token.strip():
                 raise ValueError(
                     "PLATFORM_TEST_DATABASE_ADMIN_URL requires a pre-established ownership token in "
                     "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN to verify run ownership"
                 )
-            run_token = pre_established_token[:12]
-            self.run_token = run_token
-            os.environ["_VERIFY_RUN_OWNERSHIP_TOKEN"] = run_token
-            os.environ["PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN"] = run_token
-            base_admin_url = admin_url_env
+            if not re.match(r"^postgres(?:ql)?\+asyncpg://", admin_url_env, re.IGNORECASE):
+                raise ValueError(
+                    "PLATFORM_TEST_DATABASE_ADMIN_URL must use a PostgreSQL asyncpg URL"
+                )
+            run_id = uuid.uuid4().hex[:12]
+            base_admin_url = re.sub(r"/([^/?]+)(\?.*)?$", r"/postgres\2", admin_url_env)
             allocated_port = 5432
             port_match = re.search(r":(\d+)/", admin_url_env)
             if port_match:
                 allocated_port = int(port_match.group(1))
         else:
-            run_token = uuid.uuid4().hex[:12]
-            self.run_token = run_token
-            os.environ["_VERIFY_RUN_OWNERSHIP_TOKEN"] = run_token
-            os.environ["PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN"] = run_token
-            project_id = f"voice-ai-verify-{run_token}"
+            run_id = uuid.uuid4().hex[:12]
+            ownership_token = run_id
+            project_id = f"voice-ai-verify-{run_id}"
             compose_file = self.repo_root / "tests" / "compose.postgres.yml"
             self.lifecycle.register_compose_project(project_id, compose_file)
 
@@ -766,6 +766,11 @@ class VerificationHarness:
                 raise RuntimeError(f"unparseable port output from docker compose: {out}")
             allocated_port = int(match.group(1))
             base_admin_url = f"postgresql+asyncpg://postgres:postgres_password@127.0.0.1:{allocated_port}/postgres"
+
+        self.ownership_token = ownership_token
+        self.register_secret(ownership_token)
+        os.environ["_VERIFY_RUN_OWNERSHIP_TOKEN"] = ownership_token
+        os.environ["PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN"] = ownership_token
 
         raw_admin_url = re.sub(r"\+asyncpg", "", base_admin_url)
 
@@ -804,13 +809,13 @@ class VerificationHarness:
                 "    data = json.loads(sys.stdin.read())\n"
                 "    conn = await asyncpg.connect(data['url'])\n"
                 "    await conn.execute('''\n"
-                "        CREATE TABLE IF NOT EXISTS _verification_cluster_ownership (\n"
+                "        CREATE TABLE IF NOT EXISTS public._verification_cluster_ownership (\n"
                 "            token TEXT PRIMARY KEY,\n"
                 "            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n"
                 "        );\n"
                 "    ''')\n"
                 "    await conn.execute(\n"
-                "        'INSERT INTO _verification_cluster_ownership (token) VALUES ($1) ON CONFLICT (token) DO NOTHING;',\n"
+                "        'INSERT INTO public._verification_cluster_ownership (token) VALUES ($1) ON CONFLICT (token) DO NOTHING;',\n"
                 "        data['token']\n"
                 "    )\n"
                 "    await conn.close()\n"
@@ -818,7 +823,7 @@ class VerificationHarness:
             )
             res = subprocess.run(
                 [sys.executable, "-c", setup_marker_code],
-                input=json.dumps({"url": raw_admin_url, "token": run_token}),
+                input=json.dumps({"url": raw_admin_url, "token": ownership_token}),
                 capture_output=True,
                 text=True,
             )
@@ -841,7 +846,7 @@ class VerificationHarness:
                 "        await conn.close()\n"
                 "        sys.exit(2)\n"
                 "    has_token = await conn.fetchval(\n"
-                "        'SELECT EXISTS (SELECT 1 FROM _verification_cluster_ownership WHERE token = $1);',\n"
+                "        'SELECT EXISTS (SELECT 1 FROM public._verification_cluster_ownership WHERE token = $1);',\n"
                 "        data['token']\n"
                 "    )\n"
                 "    await conn.close()\n"
@@ -850,7 +855,7 @@ class VerificationHarness:
             )
             res = subprocess.run(
                 [sys.executable, "-c", verify_marker_code],
-                input=json.dumps({"url": raw_admin_url, "token": run_token}),
+                input=json.dumps({"url": raw_admin_url, "token": ownership_token}),
                 capture_output=True,
                 text=True,
             )
@@ -863,13 +868,13 @@ class VerificationHarness:
         # Create two distinct disposable databases with bounded identifiers (<=63 bytes)
         uid1 = uuid.uuid4().hex[:12]
         uid2 = uuid.uuid4().hex[:12]
-        platform_db_name = f"platform_verify_{run_token}_{uid1}"
-        legacy_db_name = f"legacy_verify_{run_token}_{uid2}"
+        platform_db_name = f"platform_verify_{run_id}_{uid1}"
+        legacy_db_name = f"legacy_verify_{run_id}_{uid2}"
         assert len(platform_db_name) <= 63, f"database name {platform_db_name} exceeds PostgreSQL 63-byte limit"
         assert len(legacy_db_name) <= 63, f"database name {legacy_db_name} exceeds PostgreSQL 63-byte limit"
         # Register for automatic cleanup
-        self.lifecycle.register_database(raw_admin_url, platform_db_name, run_token=run_token)
-        self.lifecycle.register_database(raw_admin_url, legacy_db_name, run_token=run_token)
+        self.lifecycle.register_database(raw_admin_url, platform_db_name, ownership_token=ownership_token)
+        self.lifecycle.register_database(raw_admin_url, legacy_db_name, ownership_token=ownership_token)
 
         # Create databases with credentials passed via stdin (never in argv)
         create_code = (
@@ -908,6 +913,36 @@ class VerificationHarness:
         platform_url = re.sub(r"/postgres(\?.*)?$", f"/{platform_db_name}\\1", base_admin_url)
         legacy_url = re.sub(r"/postgres(\?.*)?$", f"/{legacy_db_name}\\1", base_admin_url)
 
+        # The agent-storage test fixture verifies ownership in its target database.
+        mark_test_database_code = (
+            "import asyncio, sys, json, asyncpg\n"
+            "async def mark():\n"
+            "    data = json.loads(sys.stdin.read())\n"
+            "    conn = await asyncpg.connect(data['url'])\n"
+            "    await conn.execute('''\n"
+            "        CREATE TABLE public._verification_cluster_ownership (\n"
+            "            token TEXT PRIMARY KEY,\n"
+            "            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n"
+            "        );\n"
+            "    ''')\n"
+            "    await conn.execute(\n"
+            "        'INSERT INTO public._verification_cluster_ownership (token) VALUES ($1);',\n"
+            "        data['token']\n"
+            "    )\n"
+            "    await conn.close()\n"
+            "asyncio.run(mark())\n"
+        )
+        res = subprocess.run(
+            [sys.executable, "-c", mark_test_database_code],
+            input=json.dumps({"url": re.sub(r"\+asyncpg", "", legacy_url), "token": ownership_token}),
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode != 0:
+            raise RuntimeError(
+                f"failed to set up test database ownership marker: {redact_secrets(res.stderr)}"
+            )
+
         return base_admin_url, platform_url, legacy_url
 
     def postgres(self, standalone: bool = True) -> int:
@@ -924,10 +959,11 @@ class VerificationHarness:
 
             env = {
                 "PLATFORM_TEST_DATABASE_ADMIN_URL": admin_url,
-                "PLATFORM_DATABASE_URL": platform_url,
+                "DATABASE_URL": platform_url,
                 "TEST_DATABASE_URL": legacy_url,
-                "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.run_token,
-                "_VERIFY_RUN_OWNERSHIP_TOKEN": self.run_token,
+                "TEST_DATABASE_OWNERSHIP_TOKEN": self.ownership_token,
+                "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.ownership_token,
+                "_VERIFY_RUN_OWNERSHIP_TOKEN": self.ownership_token,
             }
             junit_xml = self.run_dir / "postgres.xml"
             cmd = build_gate_command("postgres", self.repo_root) + [f"--junitxml={junit_xml}"]
@@ -976,7 +1012,6 @@ class VerificationHarness:
         self.register_secret(admin_url)
         self.register_secret(platform_url)
         self.register_secret(legacy_url)
-        self.register_secret(self.run_token)
 
         mail_dir = self.run_dir / "auth_mail_dev"
         mail_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1001,10 +1036,10 @@ class VerificationHarness:
             "init-db",
         ]
         schema_init_env = {
-            "PLATFORM_DATABASE_URL": platform_url,
+            "DATABASE_URL": platform_url,
             "PLATFORM_TEST_DATABASE_ADMIN_URL": admin_url,
-            "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.run_token,
-            "_VERIFY_RUN_OWNERSHIP_TOKEN": self.run_token,
+            "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.ownership_token,
+            "_VERIFY_RUN_OWNERSHIP_TOKEN": self.ownership_token,
             "PLATFORM_AUTH_CSRF_KEY": csrf_key,
             "PLATFORM_AUTH_RATE_KEY": rate_key,
             "PLATFORM_AUTH_MFA_KEY": mfa_key,
@@ -1030,10 +1065,10 @@ class VerificationHarness:
             str(api_port),
         ]
         api_env = {
-            "PLATFORM_DATABASE_URL": platform_url,
+            "DATABASE_URL": platform_url,
             "PLATFORM_TEST_DATABASE_ADMIN_URL": admin_url,
-            "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.run_token,
-            "_VERIFY_RUN_OWNERSHIP_TOKEN": self.run_token,
+            "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.ownership_token,
+            "_VERIFY_RUN_OWNERSHIP_TOKEN": self.ownership_token,
             "PLATFORM_HOST": "127.0.0.1",
             "PLATFORM_PORT": str(api_port),
             "PLATFORM_WEB_ORIGIN": f"http://127.0.0.1:{web_port}",
@@ -1162,10 +1197,10 @@ class VerificationHarness:
             "--reporter=json",
         ]
         env = {
-            "PLATFORM_DATABASE_URL": platform_url,
+            "DATABASE_URL": platform_url,
             "PLATFORM_TEST_DATABASE_ADMIN_URL": admin_url,
-            "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.run_token,
-            "_VERIFY_RUN_OWNERSHIP_TOKEN": self.run_token,
+            "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.ownership_token,
+            "_VERIFY_RUN_OWNERSHIP_TOKEN": self.ownership_token,
             "PLATFORM_AUTH_CSRF_KEY": csrf_key,
             "PLATFORM_AUTH_RATE_KEY": rate_key,
             "PLATFORM_AUTH_MFA_KEY": mfa_key,
@@ -1206,7 +1241,6 @@ class VerificationHarness:
         self.register_secret(admin_url)
         self.register_secret(platform_url)
         self.register_secret(legacy_url)
-        self.register_secret(self.run_token)
 
         mail_dir = self.run_dir / "auth_mail_tls"
         mail_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1251,10 +1285,10 @@ class VerificationHarness:
             "init-db",
         ]
         schema_init_env = {
-            "PLATFORM_DATABASE_URL": platform_url,
+            "DATABASE_URL": platform_url,
             "PLATFORM_TEST_DATABASE_ADMIN_URL": admin_url,
-            "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.run_token,
-            "_VERIFY_RUN_OWNERSHIP_TOKEN": self.run_token,
+            "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.ownership_token,
+            "_VERIFY_RUN_OWNERSHIP_TOKEN": self.ownership_token,
             "PLATFORM_AUTH_CSRF_KEY": csrf_key,
             "PLATFORM_AUTH_RATE_KEY": rate_key,
             "PLATFORM_AUTH_MFA_KEY": mfa_key,
@@ -1281,10 +1315,10 @@ class VerificationHarness:
             str(api_port),
         ]
         api_env = {
-            "PLATFORM_DATABASE_URL": platform_url,
+            "DATABASE_URL": platform_url,
             "PLATFORM_TEST_DATABASE_ADMIN_URL": admin_url,
-            "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.run_token,
-            "_VERIFY_RUN_OWNERSHIP_TOKEN": self.run_token,
+            "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.ownership_token,
+            "_VERIFY_RUN_OWNERSHIP_TOKEN": self.ownership_token,
             "PLATFORM_HOST": "127.0.0.1",
             "PLATFORM_PORT": str(api_port),
             "PLATFORM_WEB_ORIGIN": f"https://127.0.0.1:{ingress_port}",
@@ -1475,10 +1509,10 @@ class VerificationHarness:
             "--reporter=json",
         ]
         env = {
-            "PLATFORM_DATABASE_URL": platform_url,
+            "DATABASE_URL": platform_url,
             "PLATFORM_TEST_DATABASE_ADMIN_URL": admin_url,
-            "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.run_token,
-            "_VERIFY_RUN_OWNERSHIP_TOKEN": self.run_token,
+            "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.ownership_token,
+            "_VERIFY_RUN_OWNERSHIP_TOKEN": self.ownership_token,
             "PLATFORM_AUTH_CSRF_KEY": csrf_key,
             "PLATFORM_AUTH_RATE_KEY": rate_key,
             "PLATFORM_AUTH_MFA_KEY": mfa_key,

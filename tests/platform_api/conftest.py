@@ -34,7 +34,6 @@ def test_platform_settings(fresh_pg: FreshPostgres, tmp_path) -> PlatformSetting
     mail_dir = str(tmp_path / "test-mail")
     return PlatformSettings(
         database_url=fresh_pg.url,
-        local_database_url="postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai",
         auth_csrf_key=TEST_CSRF_KEY,
         auth_rate_key=TEST_RATE_KEY,
         auth_mfa_key=TEST_MFA_KEY,

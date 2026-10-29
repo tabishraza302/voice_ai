@@ -1,6 +1,6 @@
 """Database components for the platform control plane."""
 
-from platform_api.db.base import Base
+from platform_api.db.base import Base, DEFAULT_PLATFORM_SCHEMA
 from platform_api.db.session import (
     create_engine,
     get_db,
@@ -15,6 +15,7 @@ from platform_api.db.schema import (
 
 __all__ = [
     "Base",
+    "DEFAULT_PLATFORM_SCHEMA",
     "create_engine",
     "get_db",
     "get_session_factory",
