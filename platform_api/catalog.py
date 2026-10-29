@@ -79,7 +79,7 @@ class ModelCatalog(BaseModel):
     llm_models: list[CatalogModelItem]
     stt_providers: list[CatalogSTTItem]
     tts_voices: list[CatalogVoiceItem]
-
+    generation_models: list[CatalogModelItem] = Field(default_factory=list)
 
 def load_catalog(catalog_path: str | Path | None = None) -> ModelCatalog:
     """Load the configured catalog, using the baseline only when none is set.
