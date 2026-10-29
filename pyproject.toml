@@ -83,6 +83,8 @@ dependencies = [
     # RabbitMQ client for durable platform events.
     "aio-pika==9.5.8",
     "httpx==0.28.1",
+    # Local runtime registration and fixed EdDSA join-token verification/signing.
+    "PyJWT[crypto]==2.15.1",
 ]
 
 [project.optional-dependencies]

@@ -129,6 +129,19 @@ class StopEvidence(StrictModel):
     reason: str
     stopped_at: datetime | None = None
 
+class RuntimeStopAttestation(StrictModel):
+    """Authenticated runner or platform-confirmed admission compensation."""
+
+    source: Literal["voice-runtime", "platform-admission"]
+    stop_id: uuid.UUID
+    session_id: uuid.UUID
+    runner_id: str = Field(min_length=1, max_length=64)
+    registration_id: uuid.UUID
+    session_version: int = Field(ge=1, le=MAX_BIGINT)
+    stopped_at: datetime
+    reason: str = Field(min_length=1, max_length=64)
+
+
 
 class CloseBudgetRequest(StrictModel):
     """Runtime budget settlement and closure request."""
@@ -136,7 +149,8 @@ class CloseBudgetRequest(StrictModel):
     operation_id: str = Field(..., min_length=1, max_length=128)
     expected_budget_version: int = Field(..., ge=1, le=MAX_BIGINT)
     cumulative_billable_ms: int = Field(..., ge=0, le=MAX_BIGINT)
-    stop_evidence: dict[str, Any] | StopEvidence | None = None
+    stop_evidence: dict[str, Any] | StopEvidence | RuntimeStopAttestation | None = None
+    stop_attestation: RuntimeStopAttestation | None = None
     @field_validator(
         "expected_budget_version",
         "cumulative_billable_ms",
@@ -186,7 +200,7 @@ __all__ = [
     "BudgetView",
     "CheckpointRequest",
     "CloseBudgetRequest",
-    "StopEvidence",
+    "RuntimeStopAttestation",
     "AdminWalletAdjustmentRequest",
     "decode_stored_response",
 ]
