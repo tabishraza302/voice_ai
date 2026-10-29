@@ -9,14 +9,25 @@ Follows accounting-contract.md:
 from __future__ import annotations
 
 import uuid
+from collections.abc import Awaitable, Callable
+from typing import Any, TypeVar
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
+from sqlalchemy.exc import (
+    DBAPIError,
+    DisconnectionError,
+    TimeoutError as SQLAlchemyTimeoutError,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from platform_api.auth.dependencies import require_csrf, require_step_up, require_user
+from platform_api.auth.dependencies import (
+    require_admin,
+    require_csrf,
+    require_step_up,
+    require_user,
+)
 from platform_api.auth.errors import (
     DependencyUnavailableError,
-    UnauthenticatedError,
     ValidationError,
 )
 from platform_api.auth.types import AuthSessionContext, Principal
@@ -39,6 +50,62 @@ from platform_api.billing.service import (
 )
 from platform_api.db.session import get_db
 
+
+_T = TypeVar("_T")
+
+
+def _is_database_availability_error(exc: DBAPIError) -> bool:
+    if exc.connection_invalidated or isinstance(exc.orig, OSError):
+        return True
+
+    sqlstate = getattr(exc.orig, "sqlstate", None) or getattr(
+        exc.orig, "pgcode", None
+    )
+    return isinstance(sqlstate, str) and (
+        sqlstate.startswith("08") or sqlstate in {"57P01", "57P02", "57P03"}
+    )
+
+
+async def _billing_db_call(
+    service_call: Callable[..., Awaitable[_T]],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> _T:
+    """Map only database connection/availability failures to the retryable 503."""
+    try:
+        return await service_call(*args, **kwargs)
+    except (DisconnectionError, SQLAlchemyTimeoutError) as exc:
+        raise DependencyUnavailableError() from exc
+    except DBAPIError as exc:
+        if not _is_database_availability_error(exc):
+            raise
+        raise DependencyUnavailableError() from exc
+
+
+async def _require_billing_user(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> Principal:
+    return await _billing_db_call(require_user, request, db)
+
+
+async def _require_billing_step_up(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> Principal:
+    principal = await _billing_db_call(require_user, request, db)
+    principal = await require_admin(principal)
+    return await require_step_up(principal, request)
+
+
+async def _require_billing_csrf(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> AuthSessionContext:
+    return await _billing_db_call(require_csrf, request, db)
+
+
 # Owner wallet routes mounted under /api/v1
 router = APIRouter(tags=["wallet"])
 
@@ -55,12 +122,12 @@ internal_router = APIRouter(prefix="/sessions", tags=["internal_metering"])
 @router.get("/wallet", response_model=WalletView)
 async def get_wallet(
     response: Response,
-    principal: Principal = Depends(require_user),
+    principal: Principal = Depends(_require_billing_user),
     db: AsyncSession = Depends(get_db),
 ) -> WalletView:
     """Return own verified wallet balance."""
     response.headers["Cache-Control"] = "no-store"
-    return await get_wallet_view(db, user_id=principal.user_id)
+    return await _billing_db_call(get_wallet_view, db, user_id=principal.user_id)
 
 
 @router.get("/wallet/entries", response_model=WalletEntriesPage)
@@ -68,12 +135,13 @@ async def list_wallet_entries(
     response: Response,
     cursor: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=100),
-    principal: Principal = Depends(require_user),
+    principal: Principal = Depends(_require_billing_user),
     db: AsyncSession = Depends(get_db),
 ) -> WalletEntriesPage:
     """Return own wallet ledger entries with stable cursor pagination."""
     response.headers["Cache-Control"] = "no-store"
-    return await get_wallet_entries(
+    return await _billing_db_call(
+        get_wallet_entries,
         db,
         user_id=principal.user_id,
         cursor=cursor,
@@ -90,8 +158,8 @@ async def adjust_user_wallet(
     payload: AdminWalletAdjustmentRequest,
     request: Request,
     response: Response,
-    principal: Principal = Depends(require_step_up),
-    ctx: AuthSessionContext = Depends(require_csrf),
+    principal: Principal = Depends(_require_billing_step_up),
+    ctx: AuthSessionContext = Depends(_require_billing_csrf),
     idempotency_key: str = Header(..., alias="Idempotency-Key"),
     db: AsyncSession = Depends(get_db),
 ) -> WalletView:
@@ -101,7 +169,8 @@ async def adjust_user_wallet(
         raise ValidationError("Idempotency-Key header cannot be empty")
     if len(idempotency_key) > 128:
         raise ValidationError("Idempotency-Key header cannot exceed 128 characters")
-    view = await credit_wallet(
+    view = await _billing_db_call(
+        credit_wallet,
         db,
         actor=f"admin:{principal.user_id}",
         user_id=user_id,
@@ -150,7 +219,8 @@ async def session_budget_checkpoint(
         raise DependencyUnavailableError(
             "Billing deployment configuration missing: PLATFORM_BILLING_SLICE_MS and PLATFORM_BILLING_PERMIT_TTL_MS must be explicitly configured"
         )
-    return await checkpoint_and_reserve(
+    return await _billing_db_call(
+        checkpoint_and_reserve,
         db,
         runtime_principal=principal,
         session_id=session_id,
@@ -173,7 +243,8 @@ async def session_budget_close(
 ) -> BudgetView:
     """Synchronous settlement of final billable time and complete reservation release."""
     response.headers["Cache-Control"] = "no-store"
-    return await close_budget(
+    return await _billing_db_call(
+        close_budget,
         db,
         runtime_principal=principal,
         session_id=session_id,
