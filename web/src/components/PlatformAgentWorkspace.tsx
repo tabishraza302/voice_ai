@@ -504,7 +504,7 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
   };
 
   const handleValidate = async () => {
-    if (!draft || !config || identityDirty || identitySaving || publishLoading || snapshotRefreshNeeded || snapshotRefreshLoading) return;
+    if (!draft || !config || identityDirty || identitySaving || flowJsonDirty || publishLoading || snapshotRefreshNeeded || snapshotRefreshLoading) return;
     setValidationLoading(true);
     setWorkspaceError(null);
     try {
@@ -523,7 +523,7 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
   };
 
   const handlePublish = async () => {
-    if (!draft || !config || identityDirty || identitySaving || publishLoading || snapshotRefreshNeeded || snapshotRefreshLoading || !validation || !currentValidation || !validation.eligible_for_publish || !allWarningsAcknowledged || !changelog.trim()) return;
+    if (!draft || !config || identityDirty || identitySaving || flowJsonDirty || publishLoading || snapshotRefreshNeeded || snapshotRefreshLoading || !validation || !currentValidation || !validation.eligible_for_publish || !allWarningsAcknowledged || !changelog.trim()) return;
     setPublishLoading(true);
     setWorkspaceError(null);
     try {
@@ -624,7 +624,7 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
             : saveStatus === "error"
               ? "Save failed"
               : `Saved r${draft.draft_revision}`;
-  const publishDisabled = publishLoading || identityDirty || identitySaving || snapshotRefreshNeeded || snapshotRefreshLoading || dirty || saveStatus === "saving" || !eligibleToPublish || !allWarningsAcknowledged || !changelog.trim();
+  const publishDisabled = publishLoading || identityDirty || identitySaving || flowJsonDirty || snapshotRefreshNeeded || snapshotRefreshLoading || dirty || saveStatus === "saving" || !eligibleToPublish || !allWarningsAcknowledged || !changelog.trim();
 
   return (
     <div className="mx-auto max-w-[1600px] space-y-5">

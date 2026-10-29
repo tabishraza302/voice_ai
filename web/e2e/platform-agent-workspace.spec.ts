@@ -228,7 +228,7 @@ test("Chat Test uses a saved executable snapshot and reset keeps its hash but st
   expect(page.url()).toContain(`/agents/${agentId}`);
 });
 
-test("unsaved persona changes block validation and publishing", async ({ page }) => {
+test("unapplied Flow JSON and unsaved persona changes block validation and publishing", async ({ page }) => {
   await registerAndSignIn(page);
   await createBlankAgent(page, `Identity gate ${Date.now()}`);
   await page.getByRole("button", { name: "Flow JSON" }).click();
@@ -259,6 +259,14 @@ test("unsaved persona changes block validation and publishing", async ({ page })
     await warnings.nth(index).check();
   }
   await expect(publishButton).toBeEnabled();
+  await page.getByRole("button", { name: "Flow JSON" }).click();
+  const flowInput = page.getByLabel("Flow document");
+  const unappliedFlow = JSON.stringify(loanFixture.flow, null, 2)
+    .replace("Hi! I can help discuss a loan.", "Hello! I can help discuss a loan.");
+  await flowInput.fill(unappliedFlow);
+  await expect(page.getByRole("status").filter({ hasText: "Unapplied Flow JSON" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Validate current draft" })).toBeDisabled();
+  await expect(publishButton).toBeDisabled();
 
 });
 
