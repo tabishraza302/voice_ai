@@ -126,6 +126,8 @@ def charge_minor(rate_minor_per_minute: int, cumulative_billable_ms: int) -> int
 **Files:** `platform_api/sessions/{__init__,models,schemas,service,routes,admission}.py`, `bot/saas_runtime.py`, `bot/runtime/{__init__,snapshots,budget_client,session_task,transport_auth,pipeline_builder}.py`, `bot/flow_runtime.py`; existing runner/composition/observer/transcript/client seams and test files from verification plan.
 
 **Consumes:** Tasks 1–5 principal/version/flow/budget APIs and a qualified adapter tuple. **Produces:** `reserve_session`, `register_runtime`, `issue_join`, session-bound runtime config and media orchestration. The legacy runner stays local; control API import never loads GPU services.
+**Platform admission boundary:** [Task 6 session admission](session-admission.md) documents the owner/internal APIs, durable admission and teardown contracts, security bindings, and the local runtime prerequisite.
+
 
 - [ ] Write registration/funding compensation and join-binding/JTI replay tests before routes. Enforce single assigned runner/peer and per-user versus runner capacity separately.
 - [ ] Create `build_voice_pipeline(transport, settings, flow_hooks, instruments, runner_args)` at the new runtime seam using existing registries/context/language processing. Never import a concrete backend into `bot/pipeline.py`; retain the old local entrypoint and regression contracts.

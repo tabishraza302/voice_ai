@@ -49,6 +49,7 @@ from platform_api.billing.service import (
     get_wallet_view,
 )
 from platform_api.db.session import get_db
+from platform_api.sessions.admission import get_runtime_principal
 
 
 _T = TypeVar("_T")
@@ -190,16 +191,6 @@ async def adjust_user_wallet(
 # --- Internal Runtime Metering Endpoints --------------------------------------
 
 
-def get_runtime_principal(
-    request: Request,
-) -> RuntimePrincipal:
-    """Fail-closed dependency: genuine runtime authentication belongs to Task 6 (transport_auth).
-
-    Arbitrary caller-supplied headers are strictly forbidden from acting as an authenticated principal.
-    """
-    raise DependencyUnavailableError(
-        "Internal runtime authentication is unavailable; genuine transport auth is a Task 6 prerequisite"
-    )
 
 @internal_router.post("/{session_id}/budget/checkpoint", response_model=BudgetPermit)
 async def session_budget_checkpoint(
@@ -243,6 +234,11 @@ async def session_budget_close(
 ) -> BudgetView:
     """Synchronous settlement of final billable time and complete reservation release."""
     response.headers["Cache-Control"] = "no-store"
+    stop_evidence = payload.stop_evidence
+    if stop_evidence is not None and not isinstance(stop_evidence, dict):
+        stop_evidence = stop_evidence.model_dump(mode="json")
+    if stop_evidence is None and payload.stop_attestation is not None:
+        stop_evidence = payload.stop_attestation.model_dump(mode="json")
     return await _billing_db_call(
         close_budget,
         db,
@@ -251,5 +247,6 @@ async def session_budget_close(
         operation_id=payload.operation_id,
         expected_budget_version=payload.expected_budget_version,
         cumulative_billable_ms=payload.cumulative_billable_ms,
-        stop_evidence=payload.stop_evidence,
+        stop_evidence=stop_evidence,
+        stop_attestation=payload.stop_attestation,
     )

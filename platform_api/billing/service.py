@@ -37,19 +37,21 @@ from platform_api.billing.pricing import MAX_BIGINT, MIN_BIGINT, charge_minor
 from platform_api.billing.schemas import (
     BudgetPermit,
     BudgetView,
+    RuntimeStopAttestation,
     WalletEntriesPage,
     WalletEntryView,
     WalletView,
     decode_stored_response,
 )
 from platform_api.models.session import Session
+from platform_api.sessions.models import RuntimeRegistration, SessionPeer
 
 MAX_OPERATION_ID_LENGTH = 128
 
 # New spending authority is only valid for states that can still execute paid
 # work. Unknown/future states fail closed rather than being treated as live.
 LIVE_SESSION_STATES = frozenset(
-    {"ACTIVE", "CONNECTING", "CONNECTED", "RECONNECTING"}
+    {"ACTIVE", "CONNECTING", "CONNECTED", "RECONNECTING", "RESERVED", "REGISTERED"}
 )
 TERMINAL_SESSION_STATES = frozenset(
     {"CLOSED", "COMPLETED", "FAILED", "EXPIRED", "ENDED", "TERMINATED", "CANCELLED", "STOPPED"}
@@ -680,6 +682,7 @@ async def close_budget(
     expected_budget_version: int,
     cumulative_billable_ms: int,
     stop_evidence: Any = None,
+    stop_attestation: RuntimeStopAttestation | None = None,
     now: datetime | None = None,
 ) -> BudgetView:
     """Settle final proven cumulative time and release all reservations atomically.
@@ -706,6 +709,8 @@ async def close_budget(
         "cumulative_billable_ms": cumulative_billable_ms,
         "stop_evidence": raw_evidence,
     }
+    if stop_attestation is not None:
+        req_payload["stop_attestation"] = stop_attestation.model_dump(mode="json")
     req_hash = _canonical_hash(req_payload)
 
     # 1. Look up session first
@@ -807,20 +812,57 @@ async def close_budget(
     if cumulative_billable_ms > budget.cumulative_authorized_ms:
         raise InvalidTimeReportError("Billable time exceeds authorized limit on close")
 
-    # accounting-contract.md:67-71: Every close/expiry path needs confirmed stop OR expired permission.
-    # Earlier-close trust seam:
-    # Releasing reservations while an unexpired permit is live requires genuine authenticated
-    # media stop attestation from the Task 6 runtime boundary. Because Task 6 stop attestation
-    # is not yet implemented, caller-supplied stop_evidence is retained strictly as untrusted
-    # record metadata, and close_budget fails closed on ALL live permits until permit expiry
-    # (ts >= budget.permit_expiry). Client-supplied JSON or session state cannot stand in as
-    # trustworthy proof to release live financial authority.
     if budget.permit_expiry is not None and ts < budget.permit_expiry:
-        raise ConflictError(
-            f"Cannot close active budget and release reservations while permit is still live (expires at {budget.permit_expiry}); "
-            "genuine authenticated stop attestation is a Task 6 prerequisite"
-        )
-
+        if stop_attestation is None:
+            raise ConflictError(
+                f"Cannot close active budget and release reservations while permit is still live (expires at {budget.permit_expiry}); "
+                "an authenticated stop attestation is required"
+            )
+        registration = (
+            await db.execute(
+                select(RuntimeRegistration)
+                .where(RuntimeRegistration.session_id == session_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if registration is None or registration.runner_id != session_locked.runner_id:
+            raise ForbiddenError("Session registration is not assigned to this runner")
+        if (
+            runtime_principal.service_id != stop_attestation.source
+            or stop_attestation.session_id != session_id
+            or stop_attestation.runner_id != runtime_principal.runner_id
+            or stop_attestation.runner_id != session_locked.runner_id
+            or stop_attestation.registration_id != registration.registration_id
+            or stop_attestation.session_version != session_locked.version
+            or stop_attestation.stopped_at.tzinfo is None
+            or stop_attestation.stopped_at < registration.created_at
+            or stop_attestation.stopped_at > ts
+        ):
+            raise ForbiddenError("Stop attestation does not match the assigned session")
+        if stop_attestation.source == "voice-runtime":
+            if (
+                runtime_principal.service_id != "voice-runtime"
+                or session_locked.state != "ENDING"
+                or registration.status != "REGISTERED"
+            ):
+                raise ForbiddenError("Runtime stop attestation is not in the ending state")
+        elif stop_attestation.source == "platform-admission":
+            if (
+                runtime_principal.service_id != "platform-admission"
+                or session_locked.state != "RESERVED"
+                or registration.status not in {"PENDING", "REGISTERED", "RELEASE_PENDING"}
+            ):
+                raise ForbiddenError("Admission compensation is not eligible to release funding")
+            peer = (
+                await db.execute(
+                    select(SessionPeer)
+                    .where(SessionPeer.session_id == session_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if peer is not None and peer.status == "ACTIVE":
+                raise ForbiddenError("Admission compensation cannot stop an active peer")
+    # A stop attestation or expired permit is the only path that releases an active hold.
     budget.stop_evidence = raw_evidence
     # 4. Settle final proven cumulative time
     try:
@@ -861,9 +903,13 @@ async def close_budget(
     wallet.version += 1
     budget.updated_at = ts
     wallet.updated_at = ts
-    session_locked.state = "CLOSED"
-    session_locked.ended_at = ts
-    session_locked.version += 1
+    # Voice-test lifecycle remains owned by the session admission service:
+    # budget closure settles money but must not advance the version-bound
+    # ENDING state before the runtime submits its terminal transition.
+    if session_locked.kind != "voice_test":
+        session_locked.state = "CLOSED"
+        session_locked.ended_at = ts
+        session_locked.version += 1
     # Write checkpoint
     checkpoint = MeterCheckpoint(
         id=uuid.uuid4(),

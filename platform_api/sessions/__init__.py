@@ -1,5 +1,21 @@
-"""Platform sessions package."""
+"""Platform session admission API and canonical session exports."""
 
-from platform_api.models.session import Session
+from platform_api.sessions.models import (
+    RunnerCapacity,
+    RuntimeRegistration,
+    Session,
+    SessionJoinJti,
+    SessionParticipant,
+    SessionPeer,
+    SessionSlot,
+)
 
-__all__ = ["Session"]
+__all__ = [
+    "RunnerCapacity",
+    "RuntimeRegistration",
+    "Session",
+    "SessionJoinJti",
+    "SessionParticipant",
+    "SessionPeer",
+    "SessionSlot",
+]
