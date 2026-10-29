@@ -485,7 +485,6 @@ def mount_offer_guard(
     if getattr(app.state, "offer_guard_mounted", False):
         return
     app.state.offer_guard_mounted = True
-
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.requests import Request
     from starlette.responses import JSONResponse
@@ -683,27 +682,39 @@ def mount_observability(settings: Settings) -> None:
     mount_metrics(app, get_prometheus_observer(settings).registry)
     logger.info(f"prometheus metrics mounted at http://localhost:{settings.port}/metrics/")
 
-def mount_api(app, settings: Settings) -> None:
-    """Mount the multi-agent REST API and CORS middleware on the runner's app."""
+def mount_api(
+    app,
+    settings: Settings,
+    profile_resolver: Callable[..., Awaitable[Settings]] | None = None,
+) -> None:
     from fastapi.middleware.cors import CORSMiddleware
     from bot.api.router import create_api_router
     from bot.local_guard import mount_local_state_guard
 
-    mount_local_state_guard(app, settings)
+    # Mount preflight validation before local state guard so that the local
+    # security guard is added last and runs outermost (Starlette LIFO order).
+    mount_offer_guard(app, settings, profile_resolver=profile_resolver)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
             f"http://localhost:{settings.web_port}",
             f"http://127.0.0.1:{settings.web_port}",
         ],
-        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
     app.include_router(create_api_router(settings), prefix="/api")
-    mount_offer_guard(app, settings)
+    mount_local_state_guard(app, settings)
+    # Guarantee LocalStateGuardMiddleware is outermost (index 0 in user_middleware)
+    # even if another component (like mount_control) mounted it earlier.
+    if hasattr(app, "user_middleware"):
+        for idx, m in enumerate(app.user_middleware):
+            if getattr(m.cls, "__name__", "") == "LocalStateGuardMiddleware":
+                if idx > 0:
+                    guard_m = app.user_middleware.pop(idx)
+                    app.user_middleware.insert(0, guard_m)
+                break
     logger.info("multi-agent REST API mounted at /api")
-
 
 def validate_runner_bind_host(host: str) -> str:
     """Validate the final host Pipecat will bind, using Settings' guard.
@@ -750,16 +761,12 @@ if __name__ == "__main__":
 
         setup_tracing(settings)
 
+    # Mount the multi-agent REST API for web/
+    mount_api(runner.app, settings)
     # The STT switch owns "/" and "/settings". It is registered before
     # the runner mounts its own "/" -> "/client/" redirect, so route
     # order puts this page first.
     mount_control(runner.app, settings)
-    # Mount the multi-agent REST API for web/
-    mount_api(runner.app, settings)
-    mount_offer_guard(runner.app, settings)
-
-
-    # Mount the metrics endpoint before the runner starts serving.
     mount_observability(settings)
 
     # The runner takes its host and port from its module globals, and

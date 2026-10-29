@@ -16,6 +16,7 @@ from bot.bot import (
     mount_api,
     mount_offer_guard,
 )
+from bot.control import mount_control
 from bot.config import Settings
 from bot.db.session import StorageUnavailableError
 from bot.services import LlmModelNotAvailableError, SttLanguageNotSupportedError
@@ -38,9 +39,7 @@ def _create_test_app(
 ) -> FastAPI:
     """Create a FastAPI test app with the offer guard and mock endpoints."""
     app = FastAPI()
-    mount_offer_guard(app, settings, profile_resolver=profile_resolver)
-    mount_api(app, settings)
-
+    mount_api(app, settings, profile_resolver=profile_resolver)
     @app.post("/api/offer")
     async def offer_endpoint(request: Request):
         if mock_offer_handler:
@@ -383,6 +382,41 @@ def test_cors_headers_omitted_for_disallowed_origin(monkeypatch):
     assert "access-control-allow-origin" not in response.headers
 
 
+
+def test_offer_preflight_forbidden_host_or_origin_cannot_trigger_resolver(monkeypatch):
+    """Forbidden Host or Origin is rejected by local guard before offer resolver or preflight runs."""
+    resolver_called = False
+
+    async def side_effect_resolver(s, agent_id=None):
+        nonlocal resolver_called
+        resolver_called = True
+        raise AssertionError("Resolver must not be called when request is rejected by local state guard")
+
+    monkeypatch.setattr("bot.agents.service.apply_active_agent_to_settings", side_effect_resolver)
+
+    settings = Settings(_env_file=None, port=7860, web_port=3000)
+    app = _create_test_app(settings, profile_resolver=side_effect_resolver)
+    client = TestClient(app, base_url="http://127.0.0.1:7860")
+
+    # 1. Rejected Origin
+    response_origin = client.post(
+        "/api/offer",
+        headers={"Origin": "https://malicious.example"},
+        json={"sdp": "offer-sdp", "type": "offer", "request_data": {"agent_id": "test-agent"}},
+    )
+    assert response_origin.status_code == 403
+    assert resolver_called is False
+    assert "access-control-allow-origin" not in response_origin.headers
+
+    # 2. Rejected Host
+    response_host = client.post(
+        "/api/offer",
+        headers={"Host": "attacker.example:7860"},
+        json={"sdp": "offer-sdp", "type": "offer", "request_data": {"agent_id": "test-agent"}},
+    )
+    assert response_host.status_code == 403
+    assert resolver_called is False
+
 @pytest.mark.asyncio
 async def test_bot_startup_failure_tears_down_peer_connection(monkeypatch):
     """bot() closes webrtc_connection when pipeline initialization raises an error."""
@@ -402,6 +436,35 @@ async def test_bot_startup_failure_tears_down_peer_connection(monkeypatch):
         await bot(runner_args)
 
     mock_connection.disconnect.assert_awaited_once()
+
+
+def test_offer_preflight_runner_main_sequence_rejects_cross_origin_before_resolver(monkeypatch):
+    """Exact production runner sequence (mount_control + mount_api) rejects forbidden request before resolver."""
+    resolver_called = False
+
+    async def side_effect_resolver(s, agent_id=None):
+        nonlocal resolver_called
+        resolver_called = True
+        raise AssertionError("Resolver must not be called when request is rejected by local state guard")
+
+    monkeypatch.setattr("bot.agents.service.apply_active_agent_to_settings", side_effect_resolver)
+
+    settings = Settings(_env_file=None, port=7860, web_port=3000)
+    app = FastAPI()
+    # Exact production runner sequence where mount_control may run before or after mount_api:
+    mount_control(app, settings)
+    mount_api(app, settings, profile_resolver=side_effect_resolver)
+
+    client = TestClient(app, base_url="http://127.0.0.1:7860")
+
+    response = client.post(
+        "/api/offer",
+        headers={"Origin": "https://attacker.example"},
+        json={"sdp": "offer-sdp", "type": "offer", "request_data": {"agent_id": "test-agent"}},
+    )
+    assert response.status_code == 403
+    assert resolver_called is False
+    assert "access-control-allow-origin" not in response.headers
 
 
 @pytest.mark.asyncio

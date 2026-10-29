@@ -7,8 +7,13 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from bot.config import Settings
+import bot.control as control
 from bot.control import mount_control
 from bot.local_guard import mount_local_state_guard
+
+@pytest.fixture(autouse=True)
+def reset_provider_override(monkeypatch):
+    monkeypatch.setattr(control, "_override", None)
 
 
 def _settings() -> Settings:
@@ -369,3 +374,4 @@ def test_control_form_allows_alternate_loopback_and_honors_port_override():
         follow_redirects=False,
     )
     assert response.status_code == 403
+
