@@ -13,7 +13,9 @@ from bot.config import SYSTEM_PROMPT, Settings
 from tests.test_voice_live_integration import validate_loopback_base_url
 
 
-def test_defaults():
+def test_defaults(monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("database_url", raising=False)
     s = Settings(_env_file=None)
     assert s.stt_provider == "mlx-audio-realtime"
     assert s.stt_model == "mlx-community/nemotron-3.5-asr-streaming-0.6b"
@@ -30,7 +32,7 @@ def test_defaults():
     assert s.vad_stop_secs == 0.8
     assert s.vad_min_volume == 0.6
     assert s.vad_confidence == 0.7
-    assert s.sqlite_database_url == "sqlite+aiosqlite:///voice_ai.db"
+    assert s.database_url == "postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai"
     assert s.web_port == 3001
     assert s.host == "localhost"
 
@@ -49,6 +51,21 @@ def test_runtime_thresholds_and_web_port_reject_out_of_range_values(field, value
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **{field: value})
 
+
+@pytest.mark.parametrize(
+    "invalid_url",
+    [
+        "sqlite+aiosqlite:///voice_ai.db",
+        "sqlite:///voice_ai.db",
+        "postgresql://voice_ai:voice_ai@127.0.0.1:5439/voice_ai",
+        "mysql://localhost/db",
+        "",
+    ],
+)
+def test_database_url_rejects_non_async_postgres(invalid_url):
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(_env_file=None, database_url=invalid_url)
+    assert "postgresql+asyncpg" in str(exc_info.value)
 
 def test_every_field_has_a_default():
     """A field with no default would make a missing .env fatal."""

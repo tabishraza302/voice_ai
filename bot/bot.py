@@ -479,8 +479,9 @@ def mount_offer_guard(
     negotiates an SDP answer. When an agent ID is missing, malformed, or
     rejected by the database or provider configuration, the offer request
     fails closed immediately with a user-visible HTTP status code (400, 404,
-    or 500) rather than leaving the browser in a connected state with no
-    running backend session.
+    503, or 500) rather than leaving the browser in a connected state with no
+    running backend session. An unreachable PostgreSQL is a 503: the selected
+    profile may still exist, so it is not reported as missing.
     """
     if getattr(app.state, "offer_guard_mounted", False):
         return
@@ -488,7 +489,7 @@ def mount_offer_guard(
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.requests import Request
     from starlette.responses import JSONResponse
-    from sqlalchemy.exc import SQLAlchemyError
+    from sqlalchemy.exc import InterfaceError, OperationalError, SQLAlchemyError
     from bot.agents.service import AgentNotFoundError
     from bot.db.session import StorageUnavailableError
 
@@ -553,14 +554,14 @@ def mount_offer_guard(
                         content={"detail": f"Selected language model is unavailable: {exc}"},
                         headers=headers,
                     )
-                except StorageUnavailableError as exc:
+                except (StorageUnavailableError, OperationalError, InterfaceError) as exc:
                     logger.warning(f"WebRTC offer preflight could not reach agent storage: {exc}")
                     return JSONResponse(
                         status_code=503,
                         content={
                             "detail": (
-                                "Agent storage is unavailable: PostgreSQL is not reachable "
-                                "and the local SQLite fallback cannot verify saved agent profiles. "
+                                "Agent storage is unavailable: PostgreSQL is not reachable, "
+                                "so the requested agent profile cannot be verified. "
                                 "Reconnect PostgreSQL and try again."
                             )
                         },

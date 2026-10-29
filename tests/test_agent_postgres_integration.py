@@ -1,46 +1,18 @@
 """Optional PostgreSQL integration tests against a disposable schema only."""
 
 import asyncio
-import os
-import uuid
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from bot.agents.schemas import AgentCreate, BasePromptUpdate
 from bot.agents.service import AgentService
-from bot.db.base import Base
 from bot.db.seeds.presets import DEFAULT_BASE_PROMPT
-import bot.db.models  # noqa: F401
-
-
+from tests.support.postgres import disposable_postgres_schema
 @pytest_asyncio.fixture
 async def postgres_schema():
-    database_url = os.environ.get("TEST_DATABASE_URL")
-    if not database_url:
-        pytest.skip("set TEST_DATABASE_URL to run PostgreSQL integration tests")
-
-    schema = f"voice_ai_test_{uuid.uuid4().hex}"
-    admin_engine = create_async_engine(database_url)
-    async with admin_engine.begin() as connection:
-        await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
-
-    engine = create_async_engine(
-        database_url,
-        connect_args={"server_settings": {"search_path": schema}},
-    )
-    try:
-        async with engine.begin() as connection:
-            await connection.run_sync(Base.metadata.create_all)
-        yield async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-    finally:
-        await engine.dispose()
-        async with admin_engine.begin() as connection:
-            await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
-        await admin_engine.dispose()
-
+    async with disposable_postgres_schema() as (_engine, factory, _schema):
+        yield factory
 
 @pytest.mark.asyncio
 async def test_postgres_concurrent_prompt_saves_allocate_distinct_versions(postgres_schema):

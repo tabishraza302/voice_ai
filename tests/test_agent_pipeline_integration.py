@@ -1,12 +1,10 @@
 import pytest
 import pytest_asyncio
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from bot.agents.service import AgentService, apply_active_agent_to_settings
 from bot.config import Settings
-from bot.db.base import Base
-import bot.db.models  # noqa: F401
-
+from bot.db.session import StorageUnavailableError
+from tests.support.postgres import disposable_postgres_schema
 
 @pytest.fixture(autouse=True)
 def isolate_ollama_catalog(monkeypatch):
@@ -19,14 +17,9 @@ def isolate_ollama_catalog(monkeypatch):
 
 @pytest_asyncio.fixture
 async def integration_session():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-    async with factory() as session:
-        yield session
-    await engine.dispose()
-
+    async with disposable_postgres_schema() as (_engine, factory, _schema):
+        async with factory() as session:
+            yield session
 
 @pytest.mark.asyncio
 async def test_apply_active_agent_to_settings(integration_session):
@@ -75,7 +68,7 @@ async def test_explicit_agent_sqlalchemy_error_fails_closed(monkeypatch):
 
     monkeypatch.setattr("bot.db.session.get_session_factory", get_failing_factory)
 
-    with pytest.raises(OperationalError):
+    with pytest.raises(StorageUnavailableError):
         await apply_active_agent_to_settings(
             Settings(_env_file=None),
             agent_id="00000000-0000-0000-0000-000000000000",
@@ -83,7 +76,7 @@ async def test_explicit_agent_sqlalchemy_error_fails_closed(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_unrequested_agent_sqlalchemy_error_falls_back_to_defaults(monkeypatch):
+async def test_unrequested_agent_sqlalchemy_error_fails_closed(monkeypatch):
     from sqlalchemy.exc import OperationalError
 
     class FailingSessionContext:
@@ -102,9 +95,8 @@ async def test_unrequested_agent_sqlalchemy_error_falls_back_to_defaults(monkeyp
     monkeypatch.setattr("bot.db.session.get_session_factory", get_failing_factory)
 
     default_settings = Settings(_env_file=None)
-    resolved = await apply_active_agent_to_settings(default_settings)
-    assert resolved == default_settings
-
+    with pytest.raises(StorageUnavailableError):
+        await apply_active_agent_to_settings(default_settings)
 @pytest.mark.asyncio
 async def test_apply_active_agent_rejects_incompatible_realtime_non_auto_language(integration_session):
     service = AgentService(integration_session)
@@ -267,3 +259,53 @@ async def test_apply_active_agent_realtime_without_override_swaps_whisper_to_nem
 
     assert resolved.stt_provider == "mlx-audio-realtime"
     assert resolved.stt_model == NEMOTRON_MODEL
+
+
+@pytest.mark.asyncio
+async def test_apply_active_agent_preserves_explicit_batch_whisper_when_unchanged(
+    integration_session,
+):
+    service = AgentService(integration_session)
+    await service.seed_default_presets()
+    from bot.agents.schemas import AgentCreate
+    from bot.services import (
+        WHISPER_MODEL,
+        build_stt,
+        build_stt_language_router,
+        resolve_models,
+    )
+    from bot.stt_service import LocalMlxSTTService
+    from bot.language import Language, NemotronSttLanguageRouter
+
+    agent = await service.create_agent(
+        AgentCreate(
+            slug="batch-whisper-agent",
+            name="Batch Whisper Agent",
+            persona_prompt="You transcribe via batch Whisper.",
+            llm_model="qwen3.5:4b",
+            stt_provider="mlx-audio",
+        )
+    )
+
+    settings = Settings(_env_file=None, stt_provider="mlx-audio", stt_model=WHISPER_MODEL)
+
+    # Direct resolve_models preserves explicit batch whisper
+    direct_resolved = resolve_models(settings.model_copy(deep=True))
+    assert direct_resolved.stt_provider == "mlx-audio"
+    assert direct_resolved.stt_model == WHISPER_MODEL
+
+    # Profile application preserves explicit batch whisper
+    resolved = await apply_active_agent_to_settings(
+        settings, session=integration_session, agent_id=agent.id
+    )
+
+    assert resolved.stt_provider == "mlx-audio"
+    assert resolved.stt_model == WHISPER_MODEL
+
+    stt_svc = build_stt(resolved)
+    assert isinstance(stt_svc, LocalMlxSTTService)
+    assert stt_svc._settings.model == WHISPER_MODEL
+
+    stt_router = build_stt_language_router(resolved)
+    assert isinstance(stt_router, NemotronSttLanguageRouter)
+    assert stt_router.delta_for(Language.EN).model == WHISPER_MODEL

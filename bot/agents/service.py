@@ -1,28 +1,13 @@
-import asyncio
-import logging
-import weakref
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, InterfaceError, OperationalError
 from bot.db.models import Agent, BasePrompt, PromptRevision
 from bot.db.seeds.presets import DEFAULT_BASE_PROMPT, DEFAULT_PRESET_AGENTS
-from bot.db.session import StorageUnavailableError, storage_state
+from bot.db.session import StorageUnavailableError
 from bot.agents.schemas import AgentCreate, AgentUpdate, BasePromptUpdate
 from bot.agents.compiler import compile_system_prompt
 
-logger = logging.getLogger(__name__)
-_SQLITE_SEED_LOCKS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-_SQLITE_ACTIVATION_LOCKS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-_SQLITE_PROMPT_UPDATE_LOCKS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
-
-def _lock_for_loop(lock_map: weakref.WeakKeyDictionary) -> asyncio.Lock:
-    loop = asyncio.get_running_loop()
-    lock = lock_map.get(loop)
-    if lock is None:
-        lock = asyncio.Lock()
-        lock_map[loop] = lock
-    return lock
 
 
 class AgentNotFoundError(LookupError):
@@ -42,14 +27,12 @@ class AgentService:
         self.session = session
 
     async def seed_default_presets(self) -> None:
-        if self.session.get_bind().dialect.name == "sqlite":
-            async with _lock_for_loop(_SQLITE_SEED_LOCKS):
-                await self._seed_default_presets()
-            return
-        await self._seed_default_presets()
+        """Seed default base prompt and agent archetypes if table is empty.
 
-    async def _seed_default_presets(self) -> None:
-        """Seed default base prompt and agent archetypes if table is empty."""
+        Concurrent seeders serialize on the singleton base-prompt row below;
+        a racing insert on a unique slug or the partial unique active-agent
+        index surfaces as IntegrityError and is absorbed by its savepoint.
+        """
         stmt = select(BasePrompt).where(BasePrompt.name == "default")
         res = await self.session.execute(stmt)
         base = res.scalar_one_or_none()
@@ -67,8 +50,8 @@ class AgentService:
             except IntegrityError:
                 base = (await self.session.execute(stmt)).scalar_one()
 
-        # Serialize seeders on PostgreSQL; the partial unique active-agent
-        # index provides the same invariant for SQLite concurrent writers.
+        # Serialize seeders on the singleton prompt row: the row lock is what
+        # stops two of them from both deciding the preset table is empty.
         await self.session.execute(
             select(BasePrompt.id).where(BasePrompt.id == base.id).with_for_update()
         )
@@ -125,12 +108,6 @@ class AgentService:
         return base
 
     async def update_base_prompt(self, update_data: BasePromptUpdate) -> BasePrompt:
-        if self.session.get_bind().dialect.name == "sqlite":
-            async with _lock_for_loop(_SQLITE_PROMPT_UPDATE_LOCKS):
-                return await self._update_base_prompt(update_data)
-        return await self._update_base_prompt(update_data)
-
-    async def _update_base_prompt(self, update_data: BasePromptUpdate) -> BasePrompt:
         base = await self.get_base_prompt()
         result = await self.session.execute(
             update(BasePrompt)
@@ -235,19 +212,14 @@ class AgentService:
         return True
 
     async def activate_agent(self, agent_id: str) -> Agent:
-        if self.session.get_bind().dialect.name == "sqlite":
-            async with _lock_for_loop(_SQLITE_ACTIVATION_LOCKS):
-                return await self._activate_agent(agent_id)
-        return await self._activate_agent(agent_id)
-
-    async def _activate_agent(self, agent_id: str) -> Agent:
         agent = await self.get_agent(agent_id)
         if not agent:
             raise AgentNotFoundError(f"Agent with id {agent_id} not found")
 
-        # Lock the singleton prompt row as a portable serialization point.
-        # PostgreSQL honors FOR UPDATE; SQLite serializes the following write
-        # transaction. This keeps concurrent activations from both remaining active.
+        # Lock the singleton prompt row as the serialization point for
+        # concurrent activations: PostgreSQL honors FOR UPDATE, and the
+        # partial unique active-agent index is the backstop that keeps two
+        # activations from both remaining active.
         base = await self.get_base_prompt()
         await self.session.execute(
             select(BasePrompt.id).where(BasePrompt.id == base.id).with_for_update()
@@ -282,31 +254,32 @@ async def apply_active_agent_to_settings(
     session: AsyncSession | None = None,
     agent_id: str | None = None,
 ):
-    """Resolve the active or requested agent profile and apply it to session Settings."""
+    """Resolve the active or requested agent profile and apply it to session Settings.
+
+    A session that names a profile is never served a different answer: if
+    PostgreSQL cannot be reached, the request fails with
+    ``StorageUnavailableError`` (503 at the offer guard) instead of reporting
+    the profile as missing, which would read as "the agent was deleted".
+    """
     from bot.db.session import get_session_factory
     from bot.services import resolve_models, validate_llm_model_available, validate_stt_language
     async def _resolve_with_session(sess: AsyncSession):
-        if agent_id and storage_state()["fallback"]:
-            # The requested profile may live in PostgreSQL. Reading the
-            # fallback SQLite file and reporting "not found" would claim
-            # the agent was deleted when the database is merely down.
-            raise StorageUnavailableError(
-                "requested agent profile cannot be resolved while storage is "
-                "the local SQLite fallback"
-            )
         service = AgentService(sess)
-        await service.seed_default_presets()
-        if agent_id:
-            agent = await service.get_agent(agent_id)
-        else:
-            agent = await service.get_active_agent()
-
-        if not agent and agent_id:
-            raise AgentNotFoundError(f"Agent with id {agent_id} not found")
-        if not agent:
-            return settings
-
-        compiled = await service.get_compiled_prompt_for_agent(agent.id)
+        try:
+            await service.seed_default_presets()
+            if agent_id:
+                agent = await service.get_agent(agent_id)
+            else:
+                agent = await service.get_active_agent()
+            if not agent and agent_id:
+                raise AgentNotFoundError(f"Agent with id {agent_id} not found")
+            if not agent:
+                return settings
+            compiled = await service.get_compiled_prompt_for_agent(agent.id)
+        except (OperationalError, InterfaceError, ConnectionError, OSError) as exc:
+            raise StorageUnavailableError(
+                "agent profile cannot be resolved: PostgreSQL is unreachable"
+            ) from exc
 
         updated = settings.model_copy(deep=True)
         updated.system_instruction = compiled
@@ -335,13 +308,7 @@ async def apply_active_agent_to_settings(
         factory = await get_session_factory()
         async with factory() as sess:
             return await _resolve_with_session(sess)
-    except AgentNotFoundError:
-        raise
-    except SQLAlchemyError as exc:
-        if agent_id:
-            raise
-        logger.warning(
-            "Failed resolving agent configuration from database (%s); using default settings",
-            type(exc).__name__,
-        )
-        return settings
+    except (OperationalError, InterfaceError, ConnectionError, OSError) as exc:
+        raise StorageUnavailableError(
+            "agent profile cannot be resolved: PostgreSQL is unreachable"
+        ) from exc

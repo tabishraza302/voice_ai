@@ -103,11 +103,10 @@ def test_offer_preflight_rejects_missing_agent_id_with_404(monkeypatch):
     assert response.headers.get("access-control-allow-origin") == "http://localhost:3000"
 
 
-def test_offer_preflight_reports_storage_fallback_as_unavailable_not_deleted(monkeypatch):
-    """An explicit profile on the SQLite fallback returns 503, not 404."""
+def test_offer_preflight_reports_storage_unavailable_not_deleted(monkeypatch):
+    """When PostgreSQL is unreachable, an explicit profile request returns 503, not 404."""
     async def mock_resolver(s, agent_id):
-        raise StorageUnavailableError("requested profile is not available from fallback")
-
+        raise StorageUnavailableError("requested agent profile cannot be resolved: PostgreSQL is unreachable")
     monkeypatch.setattr("bot.agents.service.apply_active_agent_to_settings", mock_resolver)
 
     settings = Settings(_env_file=None, web_port=3000)
@@ -151,7 +150,7 @@ def test_offer_preflight_reports_uninstalled_model_as_unavailable(monkeypatch):
 
 
 def test_offer_preflight_fails_closed_on_database_error(monkeypatch):
-    """Database storage failure returns HTTP 500 Internal Server Error without falling back."""
+    """Database storage failure returns HTTP 503 Service Unavailable without falling back."""
     async def mock_resolver(s, agent_id):
         raise OperationalError("SELECT 1", {}, Exception("database connection lost"))
 
@@ -167,8 +166,9 @@ def test_offer_preflight_fails_closed_on_database_error(monkeypatch):
         json={"sdp": "offer-sdp", "type": "offer", "request_data": {"agent_id": "any-agent-id"}},
     )
 
-    assert response.status_code == 500
-    assert "database error" in response.json().get("detail", "").lower()
+    assert response.status_code == 503
+    detail = response.json().get("detail", "").lower()
+    assert "storage" in detail or "database" in detail
     assert response.headers.get("access-control-allow-origin") == "http://localhost:3000"
 
 
