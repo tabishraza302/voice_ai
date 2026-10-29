@@ -19,7 +19,10 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import getpass
 import json
+import os
+from pathlib import Path
 import sys
+from time import perf_counter
 from typing import Sequence
 import uuid
 
@@ -42,6 +45,20 @@ from platform_api.db.schema import (
     initialize_schema,
 )
 from platform_api.db.session import create_engine, get_session_factory
+from platform_api.ops.backup import (
+    create_backup,
+    restore_backup,
+    validate_backup_database_url,
+    validate_restore_target_database_url,
+)
+from platform_api.ops.privacy import (
+    MAX_RETENTION_BATCH,
+    apply_retention,
+    export_user_data,
+    redact_user_transcripts,
+    sanitize_operator_reason,
+    validate_retention_database_url,
+)
 import platform_api.models  # Ensure all platform models are registered
 from platform_api.models.auth import (
     AuthMail,
@@ -458,6 +475,275 @@ async def _prune_auth_command(
         await engine.dispose()
 
 
+
+def _parse_cutoff(value: str) -> datetime:
+    try:
+        cutoff = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("Cutoff must be an ISO-8601 timestamp") from exc
+    if cutoff.tzinfo is None or cutoff.utcoffset() is None:
+        raise ValueError("Cutoff must include a timezone")
+    return cutoff.astimezone(timezone.utc)
+
+
+async def _export_user_command(
+    settings: PlatformSettings,
+    *,
+    user_id: uuid.UUID,
+    output_path: Path,
+    reason: str,
+    include_transcripts: bool,
+    max_bytes: int,
+    max_records: int,
+) -> int:
+    started = perf_counter()
+    engine = create_engine(settings)
+    session_factory = get_session_factory(engine)
+    summary = None
+    try:
+        async with session_factory() as session:
+            async with session.begin():
+                summary = await export_user_data(
+                    session,
+                    user_id=user_id,
+                    output_path=output_path,
+                    reason=reason,
+                    include_transcripts=include_transcripts,
+                    max_bytes=max_bytes,
+                    max_records=max_records,
+                )
+        print(
+            json.dumps(
+                {
+                    "exported_user_id": str(summary.user_id),
+                    "output": str(summary.output_path),
+                    "record_counts": summary.record_counts,
+                    "size_bytes": summary.size_bytes,
+                    "elapsed_seconds": round(perf_counter() - started, 3),
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    except Exception as exc:
+        if summary is not None:
+            try:
+                summary.output_path.unlink()
+            except FileNotFoundError:
+                pass
+        print(f"User export failed: {type(exc).__name__}", file=sys.stderr)
+        return 1
+    finally:
+        await engine.dispose()
+
+
+async def _delete_user_transcripts_command(
+    settings: PlatformSettings,
+    *,
+    user_id: uuid.UUID,
+    reason: str,
+    batch_size: int,
+) -> int:
+    started = perf_counter()
+    try:
+        maintenance_url = validate_retention_database_url(
+            settings.database_url, os.environ.get("PLATFORM_RETENTION_DATABASE_URL", "")
+        )
+        engine = create_engine(maintenance_url, schema=settings.postgres_schema)
+        try:
+            session_factory = get_session_factory(engine)
+            async with session_factory() as session:
+                async with session.begin():
+                    counts = await redact_user_transcripts(
+                        session,
+                        user_id=user_id,
+                        reason=reason,
+                        batch_size=batch_size,
+                    )
+            print(
+                json.dumps(
+                    {
+                        "redacted_counts": counts,
+                        "elapsed_seconds": round(perf_counter() - started, 3),
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
+        finally:
+            await engine.dispose()
+    except Exception as exc:
+        print(f"Transcript deletion failed: {type(exc).__name__}", file=sys.stderr)
+        return 1
+
+
+async def _apply_retention_command(
+    settings: PlatformSettings,
+    *,
+    before: str,
+    reason: str,
+    batch_size: int,
+) -> int:
+    started = perf_counter()
+    try:
+        cutoff = _parse_cutoff(before)
+        maintenance_url = validate_retention_database_url(
+            settings.database_url, os.environ.get("PLATFORM_RETENTION_DATABASE_URL", "")
+        )
+        engine = create_engine(maintenance_url, schema=settings.postgres_schema)
+        try:
+            session_factory = get_session_factory(engine)
+            async with session_factory() as session:
+                async with session.begin():
+                    counts = await apply_retention(
+                        session,
+                        before=cutoff,
+                        reason=reason,
+                        batch_size=batch_size,
+                    )
+            print(
+                json.dumps(
+                    {
+                        "cutoff": cutoff.isoformat(),
+                        "redacted_counts": counts,
+                        "elapsed_seconds": round(perf_counter() - started, 3),
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
+        finally:
+            await engine.dispose()
+    except Exception as exc:
+        print(f"Retention failed: {type(exc).__name__}", file=sys.stderr)
+        return 1
+
+
+async def _audit_backup_creation(
+    settings: PlatformSettings, *, reason: str, row_counts: dict[str, int], size_bytes: int
+) -> None:
+    engine = create_engine(settings)
+    try:
+        session_factory = get_session_factory(engine)
+        async with session_factory() as session:
+            async with session.begin():
+                await record_audit(
+                    session,
+                    actor_kind="operator",
+                    action="ops.backup.created",
+                    target_type="platform_database",
+                    reason=sanitize_operator_reason(reason),
+                    result="success",
+                    change_summary={"row_counts": row_counts, "size_bytes": size_bytes},
+                )
+    finally:
+        await engine.dispose()
+
+
+async def _create_backup_command(
+    settings: PlatformSettings,
+    *,
+    output_path: Path,
+    reason: str,
+    max_bytes: int,
+) -> int:
+    started = perf_counter()
+    summary = None
+    try:
+        backup_url = validate_backup_database_url(
+            settings.database_url, os.environ.get("PLATFORM_BACKUP_DATABASE_URL", "")
+        )
+        summary = await create_backup(
+            backup_url,
+            output_path=output_path,
+            schema=settings.postgres_schema,
+            schema_version=settings.schema_version,
+            metadata_hash=compute_metadata_hash(Base.metadata),
+            max_bytes=max_bytes,
+        )
+        try:
+            await _audit_backup_creation(
+                settings,
+                reason=reason,
+                row_counts=summary.row_counts,
+                size_bytes=summary.size_bytes,
+            )
+        except Exception:
+            summary.output_path.unlink()
+            raise
+        print(
+            json.dumps(
+                {
+                    "output": str(summary.output_path),
+                    "size_bytes": summary.size_bytes,
+                    "row_counts": summary.row_counts,
+                    "elapsed_seconds": round(perf_counter() - started, 3),
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    except Exception as exc:
+        print(f"Backup failed: {type(exc).__name__}", file=sys.stderr)
+        return 1
+
+
+async def _restore_backup_command(
+    settings: PlatformSettings,
+    *,
+    backup_path: Path,
+    reason: str,
+    max_bytes: int,
+) -> int:
+    started = perf_counter()
+    try:
+        target_url = validate_restore_target_database_url(
+            settings.database_url, os.environ.get("PLATFORM_RESTORE_DATABASE_URL", "")
+        )
+        summary = await restore_backup(
+            backup_path,
+            target_url,
+            schema=settings.postgres_schema,
+            schema_version=settings.schema_version,
+            metadata_hash=compute_metadata_hash(Base.metadata),
+            max_bytes=max_bytes,
+            reason=reason,
+        )
+        print(
+            json.dumps(
+                {
+                    "schema": summary.schema,
+                    "row_counts": summary.row_counts,
+                    "restored_at": summary.restored_at.isoformat(),
+                    "elapsed_seconds": round(perf_counter() - started, 3),
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    except Exception as exc:
+        print(f"Restore failed: {type(exc).__name__}", file=sys.stderr)
+        return 1
+
+
+def _positive_batch_size(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("batch size must be an integer") from exc
+    if not 1 <= parsed <= MAX_RETENTION_BATCH:
+        raise argparse.ArgumentTypeError(f"batch size must be between 1 and {MAX_RETENTION_BATCH}")
+    return parsed
+
+
+def _configured_limit(requested: int | None, configured: int, option: str) -> int:
+    if requested is None:
+        return configured
+    if requested < 1:
+        raise argparse.ArgumentTypeError(f"{option} must be positive")
+    if requested > configured:
+        raise argparse.ArgumentTypeError(f"{option} exceeds the configured maximum of {configured}")
+    return requested
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse CLI arguments and dispatch commands."""
     parser = argparse.ArgumentParser(
@@ -503,12 +789,77 @@ def main(argv: Sequence[str] | None = None) -> int:
     prune_p.add_argument("--rate-limit-ttl", type=int, default=3600)
     prune_p.add_argument("--tokens-ttl", type=int, default=86400)
 
+    export_p = subparsers.add_parser("export-user", help="Write an audited, redacted user data export")
+    export_p.add_argument("--user-id", required=True, type=uuid.UUID)
+    export_p.add_argument("--output", required=True, type=Path)
+    export_p.add_argument("--reason", required=True)
+    export_p.add_argument(
+        "--include-transcripts",
+        action="store_true",
+        help="Include transcript text; the output remains private and sensitive",
+    )
+    export_p.add_argument("--max-bytes", type=int, default=None)
+    export_p.add_argument("--max-records", type=int, default=None)
+
+    delete_transcripts_p = subparsers.add_parser(
+        "delete-user-transcripts",
+        help="Redact one bounded batch of a user's transcript and chat-test text",
+    )
+    delete_transcripts_p.add_argument("--user-id", required=True, type=uuid.UUID)
+    delete_transcripts_p.add_argument("--reason", required=True)
+    delete_transcripts_p.add_argument(
+        "--batch-size", type=_positive_batch_size, default=None
+    )
+    retention_p = subparsers.add_parser(
+        "apply-retention", help="Redact one bounded batch of transcript data before a cutoff"
+    )
+    retention_p.add_argument("--before", required=True, help="ISO-8601 UTC cutoff")
+    retention_p.add_argument("--reason", required=True)
+    retention_p.add_argument("--batch-size", type=_positive_batch_size, default=None)
+    backup_p = subparsers.add_parser(
+        "backup", help="Create an audited, consistent platform database backup"
+    )
+    backup_p.add_argument("--output", required=True, type=Path)
+    backup_p.add_argument("--reason", required=True)
+    backup_p.add_argument("--max-bytes", type=int, default=None)
+
+    restore_p = subparsers.add_parser(
+        "restore", help="Restore a backup into an empty, separate platform database"
+    )
+    restore_p.add_argument("--backup", required=True, type=Path)
+    restore_p.add_argument("--reason", required=True)
+    restore_p.add_argument("--max-bytes", type=int, default=None)
+
     args = parser.parse_args(argv)
 
     try:
         settings = get_settings()
     except ValidationError as exc:
         print(f"Configuration error: {_format_safe_validation_error(exc)}", file=sys.stderr)
+        return 1
+
+    try:
+        if args.command == "export-user":
+            args.max_bytes = _configured_limit(
+                args.max_bytes, settings.ops_export_max_bytes, "--max-bytes"
+            )
+            args.max_records = _configured_limit(
+                args.max_records, settings.ops_export_max_records, "--max-records"
+            )
+        elif args.command in ("delete-user-transcripts", "apply-retention"):
+            args.batch_size = _configured_limit(
+                args.batch_size, settings.ops_retention_batch_size, "--batch-size"
+            )
+        elif args.command == "backup":
+            args.max_bytes = _configured_limit(
+                args.max_bytes, settings.ops_backup_max_bytes, "--max-bytes"
+            )
+        elif args.command == "restore":
+            args.max_bytes = _configured_limit(
+                args.max_bytes, settings.ops_restore_max_bytes, "--max-bytes"
+            )
+    except argparse.ArgumentTypeError as exc:
+        print(str(exc), file=sys.stderr)
         return 1
 
     if args.command in ("init-db", "init-schema"):
@@ -554,7 +905,78 @@ def main(argv: Sequence[str] | None = None) -> int:
                 token_ttl_seconds=args.tokens_ttl,
             )
         )
-
+    elif args.command == "export-user":
+        return asyncio.run(
+            _export_user_command(
+                settings,
+                user_id=args.user_id,
+                output_path=args.output,
+                reason=args.reason,
+                include_transcripts=args.include_transcripts,
+                max_bytes=(
+                    settings.ops_export_max_bytes
+                    if args.max_bytes is None
+                    else min(args.max_bytes, settings.ops_export_max_bytes)
+                ),
+                max_records=(
+                    settings.ops_export_max_records
+                    if args.max_records is None
+                    else min(args.max_records, settings.ops_export_max_records)
+                ),
+            )
+        )
+    elif args.command == "delete-user-transcripts":
+        return asyncio.run(
+            _delete_user_transcripts_command(
+                settings,
+                user_id=args.user_id,
+                reason=args.reason,
+                batch_size=(
+                    args.batch_size
+                    if args.batch_size is not None
+                    else settings.ops_retention_batch_size
+                ),
+            )
+        )
+    elif args.command == "apply-retention":
+        return asyncio.run(
+            _apply_retention_command(
+                settings,
+                before=args.before,
+                reason=args.reason,
+                batch_size=(
+                    args.batch_size
+                    if args.batch_size is not None
+                    else settings.ops_retention_batch_size
+                ),
+            )
+        )
+    elif args.command == "backup":
+        return asyncio.run(
+            _create_backup_command(
+                settings,
+                output_path=args.output,
+                reason=args.reason,
+                max_bytes=(
+                    settings.ops_backup_max_bytes
+                    if args.max_bytes is None
+                    else min(args.max_bytes, settings.ops_backup_max_bytes)
+                ),
+            )
+        )
+    elif args.command == "restore":
+        return asyncio.run(
+            _restore_backup_command(
+                settings,
+                backup_path=args.backup,
+                reason=args.reason,
+                max_bytes=(
+                    settings.ops_restore_max_bytes
+                    if args.max_bytes is None
+                    else min(args.max_bytes, settings.ops_restore_max_bytes)
+                ),
+            )
+        )
     return 1
 
 

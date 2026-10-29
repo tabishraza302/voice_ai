@@ -6,6 +6,7 @@ Completely isolated from bot.db.
 
 from platform_api.db.base import Base
 from platform_api.db.schema import SchemaInfo
+from platform_api.models.wallet import WalletAccount
 from platform_api.models.auth import (
     AuditLog,
     AuthMail,
