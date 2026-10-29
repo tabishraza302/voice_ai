@@ -133,7 +133,7 @@ class RuntimeRegistration(Base):
 
 
 class SessionParticipant(Base):
-    """Owner identity and exact origin bound to a session participant."""
+    """Owner or anonymous guest identity bound to one exact origin."""
 
     __tablename__ = "session_participants"
 
@@ -153,10 +153,10 @@ class SessionParticipant(Base):
         ForeignKey("users.id", ondelete="RESTRICT"),
         nullable=False,
     )
-    auth_session_id: Mapped[uuid.UUID] = mapped_column(
+    auth_session_id: Mapped[uuid.UUID | None] = mapped_column(
         postgresql.UUID(as_uuid=True),
         ForeignKey("auth_sessions.id", ondelete="RESTRICT"),
-        nullable=False,
+        nullable=True,
     )
     kind: Mapped[str] = mapped_column(String(16), nullable=False, default="owner")
     origin: Mapped[str] = mapped_column(String(512), nullable=False)
@@ -169,7 +169,15 @@ class SessionParticipant(Base):
 
     __table_args__ = (
         UniqueConstraint("session_id", "kind", name="uq_session_participants_session_kind"),
-        CheckConstraint("kind = 'owner'", name="ck_session_participants_kind"),
+        CheckConstraint(
+            "kind IN ('owner', 'guest')",
+            name="ck_session_participants_kind",
+        ),
+        CheckConstraint(
+            "(kind = 'owner' AND auth_session_id IS NOT NULL) OR "
+            "(kind = 'guest' AND auth_session_id IS NULL)",
+            name="ck_session_participants_auth_binding",
+        ),
         CheckConstraint("length(origin) BETWEEN 1 AND 512", name="ck_session_participants_origin"),
     )
 
@@ -196,10 +204,15 @@ class SessionJoinJti(Base):
         ForeignKey("users.id", ondelete="RESTRICT"),
         nullable=False,
     )
-    auth_session_id: Mapped[uuid.UUID] = mapped_column(
+    auth_session_id: Mapped[uuid.UUID | None] = mapped_column(
         postgresql.UUID(as_uuid=True),
         ForeignKey("auth_sessions.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    participant_kind: Mapped[str] = mapped_column(
+        String(16),
         nullable=False,
+        default="owner",
     )
     runner_id: Mapped[str] = mapped_column(String(64), nullable=False)
     config_version_id: Mapped[uuid.UUID] = mapped_column(
@@ -225,6 +238,15 @@ class SessionJoinJti(Base):
     key_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     __table_args__ = (
         UniqueConstraint("session_id", "participant_id", "jti", name="uq_session_join_jtis_binding"),
+        CheckConstraint(
+            "participant_kind IN ('owner', 'guest')",
+            name="ck_session_join_jtis_participant_kind",
+        ),
+        CheckConstraint(
+            "(participant_kind = 'owner' AND auth_session_id IS NOT NULL) OR "
+            "(participant_kind = 'guest' AND auth_session_id IS NULL)",
+            name="ck_session_join_jtis_auth_binding",
+        ),
         CheckConstraint("length(runner_id) BETWEEN 1 AND 64", name="ck_session_join_jtis_runner_id"),
         CheckConstraint("session_version >= 1", name="ck_session_join_jtis_session_version"),
         CheckConstraint("length(signaling_url) BETWEEN 1 AND 512", name="ck_session_join_jtis_signaling_url"),

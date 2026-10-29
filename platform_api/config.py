@@ -449,6 +449,50 @@ class PlatformSettings(BaseSettings):
             "PLATFORM_ENABLE_REAL_PAID_CALLS", "enable_real_paid_calls"
         ),
     )
+    public_signaling_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "PLATFORM_PUBLIC_SIGNALING_URL", "public_signaling_url"
+        ),
+    )
+    public_tls_qualified: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "PLATFORM_PUBLIC_TLS_QUALIFIED", "public_tls_qualified"
+        ),
+    )
+    public_turn_qualified: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "PLATFORM_PUBLIC_TURN_QUALIFIED", "public_turn_qualified"
+        ),
+    )
+    public_admission_ip_limit: int = Field(
+        default=5,
+        ge=1,
+        le=10000,
+        validation_alias=AliasChoices(
+            "PLATFORM_PUBLIC_ADMISSION_IP_LIMIT", "public_admission_ip_limit"
+        ),
+    )
+    public_admission_deployment_limit: int = Field(
+        default=20,
+        ge=1,
+        le=10000,
+        validation_alias=AliasChoices(
+            "PLATFORM_PUBLIC_ADMISSION_DEPLOYMENT_LIMIT",
+            "public_admission_deployment_limit",
+        ),
+    )
+    public_admission_window_seconds: int = Field(
+        default=60,
+        ge=1,
+        le=3600,
+        validation_alias=AliasChoices(
+            "PLATFORM_PUBLIC_ADMISSION_WINDOW_SECONDS",
+            "public_admission_window_seconds",
+        ),
+    )
     enable_qa: bool = Field(
         default=False,
         validation_alias=AliasChoices("PLATFORM_ENABLE_QA", "enable_qa"),
