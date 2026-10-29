@@ -4,7 +4,7 @@
 
 **Goal:** Build the first multiuser Voice AI release from the existing local agent, with basic prepaid accounting and no legacy-data migration.
 
-**Architecture:** Retain `web/` and `bot/`; add a separate `platform_api/` with fresh PostgreSQL metadata. Chat and voice share a pure `bot/flow/` engine; one bounded runtime serves immutable session snapshots. Wallet transactions are synchronous and use per-call reservations; RabbitMQ is for durable history, not financial authorization.
+**Architecture:** Retain `web/` and `bot/`; add a separate `platform_api/` whose metadata lives in a dedicated `platform` schema of the PostgreSQL database selected by the shared `DATABASE_URL` (the agent keeps `public`; Phoenix keeps `phoenix`). Chat and voice share a pure `bot/flow/` engine; one bounded runtime serves immutable session snapshots. Wallet transactions are synchronous and use per-call reservations; RabbitMQ is for durable history, not financial authorization.
 
 **Tech stack:** Exact selected versions in master III.2; preserve existing audio pins, pytest/asyncio and Bun; add only the named auth, AMQP, JWT and browser-test dependencies at their owned task. No installation is claimed by this plan.
 
@@ -12,7 +12,7 @@
 
 ## Global constraints
 
-- Fresh separate PostgreSQL database selected by `PLATFORM_DATABASE_URL`; no legacy backfill, local-table imports, Alembic work or SQLite fallback.
+- One PostgreSQL runtime database selected by the explicitly exported shared `DATABASE_URL`, with separate schemas: `public` for the local agent, `platform` (via `PLATFORM_POSTGRES_SCHEMA`) for the control plane, and `phoenix` for telemetry. Platform commands/startup must not silently load `.env`, invent a URL or fall back to SQLite. The Phoenix host launcher derives its URL from `DATABASE_URL`. No `PLATFORM_DATABASE_URL`, no legacy backfill, local-table imports, Alembic work or implicit migration.
 - All new application paths below are Create unless explicitly Modify. No source files or records are deleted; no `web/`/`bot/` move.
 - Existing local launcher/client, swappable registries, router protocols, metric names and bounded labels remain valid. SaaS startup does not expose local management routes.
 - All platform feature flags default false; tests/nonproduction may enable a named feature with synthetic credits. Public/real-paid flags remain off until Task 12 passes.
@@ -32,7 +32,7 @@
 
 - `platform_api.config.PlatformSettings`: namespaced settings, validated environment, origins, flags, DB/service URLs and secret references; never inherits the local `.env` implicitly in tests.
 - `platform_api.app.create_app(settings: PlatformSettings | None = None) -> FastAPI`: no GPU/provider startup during import; lifespan owns API DB pools and task cleanup.
-- `platform_api.db.schema.initialize_schema(engine: AsyncEngine, *, expected_version: str, metadata_hash: str) -> None`: fresh platform metadata only; identical schema is no-op, unknown nonempty/mismatch raises `SchemaMismatch`; no destructive reset.
+- `platform_api.db.schema.initialize_schema(engine: AsyncEngine, *, expected_version: str, metadata_hash: str) -> None`: creates or verifies only the dedicated `platform` schema; identical schema is no-op, unknown nonempty/mismatch raises `SchemaMismatch`; never touches `public`/`phoenix`, no destructive reset, no implicit migration.
 - `platform_api.auth.types.Principal` and `require_user/require_admin/require_step_up/require_csrf`: exact signatures and models in auth contract; all downstream queries use `principal.user_id`.
 - `bot.flow.schemas.FlowLimits`, `FlowDiagnostic`, `SessionState`, `StateProposal`, normalized adapter events and compiled artifacts: fields/discriminators in flow contract and schemas. The public pure operations are `validate_authoring(source, limits) -> list[FlowDiagnostic]`, `normalize_executable(source, limits) -> dict`, `validate_executable(flow, limits, capabilities) -> list[FlowDiagnostic]`, `compile_flow(flow, policy, limits, capabilities) -> CompiledFlow`, and `reduce_event(compiled: CompiledFlow, state: SessionState, event: FlowEvent) -> Reduction`. `Reduction={state,commands,diagnostics}`. No reducer I/O.
 - Platform publication wraps existing `bot.agents.compiler.compile_system_prompt`; `bot.flow` does not import `bot.agents`, SQLAlchemy or backend services. Define `CompiledFlow={normalized,manifest,flow_hash,artifact_hash}`; the manifest fields are exactly the flow contract's compiler identity. `FlowEvent` is the union of accepted user/locale/model/playback/chat/action/lifecycle events declared there.
@@ -46,7 +46,7 @@
 
 **Consumes:** existing runtime/dependency inventory and master III.2–3. **Produces:** app factory, independent Base, validated settings, explicit init command, get_db dependency and `verify unit/postgres` harness. Test setup uses this same initializer.
 
-- [ ] Write `tests/platform_api/test_auth_schema.py` for fresh init, repeated no-op, schema mismatch, independent metadata and no local fallback. Write `tests/test_verification_policy.py` and lifecycle cases from verification plan.
+- [ ] Write `tests/platform_api/test_auth_schema.py` for empty platform-schema init, repeated no-op, schema mismatch, independent metadata and no local fallback. Write `tests/test_verification_policy.py` and lifecycle cases from verification plan.
 - [ ] Write this import-boundary assertion in `tests/platform_api/test_import_boundary.py`, then run it and observe failure while the new package is absent:
 
 ```python
@@ -58,7 +58,7 @@ def test_platform_import_does_not_load_models():
     assert check.returncode == 0, check.stderr
 ```
 
-- [ ] Implement app/settings/DB lifecycle and initial schema with the exact fresh-only refusal behavior. `init-db` imports platform tables, not current local models; startup only checks readiness. Add fake-safe model catalog loading from a generated qualification/catalog JSON, never by importing GPU services into API startup.
+- [ ] Implement app/settings/DB lifecycle and initial `platform`-schema creation with the exact schema-only refusal behavior. `init-db` imports platform tables, not current local models; startup only checks readiness and never runs create-all or an implicit migration. Add fake-safe model catalog loading from a generated qualification/catalog JSON, never by importing GPU services into API startup.
 - [ ] Implement the verifier command parser, disposable process/DB ownership and mandatory skip policy using the verification plan's code examples. Preserve the old `test` dispatch and Bun collection.
 - [ ] Run focused tests and `verify unit/postgres`; attach manifest/logs. Check host ports and configured container memory. Commit this bounded slice with its contract and lock changes after tests pass; no production schema modification.
 
