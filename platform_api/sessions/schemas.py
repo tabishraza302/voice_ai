@@ -123,7 +123,8 @@ class RuntimeConfigView(StrictModel):
     session_id: uuid.UUID
     owner_user_id: uuid.UUID
     participant_id: uuid.UUID
-    auth_session_id: uuid.UUID
+    auth_session_id: uuid.UUID | None = None
+    participant_kind: Literal["owner", "guest"]
     origin: str
     runner_id: str
     registration_id: uuid.UUID

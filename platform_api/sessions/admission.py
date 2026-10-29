@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import hmac
 import ipaddress
@@ -107,6 +107,60 @@ def session_admission_config(settings: PlatformSettings) -> SessionAdmissionConf
     return session_runtime_config(settings)
 
 
+def public_session_admission_config(
+    settings: PlatformSettings,
+) -> SessionAdmissionConfig:
+    """Require the explicit public-launch and transport qualifications."""
+    if not settings.enable_public_calls or settings.enable_real_paid_calls:
+        raise DependencyUnavailableError(
+            "Public calls must be enabled and real-paid calls must remain disabled"
+        )
+    config = session_runtime_config(settings)
+    value = settings.public_signaling_url
+    if value is None:
+        raise DependencyUnavailableError(
+            "PLATFORM_PUBLIC_SIGNALING_URL is not configured"
+        )
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port
+    except ValueError as exc:
+        raise DependencyUnavailableError(
+            "PLATFORM_PUBLIC_SIGNALING_URL is invalid"
+        ) from exc
+    host = parsed.hostname
+    try:
+        loopback = bool(host and ipaddress.ip_address(host).is_loopback)
+    except ValueError:
+        loopback = host == "localhost"
+    production = settings.env in {"staging", "production"}
+    if (
+        host is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path in {"", "/"}
+        or len(value) > 512
+        or (production and (parsed.scheme != "wss" or loopback))
+        or (not production and (parsed.scheme not in {"ws", "wss"} or not loopback))
+    ):
+        raise DependencyUnavailableError(
+            "Public signaling must be a qualified WSS endpoint outside development"
+        )
+    if production and (
+        not settings.public_tls_qualified
+        or not settings.public_turn_qualified
+        or not settings.cookie_secure
+        or not settings.trusted_proxy_cidrs
+        or not settings.web_origin.startswith("https://")
+    ):
+        raise DependencyUnavailableError(
+            "Public TLS, TURN, secure-cookie, and trusted-ingress qualifications are required"
+        )
+    return replace(config, signaling_url=value)
+
+
 def session_runtime_config(settings: PlatformSettings) -> SessionAdmissionConfig:
     """Load runtime credentials independently of the new-admission kill switch."""
 
@@ -152,15 +206,36 @@ def session_runtime_config(settings: PlatformSettings) -> SessionAdmissionConfig
         settings.session_signaling_url,
         name="PLATFORM_SESSION_SIGNALING_URL",
     )
-    origin_url = _loopback_url(
-        settings.web_origin,
-        name="PLATFORM_WEB_ORIGIN",
-        root_only=True,
-        require_port=False,
-    )
+    parsed_origin = urlsplit(settings.web_origin)
+    origin_parse_valid = True
+    try:
+        origin_host = parsed_origin.hostname
+        _ = parsed_origin.port
+        origin_loopback = bool(
+            origin_host and ipaddress.ip_address(origin_host).is_loopback
+        )
+    except ValueError:
+        origin_parse_valid = False
+        origin_host = parsed_origin.hostname
+        origin_loopback = origin_host == "localhost"
+    if (
+        not origin_parse_valid
+        or parsed_origin.scheme not in {"http", "https"}
+        or not origin_host
+        or parsed_origin.username is not None
+        or parsed_origin.password is not None
+        or parsed_origin.path not in {"", "/"}
+        or parsed_origin.query
+        or parsed_origin.fragment
+        or (parsed_origin.scheme == "http" and not origin_loopback)
+    ):
+        raise DependencyUnavailableError(
+            "PLATFORM_WEB_ORIGIN must be an exact HTTPS origin or a loopback HTTP origin"
+        )
+    origin_url = f"{parsed_origin.scheme}://{parsed_origin.netloc}"
     if origin_url != settings.web_origin:
         raise DependencyUnavailableError(
-            "PLATFORM_WEB_ORIGIN must be an exact loopback origin without a path"
+            "PLATFORM_WEB_ORIGIN must be an exact origin without a trailing slash or path"
         )
     runtime_service_token = settings.runtime_service_token.get_secret_value()
     if (
@@ -346,4 +421,5 @@ __all__ = [
     "release_runtime",
     "session_admission_config",
     "session_runtime_config",
+    "public_session_admission_config",
 ]
