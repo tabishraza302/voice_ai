@@ -163,3 +163,31 @@ async def test_non_default_registry_host_and_port_do_not_collapse(monkeypatch):
     settings_no_registry = Settings(_env_file=None, llm_model="org/model:v1")
     with pytest.raises(LlmModelNotAvailableError, match="is not installed"):
         await validate_llm_model_available(settings_no_registry)
+
+
+@pytest.mark.asyncio
+async def test_invalid_explicit_empty_tag_fails_closed(monkeypatch):
+    """An explicit empty tag like 'qwen3:' fails closed and does not collapse to :latest."""
+    async def catalog(settings, *, timeout=2.0):
+        return {"qwen3:latest", "qwen3"}
+
+    monkeypatch.setattr("bot.services.fetch_local_llm_models", catalog)
+    settings = Settings(_env_file=None, llm_model="qwen3:")
+    with pytest.raises(LlmModelNotAvailableError, match="qwen3:"):
+        await validate_llm_model_available(settings)
+
+
+def test_normalize_ollama_model_name_rejects_invalid_names():
+    from bot.services import _normalize_ollama_model_name
+
+    with pytest.raises(ValueError):
+        _normalize_ollama_model_name("qwen3:")
+
+    with pytest.raises(ValueError):
+        _normalize_ollama_model_name("registry.example:5000/library/qwen3:")
+
+    with pytest.raises(ValueError):
+        _normalize_ollama_model_name(":latest")
+
+    with pytest.raises(ValueError):
+        _normalize_ollama_model_name("")

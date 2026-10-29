@@ -130,10 +130,14 @@ def _normalize_ollama_model_name(name: str) -> str:
     - Defaults: host 'registry.ollama.ai', namespace 'library', tag 'latest'.
     """
     s = name.strip()
+    if not s:
+        raise ValueError("empty model name")
+
     tag = ""
     if s.rfind(":") > s.rfind("/"):
         s, tag, _ = _cut_last(s, ":")
-
+        if not tag:
+            raise ValueError(f"invalid ollama model name: explicit empty tag in {name!r}")
     s, model, promised = _cut_last(s, "/")
     if not promised:
         host = "registry.ollama.ai"
@@ -148,6 +152,8 @@ def _normalize_ollama_model_name(name: str) -> str:
             scheme, sep, rest = s.partition("://")
             host = (rest if sep else scheme) or "registry.ollama.ai"
             namespace = namespace or "library"
+    if not model or not namespace or not host:
+        raise ValueError(f"invalid ollama model name: {name!r}")
 
     final_tag = tag or "latest"
     return f"{host.lower()}/{namespace.lower()}/{model.lower()}:{final_tag.lower()}"
@@ -191,10 +197,22 @@ async def validate_llm_model_available(settings: Settings) -> None:
     truthful report. When the catalog *is* readable, an unknown model fails
     before the call starts instead of on the first turn.
     """
+    try:
+        target = _normalize_ollama_model_name(settings.llm_model)
+    except ValueError as exc:
+        raise LlmModelNotAvailableError(
+            f"invalid llm_model {settings.llm_model!r}: {exc}"
+        ) from exc
+
     available = await fetch_local_llm_models(settings)
     if available is not None:
-        normalized_available = {_normalize_ollama_model_name(name) for name in available}
-        if _normalize_ollama_model_name(settings.llm_model) not in normalized_available:
+        normalized_available = set()
+        for name in available:
+            try:
+                normalized_available.add(_normalize_ollama_model_name(name))
+            except ValueError:
+                pass
+        if target not in normalized_available:
             installed_desc = ", ".join(sorted(available)) if available else "none"
             raise LlmModelNotAvailableError(
                 f"llm_model {settings.llm_model!r} is not installed on the local "
@@ -247,7 +265,7 @@ def resolve_models(settings: Settings) -> Settings:
     """
     if settings.stt_provider == "mlx-whisper" and settings.stt_model == NEMOTRON_MODEL:
         settings.stt_model = WHISPER_MODEL
-    if settings.stt_provider in ("mlx-audio-realtime", "mlx-audio") and settings.stt_model == WHISPER_MODEL:
+    if settings.stt_provider == "mlx-audio-realtime" and settings.stt_model == WHISPER_MODEL:
         # The realtime endpoint serves any streaming checkpoint, but
         # whisper-large-v3-turbo is not one: it would fail at load with
         # "does not support streaming". Nemotron is the streaming model
