@@ -80,6 +80,9 @@ dependencies = [
     "sqlalchemy==2.0.38",
     "asyncpg==0.30.0",
     "greenlet==3.5.6",
+    # Local runtime registration and fixed EdDSA join-token verification/signing.
+    "httpx==0.28.1",
+    "PyJWT[crypto]==2.15.1",
 ]
 
 [project.optional-dependencies]
@@ -91,7 +94,6 @@ swaps = [
 dev = [
     "pytest==9.0.1",
     "pytest-asyncio==1.3.0",
-    "httpx==0.28.1",
     # What `python -m pipecat.evals` (the eval harness) needs. The
     # `cli` extra would also work but pulls ruff, chromadb and
     # kubernetes; these four are what the eval command actually
