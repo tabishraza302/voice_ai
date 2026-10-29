@@ -72,6 +72,7 @@ async def _init_db_command(settings: PlatformSettings) -> int:
         expected_hash = compute_metadata_hash(Base.metadata)
         await initialize_schema(
             engine,
+            schema=settings.postgres_schema,
             expected_version=settings.schema_version,
             metadata_hash=expected_hash,
         )
@@ -93,6 +94,7 @@ async def _check_schema_command(settings: PlatformSettings) -> int:
     try:
         is_ready = await check_schema_readiness(
             engine,
+            schema=settings.postgres_schema,
             expected_version=settings.schema_version,
         )
         if is_ready:

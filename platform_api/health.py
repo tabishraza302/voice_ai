@@ -77,6 +77,7 @@ async def readiness(
     try:
         is_ready = await check_schema_readiness(
             engine,
+            schema=settings.postgres_schema,
             expected_version=settings.schema_version,
         )
     except Exception:

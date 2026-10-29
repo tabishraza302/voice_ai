@@ -89,6 +89,7 @@ class FreshPostgres:
     async def initialize(
         self,
         *,
+        schema: str = "platform",
         expected_version: str = "platform-v1",
         metadata_hash: str | None = None,
     ) -> None:
@@ -101,6 +102,7 @@ class FreshPostgres:
 
         await initialize_schema(
             self.engine,
+            schema=schema,
             expected_version=expected_version,
             metadata_hash=metadata_hash,
         )
