@@ -242,6 +242,7 @@ class MeterCheckpoint(Base):
     # Immutable evidence snapshot: a checkpoint must remain interpretable even
     # if the session/config/tariff records change later.
     pinned_rate: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    tariff_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     session_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
     config_version_id: Mapped[uuid.UUID | None] = mapped_column(
         postgresql.UUID(as_uuid=True),

@@ -299,8 +299,10 @@ async def test_admin_debit_below_reservation_rejected(fresh_pg: FreshPostgres):
 
 @pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_hard_end_deadline_caps_and_expired_deadline_denies_authority(fresh_pg: FreshPostgres):
-    """Session hard-duration limit caps a permit, and an already-expired deadline grants no new authority."""
+async def test_hard_end_deadline_caps_permit_expiry_and_denies_authority_after_deadline(
+    fresh_pg: FreshPostgres,
+):
+    """Permits expire at the hard deadline, and no authority is issued after it."""
     await fresh_pg.initialize()
     t0 = datetime(2026, 10, 28, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -323,6 +325,14 @@ async def test_hard_end_deadline_caps_and_expired_deadline_denies_authority(fres
             hard_end_deadline=t0 - timedelta(milliseconds=1),
         )
 
+        late_session, _ = await create_test_session(
+            db,
+            owner_user_id=user.id,
+            runner_id="runner-late",
+            created_at=t0,
+            hard_end_deadline=t0 + timedelta(milliseconds=3000),
+        )
+
         capped = await checkpoint_and_reserve(
             db,
             runtime_principal=RuntimePrincipal(runner_id="runner-capped"),
@@ -337,7 +347,40 @@ async def test_hard_end_deadline_caps_and_expired_deadline_denies_authority(fres
         )
         assert capped.authorized_through_ms == 3000
         assert capped.reserved_minor == charge_minor(200, 3000) == 10
+        assert capped.expires_at == t0 + timedelta(milliseconds=3000)
         assert not capped.funds_exhausted
+
+        late_grant = await checkpoint_and_reserve(
+            db,
+            runtime_principal=RuntimePrincipal(runner_id="runner-late"),
+            session_id=late_session.id,
+            operation_id="late-deadline-grant",
+            expected_budget_version=1,
+            cumulative_billable_ms=0,
+            requested_future_ms=10000,
+            billing_slice_ms=10000,
+            permit_ttl_ms=5000,
+            now=t0,
+        )
+        assert late_grant.authorized_through_ms == 3000
+        assert late_grant.expires_at == t0 + timedelta(milliseconds=3000)
+
+        late_expired = await checkpoint_and_reserve(
+            db,
+            runtime_principal=RuntimePrincipal(runner_id="runner-late"),
+            session_id=late_session.id,
+            operation_id="late-deadline-expired",
+            expected_budget_version=2,
+            cumulative_billable_ms=0,
+            requested_future_ms=10000,
+            billing_slice_ms=10000,
+            permit_ttl_ms=5000,
+            now=t0 + timedelta(seconds=4),
+        )
+        assert late_expired.authorized_through_ms == 0
+        assert late_expired.reserved_minor == 0
+        assert late_expired.funds_exhausted
+        assert late_expired.expires_at == t0 + timedelta(seconds=4)
 
         expired = await checkpoint_and_reserve(
             db,
@@ -381,6 +424,19 @@ async def test_hard_end_deadline_caps_and_expired_deadline_denies_authority(fres
         assert expired_close.charged_minor == 0
         assert expired_close.reserved_minor == 0
         assert expired_close.status == "CLOSED"
+
+        late_close = await close_budget(
+            db,
+            runtime_principal=RuntimePrincipal(runner_id="runner-late"),
+            session_id=late_session.id,
+            operation_id="late-deadline-close",
+            expected_budget_version=3,
+            cumulative_billable_ms=0,
+            now=t0 + timedelta(seconds=6),
+        )
+        assert late_close.charged_minor == 0
+        assert late_close.reserved_minor == 0
+        assert late_close.status == "CLOSED"
 
         await assert_wallet_invariants(db, user_id=user.id)
 

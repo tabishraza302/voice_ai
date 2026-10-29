@@ -196,7 +196,7 @@ def _ensure_live_session(session: Session) -> None:
 
 def _ensure_budget_owner(budget: CallBudget, session: Session) -> None:
     if budget.owner_user_id != session.owner_user_id:
-        raise BillingError("Call budget owner does not match the stored session owner")
+        raise ConflictError("Call budget owner does not match the stored session owner")
 
 
 def _normalize_stop_evidence(stop_evidence: Any) -> dict[str, Any] | None:
@@ -437,7 +437,11 @@ async def checkpoint_and_reserve(
     req_hash = _canonical_hash(req_payload)
 
     # 1. Look up session first
-    stmt_session = select(Session).where(Session.id == session_id)
+    stmt_session = (
+        select(Session)
+        .where(Session.id == session_id)
+        .execution_options(populate_existing=True)
+    )
     session = (await db.execute(stmt_session)).scalar_one_or_none()
     if session is None:
         raise NotFoundError("Session not found")
@@ -457,17 +461,19 @@ async def checkpoint_and_reserve(
         BillingOperation.operation_id == operation_id,
     )
     existing_op = (await db.execute(stmt_op)).scalar_one_or_none()
-    if existing_op is not None:
-        if existing_op.request_hash != req_hash:
-            raise IdempotencyConflictError("Conflicting payload under the same operation key")
-        return decode_stored_response(BudgetPermit, existing_op.response_body)
+    if existing_op is not None and existing_op.request_hash != req_hash:
+        raise IdempotencyConflictError("Conflicting payload under the same operation key")
 
-    # For NEW operations (not a duplicate replay), require a live session state.
-    _ensure_live_session(session)
+    # New operations must be live. Replays also take the normal row locks below,
+    # where runner and budget ownership are refreshed before returning the result.
+    if existing_op is None:
+        _ensure_live_session(session)
+    wallet_owner_user_id = session.owner_user_id
     stmt_wallet = (
         select(WalletAccount)
-        .where(WalletAccount.user_id == session.owner_user_id)
+        .where(WalletAccount.user_id == wallet_owner_user_id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     wallet = (await db.execute(stmt_wallet)).scalar_one_or_none()
     if wallet is None:
@@ -477,26 +483,34 @@ async def checkpoint_and_reserve(
         select(CallBudget)
         .where(CallBudget.session_id == session_id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     budget = (await db.execute(stmt_budget)).scalar_one_or_none()
     if budget is None:
-        raise NotFoundError("Call budget not found")
+        raise ConflictError("Call budget not found for existing session")
 
     # Re-verify session runner under lock against concurrent reassignment
-    stmt_session_locked = select(Session).where(Session.id == session_id).with_for_update()
+    stmt_session_locked = (
+        select(Session)
+        .where(Session.id == session_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     session_locked = (await db.execute(stmt_session_locked)).scalar_one_or_none()
     if session_locked is None or not session_locked.runner_id or session_locked.runner_id != runtime_principal.runner_id:
         raise ForbiddenError("Runner ID does not match assigned session runner")
-    # RE-CHECK idempotency under lock BEFORE terminal checks
+    if session_locked.owner_user_id != wallet_owner_user_id:
+        raise ConflictError("Session owner changed while billing rows were being locked")
+    _ensure_budget_owner(budget, session_locked)
+    # Re-check idempotency only after locked authorization and ownership checks.
     existing_op_locked = (await db.execute(stmt_op)).scalar_one_or_none()
     if existing_op_locked is not None:
         if existing_op_locked.request_hash != req_hash:
             raise IdempotencyConflictError("Conflicting payload under the same operation key")
         return decode_stored_response(BudgetPermit, existing_op_locked.response_body)
 
-    # For NEW operations under lock, verify session and budget are not closed.
+    # For new operations, verify session and budget are not closed.
     _ensure_live_session(session_locked)
-    _ensure_budget_owner(budget, session_locked)
     if budget.status == "CLOSED":
         raise BudgetClosedError("Call budget is closed")
 
@@ -559,6 +573,7 @@ async def checkpoint_and_reserve(
         runner_id=runtime_principal.runner_id,
         budget_version=budget.version,
         pinned_rate=budget.pinned_rate,
+        tariff_snapshot=session_locked.tariff_snapshot,
         session_version=session_locked.version,
         config_version_id=session_locked.agent_version_id,
         received_at=ts,
@@ -582,16 +597,24 @@ async def checkpoint_and_reserve(
     else:
         affordable_ms = desired_ms
 
-    authorized_ms = min(desired_ms, affordable_ms)
-    # Session hard-duration cap. created_at is the best available start
-    # evidence until Task 6 records the ACTIVE interval explicitly; an
-    # already-expired deadline yields zero new authority, never unlimited time.
+    # No new authority may outlive the session's absolute hard deadline.
     limit_ms = _duration_ms(session_locked.created_at, session_locked.hard_end_deadline)
-    if limit_ms is not None:
-        authorized_ms = min(authorized_ms, limit_ms)
-
-    # Authorized time cannot regress below new_proven_ms
-    authorized_ms = max(new_proven_ms, authorized_ms)
+    if limit_ms is not None and new_proven_ms > limit_ms:
+        raise InvalidTimeReportError(
+            "Billable time exceeds the session hard-end deadline"
+        )
+    deadline_reached = (
+        session_locked.hard_end_deadline is not None
+        and ts >= session_locked.hard_end_deadline
+    )
+    if deadline_reached:
+        # Settle proven time but issue no further authority once the deadline passes.
+        authorized_ms = new_proven_ms
+    else:
+        authorized_ms = min(desired_ms, affordable_ms)
+        if limit_ms is not None:
+            authorized_ms = min(authorized_ms, limit_ms)
+        authorized_ms = max(new_proven_ms, authorized_ms)
     if authorized_ms > MAX_BIGINT:
         raise BillingValidationError("authorized time exceeds the signed 64-bit range")
 
@@ -615,6 +638,8 @@ async def checkpoint_and_reserve(
     funds_exhausted = (authorized_ms <= new_proven_ms)
     permit_id = uuid.uuid4()
     expires_at = ts + timedelta(milliseconds=permit_ttl_ms) if not funds_exhausted else ts
+    if not funds_exhausted and session_locked.hard_end_deadline is not None:
+        expires_at = min(expires_at, session_locked.hard_end_deadline)
 
     budget.permit_expiry = expires_at
     budget.version += 1
@@ -684,7 +709,11 @@ async def close_budget(
     req_hash = _canonical_hash(req_payload)
 
     # 1. Look up session first
-    stmt_session = select(Session).where(Session.id == session_id)
+    stmt_session = (
+        select(Session)
+        .where(Session.id == session_id)
+        .execution_options(populate_existing=True)
+    )
     session = (await db.execute(stmt_session)).scalar_one_or_none()
     if session is None:
         raise NotFoundError("Session not found")
@@ -705,16 +734,15 @@ async def close_budget(
         BillingOperation.operation_id == operation_id,
     )
     existing_op = (await db.execute(stmt_op)).scalar_one_or_none()
-    if existing_op is not None:
-        if existing_op.request_hash != req_hash:
-            raise IdempotencyConflictError("Conflicting payload under the same operation key")
-        return decode_stored_response(BudgetView, existing_op.response_body)
-
+    if existing_op is not None and existing_op.request_hash != req_hash:
+        raise IdempotencyConflictError("Conflicting payload under the same operation key")
     # 5. Lock wallet first, then budget
+    wallet_owner_user_id = session.owner_user_id
     stmt_wallet = (
         select(WalletAccount)
-        .where(WalletAccount.user_id == session.owner_user_id)
+        .where(WalletAccount.user_id == wallet_owner_user_id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     wallet = (await db.execute(stmt_wallet)).scalar_one_or_none()
     if wallet is None:
@@ -724,16 +752,24 @@ async def close_budget(
         select(CallBudget)
         .where(CallBudget.session_id == session_id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     budget = (await db.execute(stmt_budget)).scalar_one_or_none()
     if budget is None:
-        raise NotFoundError("Call budget not found")
+        raise ConflictError("Call budget not found for existing session")
 
     # Re-verify session runner under lock against concurrent reassignment
-    stmt_session_locked = select(Session).where(Session.id == session_id).with_for_update()
+    stmt_session_locked = (
+        select(Session)
+        .where(Session.id == session_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     session_locked = (await db.execute(stmt_session_locked)).scalar_one_or_none()
     if session_locked is None or not session_locked.runner_id or session_locked.runner_id != runtime_principal.runner_id:
         raise ForbiddenError("Runner ID does not match assigned session runner")
+    if session_locked.owner_user_id != wallet_owner_user_id:
+        raise ConflictError("Session owner changed while billing rows were being locked")
     _ensure_budget_owner(budget, session_locked)
 
     # 6. RE-CHECK idempotency under lock (simultaneous request could have committed)
@@ -837,6 +873,7 @@ async def close_budget(
         runner_id=runtime_principal.runner_id,
         budget_version=budget.version,
         pinned_rate=budget.pinned_rate,
+        tariff_snapshot=session_locked.tariff_snapshot,
         session_version=session_locked.version,
         config_version_id=session_locked.agent_version_id,
         received_at=ts,
@@ -897,19 +934,22 @@ async def expire_stopped_budget(
     }
     req_hash = _canonical_hash(req_payload)
 
-    # 1. Idempotency check FIRST
+    # 1. Resolve idempotency, but defer a matching replay until the current
+    # session and budget ownership have been validated under row locks.
     stmt_op = select(BillingOperation).where(
         BillingOperation.session_id == session_id,
         BillingOperation.operation_id == operation_id,
     )
     existing_op = (await db.execute(stmt_op)).scalar_one_or_none()
-    if existing_op is not None:
-        if existing_op.request_hash != req_hash:
-            raise IdempotencyConflictError("Conflicting payload under the same operation key")
-        return decode_stored_response(BudgetView, existing_op.response_body)
+    if existing_op is not None and existing_op.request_hash != req_hash:
+        raise IdempotencyConflictError("Conflicting payload under the same operation key")
 
     # 2. Derive session
-    stmt_session = select(Session).where(Session.id == session_id)
+    stmt_session = (
+        select(Session)
+        .where(Session.id == session_id)
+        .execution_options(populate_existing=True)
+    )
     session = (await db.execute(stmt_session)).scalar_one_or_none()
     if session is None:
         raise NotFoundError("Session not found")
@@ -918,11 +958,12 @@ async def expire_stopped_budget(
     op_key = f"{session_id}:{operation_id}"
     await db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:op_key))"), {"op_key": op_key})
 
-    # 4. Lock wallet then budget
+    wallet_owner_user_id = session.owner_user_id
     stmt_wallet = (
         select(WalletAccount)
-        .where(WalletAccount.user_id == session.owner_user_id)
+        .where(WalletAccount.user_id == wallet_owner_user_id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     wallet = (await db.execute(stmt_wallet)).scalar_one_or_none()
     if wallet is None:
@@ -932,15 +973,23 @@ async def expire_stopped_budget(
         select(CallBudget)
         .where(CallBudget.session_id == session_id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     budget = (await db.execute(stmt_budget)).scalar_one_or_none()
     if budget is None:
-        raise NotFoundError("Call budget not found")
+        raise ConflictError("Call budget not found for existing session")
 
-    stmt_session_locked = select(Session).where(Session.id == session_id).with_for_update()
+    stmt_session_locked = (
+        select(Session)
+        .where(Session.id == session_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     session_locked = (await db.execute(stmt_session_locked)).scalar_one_or_none()
     if session_locked is None:
         raise NotFoundError("Session not found")
+    if session_locked.owner_user_id != wallet_owner_user_id:
+        raise ConflictError("Session owner changed while billing rows were being locked")
     _ensure_budget_owner(budget, session_locked)
     # 5. RE-CHECK idempotency under lock (simultaneous request could have committed)
     existing_op_locked = (await db.execute(stmt_op)).scalar_one_or_none()
@@ -1025,7 +1074,7 @@ async def create_call_budget(
     *,
     session_id: uuid.UUID,
     operation_id: str,
-    pinned_rate: int,
+    pinned_rate_minor_per_minute: int,
     now: datetime | None = None,
 ) -> BudgetView:
     """Initialize a fresh call budget for a new session with durable operation tracking.
@@ -1033,37 +1082,44 @@ async def create_call_budget(
     Follows accounting-contract.md:
     - Returns a BudgetView representing the initialized budget.
     - Owner identity is derived strictly from the stored session record, never from caller input.
-    - Bounded input validation for operation_id and pinned_rate.
+    - Bounded input validation for operation_id and pinned_rate_minor_per_minute.
     - Serialized under transaction advisory lock on (session_id, operation_id).
-    - Idempotent replay: identical (session_id, operation_id) returns the original recorded BudgetView,
-      reconstructed from BillingOperation.response_body, even if the underlying budget has advanced.
+    - Idempotent replay returns the original recorded BudgetView, reconstructed from
+      BillingOperation.response_body, if locked session and budget ownership still match,
+      even if the underlying budget has advanced.
     - Conflicting request payload under the same operation key raises IdempotencyConflictError.
     - A second different operation attempting to create a budget on the same session raises ConflictError.
     """
     _validate_operation_id(operation_id)
-    _validate_bounded_int("pinned_rate", pinned_rate)
+    _validate_bounded_int(
+        "pinned_rate_minor_per_minute", pinned_rate_minor_per_minute
+    )
     ts = now or datetime.now(timezone.utc)
 
     req_payload = {
         "session_id": str(session_id),
         "operation_id": operation_id,
-        "pinned_rate": pinned_rate,
+        # Keep the stored hash key stable across the Python parameter rename.
+        "pinned_rate": pinned_rate_minor_per_minute,
     }
     req_hash = _canonical_hash(req_payload)
 
-    # 1. Fast-path check for existing operation replay before locks
+    # 1. Check for a prior operation, but defer replay until the current session
+    # owner and budget have been revalidated under the accounting row locks.
     stmt_op = select(BillingOperation).where(
         BillingOperation.session_id == session_id,
         BillingOperation.operation_id == operation_id,
     )
     existing_op = (await db.execute(stmt_op)).scalar_one_or_none()
-    if existing_op is not None:
-        if existing_op.request_hash != req_hash:
-            raise IdempotencyConflictError("Conflicting payload under the same operation key")
-        return decode_stored_response(BudgetView, existing_op.response_body)
+    if existing_op is not None and existing_op.request_hash != req_hash:
+        raise IdempotencyConflictError("Conflicting payload under the same operation key")
 
     # 2. Derive owner identity strictly from the stored session
-    stmt_session = select(Session).where(Session.id == session_id)
+    stmt_session = (
+        select(Session)
+        .where(Session.id == session_id)
+        .execution_options(populate_existing=True)
+    )
     session = (await db.execute(stmt_session)).scalar_one_or_none()
     if session is None:
         raise NotFoundError("Session not found")
@@ -1072,32 +1128,60 @@ async def create_call_budget(
     op_key = f"{session_id}:{operation_id}"
     await db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:op_key))"), {"op_key": op_key})
 
-    # 4. Check for existing operation under lock
+    # 4. Re-check the request hash after acquiring the operation advisory lock.
     existing_op_locked = (await db.execute(stmt_op)).scalar_one_or_none()
-    if existing_op_locked is not None:
-        if existing_op_locked.request_hash != req_hash:
-            raise IdempotencyConflictError("Conflicting payload under the same operation key")
-        return decode_stored_response(BudgetView, existing_op_locked.response_body)
+    if existing_op_locked is not None and existing_op_locked.request_hash != req_hash:
+        raise IdempotencyConflictError("Conflicting payload under the same operation key")
 
-    # 5. Lock session row FOR UPDATE and verify budget does not already exist
-    stmt_session_locked = select(Session).where(Session.id == session_id).with_for_update()
-    session_locked = (await db.execute(stmt_session_locked)).scalar_one_or_none()
-    if session_locked is None:
-        raise NotFoundError("Session not found")
+    # 5. Lock owner wallet, budget, and session in the shared accounting order.
+    stmt_wallet = (
+        select(WalletAccount)
+        .where(WalletAccount.user_id == session.owner_user_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if (await db.execute(stmt_wallet)).scalar_one_or_none() is None:
+        raise NotFoundError("Wallet account not found")
 
     stmt_budget_check = (
         select(CallBudget)
         .where(CallBudget.session_id == session_id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     budget_check = (await db.execute(stmt_budget_check)).scalar_one_or_none()
+
+    stmt_session_locked = (
+        select(Session)
+        .where(Session.id == session_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    session_locked = (await db.execute(stmt_session_locked)).scalar_one_or_none()
+    if session_locked is None:
+        raise NotFoundError("Session not found")
+    if session_locked.owner_user_id != session.owner_user_id:
+        raise ConflictError("Session owner changed during budget creation")
+    # 6. Return an idempotent result only after row-locked owner validation.
+    existing_op_locked = (await db.execute(stmt_op)).scalar_one_or_none()
+    if existing_op_locked is not None:
+        if existing_op_locked.request_hash != req_hash:
+            raise IdempotencyConflictError("Conflicting payload under the same operation key")
+        if (
+            budget_check is None
+            or budget_check.owner_user_id != session_locked.owner_user_id
+        ):
+            raise ConflictError("Stored call budget owner does not match session owner")
+        return decode_stored_response(BudgetView, existing_op_locked.response_body)
     if budget_check is not None:
         raise ConflictError("Call budget already exists for this session under another operation")
+
+    # 7. Create the new budget only after locks and owner validation.
 
     budget = CallBudget(
         session_id=session_id,
         owner_user_id=session_locked.owner_user_id,
-        pinned_rate=pinned_rate,
+        pinned_rate=pinned_rate_minor_per_minute,
         cumulative_proven_ms=0,
         cumulative_authorized_ms=0,
         cumulative_charged_minor=0,
