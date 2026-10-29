@@ -21,9 +21,12 @@ import uuid
 
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import OperationalError, ProgrammingError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from platform_api.app import create_app
+from platform_api.billing import routes as billing_routes
 from platform_api.auth.errors import ForbiddenError
 from platform_api.auth.passwords import get_password_hasher
 from platform_api.auth.sessions import create_authenticated_session
@@ -35,14 +38,17 @@ from platform_api.billing.models import (
     WalletEntry,
 )
 from platform_api.billing.service import (
+    ConflictError,
     IdempotencyConflictError,
     InvalidTimeReportError,
     RuntimePrincipal,
     checkpoint_and_reserve,
     close_budget,
+    expire_stopped_budget,
     credit_wallet,
 )
 from platform_api.config import PlatformSettings
+from platform_api.models.session import Session
 from platform_api.models.auth import AuditLog, AuthMfa, User
 from tests.support.billing import (
     assert_wallet_invariants,
@@ -63,6 +69,11 @@ async def test_meter_ack_requires_durable_database_commit(fresh_pg: FreshPostgre
         user = await create_test_user(db)
         await create_funded_wallet(db, user_id=user.id, credited_minor=100)
         session, _ = await create_test_session(db, owner_user_id=user.id, runner_id="runner-1")
+        session.tariff_snapshot = {
+            "tariff_version": "retail-2026-10",
+            "rate_minor_per_minute": 200,
+        }
+        await db.commit()
 
         permit = await checkpoint_and_reserve(
             db,
@@ -87,6 +98,30 @@ async def test_meter_ack_requires_durable_database_commit(fresh_pg: FreshPostgre
         assert chk is not None
         assert chk.cumulative_proven_ms == 0
         assert chk.runner_id == "runner-1"
+
+    async with fresh_pg.new_session() as db:
+        stored_session = (
+            await db.execute(select(Session).where(Session.id == session.id))
+        ).scalar_one()
+        stored_session.tariff_snapshot = {
+            "tariff_version": "retail-2026-11",
+            "rate_minor_per_minute": 250,
+        }
+        await db.commit()
+
+    async with fresh_pg.new_session() as db:
+        chk = (
+            await db.execute(
+                select(MeterCheckpoint).where(
+                    MeterCheckpoint.session_id == session.id,
+                    MeterCheckpoint.operation_id == "chk-ack-1",
+                )
+            )
+        ).scalar_one()
+        assert chk.tariff_snapshot == {
+            "tariff_version": "retail-2026-10",
+            "rate_minor_per_minute": 200,
+        }
 
 
 @pytest.mark.postgres
@@ -156,6 +191,634 @@ async def test_out_of_order_meter_update_obeys_contract(fresh_pg: FreshPostgres)
 
         await assert_wallet_invariants(db, user_id=user.id)
 
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("operation", ["checkpoint", "close"])
+@pytest.mark.asyncio
+async def test_locked_session_refresh_rejects_runner_reassignment_before_financial_changes(
+    fresh_pg: FreshPostgres,
+    operation: str,
+):
+    """A runner reassigned during a request cannot use stale ORM state to change money."""
+    await fresh_pg.initialize()
+
+    async with fresh_pg.new_session() as db:
+        user = await create_test_user(db)
+        await create_funded_wallet(db, user_id=user.id, credited_minor=100)
+        session, _ = await create_test_session(
+            db,
+            owner_user_id=user.id,
+            runner_id="runner-before",
+        )
+
+    initial_session_read = asyncio.Event()
+    continue_request = asyncio.Event()
+    pause_once = True
+
+    class PausingSession(AsyncSession):
+        async def execute(self, statement, *args, **kwargs):
+            nonlocal pause_once
+            result = await super().execute(statement, *args, **kwargs)
+            query = str(statement).lower()
+            if pause_once and "from sessions" in query and "for update" not in query:
+                pause_once = False
+                initial_session_read.set()
+                await continue_request.wait()
+            return result
+
+    session_factory = async_sessionmaker(
+        bind=fresh_pg.engine,
+        class_=PausingSession,
+        expire_on_commit=False,
+    )
+
+    async def invoke():
+        async with session_factory() as db:
+            if operation == "checkpoint":
+                return await checkpoint_and_reserve(
+                    db,
+                    runtime_principal=RuntimePrincipal(runner_id="runner-before"),
+                    session_id=session.id,
+                    operation_id="stale-session-checkpoint",
+                    expected_budget_version=1,
+                    cumulative_billable_ms=0,
+                    requested_future_ms=1000,
+                    billing_slice_ms=1000,
+                    permit_ttl_ms=5000,
+                )
+            return await close_budget(
+                db,
+                runtime_principal=RuntimePrincipal(runner_id="runner-before"),
+                session_id=session.id,
+                operation_id="stale-session-close",
+                expected_budget_version=1,
+                cumulative_billable_ms=0,
+            )
+
+    request = asyncio.create_task(invoke())
+    try:
+        await asyncio.wait_for(initial_session_read.wait(), timeout=5)
+        async with fresh_pg.new_session() as updater:
+            await updater.execute(
+                update(Session)
+                .where(Session.id == session.id)
+                .values(runner_id="runner-after", version=Session.version + 1)
+            )
+            await updater.commit()
+    finally:
+        continue_request.set()
+
+    with pytest.raises(ForbiddenError):
+        await request
+
+    async with fresh_pg.new_session() as db:
+        wallet = (
+            await db.execute(
+                select(WalletAccount).where(WalletAccount.user_id == user.id)
+            )
+        ).scalar_one()
+        budget = (
+            await db.execute(
+                select(CallBudget).where(CallBudget.session_id == session.id)
+            )
+        ).scalar_one()
+        assert wallet.posted_minor == 100
+        assert wallet.reserved_minor == 0
+        assert budget.version == 1
+        assert budget.status == "OPEN"
+        stored_session = (
+            await db.execute(select(Session).where(Session.id == session.id))
+        ).scalar_one()
+        assert stored_session.runner_id == "runner-after"
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("operation", ["checkpoint", "close"])
+@pytest.mark.asyncio
+async def test_meter_replay_revalidates_runner_after_initial_session_read(
+    fresh_pg: FreshPostgres,
+    operation: str,
+):
+    """A runner reassigned during an idempotent retry cannot receive stored output."""
+    await fresh_pg.initialize()
+
+    async with fresh_pg.new_session() as db:
+        user = await create_test_user(db)
+        await create_funded_wallet(db, user_id=user.id, credited_minor=100)
+        session, _ = await create_test_session(
+            db,
+            owner_user_id=user.id,
+            runner_id="runner-before",
+        )
+        if operation == "checkpoint":
+            await checkpoint_and_reserve(
+                db,
+                runtime_principal=RuntimePrincipal(runner_id="runner-before"),
+                session_id=session.id,
+                operation_id="replay-runner-checkpoint",
+                expected_budget_version=1,
+                cumulative_billable_ms=0,
+                requested_future_ms=1000,
+                billing_slice_ms=1000,
+                permit_ttl_ms=5000,
+            )
+        else:
+            await close_budget(
+                db,
+                runtime_principal=RuntimePrincipal(runner_id="runner-before"),
+                session_id=session.id,
+                operation_id="replay-runner-close",
+                expected_budget_version=1,
+                cumulative_billable_ms=0,
+            )
+
+    async with fresh_pg.new_session() as db:
+        wallet = (
+            await db.execute(
+                select(WalletAccount).where(WalletAccount.user_id == user.id)
+            )
+        ).scalar_one()
+        budget = (
+            await db.execute(
+                select(CallBudget).where(CallBudget.session_id == session.id)
+            )
+        ).scalar_one()
+        wallet_before = (
+            wallet.posted_minor,
+            wallet.reserved_minor,
+            wallet.version,
+        )
+        budget_before = (
+            budget.cumulative_proven_ms,
+            budget.cumulative_authorized_ms,
+            budget.cumulative_charged_minor,
+            budget.reserved_minor,
+            budget.version,
+            budget.status,
+        )
+
+    initial_session_read = asyncio.Event()
+    continue_request = asyncio.Event()
+    pause_once = True
+
+    class PausingReplaySession(AsyncSession):
+        async def execute(self, statement, *args, **kwargs):
+            nonlocal pause_once
+            result = await super().execute(statement, *args, **kwargs)
+            query = str(statement).lower()
+            if pause_once and "from sessions" in query and "for update" not in query:
+                pause_once = False
+                initial_session_read.set()
+                await continue_request.wait()
+            return result
+
+    session_factory = async_sessionmaker(
+        bind=fresh_pg.engine,
+        class_=PausingReplaySession,
+        expire_on_commit=False,
+    )
+
+    async def replay():
+        async with session_factory() as db:
+            if operation == "checkpoint":
+                return await checkpoint_and_reserve(
+                    db,
+                    runtime_principal=RuntimePrincipal(runner_id="runner-before"),
+                    session_id=session.id,
+                    operation_id="replay-runner-checkpoint",
+                    expected_budget_version=1,
+                    cumulative_billable_ms=0,
+                    requested_future_ms=1000,
+                    billing_slice_ms=1000,
+                    permit_ttl_ms=5000,
+                )
+            return await close_budget(
+                db,
+                runtime_principal=RuntimePrincipal(runner_id="runner-before"),
+                session_id=session.id,
+                operation_id="replay-runner-close",
+                expected_budget_version=1,
+                cumulative_billable_ms=0,
+            )
+
+    replay_task = asyncio.create_task(replay())
+    read_wait_task = asyncio.create_task(initial_session_read.wait())
+    try:
+        done, _ = await asyncio.wait(
+            (replay_task, read_wait_task),
+            timeout=5,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if replay_task in done:
+            await replay_task
+        assert read_wait_task in done, "replay did not reach the initial session read"
+        async with fresh_pg.new_session() as updater:
+            await updater.execute(
+                update(Session)
+                .where(Session.id == session.id)
+                .values(runner_id="runner-after", version=Session.version + 1)
+            )
+            await updater.commit()
+    finally:
+        continue_request.set()
+        if not replay_task.done():
+            await asyncio.wait((replay_task,), timeout=5)
+        for task in (replay_task, read_wait_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(replay_task, read_wait_task, return_exceptions=True)
+
+    with pytest.raises(ForbiddenError):
+        await replay_task
+
+    async with fresh_pg.new_session() as db:
+        wallet = (
+            await db.execute(
+                select(WalletAccount).where(WalletAccount.user_id == user.id)
+            )
+        ).scalar_one()
+        budget = (
+            await db.execute(
+                select(CallBudget).where(CallBudget.session_id == session.id)
+            )
+        ).scalar_one()
+        stored_session = (
+            await db.execute(select(Session).where(Session.id == session.id))
+        ).scalar_one()
+        assert (
+            wallet.posted_minor,
+            wallet.reserved_minor,
+            wallet.version,
+        ) == wallet_before
+        assert (
+            budget.cumulative_proven_ms,
+            budget.cumulative_authorized_ms,
+            budget.cumulative_charged_minor,
+            budget.reserved_minor,
+            budget.version,
+            budget.status,
+        ) == budget_before
+        assert stored_session.runner_id == "runner-after"
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_expiry_replay_revalidates_session_budget_owner(fresh_pg: FreshPostgres):
+    """A recovery replay cannot return a stored budget after session ownership changes."""
+    await fresh_pg.initialize()
+    t0 = datetime(2026, 10, 28, 12, 0, 0, tzinfo=timezone.utc)
+
+    async with fresh_pg.new_session() as db:
+        original_owner = await create_test_user(db)
+        replacement_owner = await create_test_user(db)
+        await create_funded_wallet(db, user_id=original_owner.id, credited_minor=100)
+        await create_funded_wallet(db, user_id=replacement_owner.id, credited_minor=0)
+        session, _ = await create_test_session(
+            db,
+            owner_user_id=original_owner.id,
+            runner_id="runner-expiry-owner",
+            created_at=t0,
+        )
+        await checkpoint_and_reserve(
+            db,
+            runtime_principal=RuntimePrincipal(runner_id="runner-expiry-owner"),
+            session_id=session.id,
+            operation_id="expiry-owner-checkpoint",
+            expected_budget_version=1,
+            cumulative_billable_ms=0,
+            requested_future_ms=1000,
+            billing_slice_ms=1000,
+            permit_ttl_ms=1000,
+            now=t0,
+        )
+        await expire_stopped_budget(
+            db,
+            session_id=session.id,
+            operation_id="expiry-owner-replay",
+            now=t0 + timedelta(seconds=1),
+        )
+
+    async with fresh_pg.new_session() as updater:
+        await updater.execute(
+            update(Session)
+            .where(Session.id == session.id)
+            .values(
+                owner_user_id=replacement_owner.id,
+                version=Session.version + 1,
+            )
+        )
+        await updater.commit()
+
+    async with fresh_pg.new_session() as db:
+        with pytest.raises(ConflictError) as exc_info:
+            await expire_stopped_budget(
+                db,
+                session_id=session.id,
+                operation_id="expiry-owner-replay",
+                now=t0 + timedelta(seconds=2),
+            )
+        assert exc_info.value.status_code == 409
+
+    async with fresh_pg.new_session() as db:
+        stored_session = (
+            await db.execute(select(Session).where(Session.id == session.id))
+        ).scalar_one()
+        stored_budget = (
+            await db.execute(
+                select(CallBudget).where(CallBudget.session_id == session.id)
+            )
+        ).scalar_one()
+        assert stored_session.owner_user_id == replacement_owner.id
+        assert stored_budget.owner_user_id == original_owner.id
+        assert stored_budget.status == "CLOSED"
+
+@pytest.mark.postgres
+@pytest.mark.parametrize("operation", ["checkpoint", "close", "expire"])
+@pytest.mark.asyncio
+async def test_owner_reassigned_after_wallet_lock_cannot_mutate_previous_wallet(
+    fresh_pg: FreshPostgres,
+    operation: str,
+):
+    """A matching session/budget owner change cannot redirect old wallet locks."""
+    await fresh_pg.initialize()
+    t0 = datetime(2026, 10, 28, 12, 0, 0, tzinfo=timezone.utc)
+    operation_now = t0 + timedelta(seconds=2)
+
+    async with fresh_pg.new_session() as db:
+        original_owner = await create_test_user(db)
+        replacement_owner = await create_test_user(db)
+        await create_funded_wallet(db, user_id=original_owner.id, credited_minor=100)
+        await create_funded_wallet(db, user_id=replacement_owner.id, credited_minor=100)
+        session, _ = await create_test_session(
+            db,
+            owner_user_id=original_owner.id,
+            runner_id="runner-wallet-owner",
+            created_at=t0,
+        )
+        await checkpoint_and_reserve(
+            db,
+            runtime_principal=RuntimePrincipal(runner_id="runner-wallet-owner"),
+            session_id=session.id,
+            operation_id="wallet-owner-prime",
+            expected_budget_version=1,
+            cumulative_billable_ms=0,
+            requested_future_ms=5000,
+            billing_slice_ms=5000,
+            permit_ttl_ms=1000,
+            now=t0,
+        )
+
+    async with fresh_pg.new_session() as db:
+        accounts = (
+            await db.execute(
+                select(WalletAccount).where(
+                    WalletAccount.user_id.in_(
+                        (original_owner.id, replacement_owner.id)
+                    )
+                )
+            )
+        ).scalars().all()
+        wallet_before = {
+            account.user_id: (
+                account.posted_minor,
+                account.reserved_minor,
+                account.version,
+            )
+            for account in accounts
+        }
+        budget = (
+            await db.execute(
+                select(CallBudget).where(CallBudget.session_id == session.id)
+            )
+        ).scalar_one()
+        budget_before = (
+            budget.cumulative_proven_ms,
+            budget.cumulative_authorized_ms,
+            budget.cumulative_charged_minor,
+            budget.reserved_minor,
+            budget.version,
+            budget.status,
+            budget.permit_expiry,
+        )
+
+    wallet_row_locked = asyncio.Event()
+    continue_request = asyncio.Event()
+    pause_once = True
+
+    class PausingWalletSession(AsyncSession):
+        async def execute(self, statement, *args, **kwargs):
+            nonlocal pause_once
+            result = await super().execute(statement, *args, **kwargs)
+            query = str(statement).lower()
+            if (
+                pause_once
+                and "from wallet_accounts" in query
+                and "for update" in query
+            ):
+                pause_once = False
+                wallet_row_locked.set()
+                await continue_request.wait()
+            return result
+
+    session_factory = async_sessionmaker(
+        bind=fresh_pg.engine,
+        class_=PausingWalletSession,
+        expire_on_commit=False,
+    )
+    operation_id = f"owner-wallet-race-{operation}"
+
+    async def invoke():
+        async with session_factory() as db:
+            if operation == "checkpoint":
+                return await checkpoint_and_reserve(
+                    db,
+                    runtime_principal=RuntimePrincipal(runner_id="runner-wallet-owner"),
+                    session_id=session.id,
+                    operation_id=operation_id,
+                    expected_budget_version=2,
+                    cumulative_billable_ms=1000,
+                    requested_future_ms=1000,
+                    billing_slice_ms=1000,
+                    permit_ttl_ms=1000,
+                    now=operation_now,
+                )
+            if operation == "close":
+                return await close_budget(
+                    db,
+                    runtime_principal=RuntimePrincipal(runner_id="runner-wallet-owner"),
+                    session_id=session.id,
+                    operation_id=operation_id,
+                    expected_budget_version=2,
+                    cumulative_billable_ms=1000,
+                    now=operation_now,
+                )
+            return await expire_stopped_budget(
+                db,
+                session_id=session.id,
+                operation_id=operation_id,
+                now=operation_now,
+            )
+
+    request_task = asyncio.create_task(invoke())
+    wallet_wait_task = asyncio.create_task(wallet_row_locked.wait())
+    try:
+        done, _ = await asyncio.wait(
+            (request_task, wallet_wait_task),
+            timeout=5,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if request_task in done:
+            await request_task
+        assert wallet_wait_task in done, "billing operation did not lock its wallet first"
+        async with fresh_pg.new_session() as updater:
+            await updater.execute(
+                update(CallBudget)
+                .where(CallBudget.session_id == session.id)
+                .values(owner_user_id=replacement_owner.id)
+            )
+            await updater.execute(
+                update(Session)
+                .where(Session.id == session.id)
+                .values(
+                    owner_user_id=replacement_owner.id,
+                    version=Session.version + 1,
+                )
+            )
+            await updater.commit()
+    finally:
+        continue_request.set()
+        if not request_task.done():
+            await asyncio.wait((request_task,), timeout=5)
+        for task in (request_task, wallet_wait_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(request_task, wallet_wait_task, return_exceptions=True)
+
+    with pytest.raises(ConflictError) as exc_info:
+        await request_task
+    assert exc_info.value.status_code == 409
+
+    async with fresh_pg.new_session() as db:
+        accounts = (
+            await db.execute(
+                select(WalletAccount).where(
+                    WalletAccount.user_id.in_(
+                        (original_owner.id, replacement_owner.id)
+                    )
+                )
+            )
+        ).scalars().all()
+        wallet_after = {
+            account.user_id: (
+                account.posted_minor,
+                account.reserved_minor,
+                account.version,
+            )
+            for account in accounts
+        }
+        budget = (
+            await db.execute(
+                select(CallBudget).where(CallBudget.session_id == session.id)
+            )
+        ).scalar_one()
+        stored_session = (
+            await db.execute(select(Session).where(Session.id == session.id))
+        ).scalar_one()
+        attempted_operation = (
+            await db.execute(
+                select(BillingOperation).where(
+                    BillingOperation.session_id == session.id,
+                    BillingOperation.operation_id == operation_id,
+                )
+            )
+        ).scalar_one_or_none()
+        assert wallet_after == wallet_before
+        assert (
+            budget.cumulative_proven_ms,
+            budget.cumulative_authorized_ms,
+            budget.cumulative_charged_minor,
+            budget.reserved_minor,
+            budget.version,
+            budget.status,
+            budget.permit_expiry,
+        ) == budget_before
+        assert budget.owner_user_id == replacement_owner.id
+        assert stored_session.owner_user_id == replacement_owner.id
+        assert stored_session.state == "ACTIVE"
+        assert attempted_operation is None
+
+
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_existing_session_without_budget_returns_conflict(fresh_pg: FreshPostgres):
+    """Checkpoint and close on a stored session without its budget return 409 conflicts."""
+    await fresh_pg.initialize()
+
+    async with fresh_pg.new_session() as db:
+        user = await create_test_user(db)
+        await create_funded_wallet(db, user_id=user.id, credited_minor=100)
+        session = Session(
+            id=uuid.uuid4(),
+            owner_user_id=user.id,
+            runner_id="runner-no-budget",
+            kind="voice",
+            state="ACTIVE",
+            version=1,
+        )
+        db.add(session)
+        await db.commit()
+
+    async with fresh_pg.new_session() as db:
+        with pytest.raises(ConflictError) as exc_info:
+            await checkpoint_and_reserve(
+                db,
+                runtime_principal=RuntimePrincipal(runner_id="runner-no-budget"),
+                session_id=session.id,
+                operation_id="missing-budget-checkpoint",
+                expected_budget_version=1,
+                cumulative_billable_ms=0,
+                requested_future_ms=1000,
+                billing_slice_ms=1000,
+                permit_ttl_ms=5000,
+            )
+        assert exc_info.value.status_code == 409
+
+    async with fresh_pg.new_session() as db:
+        with pytest.raises(ConflictError) as exc_info:
+            await close_budget(
+                db,
+                runtime_principal=RuntimePrincipal(runner_id="runner-no-budget"),
+                session_id=session.id,
+                operation_id="missing-budget-close",
+                expected_budget_version=1,
+                cumulative_billable_ms=0,
+            )
+        assert exc_info.value.status_code == 409
+
+    async with fresh_pg.new_session() as db:
+        with pytest.raises(ConflictError) as exc_info:
+            await expire_stopped_budget(
+                db,
+                session_id=session.id,
+                operation_id="missing-budget-expiry",
+                now=datetime.now(timezone.utc),
+            )
+        assert exc_info.value.status_code == 409
+
+    async with fresh_pg.new_session() as db:
+        wallet = (
+            await db.execute(
+                select(WalletAccount).where(WalletAccount.user_id == user.id)
+            )
+        ).scalar_one()
+        stored_session = (
+            await db.execute(select(Session).where(Session.id == session.id))
+        ).scalar_one()
+        assert wallet.posted_minor == 100
+        assert wallet.reserved_minor == 0
+        assert stored_session.state == "ACTIVE"
 
 @pytest.mark.postgres
 @pytest.mark.asyncio
@@ -439,6 +1102,78 @@ async def test_http_owner_wallet_endpoints(
     assert len(entries_data["items"]) == 1
     assert entries_data["items"][0]["amount_minor"] == 500
 
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_billing_database_connection_failure_returns_retryable_503(
+    app_client: httpx.AsyncClient,
+    test_platform_settings: PlatformSettings,
+    initialized_pg: FreshPostgres,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    now = datetime.now(timezone.utc)
+    async with initialized_pg.sessions() as db:
+        user = await create_test_user(db)
+        await create_funded_wallet(db, user_id=user.id, credited_minor=0)
+        _, secret = await create_authenticated_session(
+            db,
+            test_platform_settings,
+            user=user,
+            client_ip="127.0.0.1",
+            user_agent="WalletOutage",
+            now=now,
+        )
+        await db.commit()
+
+    async def unavailable_wallet(*args, **kwargs):
+        raise OperationalError(
+            "SELECT wallet_accounts",
+            {},
+            ConnectionError("connection refused"),
+        )
+
+    monkeypatch.setattr(billing_routes, "get_wallet_view", unavailable_wallet)
+    response = await app_client.get(
+        "/api/v1/wallet",
+        headers={
+            "Cookie": (
+                f"{test_platform_settings.session_cookie_name}={secret}"
+            )
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "5"
+    assert response.json()["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+    assert response.json()["error"]["retryable"] is True
+
+    async def unavailable_auth(*args, **kwargs):
+        raise OperationalError(
+            "SELECT auth_sessions",
+            {},
+            ConnectionError("connection refused"),
+        )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(billing_routes, "require_user", unavailable_auth)
+        auth_response = await app_client.get("/api/v1/wallet")
+    assert auth_response.status_code == 503
+    assert auth_response.json()["error"]["retryable"] is True
+
+    async def invalid_wallet_query(*args, **kwargs):
+        raise ProgrammingError("SELECT wallet_accounts", {}, Exception("bad SQL"))
+
+    monkeypatch.setattr(billing_routes, "get_wallet_view", invalid_wallet_query)
+    with pytest.raises(ProgrammingError, match="bad SQL"):
+        await app_client.get(
+            "/api/v1/wallet",
+            headers={
+                "Cookie": (
+                    f"{test_platform_settings.session_cookie_name}={secret}"
+                )
+            },
+        )
 
 @pytest.mark.postgres
 @pytest.mark.asyncio
