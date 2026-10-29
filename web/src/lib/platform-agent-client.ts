@@ -531,6 +531,7 @@ function parseChatTest(value: unknown): ChatTestView {
   return {
     test_id: requireString(row.test_id, "chat_test.test_id"),
     snapshot_hash: requireString(row.snapshot_hash, "chat_test.snapshot_hash"),
+    turn_sequence: requireNumber(row.turn_sequence, "chat_test.turn_sequence"),
     pending_turn_sequence: requireNullableNumber(row.pending_turn_sequence, "chat_test.pending_turn_sequence"),
     messages: row.messages.map(parseChatMessage),
     flow_state: requireJsonObject(row.flow_state, "chat_test.flow_state"),
