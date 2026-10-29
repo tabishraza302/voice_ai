@@ -52,6 +52,7 @@ from platform_api.sessions.routes import (
     internal_router as internal_sessions_router,
     owner_router as sessions_router,
 )
+from platform_api.public.routes import router as public_router
 import platform_api.models  # Register complete platform models onto Base.metadata
 
 AUTH_ROUTE_BODY_LIMIT = 8192  # 8 KiB
@@ -283,6 +284,8 @@ def create_app(settings: PlatformSettings | None = None) -> FastAPI:
             allow_headers=[
                 "Content-Type",
                 "X-CSRF-Token",
+                "X-Public-CSRF",
+                "X-Guest-CSRF",
                 "Idempotency-Key",
                 "X-Request-ID",
             ],
@@ -309,7 +312,7 @@ def create_app(settings: PlatformSettings | None = None) -> FastAPI:
             message="Validation error",
             fields=fields,
         )
-        err_obj.status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
+        err_obj.status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
         err_obj.code = "VALIDATION"
         return platform_error_response(err_obj, req_id)
 
@@ -338,6 +341,7 @@ def create_app(settings: PlatformSettings | None = None) -> FastAPI:
     api_v1.include_router(chat_test_router)
     api_v1.include_router(session_history_router)
     api_v1.include_router(sessions_router)
+    api_v1.include_router(public_router)
 
     app.include_router(api_v1)
     # Mount internal routes under /internal
