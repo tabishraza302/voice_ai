@@ -7,6 +7,8 @@ import { ArrowLeft, RefreshCw, WandSparkles } from "lucide-react";
 import {
   platformAgentApi,
   type AgentCreateRequest,
+  type JsonObject,
+  type JsonValue,
   type AgentProposal,
   type AgentTemplateView,
   type GenerationJobAccepted,
@@ -24,6 +26,83 @@ interface KeyRecord {
   fingerprint: string;
   key: string;
 }
+interface GeneratedSaveRecord {
+  version: 1;
+  jobId: string;
+  fingerprint: string;
+  request: AgentCreateRequest;
+  config: JsonObject;
+  idempotencyKey: string;
+  agentId: string | null;
+  expectedRevision: number | null;
+  savedRevision: number | null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isJsonValue(value: unknown): value is JsonValue {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) return value.every(isJsonValue);
+  return isRecord(value) && Object.values(value).every(isJsonValue);
+}
+
+function isJsonObject(value: unknown): value is JsonObject {
+  return isRecord(value) && Object.values(value).every(isJsonValue);
+}
+
+function createIdempotencyKey(): string {
+  if (!globalThis.crypto?.randomUUID) {
+    throw new Error("This browser cannot create an idempotency key for the requested action.");
+  }
+  return globalThis.crypto.randomUUID();
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (isRecord(value)) {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function generatedSaveStorageKey(jobId: string): string {
+  return `platform-agent-generated-save:${jobId}`;
+}
+
+function readGeneratedSaveRecord(jobId: string): GeneratedSaveRecord | null {
+  const raw = window.sessionStorage.getItem(generatedSaveStorageKey(jobId));
+  if (raw === null) return null;
+  const parsed: unknown = JSON.parse(raw);
+  if (!isRecord(parsed)) throw new Error("The saved generated-agent retry is invalid.");
+  const request = parsed.request;
+  const validRequest = isRecord(request) &&
+    typeof request.name === "string" &&
+    typeof request.description === "string" &&
+    typeof request.persona_prompt === "string" &&
+    request.source === "generated";
+  const validRevision = (value: unknown) => value === null || (typeof value === "number" && Number.isInteger(value) && value >= 1);
+  if (
+    parsed.version !== 1 ||
+    parsed.jobId !== jobId ||
+    typeof parsed.fingerprint !== "string" ||
+    !validRequest ||
+    !isJsonObject(parsed.config) ||
+    typeof parsed.idempotencyKey !== "string" ||
+    (parsed.agentId !== null && typeof parsed.agentId !== "string") ||
+    !validRevision(parsed.expectedRevision) ||
+    !validRevision(parsed.savedRevision)
+  ) {
+    throw new Error("The saved generated-agent retry is invalid. It was not sent again.");
+  }
+  return parsed as unknown as GeneratedSaveRecord;
+}
+
+function persistGeneratedSaveRecord(record: GeneratedSaveRecord): void {
+  window.sessionStorage.setItem(generatedSaveStorageKey(record.jobId), JSON.stringify(record));
+}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "The platform request failed.";
@@ -31,16 +110,13 @@ function errorMessage(error: unknown): string {
 
 function idempotencyKeyFor(ref: { current: KeyRecord | null }, fingerprint: string): string {
   if (ref.current?.fingerprint === fingerprint) return ref.current.key;
-  if (!globalThis.crypto?.randomUUID) {
-    throw new Error("This browser cannot create an idempotency key for the requested action.");
-  }
-  const key = globalThis.crypto.randomUUID();
+  const key = createIdempotencyKey();
   ref.current = { fingerprint, key };
   return key;
 }
 
 function isRunning(status: GenerationStatus | undefined): boolean {
-  return status === "QUEUED" || status === "RUNNING";
+  return status === "QUEUED" || status === "RUNNING" || status === "CANCELLING";
 }
 
 export function PlatformAgentCreate({ initialMode, initialJobId = null }: PlatformAgentCreateProps) {
@@ -70,7 +146,6 @@ export function PlatformAgentCreate({ initialMode, initialJobId = null }: Platfo
   const [submitting, setSubmitting] = useState(false);
   const [createdAgentId, setCreatedAgentId] = useState<string | null>(null);
   const manualKeyRef = useRef<KeyRecord | null>(null);
-  const generatedKeyRef = useRef<KeyRecord | null>(null);
 
   useEffect(() => {
     let current = true;
@@ -110,6 +185,13 @@ export function PlatformAgentCreate({ initialMode, initialJobId = null }: Platfo
     if (!initialJobId) return;
     let current = true;
     setPageError(null);
+    setCreatedAgentId(null);
+    try {
+      const savedOperation = readGeneratedSaveRecord(initialJobId);
+      if (savedOperation?.agentId) setCreatedAgentId(savedOperation.agentId);
+    } catch (error: unknown) {
+      setPageError(errorMessage(error));
+    }
     platformAgentApi.getGenerationJob(initialJobId).then((details) => {
       if (!current) return;
       setJob({ job_id: initialJobId, status: details.status });
@@ -179,7 +261,6 @@ export function PlatformAgentCreate({ initialMode, initialJobId = null }: Platfo
     setJob(null);
     setJobDetails(null);
     setCreatedAgentId(null);
-    generatedKeyRef.current = null;
     try {
       const accepted = await platformAgentApi.startGenerationJob({
         requirement: requirement.trim(),
@@ -214,7 +295,8 @@ export function PlatformAgentCreate({ initialMode, initialJobId = null }: Platfo
 
   const handleSaveProposal = async () => {
     const proposal = jobDetails?.proposal;
-    if (!proposal) return;
+    const jobId = job?.job_id;
+    if (!proposal || !jobId) return;
     setSubmitting(true);
     setPageError(null);
     try {
@@ -224,18 +306,58 @@ export function PlatformAgentCreate({ initialMode, initialJobId = null }: Platfo
         persona_prompt: proposal.persona_prompt,
         source: "generated",
       };
-      const key = idempotencyKeyFor(generatedKeyRef, JSON.stringify({ request, config: proposal.config }));
-      let agentId = createdAgentId;
-      if (!agentId) {
-        const agent = await platformAgentApi.createAgent(request, key);
-        agentId = agent.id;
-        setCreatedAgentId(agentId);
+      const fingerprint = canonicalJson({ job_id: jobId, request, config: proposal.config });
+      let operation = readGeneratedSaveRecord(jobId);
+      if (operation && operation.fingerprint !== fingerprint) {
+        throw new Error("This generation job is already bound to a different save operation. Its original agent was not changed.");
       }
+      if (!operation) {
+        operation = {
+          version: 1,
+          jobId,
+          fingerprint,
+          request,
+          config: proposal.config,
+          idempotencyKey: createIdempotencyKey(),
+          agentId: null,
+          expectedRevision: null,
+          savedRevision: null,
+        };
+        persistGeneratedSaveRecord(operation);
+      }
+      if (operation.savedRevision !== null) {
+        if (!operation.agentId) throw new Error("The saved generation operation has no agent ID.");
+        setCreatedAgentId(operation.agentId);
+        router.push(`/agents/${operation.agentId}`);
+        return;
+      }
+      if (!operation.agentId) {
+        const created = await platformAgentApi.createAgent(operation.request, operation.idempotencyKey);
+        operation = { ...operation, agentId: created.id, expectedRevision: 1 };
+        persistGeneratedSaveRecord(operation);
+      }
+      const agentId = operation.agentId;
+      const expectedRevision = operation.expectedRevision;
+      if (!agentId || expectedRevision === null) {
+        throw new Error("The saved generation operation has no durable draft revision. No draft changes were sent.");
+      }
+      setCreatedAgentId(agentId);
       const draft = await platformAgentApi.getDraft(agentId);
-      await platformAgentApi.patchDraft(agentId, {
-        expected_revision: draft.draft_revision,
-        config: proposal.config,
+      if (canonicalJson(draft.config) === canonicalJson(operation.config)) {
+        operation = { ...operation, savedRevision: draft.draft_revision };
+        persistGeneratedSaveRecord(operation);
+        router.push(`/agents/${agentId}`);
+        return;
+      }
+      if (draft.draft_revision !== expectedRevision) {
+        throw new Error(`The created draft changed from r${expectedRevision} to r${draft.draft_revision}. It was not overwritten; open the draft to review it.`);
+      }
+      const savedDraft = await platformAgentApi.patchDraft(agentId, {
+        expected_revision: expectedRevision,
+        config: operation.config,
       });
+      operation = { ...operation, savedRevision: savedDraft.draft_revision };
+      persistGeneratedSaveRecord(operation);
       router.push(`/agents/${agentId}`);
     } catch (error: unknown) {
       setPageError(errorMessage(error));
@@ -273,11 +395,10 @@ export function PlatformAgentCreate({ initialMode, initialJobId = null }: Platfo
         </div>
       ) : null}
 
-      <div role="tablist" aria-label="Agent creation method" className="flex flex-wrap gap-2">
+      <div role="group" aria-label="Agent creation method" className="flex flex-wrap gap-2">
         <button
           type="button"
-          role="tab"
-          aria-selected={mode === "manual"}
+          aria-pressed={mode === "manual"}
           className={mode === "manual" ? "button-primary" : "button-secondary"}
           onClick={() => switchMode("manual")}
         >
@@ -285,8 +406,7 @@ export function PlatformAgentCreate({ initialMode, initialJobId = null }: Platfo
         </button>
         <button
           type="button"
-          role="tab"
-          aria-selected={mode === "generate"}
+          aria-pressed={mode === "generate"}
           className={mode === "generate" ? "button-primary" : "button-secondary"}
           onClick={() => switchMode("generate")}
         >
@@ -295,7 +415,7 @@ export function PlatformAgentCreate({ initialMode, initialJobId = null }: Platfo
       </div>
 
       {mode === "manual" ? (
-        <section role="tabpanel" aria-label="Create manually" className="surface p-5 sm:p-7">
+        <section aria-label="Create manually" className="surface p-5 sm:p-7">
           <form className="space-y-5" onSubmit={handleManualCreate}>
             <div>
               <label className="field-label" htmlFor="manual-agent-name">Agent name</label>
@@ -362,7 +482,7 @@ export function PlatformAgentCreate({ initialMode, initialJobId = null }: Platfo
           </form>
         </section>
       ) : (
-        <section role="tabpanel" aria-label="Generate from prompt" className="space-y-5">
+        <section aria-label="Generate from prompt" className="space-y-5">
           <form className="surface space-y-5 p-5 sm:p-7" onSubmit={handleStartGeneration}>
             <div>
               <label className="field-label" htmlFor="generation-requirement">What should the agent do?</label>
@@ -494,15 +614,15 @@ function GenerationJobCard({
           <p className="mt-1 break-all text-xs text-limestone-500">Job ID: {job.job_id}</p>
         </div>
         {running ? (
-          <button type="button" className="button-secondary" onClick={onCancel} disabled={submitting}>
-            {submitting ? "Cancelling…" : "Cancel generation"}
+          <button type="button" className="button-secondary" onClick={onCancel} disabled={submitting || job.status === "CANCELLING"}>
+            {submitting || job.status === "CANCELLING" ? "Cancelling…" : "Cancel generation"}
           </button>
         ) : null}
       </div>
 
       {running ? (
         <p role="status" className="flex items-center gap-2 text-sm text-limestone-400">
-          <RefreshCw className="h-4 w-4 animate-spin text-copper-400" />Waiting for the generator…
+          <RefreshCw className="h-4 w-4 animate-spin text-copper-400" />{job.status === "CANCELLING" ? "Waiting for the current generation request to stop…" : "Waiting for the generator…"}
         </p>
       ) : null}
       {pollingError ? (

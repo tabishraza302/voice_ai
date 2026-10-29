@@ -52,6 +52,60 @@ interface DraftSummaryState {
   error?: string;
 }
 
+interface PendingDuplicate {
+  idempotencyKey: string;
+  request: { name: string; source_revision_or_version: "draft" };
+}
+
+function getPendingDuplicate(agent: AgentView): PendingDuplicate {
+  const storageKey = `platform-agent-duplicate:${agent.id}`;
+  const saved = window.sessionStorage.getItem(storageKey);
+  if (saved !== null) {
+    const parsed: unknown = JSON.parse(saved);
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      !("idempotencyKey" in parsed) ||
+      typeof parsed.idempotencyKey !== "string" ||
+      !("request" in parsed) ||
+      typeof parsed.request !== "object" ||
+      parsed.request === null ||
+      !("name" in parsed.request) ||
+      typeof parsed.request.name !== "string" ||
+      !("source_revision_or_version" in parsed.request) ||
+      parsed.request.source_revision_or_version !== "draft"
+    ) {
+      throw new Error("The saved duplicate retry is invalid. Clear this browser session before trying again.");
+    }
+    return {
+      idempotencyKey: parsed.idempotencyKey,
+      request: {
+        name: parsed.request.name,
+        source_revision_or_version: "draft",
+      },
+    };
+  }
+  if (!globalThis.crypto?.randomUUID) {
+    throw new Error("Secure idempotency keys are unavailable in this browser.");
+  }
+  const operation: PendingDuplicate = {
+    idempotencyKey: globalThis.crypto.randomUUID(),
+    request: {
+      name: `Copy of ${agent.name}`,
+      source_revision_or_version: "draft",
+    },
+  };
+  window.sessionStorage.setItem(storageKey, JSON.stringify(operation));
+  return operation;
+}
+
+function clearPendingDuplicate(agentId: string): void {
+  try {
+    window.sessionStorage.removeItem(`platform-agent-duplicate:${agentId}`);
+  } catch {
+    // The operation has succeeded; a retained key is safe to replay.
+  }
+}
 const PAGE_SIZE = 12;
 
 function displayError(error: unknown): string {
@@ -150,11 +204,10 @@ export function PlatformAgentDirectory({ compact = false }: PlatformAgentDirecto
     setActionLoading(`duplicate-${agent.id}`);
     setActionError(null);
     try {
-      const duplicate = await platformAgentApi.duplicateAgent(agent.id, {
-        name: `Copy of ${agent.name}`,
-        source_revision_or_version: "draft",
-      });
-      setAgents((current) => [...current, duplicate]);
+      const operation = getPendingDuplicate(agent);
+      const duplicate = await platformAgentApi.duplicateAgent(agent.id, operation.request, operation.idempotencyKey);
+      setAgents((current) => current.some((item) => item.id === duplicate.id) ? current : [...current, duplicate]);
+      clearPendingDuplicate(agent.id);
     } catch (error: unknown) {
       setActionError(displayError(error));
     } finally {
