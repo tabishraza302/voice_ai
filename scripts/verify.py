@@ -924,7 +924,7 @@ class VerificationHarness:
 
             env = {
                 "PLATFORM_TEST_DATABASE_ADMIN_URL": admin_url,
-                "PLATFORM_DATABASE_URL": platform_url,
+                "DATABASE_URL": platform_url,
                 "TEST_DATABASE_URL": legacy_url,
                 "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.run_token,
                 "_VERIFY_RUN_OWNERSHIP_TOKEN": self.run_token,
@@ -1001,7 +1001,7 @@ class VerificationHarness:
             "init-db",
         ]
         schema_init_env = {
-            "PLATFORM_DATABASE_URL": platform_url,
+            "DATABASE_URL": platform_url,
             "PLATFORM_TEST_DATABASE_ADMIN_URL": admin_url,
             "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.run_token,
             "_VERIFY_RUN_OWNERSHIP_TOKEN": self.run_token,
@@ -1030,7 +1030,7 @@ class VerificationHarness:
             str(api_port),
         ]
         api_env = {
-            "PLATFORM_DATABASE_URL": platform_url,
+            "DATABASE_URL": platform_url,
             "PLATFORM_TEST_DATABASE_ADMIN_URL": admin_url,
             "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.run_token,
             "_VERIFY_RUN_OWNERSHIP_TOKEN": self.run_token,
@@ -1162,7 +1162,7 @@ class VerificationHarness:
             "--reporter=json",
         ]
         env = {
-            "PLATFORM_DATABASE_URL": platform_url,
+            "DATABASE_URL": platform_url,
             "PLATFORM_TEST_DATABASE_ADMIN_URL": admin_url,
             "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.run_token,
             "_VERIFY_RUN_OWNERSHIP_TOKEN": self.run_token,
@@ -1251,7 +1251,7 @@ class VerificationHarness:
             "init-db",
         ]
         schema_init_env = {
-            "PLATFORM_DATABASE_URL": platform_url,
+            "DATABASE_URL": platform_url,
             "PLATFORM_TEST_DATABASE_ADMIN_URL": admin_url,
             "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.run_token,
             "_VERIFY_RUN_OWNERSHIP_TOKEN": self.run_token,
@@ -1281,7 +1281,7 @@ class VerificationHarness:
             str(api_port),
         ]
         api_env = {
-            "PLATFORM_DATABASE_URL": platform_url,
+            "DATABASE_URL": platform_url,
             "PLATFORM_TEST_DATABASE_ADMIN_URL": admin_url,
             "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.run_token,
             "_VERIFY_RUN_OWNERSHIP_TOKEN": self.run_token,
@@ -1475,7 +1475,7 @@ class VerificationHarness:
             "--reporter=json",
         ]
         env = {
-            "PLATFORM_DATABASE_URL": platform_url,
+            "DATABASE_URL": platform_url,
             "PLATFORM_TEST_DATABASE_ADMIN_URL": admin_url,
             "PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN": self.run_token,
             "_VERIFY_RUN_OWNERSHIP_TOKEN": self.run_token,
