@@ -52,6 +52,32 @@ def make_settings(**overrides) -> PlatformSettings:
     return PlatformSettings(**kwargs)
 
 
+def test_operations_policy_limits_have_documented_defaults():
+    settings = make_settings()
+
+    assert settings.ops_export_max_bytes == 16 * 1024 * 1024
+    assert settings.ops_export_max_records == 10_000
+    assert settings.ops_retention_batch_size == 500
+    assert settings.ops_backup_max_bytes == 8 * 1024 * 1024 * 1024
+    assert settings.ops_restore_max_bytes == 8 * 1024 * 1024 * 1024
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("ops_export_max_bytes", 0),
+        ("ops_export_max_records", 0),
+        ("ops_retention_batch_size", 0),
+        ("ops_retention_batch_size", 1001),
+        ("ops_backup_max_bytes", 0),
+        ("ops_restore_max_bytes", 0),
+    ],
+)
+def test_operations_policy_limits_reject_invalid_values(field, value):
+    with pytest.raises(ValidationError):
+        make_settings(**{field: value})
+
+
 def test_settings_requires_contract_ttl_names():
     """Settings must use exact contract names (TTL_SECONDS), not non-contract names."""
     settings = make_settings(

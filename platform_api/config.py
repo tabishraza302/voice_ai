@@ -182,6 +182,38 @@ class PlatformSettings(BaseSettings):
         description="Restricted PostgreSQL login for event-history consumption",
     )
 
+    # --- Operational privacy and archive limits -------------------------------
+    ops_export_max_bytes: int = Field(
+        default=16 * 1024 * 1024,
+        ge=1,
+        validation_alias=AliasChoices("PLATFORM_OPS_EXPORT_MAX_BYTES", "ops_export_max_bytes"),
+    )
+    ops_export_max_records: int = Field(
+        default=10_000,
+        ge=1,
+        validation_alias=AliasChoices(
+            "PLATFORM_OPS_EXPORT_MAX_RECORDS", "ops_export_max_records"
+        ),
+    )
+    ops_retention_batch_size: int = Field(
+        default=500,
+        ge=1,
+        le=1000,
+        validation_alias=AliasChoices(
+            "PLATFORM_OPS_RETENTION_BATCH_SIZE", "ops_retention_batch_size"
+        ),
+    )
+    ops_backup_max_bytes: int = Field(
+        default=8 * 1024 * 1024 * 1024,
+        ge=1,
+        validation_alias=AliasChoices("PLATFORM_OPS_BACKUP_MAX_BYTES", "ops_backup_max_bytes"),
+    )
+    ops_restore_max_bytes: int = Field(
+        default=8 * 1024 * 1024 * 1024,
+        ge=1,
+        validation_alias=AliasChoices("PLATFORM_OPS_RESTORE_MAX_BYTES", "ops_restore_max_bytes"),
+    )
+
     # --- Server and Networking ------------------------------------------------
     host: str = Field(
         default="127.0.0.1",
