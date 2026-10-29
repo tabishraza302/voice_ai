@@ -35,6 +35,77 @@ WEB_PORT="${WEB_PORT:-${CONFIGURED_WEB_PORT:-3001}}"
 # value keeps the checkpoint's default; scripts/stt_server.py validates it.
 CONFIGURED_STT_LOOKAHEAD="$(grep -E '^[[:space:]]*(stt_lookahead_frames|STT_LOOKAHEAD_FRAMES)=' "$REPO_ROOT/.env" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '"\047[:space:]' || true)"
 STT_LOOKAHEAD_FRAMES="${STT_LOOKAHEAD_FRAMES:-$CONFIGURED_STT_LOOKAHEAD}"
+# Parse a variable from a .env file, handling mixed-case keys, optional
+# 'export', spaces around '=', quotes, and inline comments.
+parse_dotenv_setting() {
+  local file="$1"
+  local target_key="$2"
+  [ -f "$file" ] || return 1
+  awk -v target="$target_key" '
+    BEGIN { found = 0; val = "" }
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      if (line == "" || substr(line, 1, 1) == "#") next
+      if (line ~ /^export[[:space:]]+/) {
+        sub(/^export[[:space:]]+/, "", line)
+      }
+      eq_idx = index(line, "=")
+      if (eq_idx == 0) next
+      k = substr(line, 1, eq_idx - 1)
+      v = substr(line, eq_idx + 1)
+      sub(/[[:space:]]+$/, "", k)
+      if (tolower(k) != tolower(target)) next
+      sub(/^[[:space:]]+/, "", v)
+      first_char = substr(v, 1, 1)
+      if (first_char == "\"" || first_char == "\x27") {
+        rest = substr(v, 2)
+        q_idx = index(rest, first_char)
+        if (q_idx > 0) {
+          val = substr(rest, 1, q_idx - 1)
+        } else {
+          val = rest
+        }
+      } else {
+        if (substr(v, 1, 1) == "#") {
+          v = ""
+        } else {
+          sub(/[[:space:]]+#.*$/, "", v)
+        }
+        sub(/[[:space:]]+$/, "", v)
+        val = v
+      }
+      found = 1
+    }
+    END {
+      if (found) {
+        print val
+        exit 0
+      }
+      exit 1
+    }
+  ' "$file"
+}
+
+# The agent's opt-in to its local SQLite store. `start` may choose that
+# store when PostgreSQL is unavailable, but an explicit setting — in the
+# environment or .env — wins over the script's choice. Environment variables
+# take precedence over .env definitions.
+CONFIGURED_ALLOW_SQLITE_FALLBACK=""
+DOTENV_HAS_FALLBACK=0
+if [ -f "$REPO_ROOT/.env" ] && CONFIGURED_ALLOW_SQLITE_FALLBACK="$(parse_dotenv_setting "$REPO_ROOT/.env" "allow_sqlite_fallback")"; then
+  DOTENV_HAS_FALLBACK=1
+fi
+
+if [ -n "${ALLOW_SQLITE_FALLBACK+x}" ]; then
+  ALLOW_SQLITE_FALLBACK_EXPLICIT=1
+elif [ "$DOTENV_HAS_FALLBACK" -eq 1 ]; then
+  ALLOW_SQLITE_FALLBACK="$CONFIGURED_ALLOW_SQLITE_FALLBACK"
+  ALLOW_SQLITE_FALLBACK_EXPLICIT=1
+else
+  ALLOW_SQLITE_FALLBACK=""
+  ALLOW_SQLITE_FALLBACK_EXPLICIT=0
+fi
 export WEB_PORT
 export STT_LOOKAHEAD_FRAMES
 export POSTGRES_PORT
@@ -58,6 +129,22 @@ log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m  ok\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m  --\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m  !!\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Pydantic parses these spellings as false for ALLOW_SQLITE_FALLBACK. The
+# script must agree with the agent it launches about what an opt-out is.
+sqlite_fallback_disabled() {
+  case "$(printf '%s' "$ALLOW_SQLITE_FALLBACK" | tr -d '"\047[:space:]' | tr '[:upper:]' '[:lower:]')" in
+    0|false|f|no|n|off) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+sqlite_fallback_enabled() {
+  case "$(printf '%s' "$ALLOW_SQLITE_FALLBACK" | tr -d '"\047[:space:]' | tr '[:upper:]' '[:lower:]')" in
+    1|true|t|yes|y|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 [[ "$WEB_PORT" =~ ^[0-9]+$ ]] && (( WEB_PORT >= 1 && WEB_PORT <= 65535 )) \
   || die "WEB_PORT must be an integer between 1 and 65535"
@@ -323,10 +410,23 @@ cmd_start() {
     # The agent no longer falls back implicitly: a configured PostgreSQL
     # failure fails closed. This script is deliberately choosing a
     # local-only store for this launch, so it must say so out loud and
-    # hand the agent an explicit opt-in.
-    export ALLOW_SQLITE_FALLBACK=1
-    warn "PostgreSQL is unavailable; falling back to SQLite for local agent data (docker compose logs postgres)"
-    warn "WARNING: ALLOW_SQLITE_FALLBACK=1. Agent edits now go to the local SQLite file and will NOT appear in PostgreSQL."
+    # hand the agent an explicit opt-in. An explicit setting (opt-out
+    # or invalid), however, belongs to the deployment and must not be overwritten here.
+    if [ "$ALLOW_SQLITE_FALLBACK_EXPLICIT" -eq 1 ]; then
+      if sqlite_fallback_disabled; then
+        warn "PostgreSQL is unavailable; ALLOW_SQLITE_FALLBACK is disabled, so the agent will fail closed instead of using SQLite (docker compose logs postgres)"
+      elif sqlite_fallback_enabled; then
+        export ALLOW_SQLITE_FALLBACK=1
+        warn "PostgreSQL is unavailable; falling back to SQLite for local agent data (docker compose logs postgres)"
+        warn "WARNING: ALLOW_SQLITE_FALLBACK=1. Agent edits now go to the local SQLite file and will NOT appear in PostgreSQL."
+      else
+        warn "PostgreSQL is unavailable; ALLOW_SQLITE_FALLBACK is invalid ('$ALLOW_SQLITE_FALLBACK'), so the agent will fail closed instead of using SQLite (docker compose logs postgres)"
+      fi
+    else
+      export ALLOW_SQLITE_FALLBACK=1
+      warn "PostgreSQL is unavailable; falling back to SQLite for local agent data (docker compose logs postgres)"
+      warn "WARNING: ALLOW_SQLITE_FALLBACK=1. Agent edits now go to the local SQLite file and will NOT appear in PostgreSQL."
+    fi
   fi
 
   # Web studio (if requested via --web)
