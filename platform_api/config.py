@@ -373,10 +373,17 @@ class PlatformSettings(BaseSettings):
     )
 
     # --- Accounting and Events ------------------------------------------------
-    billing_slice_ms: int = Field(
-        default=1000,
+    billing_slice_ms: int | None = Field(
+        default=None,
         gt=0,
         validation_alias=AliasChoices("PLATFORM_BILLING_SLICE_MS", "billing_slice_ms"),
+        description="Deployment-derived maximum slice duration in ms; required when billing is active, no universal default",
+    )
+    billing_permit_ttl_ms: int | None = Field(
+        default=None,
+        gt=0,
+        validation_alias=AliasChoices("PLATFORM_BILLING_PERMIT_TTL_MS", "billing_permit_ttl_ms"),
+        description="Deployment-derived permit validity duration in ms; required when billing is active, no universal default",
     )
     amqp_url: str | None = Field(
         default=None,

@@ -24,6 +24,11 @@ from platform_api.auth.errors import (
     platform_error_response,
 )
 from platform_api.auth.routes import router as auth_router
+from platform_api.billing.routes import (
+    admin_router as admin_billing_router,
+    internal_router as internal_billing_router,
+    router as billing_router,
+)
 from platform_api.config import PlatformSettings, get_settings
 from platform_api.db.base import Base
 from platform_api.db.schema import check_schema_readiness
@@ -173,10 +178,16 @@ def create_app(settings: PlatformSettings | None = None) -> FastAPI:
     api_v1.include_router(auth_router)
     api_v1.include_router(account_router)
     api_v1.include_router(admin_router)
+    api_v1.include_router(admin_billing_router)
+    api_v1.include_router(billing_router)
     api_v1.include_router(health_router)
 
     app.include_router(api_v1)
+    # Mount internal routes under /internal
+    internal = APIRouter(prefix="/internal")
+    internal.include_router(internal_billing_router)
+    app.include_router(internal)
+
     # Also include health_router at root for /health/live, /health/ready, /catalog
     app.include_router(health_router)
-
     return app
