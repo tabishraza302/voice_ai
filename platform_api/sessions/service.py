@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hmac
 import uuid
@@ -32,6 +33,7 @@ from platform_api.agents.models import (
     IdempotencyRecord,
     PlatformPromptVersion,
 )
+from platform_api.public.models import PublicDeployment, PublicGuestCapability
 from platform_api.agents.service import (
     check_idempotency_record,
     compute_payload_hash,
@@ -67,6 +69,7 @@ from platform_api.sessions.admission import (
     RuntimeRegistrationRejectedError,
     SessionAdmissionConfig,
     register_runtime as register_with_runtime,
+    public_session_admission_config,
     release_runtime as release_from_runtime,
     session_admission_config,
     session_runtime_config,
@@ -98,6 +101,9 @@ from platform_api.sessions.schemas import (
 
 
 SESSION_ADMISSION_ACTION = "session.admit"
+PUBLIC_SESSION_ADMISSION_ACTION = "public.session.admit"
+PUBLIC_SESSION_JOIN_ACTION = "public.session.join"
+PUBLIC_SESSION_END_ACTION = "public.session.end"
 SESSION_JOIN_ACTION = "session.join"
 SESSION_END_ACTION = "session.end"
 LIVE_SESSION_STATES = frozenset(
@@ -115,6 +121,13 @@ ALLOWED_RUNTIME_TRANSITIONS = {
     "RECONNECTING": frozenset({"ACTIVE", "ENDING"}),
     "ENDING": frozenset({"COMPLETED", "FAILED", "EXPIRED"}),
 }
+
+
+@dataclass(frozen=True)
+class GuestSessionAdmission:
+    session_id: uuid.UUID
+    hard_end_deadline: datetime
+    join_details: JoinDetails
 
 
 def _utc_now() -> datetime:
@@ -153,18 +166,23 @@ def _request_hash(
     *,
     agent_id: uuid.UUID,
     agent_version_id: uuid.UUID,
-    auth_session_id: uuid.UUID,
+    auth_session_id: uuid.UUID | None,
     origin: str,
+    kind: str = "voice_test",
+    public_deployment_id: uuid.UUID | None = None,
 ) -> str:
-    return compute_payload_hash(
-        {
-            "agent_id": str(agent_id),
-            "agent_version_id": str(agent_version_id),
-            "auth_session_id": str(auth_session_id),
-            "kind": "voice_test",
-            "origin": origin,
-        }
-    )
+    payload: dict[str, Any] = {
+        "agent_id": str(agent_id),
+        "agent_version_id": str(agent_version_id),
+        "auth_session_id": (
+            str(auth_session_id) if auth_session_id is not None else None
+        ),
+        "kind": kind,
+        "origin": origin,
+    }
+    if public_deployment_id is not None:
+        payload["public_deployment_id"] = str(public_deployment_id)
+    return compute_payload_hash(payload)
 
 
 async def _verify_owner_session(
@@ -377,11 +395,55 @@ async def _lock_runner_capacity(
     return row
 
 
+async def _verify_public_deployment(
+    db: AsyncSession,
+    *,
+    deployment_id: uuid.UUID,
+    owner_user_id: uuid.UUID,
+    agent_id: uuid.UUID,
+    agent_version_id: uuid.UUID,
+    origin: str,
+) -> User:
+    deployment = (
+        await db.execute(
+            select(PublicDeployment)
+            .where(PublicDeployment.id == deployment_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    agent = (
+        await db.execute(
+            select(Agent).where(Agent.id == agent_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    owner = (
+        await db.execute(
+            select(User).where(User.id == owner_user_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if (
+        deployment is None
+        or not deployment.enabled
+        or deployment.owner_user_id != owner_user_id
+        or deployment.agent_id != agent_id
+        or not hmac.compare_digest(deployment.origin, origin)
+        or agent is None
+        or not agent.enabled
+        or agent.owner_user_id != owner_user_id
+        or agent.current_published_version_id != agent_version_id
+    ):
+        raise NotFoundError("Public deployment is unavailable")
+    if owner is None or owner.status != "active":
+        raise ForbiddenError("Deployment owner is not eligible for public calls")
+    return owner
+
+
 async def _create_or_replay_reservation(
     db: AsyncSession,
     *,
-    principal: Principal,
-    auth_session_id: uuid.UUID,
+    principal: Principal | None,
+    owner_user_id: uuid.UUID,
+    auth_session_id: uuid.UUID | None,
     origin: str,
     agent_id: uuid.UUID,
     agent_version_id: uuid.UUID,
@@ -392,28 +454,60 @@ async def _create_or_replay_reservation(
     config: SessionAdmissionConfig,
     settings: PlatformSettings,
     now: datetime,
+    participant_kind: str = "owner",
+    public_deployment_id: uuid.UUID | None = None,
+    capability_digest: str | None = None,
 ) -> tuple[uuid.UUID, str, str | None]:
-    action = SESSION_ADMISSION_ACTION
+    if participant_kind not in {"owner", "guest"}:
+        raise DependencyUnavailableError("Session participant kind is invalid")
+    action = (
+        SESSION_ADMISSION_ACTION
+        if participant_kind == "owner"
+        else PUBLIC_SESSION_ADMISSION_ACTION
+    )
+    if participant_kind == "owner":
+        if principal is None or auth_session_id is None or public_deployment_id is not None:
+            raise UnauthenticatedError("A verified owner session is required")
+    elif (
+        principal is not None
+        or auth_session_id is not None
+        or public_deployment_id is None
+        or capability_digest is None
+    ):
+        raise UnauthenticatedError("A public guest admission is required")
+
     await lock_idempotency_key(
         db,
-        user_id=principal.user_id,
+        user_id=owner_user_id,
         idempotency_key=operation_id,
         action=action,
     )
     cached = await check_idempotency_record(
         db,
-        user_id=principal.user_id,
+        user_id=owner_user_id,
         idempotency_key=operation_id,
         action=action,
         request_hash=request_hash,
     )
-    if cached is not None:
-        await _verify_owner_session(
+    if participant_kind == "owner":
+        assert principal is not None and auth_session_id is not None
+        owner = await _verify_owner_session(
             db,
             principal=principal,
             auth_session_id=auth_session_id,
             now=now,
         )
+    else:
+        assert public_deployment_id is not None
+        owner = await _verify_public_deployment(
+            db,
+            deployment_id=public_deployment_id,
+            owner_user_id=owner_user_id,
+            agent_id=agent_id,
+            agent_version_id=agent_version_id,
+            origin=origin,
+        )
+    if cached is not None:
         raw_session_id = cached.response_json.get("session_id")
         try:
             session_id = uuid.UUID(str(raw_session_id))
@@ -430,13 +524,10 @@ async def _create_or_replay_reservation(
             "This admission operation already failed; use a new Idempotency-Key"
         )
 
-    session_admission_config(settings)
-    owner = await _verify_owner_session(
-        db,
-        principal=principal,
-        auth_session_id=auth_session_id,
-        now=now,
-    )
+    if participant_kind == "owner":
+        session_admission_config(settings)
+    else:
+        public_session_admission_config(settings)
     _, _, snapshot = await _load_owned_version(
         db,
         owner_user_id=owner.id,
@@ -479,8 +570,10 @@ async def _create_or_replay_reservation(
     participant_id = uuid.uuid4()
     connect_deadline = now + timedelta(seconds=config.setup_timeout_seconds)
     hard_end_deadline = now + timedelta(milliseconds=config.max_duration_ms)
+    session_kind = "voice_test" if participant_kind == "owner" else "voice"
+    is_public = participant_kind == "guest"
     tariff_snapshot = {
-        "kind": "voice_test",
+        "kind": session_kind,
         "currency": "INR",
         "rate_minor_per_minute": config.rate_minor_per_minute,
         "tariff_version": config.tariff_version,
@@ -489,7 +582,7 @@ async def _create_or_replay_reservation(
         "maximum_session_duration_ms": config.max_duration_ms,
         "setup_timeout_seconds": config.setup_timeout_seconds,
         "reconnect_grace_seconds": config.reconnect_grace_seconds,
-        "public": False,
+        "public": is_public,
         "paid": False,
     }
     session = Session(
@@ -498,7 +591,7 @@ async def _create_or_replay_reservation(
         participant_id=str(participant_id),
         agent_version_id=agent_version_id,
         tariff_snapshot=tariff_snapshot,
-        kind="voice_test",
+        kind=session_kind,
         state="CREATED",
         version=1,
         runner_id=config.runner_id,
@@ -537,11 +630,25 @@ async def _create_or_replay_reservation(
             session_id=session_id,
             owner_user_id=owner.id,
             auth_session_id=auth_session_id,
-            kind="owner",
+            kind=participant_kind,
             origin=origin,
             created_at=now,
         )
     )
+    await db.flush()
+    if is_public:
+        assert public_deployment_id is not None and capability_digest is not None
+        db.add(
+            PublicGuestCapability(
+                session_id=session_id,
+                deployment_id=public_deployment_id,
+                owner_user_id=owner.id,
+                participant_id=participant_id,
+                capability_digest=capability_digest,
+                expires_at=hard_end_deadline,
+                created_at=now,
+            )
+        )
     await store_idempotency_record(
         db,
         user_id=owner.id,
@@ -574,7 +681,6 @@ async def _load_reservation(
         await db.execute(
             select(SessionParticipant).where(
                 SessionParticipant.session_id == session_id,
-                SessionParticipant.kind == "owner",
             )
         )
     ).scalar_one_or_none()
@@ -650,6 +756,7 @@ async def _mark_admission_failure(
     operation_id: str,
     failure_code: str,
     now: datetime,
+    action: str = SESSION_ADMISSION_ACTION,
 ) -> None:
     session = (
         await db.execute(
@@ -676,7 +783,7 @@ async def _mark_admission_failure(
             .where(
                 IdempotencyRecord.user_id == user_id,
                 IdempotencyRecord.idempotency_key == operation_id,
-                IdempotencyRecord.action == SESSION_ADMISSION_ACTION,
+                IdempotencyRecord.action == action,
             )
             .with_for_update()
         )
@@ -699,6 +806,15 @@ async def _mark_admission_failure(
         "session_id": str(session_id),
         "failure_code": failure_code,
     }
+    capability = (
+        await db.execute(
+            select(PublicGuestCapability)
+            .where(PublicGuestCapability.session_id == session_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if capability is not None:
+        capability.revoked_at = capability.revoked_at or now
     await db.commit()
 
 
@@ -711,6 +827,7 @@ async def _complete_release_compensation(
     operation_id: str,
     failure_code: str,
     now: datetime,
+    action: str = SESSION_ADMISSION_ACTION,
 ) -> None:
     session, registration, _ = await _load_reservation(db, session_id=session_id)
     await db.commit()
@@ -767,6 +884,7 @@ async def _complete_release_compensation(
         operation_id=operation_id,
         failure_code=failure_code,
         now=stopped_at,
+        action=action,
     )
 async def _new_first_permit(
     db: AsyncSession,
@@ -830,6 +948,8 @@ async def _finalize_registered_session(
     config: SessionAdmissionConfig,
     permit: BudgetPermit,
     now: datetime,
+    participant_kind: str = "owner",
+    action: str = SESSION_ADMISSION_ACTION,
 ) -> str:
     session = (
         await db.execute(
@@ -852,7 +972,7 @@ async def _finalize_registered_session(
             select(SessionParticipant)
             .where(
                 SessionParticipant.session_id == session_id,
-                SessionParticipant.kind == "owner",
+                SessionParticipant.kind == participant_kind,
             )
             .with_for_update()
             .execution_options(populate_existing=True)
@@ -864,7 +984,7 @@ async def _finalize_registered_session(
             .where(
                 IdempotencyRecord.user_id == owner_user_id,
                 IdempotencyRecord.idempotency_key == operation_id,
-                IdempotencyRecord.action == SESSION_ADMISSION_ACTION,
+                IdempotencyRecord.action == action,
             )
             .with_for_update()
             .execution_options(populate_existing=True)
@@ -880,6 +1000,10 @@ async def _finalize_registered_session(
         or registration.runner_id != config.runner_id
         or session.runner_id != config.runner_id
         or session.agent_version_id is None
+        or session.kind != ("voice_test" if participant_kind == "owner" else "voice")
+        or not isinstance(session.tariff_snapshot, dict)
+        or session.tariff_snapshot.get("public") is not (participant_kind == "guest")
+        or session.tariff_snapshot.get("paid") is not False
     ):
         raise ConflictError("Session is not ready for registration finalization")
 
@@ -906,6 +1030,7 @@ async def _finalize_registered_session(
             or stored_join.participant_id != participant.participant_id
             or stored_join.owner_user_id != owner_user_id
             or stored_join.auth_session_id != participant.auth_session_id
+            or stored_join.participant_kind != participant_kind
             or stored_join.runner_id != registration.runner_id
             or stored_join.config_version_id != session.agent_version_id
             or stored_join.registration_id != registration.registration_id
@@ -944,6 +1069,7 @@ async def _finalize_registered_session(
             participant_id=participant.participant_id,
             owner_user_id=session.owner_user_id,
             auth_session_id=participant.auth_session_id,
+            participant_kind=participant_kind,
             runner_id=registration.runner_id,
             config_version_id=session.agent_version_id,
             registration_id=registration.registration_id,
@@ -980,12 +1106,14 @@ def _jwt_for_jti(
         "runner_id": row.runner_id,
         "registration_id": str(row.registration_id),
         "origin": row.origin,
-        "auth_session_id": str(row.auth_session_id),
+        "participant_kind": row.participant_kind,
         "jti": row.jti,
         "iat": int(row.issued_at.timestamp()),
         "nbf": int(row.issued_at.timestamp()),
         "exp": int(row.expires_at.timestamp()),
     }
+    if row.auth_session_id is not None:
+        claims["auth_session_id"] = str(row.auth_session_id)
     return jwt.encode(
         claims,
         config.join_private_key,
@@ -1050,6 +1178,76 @@ async def _registered_result(
     )
 
 
+async def _registered_guest_result(
+    db: AsyncSession,
+    *,
+    session_id: uuid.UUID,
+    jti: str,
+    config: SessionAdmissionConfig,
+) -> GuestSessionAdmission:
+    session = (
+        await db.execute(select(Session).where(Session.id == session_id))
+    ).scalar_one_or_none()
+    participant = (
+        await db.execute(
+            select(SessionParticipant).where(
+                SessionParticipant.session_id == session_id,
+                SessionParticipant.kind == "guest",
+            )
+        )
+    ).scalar_one_or_none()
+    join = (
+        await db.execute(select(SessionJoinJti).where(SessionJoinJti.jti == jti))
+    ).scalar_one_or_none()
+    capability = (
+        await db.execute(
+            select(PublicGuestCapability).where(
+                PublicGuestCapability.session_id == session_id
+            )
+        )
+    ).scalar_one_or_none()
+    now = _utc_now()
+    if (
+        session is None
+        or participant is None
+        or join is None
+        or capability is None
+        or session.state not in LIVE_SESSION_STATES
+        or session.kind != "voice"
+        or not isinstance(session.tariff_snapshot, dict)
+        or session.tariff_snapshot.get("public") is not True
+        or session.tariff_snapshot.get("paid") is not False
+        or session.owner_user_id != participant.owner_user_id
+        or participant.auth_session_id is not None
+        or join.participant_kind != "guest"
+        or join.auth_session_id is not None
+        or join.session_id != session_id
+        or join.participant_id != participant.participant_id
+        or join.owner_user_id != session.owner_user_id
+        or join.config_version_id != session.agent_version_id
+        or join.runner_id != session.runner_id
+        or join.origin != participant.origin
+        or capability.owner_user_id != session.owner_user_id
+        or capability.participant_id != participant.participant_id
+        or capability.revoked_at is not None
+        or capability.expires_at <= now
+        or join.expires_at <= now
+    ):
+        raise ConflictError("Stored guest admission result is no longer valid")
+    return GuestSessionAdmission(
+        session_id=session.id,
+        hard_end_deadline=session.hard_end_deadline,
+        join_details=JoinDetails(
+            session_id=session.id,
+            runner_id=join.runner_id,
+            config_version_id=join.config_version_id,
+            signaling_url=join.signaling_url,
+            join_token=_jwt_for_jti(join, config),
+            expires_at=join.expires_at,
+        ),
+    )
+
+
 async def register_runtime(
     db: AsyncSession,
     *,
@@ -1095,20 +1293,109 @@ async def reserve_session(
     operation_id: str,
     settings: PlatformSettings,
 ) -> RegisteredSession:
-    """Reserve capacity, register and fund the runner, then issue a join JTI."""
-    config = session_runtime_config(settings)
+    result = await _reserve_session(
+        db,
+        principal=principal,
+        owner_user_id=principal.user_id,
+        auth_session_id=auth_session_id,
+        origin=origin,
+        agent_id=agent_id,
+        agent_version_id=agent_version_id,
+        capabilities=capabilities,
+        qualification_settings=qualification_settings,
+        operation_id=operation_id,
+        settings=settings,
+    )
+    if not isinstance(result, RegisteredSession):
+        raise DependencyUnavailableError("Owner admission returned a guest result")
+    return result
+
+
+async def reserve_guest_session(
+    db: AsyncSession,
+    *,
+    owner_user_id: uuid.UUID,
+    deployment_id: uuid.UUID,
+    origin: str,
+    agent_id: uuid.UUID,
+    agent_version_id: uuid.UUID,
+    capabilities: AdapterCapabilities | None,
+    qualification_settings: AgentQualificationSettings | None,
+    operation_id: str,
+    capability_digest: str,
+    settings: PlatformSettings,
+) -> GuestSessionAdmission:
+    result = await _reserve_session(
+        db,
+        principal=None,
+        owner_user_id=owner_user_id,
+        auth_session_id=None,
+        origin=origin,
+        agent_id=agent_id,
+        agent_version_id=agent_version_id,
+        capabilities=capabilities,
+        qualification_settings=qualification_settings,
+        operation_id=operation_id,
+        settings=settings,
+        participant_kind="guest",
+        public_deployment_id=deployment_id,
+        capability_digest=capability_digest,
+    )
+    if not isinstance(result, GuestSessionAdmission):
+        raise DependencyUnavailableError("Guest admission returned an owner result")
+    return result
+
+
+async def _reserve_session(
+    db: AsyncSession,
+    *,
+    principal: Principal | None,
+    owner_user_id: uuid.UUID,
+    auth_session_id: uuid.UUID | None,
+    origin: str,
+    agent_id: uuid.UUID,
+    agent_version_id: uuid.UUID,
+    capabilities: AdapterCapabilities | None,
+    qualification_settings: AgentQualificationSettings | None,
+    operation_id: str,
+    settings: PlatformSettings,
+    participant_kind: str = "owner",
+    public_deployment_id: uuid.UUID | None = None,
+    capability_digest: str | None = None,
+) -> RegisteredSession | GuestSessionAdmission:
+    """Reserve and fund a session using owner or server-resolved guest authority."""
+    if participant_kind == "owner":
+        if principal is None or auth_session_id is None:
+            raise UnauthenticatedError("A verified owner session is required")
+        config = session_runtime_config(settings)
+        kind = "voice_test"
+    elif participant_kind == "guest":
+        if principal is not None or auth_session_id is not None:
+            raise UnauthenticatedError("A guest cannot use owner credentials")
+        config = public_session_admission_config(settings)
+        kind = "voice"
+    else:
+        raise ValidationError("Unsupported session participant kind")
     _check_origin(origin, settings)
     operation_id = _check_operation_id(operation_id)
+    action = (
+        SESSION_ADMISSION_ACTION
+        if participant_kind == "owner"
+        else PUBLIC_SESSION_ADMISSION_ACTION
+    )
     request_hash = _request_hash(
         agent_id=agent_id,
         agent_version_id=agent_version_id,
         auth_session_id=auth_session_id,
         origin=origin,
+        kind=kind,
+        public_deployment_id=public_deployment_id,
     )
     now = _utc_now()
     session_id, outcome, stored_jti = await _create_or_replay_reservation(
         db,
         principal=principal,
+        owner_user_id=owner_user_id,
         auth_session_id=auth_session_id,
         origin=origin,
         agent_id=agent_id,
@@ -1120,16 +1407,25 @@ async def reserve_session(
         config=config,
         settings=settings,
         now=now,
+        participant_kind=participant_kind,
+        public_deployment_id=public_deployment_id,
+        capability_digest=capability_digest,
     )
     if outcome == "registered":
         await db.commit()
-        return await _registered_result(
+        if participant_kind == "owner":
+            return await _registered_result(
+                db,
+                session_id=session_id,
+                jti=stored_jti or "",
+                config=config,
+            )
+        return await _registered_guest_result(
             db,
             session_id=session_id,
             jti=stored_jti or "",
             config=config,
         )
-
     session, registration, _participant = await _load_reservation(
         db, session_id=session_id
     )
@@ -1138,16 +1434,23 @@ async def reserve_session(
         idem = (
             await db.execute(
                 select(IdempotencyRecord).where(
-                    IdempotencyRecord.user_id == principal.user_id,
+                    IdempotencyRecord.user_id == owner_user_id,
                     IdempotencyRecord.idempotency_key == operation_id,
-                    IdempotencyRecord.action == SESSION_ADMISSION_ACTION,
+                    IdempotencyRecord.action == action,
                 )
             )
         ).scalar_one_or_none()
         await db.commit()
         if idem is None or not isinstance(idem.response_json.get("jti"), str):
             raise DependencyUnavailableError("Registered admission outcome is incomplete")
-        return await _registered_result(
+        if participant_kind == "owner":
+            return await _registered_result(
+                db,
+                session_id=session_id,
+                jti=idem.response_json["jti"],
+                config=config,
+            )
+        return await _registered_guest_result(
             db,
             session_id=session_id,
             jti=idem.response_json["jti"],
@@ -1160,10 +1463,11 @@ async def reserve_session(
             db,
             config=config,
             session_id=session_id,
-            user_id=principal.user_id,
+            user_id=owner_user_id,
             operation_id=operation_id,
             failure_code=registration.last_error_code or "ADMISSION_COMPENSATION",
             now=_utc_now(),
+            action=action,
         )
         raise ConflictError("Session admission failed and was compensated")
 
@@ -1182,10 +1486,11 @@ async def reserve_session(
             db,
             config=config,
             session_id=session_id,
-            user_id=principal.user_id,
+            user_id=owner_user_id,
             operation_id=operation_id,
             failure_code="CONNECT_TIMEOUT",
             now=expired_at,
+            action=action,
         )
         raise ConflictError("Session setup deadline expired before registration")
 
@@ -1202,10 +1507,11 @@ async def reserve_session(
         await _mark_admission_failure(
             db,
             session_id=session_id,
-            user_id=principal.user_id,
+            user_id=owner_user_id,
             operation_id=operation_id,
             failure_code="RUNTIME_REJECTED",
             now=_utc_now(),
+            action=action,
         )
         raise
 
@@ -1227,10 +1533,11 @@ async def reserve_session(
             db,
             config=config,
             session_id=session_id,
-            user_id=principal.user_id,
+            user_id=owner_user_id,
             operation_id=operation_id,
             failure_code="RUNTIME_RESERVATION_EXPIRED",
             now=now,
+            action=action,
         )
         raise ConflictError("Runtime registration expired before admission completed")
 
@@ -1259,10 +1566,11 @@ async def reserve_session(
             db,
             config=config,
             session_id=session_id,
-            user_id=principal.user_id,
+            user_id=owner_user_id,
             operation_id=operation_id,
             failure_code=failure_code,
             now=stopped_at,
+            action=action,
         )
         raise ConflictError(
             "Session funding failed; the runtime reservation was compensated"
@@ -1284,23 +1592,33 @@ async def reserve_session(
             db,
             config=config,
             session_id=session_id,
-            user_id=principal.user_id,
+            user_id=owner_user_id,
             operation_id=operation_id,
             failure_code=failure_code,
             now=_utc_now(),
+            action=action,
         )
         raise ConflictError("Session funding was denied or expired")
 
     jti = await _finalize_registered_session(
         db,
         session_id=session_id,
-        owner_user_id=principal.user_id,
+        owner_user_id=owner_user_id,
         operation_id=operation_id,
         config=config,
         permit=permit,
         now=_utc_now(),
+        participant_kind=participant_kind,
+        action=action,
     )
-    return await _registered_result(
+    if participant_kind == "owner":
+        return await _registered_result(
+            db,
+            session_id=session_id,
+            jti=jti,
+            config=config,
+        )
+    return await _registered_guest_result(
         db,
         session_id=session_id,
         jti=jti,
@@ -1339,7 +1657,7 @@ def _signing_claims(token: str, config: SessionAdmissionConfig) -> dict[str, Any
                     "runner_id",
                     "registration_id",
                     "origin",
-                    "auth_session_id",
+                    "participant_kind",
                 ],
             },
         )
@@ -1362,10 +1680,18 @@ def _signing_claims(token: str, config: SessionAdmissionConfig) -> dict[str, Any
                 "config_version_id",
                 "runner_id",
                 "registration_id",
-                "jti",
                 "origin",
-                "auth_session_id",
+                "participant_kind",
             )
+        )
+        or claims.get("participant_kind") not in {"owner", "guest"}
+        or (
+            claims["participant_kind"] == "owner"
+            and type(claims.get("auth_session_id")) is not str
+        )
+        or (
+            claims["participant_kind"] == "guest"
+            and "auth_session_id" in claims
         )
     ):
         raise UnauthenticatedError("Join token claims are invalid")
@@ -1394,11 +1720,14 @@ async def get_runtime_config(
             )
         )
     ).scalar_one_or_none()
+    participant_kind = (
+        "guest" if session is not None and session.kind == "voice" else "owner"
+    )
     participant = (
         await db.execute(
             select(SessionParticipant).where(
                 SessionParticipant.session_id == session_id,
-                SessionParticipant.kind == "owner",
+                SessionParticipant.kind == participant_kind,
             )
         )
     ).scalar_one_or_none()
@@ -1430,31 +1759,61 @@ async def get_runtime_config(
         )
     ):
         raise NotFoundError("Registered session runtime configuration not found")
-    auth_session = (
-        await db.execute(
-            select(AuthSession).where(AuthSession.id == participant.auth_session_id)
-        )
-    ).scalar_one_or_none()
+    auth_session = None
+    if participant.auth_session_id is not None:
+        auth_session = (
+            await db.execute(
+                select(AuthSession).where(
+                    AuthSession.id == participant.auth_session_id
+                )
+            )
+        ).scalar_one_or_none()
     owner = (
         await db.execute(select(User).where(User.id == session.owner_user_id))
     ).scalar_one_or_none()
+    capability = None
+    if participant.kind == "guest":
+        capability = (
+            await db.execute(
+                select(PublicGuestCapability).where(
+                    PublicGuestCapability.session_id == session_id
+                )
+            )
+        ).scalar_one_or_none()
     if (
-        auth_session is None
-        or auth_session.user_id != session.owner_user_id
-        or auth_session.state != "authenticated"
-        or auth_session.revoked_at is not None
-        or auth_session.idle_expires_at <= now
-        or auth_session.absolute_expires_at <= now
-        or owner is None
+        owner is None
         or owner.status != "active"
-        or auth_session.auth_version != owner.auth_version
         or participant.revoked_at is not None
-        or session.kind != "voice_test"
+        or participant.kind not in {"owner", "guest"}
+        or session.kind != ("voice_test" if participant.kind == "owner" else "voice")
         or not isinstance(session.tariff_snapshot, dict)
-        or session.tariff_snapshot.get("public") is not False
+        or session.tariff_snapshot.get("public") is not (participant.kind == "guest")
         or session.tariff_snapshot.get("paid") is not False
+        or (
+            participant.kind == "owner"
+            and (
+                auth_session is None
+                or auth_session.user_id != session.owner_user_id
+                or auth_session.state != "authenticated"
+                or auth_session.revoked_at is not None
+                or auth_session.idle_expires_at <= now
+                or auth_session.absolute_expires_at <= now
+                or auth_session.auth_version != owner.auth_version
+            )
+        )
+        or (
+            participant.kind == "guest"
+            and (
+                participant.auth_session_id is not None
+                or capability is None
+                or capability.owner_user_id != session.owner_user_id
+                or capability.participant_id != participant.participant_id
+                or capability.revoked_at is not None
+                or capability.expires_at <= now
+            )
+        )
     ):
-        raise ForbiddenError("Registered session owner authentication is no longer valid")
+        raise ForbiddenError("Registered session participant is no longer valid")
 
     version_row = (
         await db.execute(
@@ -1531,6 +1890,7 @@ async def get_runtime_config(
         owner_user_id=session.owner_user_id,
         participant_id=participant.participant_id,
         auth_session_id=participant.auth_session_id,
+        participant_kind=participant.kind,
         origin=participant.origin,
         runner_id=registration.runner_id,
         registration_id=registration.registration_id,
@@ -1754,6 +2114,251 @@ async def issue_join(
     )
 
 
+async def issue_guest_join(
+    db: AsyncSession,
+    *,
+    session_id: uuid.UUID,
+    owner_user_id: uuid.UUID,
+    origin: str,
+    operation_id: str,
+    settings: PlatformSettings,
+) -> JoinDetails:
+    """Issue a capability-bound, single-use guest reconnect token."""
+    config = public_session_admission_config(settings)
+    _check_origin(origin, settings)
+    operation_id = _check_operation_id(operation_id)
+    now = _utc_now()
+    request_hash = compute_payload_hash(
+        {"session_id": str(session_id), "owner_user_id": str(owner_user_id), "origin": origin}
+    )
+    await lock_idempotency_key(
+        db,
+        user_id=owner_user_id,
+        idempotency_key=operation_id,
+        action=PUBLIC_SESSION_JOIN_ACTION,
+    )
+    cached = await check_idempotency_record(
+        db,
+        user_id=owner_user_id,
+        idempotency_key=operation_id,
+        action=PUBLIC_SESSION_JOIN_ACTION,
+        request_hash=request_hash,
+    )
+    if cached is not None:
+        jti = cached.response_json.get("jti")
+        if cached.status_code != 201 or not isinstance(jti, str):
+            raise ConflictError("Stored guest reconnect outcome is not available")
+        await db.commit()
+        row = (
+            await db.execute(select(SessionJoinJti).where(SessionJoinJti.jti == jti))
+        ).scalar_one_or_none()
+        if (
+            row is None
+            or row.session_id != session_id
+            or row.owner_user_id != owner_user_id
+            or row.participant_kind != "guest"
+            or row.auth_session_id is not None
+            or not hmac.compare_digest(row.origin, origin)
+            or row.revoked_at is not None
+            or row.consumed_at is not None
+            or row.expires_at <= now
+        ):
+            raise ConflictError("Stored guest reconnect token is no longer usable")
+        return JoinDetails(
+            session_id=row.session_id,
+            runner_id=row.runner_id,
+            config_version_id=row.config_version_id,
+            signaling_url=row.signaling_url,
+            join_token=_jwt_for_jti(row, config),
+            expires_at=row.expires_at,
+        )
+
+    session = (
+        await db.execute(
+            select(Session).where(Session.id == session_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    participant = (
+        await db.execute(
+            select(SessionParticipant)
+            .where(
+                SessionParticipant.session_id == session_id,
+                SessionParticipant.kind == "guest",
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    registration = (
+        await db.execute(
+            select(RuntimeRegistration)
+            .where(RuntimeRegistration.session_id == session_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    budget = (
+        await db.execute(
+            select(CallBudget).where(CallBudget.session_id == session_id)
+        )
+    ).scalar_one_or_none()
+    peer = (
+        await db.execute(
+            select(SessionPeer)
+            .where(SessionPeer.session_id == session_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    capability = (
+        await db.execute(
+            select(PublicGuestCapability)
+            .where(PublicGuestCapability.session_id == session_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    owner = None
+    deployment = None
+    if session is not None and capability is not None:
+        owner = (
+            await db.execute(
+                select(User).where(User.id == session.owner_user_id)
+            )
+        ).scalar_one_or_none()
+        deployment = (
+            await db.execute(
+                select(PublicDeployment)
+                .where(PublicDeployment.id == capability.deployment_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+    version_agent_id = None
+    if session is not None and session.agent_version_id is not None:
+        version_agent_id = (
+            await db.execute(
+                select(AgentVersion.agent_id).where(
+                    AgentVersion.id == session.agent_version_id
+                )
+            )
+        ).scalar_one_or_none()
+    if (
+        session is None
+        or participant is None
+        or registration is None
+        or budget is None
+        or capability is None
+        or owner is None
+        or deployment is None
+        or owner.id != owner_user_id
+        or owner.status != "active"
+        or session.owner_user_id != owner_user_id
+        or participant.owner_user_id != owner_user_id
+        or participant.auth_session_id is not None
+        or participant.revoked_at is not None
+        or not hmac.compare_digest(participant.origin, origin)
+        or session.kind != "voice"
+        or session.agent_version_id is None
+        or not isinstance(session.tariff_snapshot, dict)
+        or session.tariff_snapshot.get("public") is not True
+        or session.tariff_snapshot.get("paid") is not False
+        or session.runner_id != config.runner_id
+        or registration.runner_id != config.runner_id
+        or registration.status != "REGISTERED"
+        or session.state not in {"REGISTERED", "RECONNECTING"}
+        or session.hard_end_deadline is None
+        or session.hard_end_deadline <= now
+        or (
+            session.state == "REGISTERED"
+            and (session.connect_deadline is None or session.connect_deadline <= now)
+        )
+        or budget.status != "OPEN"
+        or budget.permit_expiry is None
+        or budget.permit_expiry <= now
+        or budget.cumulative_authorized_ms <= budget.cumulative_proven_ms
+        or (peer is not None and peer.status == "ACTIVE")
+        or (session.state == "RECONNECTING" and (
+            peer is None or peer.status != "RELEASED"
+            or peer.reconnect_until is None or peer.reconnect_until <= now
+        ))
+        or capability.owner_user_id != owner_user_id
+        or capability.participant_id != participant.participant_id
+        or capability.revoked_at is not None
+        or capability.expires_at <= now
+        or deployment.owner_user_id != owner_user_id
+        or deployment.agent_id != version_agent_id
+        or not deployment.enabled
+        or deployment.disabled_at is not None
+        or not hmac.compare_digest(deployment.origin, origin)
+    ):
+        raise ConflictError("Guest session is not eligible for reconnect")
+    reconnect_until = peer.reconnect_until if peer is not None else None
+    expiry = min(
+        now + timedelta(seconds=config.join_ttl_seconds),
+        session.hard_end_deadline,
+        budget.permit_expiry,
+        capability.expires_at,
+        reconnect_until or session.hard_end_deadline,
+    )
+    expiry = datetime.fromtimestamp(int(expiry.timestamp()), tz=timezone.utc)
+    issued_at = datetime.fromtimestamp(int(now.timestamp()), tz=timezone.utc)
+    if expiry <= issued_at:
+        raise ConflictError("No live guest reconnect window remains")
+    stale_jtis = (
+        await db.execute(
+            select(SessionJoinJti)
+            .where(
+                SessionJoinJti.session_id == session_id,
+                SessionJoinJti.participant_id == participant.participant_id,
+                SessionJoinJti.participant_kind == "guest",
+                SessionJoinJti.revoked_at.is_(None),
+                SessionJoinJti.consumed_at.is_(None),
+            )
+            .with_for_update()
+        )
+    ).scalars().all()
+    for stale_jti in stale_jtis:
+        stale_jti.revoked_at = now
+    jti = str(uuid.uuid4())
+    db.add(
+        SessionJoinJti(
+            jti=jti,
+            session_id=session_id,
+            participant_id=participant.participant_id,
+            owner_user_id=owner_user_id,
+            auth_session_id=None,
+            participant_kind="guest",
+            runner_id=registration.runner_id,
+            config_version_id=session.agent_version_id,
+            registration_id=registration.registration_id,
+            session_version=session.version,
+            signaling_url=config.signaling_url,
+            origin=participant.origin,
+            issued_at=issued_at,
+            expires_at=expiry,
+            key_fingerprint=config.join_key_fingerprint,
+        )
+    )
+    await store_idempotency_record(
+        db,
+        user_id=owner_user_id,
+        idempotency_key=operation_id,
+        action=PUBLIC_SESSION_JOIN_ACTION,
+        request_hash=request_hash,
+        status_code=201,
+        response_json={"session_id": str(session_id), "jti": jti},
+    )
+    await db.commit()
+    row = (
+        await db.execute(select(SessionJoinJti).where(SessionJoinJti.jti == jti))
+    ).scalar_one()
+    await db.commit()
+    return JoinDetails(
+        session_id=session_id,
+        runner_id=row.runner_id,
+        config_version_id=row.config_version_id,
+        signaling_url=row.signaling_url,
+        join_token=_jwt_for_jti(row, config),
+        expires_at=row.expires_at,
+    )
+
+
 async def consume_join(
     db: AsyncSession,
     *,
@@ -1773,7 +2378,12 @@ async def consume_join(
     try:
         token_session_id = uuid.UUID(claims["session_id"])
         participant_id = uuid.UUID(claims["sub"])
-        token_auth_session_id = uuid.UUID(claims["auth_session_id"])
+        participant_kind = claims["participant_kind"]
+        token_auth_session_id = (
+            uuid.UUID(claims["auth_session_id"])
+            if participant_kind == "owner"
+            else None
+        )
         config_version_id = uuid.UUID(claims["config_version_id"])
         registration_id = uuid.UUID(claims["registration_id"])
         uuid.UUID(claims["jti"])
@@ -1802,7 +2412,6 @@ async def consume_join(
             select(SessionParticipant)
             .where(
                 SessionParticipant.session_id == session_id,
-                SessionParticipant.kind == "owner",
             )
             .with_for_update()
         )
@@ -1821,6 +2430,24 @@ async def consume_join(
             .with_for_update()
         )
     ).scalar_one_or_none()
+    guest_capability = None
+    deployment = None
+    if participant_kind == "guest":
+        guest_capability = (
+            await db.execute(
+                select(PublicGuestCapability)
+                .where(PublicGuestCapability.session_id == session_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if guest_capability is not None:
+            deployment = (
+                await db.execute(
+                    select(PublicDeployment).where(
+                        PublicDeployment.id == guest_capability.deployment_id
+                    )
+                )
+            ).scalar_one_or_none()
     if (
         session is None
         or registration is None
@@ -1832,9 +2459,9 @@ async def consume_join(
         or registration.registration_id != registration_id
         or session.runner_id != runtime_principal.runner_id
         or session.agent_version_id != config_version_id
-        or session.kind != "voice_test"
+        or session.kind != ("voice_test" if participant_kind == "owner" else "voice")
         or not isinstance(session.tariff_snapshot, dict)
-        or session.tariff_snapshot.get("public") is not False
+        or session.tariff_snapshot.get("public") is not (participant_kind == "guest")
         or session.tariff_snapshot.get("paid") is not False
         or session.state not in LIVE_SESSION_STATES - {"RESERVED"}
         or session.hard_end_deadline is None
@@ -1847,6 +2474,7 @@ async def consume_join(
             )
         )
         or participant.participant_id != participant_id
+        or participant.kind != participant_kind
         or participant.owner_user_id != session.owner_user_id
         or participant.auth_session_id != token_auth_session_id
         or participant.revoked_at is not None
@@ -1855,6 +2483,7 @@ async def consume_join(
         or jti.participant_id != participant_id
         or jti.owner_user_id != session.owner_user_id
         or jti.auth_session_id != token_auth_session_id
+        or jti.participant_kind != participant_kind
         or jti.config_version_id != config_version_id
         or jti.registration_id != registration_id
         or jti.runner_id != runtime_principal.runner_id
@@ -1922,26 +2551,51 @@ async def consume_join(
         or budget.cumulative_authorized_ms <= budget.cumulative_proven_ms
     ):
         raise ConflictError("Session has no live funded permit")
-    auth_session = (
-        await db.execute(
-            select(AuthSession).where(AuthSession.id == token_auth_session_id)
-        )
-    ).scalar_one_or_none()
+    auth_session = None
+    if token_auth_session_id is not None:
+        auth_session = (
+            await db.execute(
+                select(AuthSession).where(AuthSession.id == token_auth_session_id)
+            )
+        ).scalar_one_or_none()
     owner = (
         await db.execute(select(User).where(User.id == session.owner_user_id))
     ).scalar_one_or_none()
-    if (
+    if owner is None or owner.status != "active":
+        raise ForbiddenError("Join owner is no longer active")
+    if participant_kind == "owner" and (
         auth_session is None
         or auth_session.user_id != session.owner_user_id
         or auth_session.state != "authenticated"
         or auth_session.revoked_at is not None
         or auth_session.idle_expires_at <= now
         or auth_session.absolute_expires_at <= now
-        or owner is None
-        or owner.status != "active"
         or auth_session.auth_version != owner.auth_version
     ):
         raise ForbiddenError("Join owner authentication is no longer valid")
+    if participant_kind == "guest":
+        version_agent_id = (
+            await db.execute(
+                select(AgentVersion.agent_id).where(
+                    AgentVersion.id == session.agent_version_id
+                )
+            )
+        ).scalar_one_or_none()
+        if (
+            token_auth_session_id is not None
+            or guest_capability is None
+            or deployment is None
+            or guest_capability.owner_user_id != session.owner_user_id
+            or guest_capability.participant_id != participant.participant_id
+            or guest_capability.revoked_at is not None
+            or guest_capability.expires_at <= now
+            or deployment.owner_user_id != session.owner_user_id
+            or deployment.agent_id != version_agent_id
+            or not deployment.enabled
+            or deployment.disabled_at is not None
+            or not hmac.compare_digest(deployment.origin, payload.origin)
+        ):
+            raise ForbiddenError("Guest deployment or capability is no longer valid")
 
     jti.consumed_at = now
     jti.consumed_peer_id = payload.peer_id
@@ -2274,6 +2928,157 @@ async def end_owner_session(
     return view
 
 
+async def end_guest_session(
+    db: AsyncSession,
+    *,
+    session_id: uuid.UUID,
+    owner_user_id: uuid.UUID,
+    origin: str,
+    operation_id: str,
+    settings: PlatformSettings,
+) -> SessionStateView:
+    """End a public guest session using only its session-scoped capability."""
+    config = session_runtime_config(settings)
+    _check_origin(origin, settings)
+    operation_id = _check_operation_id(operation_id)
+    now = _utc_now()
+    request_hash = compute_payload_hash(
+        {"session_id": str(session_id), "owner_user_id": str(owner_user_id), "origin": origin}
+    )
+    await lock_idempotency_key(
+        db,
+        user_id=owner_user_id,
+        idempotency_key=operation_id,
+        action=PUBLIC_SESSION_END_ACTION,
+    )
+    cached = await check_idempotency_record(
+        db,
+        user_id=owner_user_id,
+        idempotency_key=operation_id,
+        action=PUBLIC_SESSION_END_ACTION,
+        request_hash=request_hash,
+    )
+    if cached is not None:
+        if cached.status_code not in {200, 202}:
+            raise ConflictError("Stored guest session end outcome is unavailable")
+        try:
+            view = decode_stored_response(SessionStateView, cached.response_json)
+        except PydanticValidationError as exc:
+            raise DependencyUnavailableError(
+                "Stored guest session end outcome is invalid"
+            ) from exc
+        await db.commit()
+        if view.state == "ENDING":
+            await _release_execution_slot(
+                db,
+                config=config,
+                session_id=session_id,
+                runner_id=config.runner_id,
+            )
+        return view
+
+    session = (
+        await db.execute(
+            select(Session)
+            .where(
+                Session.id == session_id,
+                Session.owner_user_id == owner_user_id,
+                Session.kind == "voice",
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    participant = (
+        await db.execute(
+            select(SessionParticipant)
+            .where(
+                SessionParticipant.session_id == session_id,
+                SessionParticipant.kind == "guest",
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    capability = (
+        await db.execute(
+            select(PublicGuestCapability)
+            .where(PublicGuestCapability.session_id == session_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if (
+        session is None
+        or participant is None
+        or capability is None
+        or participant.owner_user_id != owner_user_id
+        or participant.auth_session_id is not None
+        or participant.revoked_at is not None
+        or not hmac.compare_digest(participant.origin, origin)
+        or capability.owner_user_id != owner_user_id
+        or capability.participant_id != participant.participant_id
+        or capability.revoked_at is not None
+        or capability.expires_at <= now
+    ):
+        raise NotFoundError("Guest session is not available to this capability")
+    if session.runner_id != config.runner_id:
+        raise DependencyUnavailableError(
+            "Configured runner does not match the existing session assignment"
+        )
+    if session.state in LIVE_SESSION_STATES:
+        registration = (
+            await db.execute(
+                select(RuntimeRegistration)
+                .where(RuntimeRegistration.session_id == session_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        slot = (
+            await db.execute(
+                select(SessionSlot)
+                .where(SessionSlot.session_id == session_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if (
+            registration is None
+            or registration.runner_id != config.runner_id
+            or registration.status not in {"REGISTERED", "RELEASED"}
+            or slot is None
+            or slot.runner_id != config.runner_id
+        ):
+            raise DependencyUnavailableError(
+                "Guest session runtime release records are incomplete"
+            )
+        if session.state == "RESERVED":
+            raise ConflictError("Guest session admission is still being resolved")
+        if session.state != "ENDING":
+            session.state = "ENDING"
+            session.version += 1
+            session.failure_code = None
+    elif session.state not in TERMINAL_SESSION_STATES:
+        raise ConflictError("Guest session cannot be ended from its current state")
+    else:
+        capability.revoked_at = capability.revoked_at or now
+    view = _session_state_view(session)
+    await store_idempotency_record(
+        db,
+        user_id=owner_user_id,
+        idempotency_key=operation_id,
+        action=PUBLIC_SESSION_END_ACTION,
+        request_hash=request_hash,
+        status_code=202 if view.state == "ENDING" else 200,
+        response_json=view.model_dump(mode="json"),
+    )
+    await db.commit()
+    if view.state == "ENDING":
+        await _release_execution_slot(
+            db,
+            config=config,
+            session_id=session_id,
+            runner_id=config.runner_id,
+        )
+    return view
+
+
 async def release_peer(
     db: AsyncSession,
     *,
@@ -2494,6 +3299,16 @@ async def transition_runtime_session(
     elif payload.target_state == "ENDING":
         session.failure_code = payload.failure_code
 
+    if payload.target_state in TERMINAL_SESSION_STATES:
+        capability = (
+            await db.execute(
+                select(PublicGuestCapability)
+                .where(PublicGuestCapability.session_id == session_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if capability is not None:
+            capability.revoked_at = capability.revoked_at or now
     session.state = payload.target_state
     session.version += 1
     view = _session_state_view(session)
@@ -2510,12 +3325,15 @@ async def transition_runtime_session(
 
 __all__ = [
     "consume_join",
+    "end_guest_session",
     "end_owner_session",
     "get_owner_session",
     "get_runtime_config",
+    "issue_guest_join",
     "issue_join",
     "release_peer",
     "register_runtime",
+    "reserve_guest_session",
     "reserve_session",
     "transition_runtime_session",
 ]

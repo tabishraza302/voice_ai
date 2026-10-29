@@ -48,6 +48,7 @@ from platform_api.events.models import (
 )
 from platform_api.generation.models import GenerationJob
 from platform_api.testing.models import ChatMessage, ChatTestSession
+from platform_api.public.models import PublicDeployment, PublicGuestCapability
 
 __all__ = [
     "Base",
@@ -86,4 +87,6 @@ __all__ = [
     "GenerationJob",
     "ChatTestSession",
     "ChatMessage",
+    "PublicDeployment",
+    "PublicGuestCapability",
 ]
