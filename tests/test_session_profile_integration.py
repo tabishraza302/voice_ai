@@ -8,6 +8,15 @@ from bot.config import SYSTEM_PROMPT, Settings
 from bot.db.base import Base
 from bot.session_settings import resolve_session_settings
 
+@pytest.fixture(autouse=True)
+def isolate_ollama_catalog(monkeypatch):
+    """Isolate non-live profile integration tests from actual Ollama by injecting catalog."""
+    async def fake_fetch_local_llm_models(settings, *, timeout=2.0):
+        return {"qwen3.5:4b", "configured-local-model"}
+
+    monkeypatch.setattr("bot.services.fetch_local_llm_models", fake_fetch_local_llm_models)
+
+
 
 @pytest_asyncio.fixture
 async def session():
