@@ -10,7 +10,7 @@ Verifies:
 - Custom CORS validation: wildcards forbidden, non-HTTPS forbidden in staging/prod
 - CORS defaults: development defaults to [web_origin], production defaults to []
 - Trusted proxy CIDR validation: invalid CIDRs/IPs rejected
-- Fail-closed on malformed local_database_url
+- Fail-closed on malformed database_url
 - Zero and negative duration/limit/concurrency/port validation
 - Invariant validations: idle TTL <= session TTL, touch <= session TTL, step-up <= session TTL,
   mail lease > SMTP timeout (each reaching its intended validation branch)
@@ -20,8 +20,8 @@ Verifies:
 - Key validation (32-byte CSRF/rate keys, Fernet MFA key)
 - Mail mode and SMTP validation
 - Feature flags default to False (cannot enable unsafe capabilities)
-- Database separation: reject SQLite, non-PostgreSQL, non-asyncpg, local default DB collision,
-  and configured local DB collision without importing bot.db.
+- Database settings: reject SQLite, non-PostgreSQL, non-asyncpg, require valid postgres_schema,
+  and accept sharing local database with schema separation.
 """
 
 from __future__ import annotations
@@ -256,11 +256,10 @@ def test_trusted_proxy_cidrs_validation():
     assert s.trusted_proxy_cidrs == ["10.0.0.0/8", "192.168.1.1", "172.16.0.0/12"]
 
 
-def test_malformed_local_database_url_fails_closed():
-    """Malformed local_database_url must fail closed with ValidationError."""
+def test_malformed_database_url_fails_closed():
+    """Malformed database_url must fail closed with ValidationError."""
     with pytest.raises(ValidationError):
-        make_settings(local_database_url="not-a-valid-database-url")
-
+        make_settings(database_url="not-a-valid-database-url")
 
 def test_settings_rejects_zero_or_negative_durations():
     """Reject zero or negative duration, TTL, count, concurrency, and port values."""
@@ -515,14 +514,40 @@ def test_feature_flags_default_to_false():
     assert settings.enable_gateway is False
 
 
-def test_settings_rejects_default_local_bot_db_collision():
-    """Reject platform DB URL pointing to default local DB (127.0.0.1:5439/voice_ai or localhost:5439/voice_ai)."""
+def test_settings_accepts_default_local_bot_db_with_schema_separation():
+    """Accept platform DB URL pointing to default local DB with non-colliding schema separation."""
+    settings = make_settings(
+        database_url="postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai"
+    )
+    assert settings.database_url == "postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai"
+    assert settings.postgres_schema == "platform"
+
+    settings_localhost = make_settings(
+        database_url="postgresql+asyncpg://voice_ai:voice_ai@localhost:5439/voice_ai"
+    )
+    assert settings_localhost.database_url == "postgresql+asyncpg://voice_ai:voice_ai@localhost:5439/voice_ai"
+
+
+def test_settings_rejects_public_schema():
+    """Reject 'public' schema to prevent collision with local bot tables in shared DB."""
+    with pytest.raises(ValidationError) as exc:
+        make_settings(postgres_schema="public")
+    assert "Platform schema cannot be 'public'" in str(exc.value)
+
+def test_settings_rejects_phoenix_schema():
+    """Reject 'phoenix' schema to prevent collision with Phoenix telemetry schema in shared DB."""
+    with pytest.raises(ValidationError) as exc:
+        make_settings(postgres_schema="phoenix")
+    assert "Platform schema cannot be 'phoenix'" in str(exc.value)
+
+
+def test_settings_rejects_invalid_schema_identifiers():
+    """Reject empty, system, or invalid schema identifiers."""
     with pytest.raises(ValidationError):
-        make_settings(
-            database_url="postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai"
-        )
+        make_settings(postgres_schema="")
 
     with pytest.raises(ValidationError):
-        make_settings(
-            database_url="postgresql+asyncpg://voice_ai:voice_ai@localhost:5439/voice_ai"
-        )
+        make_settings(postgres_schema="pg_catalog")
+
+    with pytest.raises(ValidationError):
+        make_settings(postgres_schema="invalid-schema-name")

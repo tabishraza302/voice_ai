@@ -41,17 +41,20 @@ TEST_KEYS = {
 
 def test_platform_settings_no_implicit_dotenv(monkeypatch):
     """PlatformSettings must never implicitly load root .env when env vars are absent."""
-    # Ensure PLATFORM_DATABASE_URL is not in environment
-    monkeypatch.delenv("PLATFORM_DATABASE_URL", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("database_url", raising=False)
+    monkeypatch.delenv("PLATFORM_DATABASE_URL", raising=False)
+    monkeypatch.delenv("PLATFORM_AUTH_CSRF_KEY", raising=False)
+    monkeypatch.delenv("PLATFORM_AUTH_RATE_KEY", raising=False)
+    monkeypatch.delenv("PLATFORM_AUTH_MFA_KEY", raising=False)
 
     with pytest.raises(ValidationError) as exc_info:
         PlatformSettings()
 
-    # Must fail because database_url is required
+    # Must fail because database_url and auth keys are required
     errors = exc_info.value.errors()
-    assert any("database_url" in str(e["loc"]) or "PLATFORM_DATABASE_URL" in str(e["loc"]) for e in errors)
-
+    assert any("database_url" in str(e["loc"]).lower() for e in errors)
+    assert any("csrf" in str(e["loc"]).lower() or "rate" in str(e["loc"]).lower() for e in errors)
 
 def test_platform_settings_rejects_sqlite():
     """PlatformSettings must refuse SQLite URLs; no local fallback is permitted."""
@@ -63,27 +66,49 @@ def test_platform_settings_rejects_sqlite():
     assert "SQLite is not supported" in str(exc_info.value)
 
 
-def test_platform_settings_rejects_same_database_as_local():
-    """PlatformSettings must refuse connection if pointing to same DB as local DATABASE_URL."""
+def test_platform_settings_accepts_shared_database_with_schema_separation():
+    """PlatformSettings must accept shared DB with schema separation."""
+    settings = PlatformSettings(
+        database_url="postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai",
+        **TEST_KEYS,
+    )
+    assert settings.database_url == "postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai"
+    assert settings.postgres_schema == "platform"
+
+
+def test_platform_settings_rejects_public_schema():
+    """PlatformSettings must refuse 'public' schema to prevent collision with local tables."""
     with pytest.raises(ValidationError) as exc_info:
         PlatformSettings(
             database_url="postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai",
-            local_database_url="postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai",
+            postgres_schema="public",
             **TEST_KEYS,
         )
-    assert ("same database" in str(exc_info.value)) or ("default local bot database" in str(exc_info.value))
+    assert "Platform schema cannot be 'public'" in str(exc_info.value)
 
 
-def test_platform_settings_accepts_separate_postgres():
-    """PlatformSettings accepts distinct PostgreSQL database."""
-    settings = PlatformSettings(
-        database_url="postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai_platform",
-        local_database_url="postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai",
-        **TEST_KEYS,
-    )
-    assert settings.database_url == "postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai_platform"
-    assert settings.schema_version == "platform-v1"
+def test_platform_settings_rejects_phoenix_schema():
+    """PlatformSettings must refuse 'phoenix' schema to prevent collision with telemetry tables."""
+    with pytest.raises(ValidationError) as exc_info:
+        PlatformSettings(
+            database_url="postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai",
+            postgres_schema="phoenix",
+            **TEST_KEYS,
+        )
+    assert "Platform schema cannot be 'phoenix'" in str(exc_info.value)
 
+
+def test_platform_settings_requires_explicit_database_url(monkeypatch):
+    """PlatformSettings requires explicit shared DATABASE_URL in environment with no silent default."""
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("database_url", raising=False)
+    monkeypatch.delenv("PLATFORM_DATABASE_URL", raising=False)
+
+    with pytest.raises(ValidationError) as exc_info:
+        PlatformSettings(**TEST_KEYS)
+
+    errors = exc_info.value.errors()
+    assert any("database_url" in str(e["loc"]).lower() for e in errors)
 
 def test_platform_metadata_independent_from_bot_db():
     """Base.metadata must declare platform tables only, completely disjoint from bot.db.Base."""
@@ -296,34 +321,34 @@ async def test_schema_concurrent_initialization(fresh_pg: FreshPostgres):
 @pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_schema_mismatch_refusal(fresh_pg: FreshPostgres):
-    """Detect and reject missing required tables, extra unexpected tables, and unexpected views."""
+    """Detect and reject missing required tables, extra unexpected tables, and unexpected views within platform schema."""
     metadata_hash = compute_metadata_hash(Base.metadata)
 
     # Initialize clean schema
     await initialize_schema(fresh_pg.engine, metadata_hash=metadata_hash)
     assert await check_schema_readiness(fresh_pg.engine) is True
 
-    # 1. Missing required table: drop wallet_accounts
+    # 1. Missing required table: drop platform.wallet_accounts
     async with fresh_pg.engine.begin() as conn:
-        await conn.execute(text("DROP TABLE wallet_accounts CASCADE"))
+        await conn.execute(text("DROP TABLE platform.wallet_accounts CASCADE"))
 
     assert await check_schema_readiness(fresh_pg.engine) is False
     with pytest.raises(SchemaMismatch):
         await initialize_schema(fresh_pg.engine, metadata_hash=metadata_hash)
 
-    # 2. Recreate missing table structure so table count is restored, then add extra table
+    # 2. Recreate missing table structure so table count is restored, then add extra table in platform schema
     async with fresh_pg.engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        await conn.execute(text("CREATE TABLE unexpected_extra_table (id INT PRIMARY KEY)"))
+        await conn.execute(text("CREATE TABLE platform.unexpected_extra_table (id INT PRIMARY KEY)"))
 
     assert await check_schema_readiness(fresh_pg.engine) is False
     with pytest.raises(SchemaMismatch):
         await initialize_schema(fresh_pg.engine, metadata_hash=metadata_hash)
 
-    # 3. Drop extra table, add unexpected view
+    # 3. Drop extra table, add unexpected view in platform schema
     async with fresh_pg.engine.begin() as conn:
-        await conn.execute(text("DROP TABLE unexpected_extra_table"))
-        await conn.execute(text("CREATE VIEW unexpected_view AS SELECT 1 AS col"))
+        await conn.execute(text("DROP TABLE platform.unexpected_extra_table"))
+        await conn.execute(text("CREATE VIEW platform.unexpected_view AS SELECT 1 AS col"))
 
     assert await check_schema_readiness(fresh_pg.engine) is False
     with pytest.raises(SchemaMismatch):
@@ -333,10 +358,11 @@ async def test_schema_mismatch_refusal(fresh_pg: FreshPostgres):
 @pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_schema_rejects_unknown_nonempty_database(fresh_pg: FreshPostgres):
-    """Refuse to initialize an unknown non-empty database that lacks schema_info."""
-    # Create an arbitrary non-platform table before initialization
+    """Refuse to initialize an unknown non-empty platform schema that lacks schema_info."""
+    # Create an arbitrary non-platform table inside the platform schema before initialization
     async with fresh_pg.engine.begin() as conn:
-        await conn.execute(text("CREATE TABLE foreign_untracked (id INT PRIMARY KEY, name TEXT)"))
+        await conn.execute(text("CREATE SCHEMA IF NOT EXISTS platform"))
+        await conn.execute(text("CREATE TABLE platform.foreign_untracked (id INT PRIMARY KEY, name TEXT)"))
 
     assert await check_schema_readiness(fresh_pg.engine) is False
     with pytest.raises(SchemaMismatch):
@@ -346,9 +372,10 @@ async def test_schema_rejects_unknown_nonempty_database(fresh_pg: FreshPostgres)
 @pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_schema_rejects_standalone_sequence(fresh_pg: FreshPostgres):
-    """Refuse to initialize an empty database that contains a pre-existing standalone sequence."""
+    """Refuse to initialize when platform schema contains a pre-existing standalone sequence."""
     async with fresh_pg.engine.begin() as conn:
-        await conn.execute(text("CREATE SEQUENCE standalone_test_seq"))
+        await conn.execute(text("CREATE SCHEMA IF NOT EXISTS platform"))
+        await conn.execute(text("CREATE SEQUENCE platform.standalone_test_seq"))
 
     assert await check_schema_readiness(fresh_pg.engine) is False
     with pytest.raises(SchemaMismatch):
@@ -358,9 +385,10 @@ async def test_schema_rejects_standalone_sequence(fresh_pg: FreshPostgres):
 @pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_schema_rejects_custom_type(fresh_pg: FreshPostgres):
-    """Refuse to initialize an empty database that contains a pre-existing custom type/enum."""
+    """Refuse to initialize when platform schema contains a pre-existing custom type/enum."""
     async with fresh_pg.engine.begin() as conn:
-        await conn.execute(text("CREATE TYPE custom_test_enum AS ENUM ('first', 'second')"))
+        await conn.execute(text("CREATE SCHEMA IF NOT EXISTS platform"))
+        await conn.execute(text("CREATE TYPE platform.custom_test_enum AS ENUM ('first', 'second')"))
 
     assert await check_schema_readiness(fresh_pg.engine) is False
     with pytest.raises(SchemaMismatch):
@@ -369,58 +397,79 @@ async def test_schema_rejects_custom_type(fresh_pg: FreshPostgres):
 
 @pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_schema_rejects_custom_user_schema(fresh_pg: FreshPostgres):
-    """Refuse to initialize a database that contains an unexpected user-created schema."""
+async def test_schema_tolerates_local_and_phoenix_schemas(fresh_pg: FreshPostgres):
+    """Platform initialization tolerates legitimate local tables in public and external schemas like phoenix."""
+    # Create legitimate local bot tables in public schema and an external Phoenix schema
     async with fresh_pg.engine.begin() as conn:
-        await conn.execute(text("CREATE SCHEMA custom_user_schema"))
+        await conn.execute(text("CREATE SCHEMA IF NOT EXISTS phoenix"))
+        await conn.execute(text("CREATE TABLE phoenix.spans (id TEXT PRIMARY KEY, span_name TEXT)"))
+        await conn.execute(text("CREATE TABLE public.local_agents (id TEXT PRIMARY KEY, name TEXT)"))
+        await conn.execute(text("CREATE TABLE public.voice_sessions (id TEXT PRIMARY KEY)"))
+        await conn.execute(text("CREATE VIEW public.local_sessions_view AS SELECT id FROM public.voice_sessions"))
 
-    assert await check_schema_readiness(fresh_pg.engine) is False
-    with pytest.raises(SchemaMismatch):
-        await initialize_schema(fresh_pg.engine)
+    # Platform schema initialization must succeed despite non-empty public and phoenix schemas
+    await initialize_schema(fresh_pg.engine)
+    assert await check_schema_readiness(fresh_pg.engine) is True
+
+    # Verify public and phoenix tables/views remain completely intact and unaffected
+    async with fresh_pg.engine.connect() as conn:
+        local_tables = await conn.execute(
+            text("SELECT relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind = 'r'")
+        )
+        assert {"local_agents", "voice_sessions"} <= {r[0] for r in local_tables.all()}
+
+        phoenix_tables = await conn.execute(
+            text("SELECT relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'phoenix' AND c.relkind = 'r'")
+        )
+        assert {"spans"} <= {r[0] for r in phoenix_tables.all()}
+
+        # Verify platform tables only exist in platform schema, not leaked into public
+        public_table_names = {
+            r[0]
+            for r in (
+                await conn.execute(
+                    text("SELECT relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public'")
+                )
+            ).all()
+        }
+        assert "schema_info" not in public_table_names
+        assert "users" not in public_table_names
+        assert "wallet_accounts" not in public_table_names
+
 
 @pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_platform_initialization_leaves_legacy_db_untouched(fresh_pg: FreshPostgres):
-    """Verify platform schema initialization does not modify or contaminate the legacy database."""
+    """Verify platform schema initialization does not modify or contaminate local/legacy tables."""
     from sqlalchemy import inspect
 
-    legacy_url = os.environ.get("DATABASE_URL") or os.environ.get("LOCAL_DATABASE_URL")
-    legacy_engine = None
-    legacy_tables_before: set[str] = set()
+    # Pre-populate public schema with local bot tables
+    async with fresh_pg.engine.begin() as conn:
+        await conn.execute(text("CREATE TABLE IF NOT EXISTS public.bot_agent_presets (id TEXT PRIMARY KEY)"))
+        await conn.execute(text("CREATE TABLE IF NOT EXISTS public.session_history (id TEXT PRIMARY KEY)"))
 
-    if legacy_url and "sqlite" not in legacy_url:
-        try:
-            legacy_engine = create_async_engine(legacy_url)
-            def _get_tables(conn):
-                return set(inspect(conn).get_table_names())
-            async with legacy_engine.connect() as conn:
-                legacy_tables_before = await conn.run_sync(_get_tables)
-        except Exception:
-            legacy_engine = None
+    def _get_public_tables(conn):
+        return set(inspect(conn).get_table_names(schema="public"))
 
-    try:
-        # Initialize platform schema on isolated fresh_pg
-        await initialize_schema(fresh_pg.engine)
+    async with fresh_pg.engine.connect() as conn:
+        public_before = await conn.run_sync(_get_public_tables)
 
-        # 1. Assert fresh_pg contains only platform tables, none from legacy bot models
-        def _inspect_fresh(conn):
-            return set(inspect(conn).get_table_names())
-        async with fresh_pg.engine.connect() as conn:
-            platform_tables = await conn.run_sync(_inspect_fresh)
+    # Initialize platform schema on the same database
+    await initialize_schema(fresh_pg.engine)
 
-        legacy_bot_tables = {"bot_agent_presets", "session_history", "voice_sessions"}
-        assert not (platform_tables & legacy_bot_tables), "Legacy tables contaminated platform database"
+    async with fresh_pg.engine.connect() as conn:
+        public_after = await conn.run_sync(_get_public_tables)
 
-        # 2. Assert legacy database (if accessible) is completely untouched
-        if legacy_engine is not None:
-            async with legacy_engine.connect() as conn:
-                legacy_tables_after = await conn.run_sync(_get_tables)
-            assert legacy_tables_before == legacy_tables_after, "Legacy database tables were modified by platform init"
-            assert "schema_info" not in legacy_tables_after, "Platform schema_info leaked into legacy database"
-    finally:
-        if legacy_engine is not None:
-            await legacy_engine.dispose()
+        def _get_platform_tables(c):
+            return set(inspect(c).get_table_names(schema="platform"))
 
+        platform_tables = await conn.run_sync(_get_platform_tables)
+
+    assert public_before == public_after, "Local public tables were modified by platform initialization"
+    assert "schema_info" not in public_after, "Platform schema_info leaked into public schema"
+    assert "users" not in public_after, "Platform users table leaked into public schema"
+    assert "schema_info" in platform_tables, "Platform schema_info missing from platform schema"
+    assert "users" in platform_tables, "Platform users table missing from platform schema"
 @pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_cli_init_and_independent_app_readiness(fresh_pg: FreshPostgres):
@@ -451,3 +500,21 @@ async def test_cli_init_and_independent_app_readiness(fresh_pg: FreshPostgres):
         assert ready is True
     finally:
         await app_engine.dispose()
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_nondefault_platform_schema_initializes_and_checks_readiness(fresh_pg: FreshPostgres):
+    """The configured platform schema is created and verified without touching the default schema."""
+    schema = "platform_custom"
+
+    await fresh_pg.initialize(schema=schema)
+    assert await check_schema_readiness(fresh_pg.engine, schema=schema) is True
+
+    async with fresh_pg.engine.connect() as conn:
+        assert await conn.scalar(
+            text("SELECT to_regclass(:qualified_name) IS NOT NULL"),
+            {"qualified_name": f"{schema}.schema_info"},
+        ) is True
+        assert await conn.scalar(
+            text("SELECT to_regclass('platform.schema_info') IS NOT NULL")
+        ) is False

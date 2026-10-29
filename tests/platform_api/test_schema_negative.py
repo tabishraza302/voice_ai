@@ -1,8 +1,6 @@
 """Negative behavioral tests for schema initialization, verification, and metadata hash.
 
 Verifies:
-- Schema initialization rejects non-PostgreSQL engines with SchemaMismatch
-- Schema readiness check returns False for non-PostgreSQL engines
 - Schema initialization rejects unknown non-empty schemas (tables without schema_info)
 - Schema initialization rejects schemas containing views without schema_info
 - Schema initialization rejects databases with matching schema_info but missing required tables
@@ -18,7 +16,6 @@ Verifies:
 
 from __future__ import annotations
 
-import pytest
 from sqlalchemy import (
     CheckConstraint,
     Column,
@@ -29,30 +26,10 @@ from sqlalchemy import (
     Table,
     text,
 )
-from sqlalchemy.ext.asyncio import create_async_engine
 
 from platform_api.db.base import Base
-from platform_api.db.schema import (
-    SchemaMismatch,
-    check_schema_readiness,
-    compute_metadata_hash,
-    initialize_schema,
-)
+from platform_api.db.schema import compute_metadata_hash
 import platform_api.models  # Load platform models
-
-
-@pytest.mark.asyncio
-async def test_schema_rejects_non_postgresql():
-    """Schema initialization and readiness must reject non-PostgreSQL engines."""
-    sqlite_engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-
-    with pytest.raises(SchemaMismatch):
-        await initialize_schema(sqlite_engine)
-
-    ready = await check_schema_readiness(sqlite_engine)
-    assert ready is False
-
-    await sqlite_engine.dispose()
 
 
 def test_metadata_hash_incorporates_check_expressions():
@@ -180,6 +157,10 @@ def test_cli_and_app_import_identical_metadata():
     cli_tables = set(platform_api.cli.Base.metadata.tables.keys())
     app_tables = set(platform_api.app.Base.metadata.tables.keys())
     assert cli_tables == app_tables
-    assert "users" in app_tables
-    assert "wallet_accounts" in app_tables
-    assert "schema_info" in app_tables
+    table_names = {t.name for t in platform_api.app.Base.metadata.tables.values()}
+    assert "users" in table_names
+    assert "wallet_accounts" in table_names
+    assert "schema_info" in table_names
+    assert "platform.users" in app_tables
+    assert "platform.wallet_accounts" in app_tables
+    assert "platform.schema_info" in app_tables

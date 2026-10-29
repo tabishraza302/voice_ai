@@ -3,9 +3,11 @@
 Owns validated environment variables, connection URLs, secret keys,
 cookie policies, lifetime policies, and runtime boundaries.
 
-Explicitly rejects SQLite URLs (no fallback), forbids pointing
-PLATFORM_DATABASE_URL at the local default database (localhost:5439/voice_ai)
-or configured local DATABASE_URL, and never imports bot.db.
+Requires an explicit shared PostgreSQL database in the environment via DATABASE_URL
+(no implicit .env loading or silent fallback), isolates platform tables in a
+dedicated PostgreSQL schema (default 'platform') that cannot collide with local
+'public' or 'phoenix' schemas, explicitly rejects SQLite URLs (no fallback),
+and never imports bot.db.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ from __future__ import annotations
 import base64
 from functools import lru_cache
 import ipaddress
+import re
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -78,18 +81,20 @@ class PlatformSettings(BaseSettings):
     # --- Database -------------------------------------------------------------
     database_url: str = Field(
         ...,
-        validation_alias=AliasChoices("PLATFORM_DATABASE_URL", "database_url"),
-        description="PostgreSQL asyncpg connection URL for platform database",
-    )
-    local_database_url: str | None = Field(
-        default=None,
         validation_alias=AliasChoices(
             "DATABASE_URL",
-            "LOCAL_DATABASE_URL",
-            "PLATFORM_LOCAL_DATABASE_URL",
-            "local_database_url",
+            "database_url",
         ),
-        description="Local bot database URL to verify database isolation",
+        description="Shared PostgreSQL asyncpg connection URL for the entire application (required in environment)",
+    )
+    postgres_schema: str = Field(
+        default="platform",
+        validation_alias=AliasChoices(
+            "PLATFORM_POSTGRES_SCHEMA",
+            "PLATFORM_SCHEMA",
+            "postgres_schema",
+        ),
+        description="PostgreSQL schema name isolating platform tables within the database",
     )
 
     # --- Server and Networking ------------------------------------------------
@@ -394,12 +399,12 @@ class PlatformSettings(BaseSettings):
     @classmethod
     def validate_database_url(cls, v: str) -> str:
         if not v or not v.strip():
-            raise ValueError("PLATFORM_DATABASE_URL is required and cannot be empty.")
+            raise ValueError("DATABASE_URL is required and cannot be empty.")
         url_str = v.strip()
         try:
             parsed = make_url(url_str)
         except Exception as e:
-            raise ValueError(f"Invalid PLATFORM_DATABASE_URL: {e}") from e
+            raise ValueError(f"Invalid DATABASE_URL: {e}") from e
 
         backend = parsed.get_backend_name()
         if backend == "sqlite":
@@ -417,6 +422,27 @@ class PlatformSettings(BaseSettings):
                 f"Platform database must use asyncpg driver (postgresql+asyncpg://), got: {driver}"
             )
         return url_str
+    @field_validator("postgres_schema")
+    @classmethod
+    def validate_postgres_schema(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Platform schema cannot be empty.")
+        schema = v.strip().lower()
+        if (
+            schema in {"public", "information_schema", "pg_catalog", "phoenix"}
+            or schema.startswith("pg_")
+        ):
+            raise ValueError(
+                f"Platform schema cannot be '{schema}'. It must be a dedicated non-system, "
+                "non-colliding schema (conventionally 'platform') that does not conflict with "
+                "local tables ('public') or Phoenix telemetry ('phoenix')."
+            )
+        if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", schema):
+            raise ValueError(
+                f"Platform schema '{schema}' is not a valid PostgreSQL identifier."
+            )
+        return schema
+
 
     @field_validator("env")
     @classmethod
@@ -641,48 +667,17 @@ class PlatformSettings(BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def validate_database_separation(self) -> PlatformSettings:
+    def validate_database_schema(self) -> PlatformSettings:
         if not self.database_url:
             return self
 
-        plat_url = make_url(self.database_url)
-        plat_host = (plat_url.host or "localhost").lower()
-        plat_port = plat_url.port or 5432
-        plat_db = (plat_url.database or "").lstrip("/")
-
-        # Check collision with local default DB (localhost:5439/voice_ai or 127.0.0.1:5439/voice_ai)
-        if plat_host in {"127.0.0.1", "localhost"} and plat_port == 5439 and plat_db == "voice_ai":
+        # Platform and local share the same database with schema separation (default 'platform').
+        # Ensure postgres_schema is not 'public' or 'phoenix', which would collide with local or Phoenix tables.
+        if self.postgres_schema.lower() in {"public", "phoenix"}:
             raise ValueError(
-                "PLATFORM_DATABASE_URL points to the default local bot database "
-                "(localhost:5439/voice_ai). The platform database must be a separate database."
+                f"Platform schema cannot be '{self.postgres_schema}'. A dedicated schema is required to share the database safely."
             )
 
-        # Check collision with configured local_database_url (fail-closed on malformed URL)
-        if self.local_database_url:
-            try:
-                loc_url = make_url(self.local_database_url)
-            except Exception as e:
-                raise ValueError(
-                    f"Invalid local_database_url: {e}. Refusing to start with malformed local DB URL."
-                ) from e
-
-            loc_host = (loc_url.host or "localhost").lower()
-            loc_port = loc_url.port or 5432
-            loc_db = (loc_url.database or "").lstrip("/")
-
-            # Normalize 127.0.0.1 and localhost equivalence
-            host_equiv = {plat_host, loc_host} <= {"127.0.0.1", "localhost"} or plat_host == loc_host
-
-            if (
-                plat_url.get_backend_name() == loc_url.get_backend_name()
-                and host_equiv
-                and plat_port == loc_port
-                and plat_db == loc_db
-            ):
-                raise ValueError(
-                    f"PLATFORM_DATABASE_URL points to the same database as local DATABASE_URL ({plat_db}). "
-                    "The platform database must be a separate database."
-                )
         return self
 
 

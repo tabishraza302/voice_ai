@@ -5,14 +5,17 @@ dependency install, measurement, or qualification command was run while writing
 this document. Commands under “new” are acceptance interfaces to implement,
 not commands claimed to exist today.
 
-**Goal:** make every first-release gate executable, including fresh PostgreSQL
-initialization, isolation between two users, shared flow execution, browser
-journeys, bounded prepaid accounting, and actual audio-input qualification.
+**Goal:** make every first-release gate executable, including initialization of
+the shared PostgreSQL database's `platform` schema, isolation between two users,
+shared flow execution, browser journeys, bounded prepaid accounting, and actual
+audio-input qualification.
 
-**Architecture:** the new control plane is `platform_api/`, with its own fresh
-PostgreSQL database and initial schema. Shared flow logic is a pure package at
-`bot/flow/`. Basic prepaid accounting lives in `platform_api/billing/`, uses
-integer paise, small per-session reservations, and PostgreSQL wallet-row locks.
+**Architecture:** the new control plane is `platform_api/`, whose tables live in
+a dedicated `platform` schema of the PostgreSQL database selected by the shared
+`DATABASE_URL`; the local agent keeps `public` and Phoenix keeps `phoenix`.
+Shared flow logic is a pure package at `bot/flow/`. Basic prepaid accounting
+lives in `platform_api/billing/`, uses integer paise, small per-session
+reservations, and PostgreSQL wallet-row locks.
 There are no legacy data conversion, Alembic migration, account coordinator,
 shared account-pool, epoch, or pool-subgrant acceptance requirements.
 
@@ -78,13 +81,8 @@ an execution result from this planning session.
   `scripts/voice-ai.sh turn-bench --audio /absolute/fixture.wav --runs 5 --backend mlx-audio --out /absolute/result.json`.
   The turn benchmark uses real audio/STT/TTS with a **stub LLM streaming a
   fixed reply**; it cannot certify actual-model end-to-end latency.
-- Existing API/service fixtures generally initialize in-memory SQLite with
-  SQLAlchemy; those remain useful for existing behavior but cannot qualify
-  PostgreSQL locks, isolation, constraints or financial concurrency.
-- Existing dev pins are `pytest==9.0.1`, `pytest-asyncio==1.3.0`. Runtime pins
-  already include `sqlalchemy==2.0.38`, `asyncpg==0.30.0`,
-  `aiosqlite==0.22.1`. `uv.lock` already resolves `httpx==0.28.1`,
-  `aiortc==1.15.0`, `aiohttp==3.14.5`, `uvicorn==0.54.0`.
+- Existing API/service fixtures use SQLite with SQLAlchemy; they remain legacy behavior tests only and cannot qualify runtime database behavior. New platform/runtime paths and qualification MUST use PostgreSQL; there is no SQLite runtime or fallback.
+- Existing dev pins are `pytest==9.0.1`, `pytest-asyncio==1.3.0`. Runtime pins already include `sqlalchemy==2.0.38`, `asyncpg==0.30.0`, `aiosqlite==0.22.1`. `uv.lock` already resolves `httpx==0.28.1`, `aiortc==1.15.0`, `aiohttp==3.14.5`, `uvicorn==0.54.0`.
 - Inspected local executables report Python 3.12.13, Bun 1.3.14, Node
   v24.15.0, uv 0.11.25. These are inventory evidence, not deployment minimums
   or a promise that browser binaries/models are installed.
@@ -153,13 +151,16 @@ New environment keys, read by the verifier rather than inherited blindly:
   The verifier sets this itself for every gate, including local runs of
   `verify`. Raw `pytest` retains its opt-in developer behavior.
 - `PLATFORM_TEST_DATABASE_ADMIN_URL`: optional URL to a dedicated disposable
-  PostgreSQL cluster with database-creation privilege. It must target a
-  verification-owned cluster and identify the run; never accept a production
-  URL or the local default `voice_ai` database. Without it, provision the
-  isolated container below. Tests do not log the credential-bearing URL.
-- `PLATFORM_DATABASE_URL`: injected by the verifier for the freshly created
-  database only. The new app must not fall back to SQLite. `TEST_DATABASE_URL`
-  points at a different disposable database for existing bot PostgreSQL tests.
+  PostgreSQL cluster with database-creation privilege and the asyncpg driver
+  (normally `postgresql+asyncpg://`). The verifier connects to the `postgres`
+  maintenance database (preserving URL query options) and
+  requires `PLATFORM_TEST_DATABASE_OWNERSHIP_TOKEN` to match an existing row
+  in `public._verification_cluster_ownership` before creating test databases.
+  Random run IDs in database names are independent of the opaque ownership
+  token. Never use a production URL or the local runtime `voice_ai` database.
+  Without it, provision the isolated container below. Tests do not log the
+  credential-bearing URL.
+- `DATABASE_URL`: explicitly exported by the verifier for the freshly created disposable platform database only; the verifier strips any ambient `DATABASE_URL` from child processes before injecting this owned URL. The new app must require it, must not silently load `.env` or fall back to SQLite, and must use the `platform` schema. `TEST_DATABASE_URL` points at a different disposable database for existing bot PostgreSQL tests. Neither variable may target the single runtime database.
 - `VERIFY_ARTIFACT_DIR`: verifier-owned absolute run directory. User-supplied
   artifact paths may not overwrite source files or prior evidence.
 - `VERIFY_AUDIO_ROOT`: absolute directory of pre-provisioned, checksummed
@@ -212,8 +213,10 @@ Fresh database names are `platform_verify_<uuid>` and
 template, initializes the target metadata once through the same production
 initializer, and uses independent sessions/connections for each participant.
 Each test gets its own platform database; concurrency participants share only
-that test's database. Reject SQLite and databases without the verified run
-ownership token. Do not recreate tables on every API request.
+that test's database. These disposable test databases are separate from the
+runtime database; they exercise the same `public`/`platform`/`phoenix` schema
+contract without touching runtime data. Reject SQLite and databases without the
+verified run ownership token. Do not recreate tables on every API request.
 
 Every gate owns and closes its HTTP clients, peer connections, app lifespans,
 engines and child processes. In `finally`, terminate only recorded owned
@@ -237,7 +240,7 @@ remove unrelated Docker containers. Preserve redacted artifacts on failure.
    least one Python and one Bun test must run; missing reports fail.
 3. **New `verify postgres`:** provision disposable PostgreSQL, then root
    `uv run --frozen pytest tests/test_agent_postgres_integration.py tests/platform_api -m postgres --strict-markers --junitxml=<run>/postgres.xml`.
-   Populate the separate legacy/platform DB environment described above. No
+   Populate the disposable legacy/platform database environment described above. No
    model server, gateway or browser is needed for this lane. Phase 8 adds its
    actual disposable RabbitMQ fixture for tests marked `broker`; until then
    no broker tests exist. Once Phase 8 is present, this gate also executes
@@ -271,12 +274,13 @@ remove unrelated Docker containers. Preserve redacted artifacts on failure.
    from the nominated compatible qualification runner; absence fails.
 
 `schema init` is a new production/bootstrap command, separate from verify.
-It requires an explicit `PLATFORM_DATABASE_URL`, creates the initial platform
-schema in an empty database, and validates an already-current schema without
-data changes. Serialize concurrent initializers with a database transaction
-lock. Existing incompatible schemas fail with a clear fresh-install error;
-there is no conversion/backfill path and no legacy bot DB import. Tests call
-the same initializer, not a parallel test-only SQL schema.
+It requires an explicit `DATABASE_URL`, creates the initial `platform` schema
+in the shared database when that schema is absent or empty, and validates an
+already-current schema without data changes. Serialize concurrent initializers
+with a database transaction lock. Existing incompatible `platform` schemas fail
+with a clear fresh-install error; it never touches `public` or `phoenix`, there
+is no conversion/backfill path, no legacy bot DB import and no implicit
+migration. Tests call the same initializer, not a parallel test-only SQL schema.
 
 ## 4. Fixture interfaces
 
@@ -378,7 +382,7 @@ Tests: `test_required_prerequisite_missing_is_failure`,
 `test_bun_test_does_not_collect_playwright_specs`.
 Run `verify unit` and infrastructure fixture tests under `verify postgres`.
 
-### Phase 1 — fresh schema, auth and ownership
+### Phase 1 — platform schema, auth and ownership
 
 Create `tests/support/auth.py`, `tests/platform_api/conftest.py`,
 `tests/platform_api/test_schema.py`, `tests/platform_api/test_auth.py`,
@@ -489,8 +493,9 @@ Tests/assertions:
   `test_crash_after_usage_persist_recovers_one_settlement`,
   `test_crash_after_settlement_commit_does_not_double_charge`,
   `test_unknown_usage_is_not_guessed_or_automatically_refunded`: restart a
-  separate app/worker process on the same fresh DB and verify recovery under
-  the billing contract. Killing only an asyncio task is not crash coverage.
+  separate app/worker process on the same disposable test database and verify
+  recovery under the billing contract. Killing only an asyncio task is not
+  crash coverage.
 - `test_seeded_financial_sequences_preserve_committed_invariants`: generate
   credit/reserve/renew/settle/release/retry/failure sequences with a recorded
   seed, integer amounts and fake clock; assert ledger reconciliation and

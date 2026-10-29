@@ -27,27 +27,34 @@ Store these keys in your secure deployment secret manager (e.g. AWS Secrets Mana
 
 ---
 
-## 2. Platform Database Schema Initialization
+## 2. Shared Database and Platform Schema Initialization
 
-The platform database MUST be a distinct, fresh PostgreSQL database (`PLATFORM_DATABASE_URL`). It must never point to the local bot database (`DATABASE_URL`).
+The platform shares the single PostgreSQL runtime database selected by the explicitly exported `DATABASE_URL` with the local agent and Phoenix. Export that variable in the shell/process environment before running platform commands; the platform must not silently load `.env`, supply a default, open a second database or fall back to SQLite. The agent owns `public`, the platform owns `platform` (override with `PLATFORM_POSTGRES_SCHEMA`), and Phoenix owns `phoenix`. The host launcher derives Phoenix's PostgreSQL URL from `DATABASE_URL` and selects the `phoenix` schema; do not set a separate Phoenix database URL. `init-db` (also accepted as `init-schema`) creates only the platform schema; it does not touch `public` or `phoenix` and performs no implicit migration.
 
 ### 2.1 Initialize Schema
 
-Run the schema initialization command against a clean database:
+Run the schema initialization command against the shared database:
 
 ```bash
-uv run python -m platform_api.cli init-schema
+uv run python -m platform_api.cli init-db
 ```
 
-This verifies that the target database is empty, acquires an exclusive advisory lock, and applies the independent platform metadata and schema revision 1 atomically.
+This verifies that the `platform` schema is absent or empty, acquires an exclusive advisory lock, and applies the independent platform metadata and `schema_info` record (version `platform-v1`) atomically. A nonempty unknown `platform` schema or a mismatched recorded schema fails with `SCHEMA_MISMATCH`; the command never repairs or converts local or Phoenix tables.
 
 ### 2.2 Verify Schema Readiness
 
-Verify that the database metadata matches the expected platform specification:
+Verify that the `platform` schema metadata matches the expected platform specification:
 
 ```bash
 uv run python -m platform_api.cli check-schema
 ```
+
+### 2.3 Schema Boundaries
+
+- `public`: local agent tables; not created or migrated by `platform_api`.
+- `platform`: platform control-plane tables and `schema_info`; created only by explicit `init-db` (also accepted as `init-schema`).
+- `phoenix`: Phoenix telemetry tables; owned by Phoenix and never read or written by `platform_api`. The host launcher derives the connection URL from `DATABASE_URL` and sets `PHOENIX_SQL_DATABASE_SCHEMA=phoenix`; never configure a second database URL.
+- Backups and restores cover the whole database, so all three schemas move together; restore tests must not split them apart.
 
 ---
 
@@ -165,8 +172,8 @@ To immediately revoke all access for a compromised account:
 To revoke all sessions for an individual user from the database in an emergency:
 
 ```sql
-UPDATE users SET auth_version = auth_version + 1, updated_at = NOW() WHERE id = '<user_uuid>';
-UPDATE auth_sessions SET revoked_at = NOW() WHERE user_id = '<user_uuid>' AND revoked_at IS NULL;
+UPDATE platform.users SET auth_version = auth_version + 1, updated_at = NOW() WHERE id = '<user_uuid>';
+UPDATE platform.auth_sessions SET revoked_at = NOW() WHERE user_id = '<user_uuid>' AND revoked_at IS NULL;
 ```
 
 ---
