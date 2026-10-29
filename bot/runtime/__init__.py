@@ -1,11 +1,25 @@
-"""Authorized-runtime glue.
+"""Authorized runtime glue for the shared pipeline and durable event spool.
 
-The first slice is the pipeline seam: ``build_voice_pipeline`` is the one
-place the voice pipeline is composed, shared by the local entrypoint and
-the later authorized runtime. It exports no platform session, admission,
-billing or transport type.
+The pipeline builder is the one composition point shared by the local runner
+and authorized runtime. Model services remain behind the existing registries.
 """
 
+from bot.runtime.outbox import (
+    EventSpool,
+    PublishBatchResult,
+    SpoolCapacity,
+    SpoolCapacityError,
+    SpoolCorruptionError,
+    SpoolRecord,
+)
 from bot.runtime.pipeline_builder import build_voice_pipeline
 
-__all__ = ["build_voice_pipeline"]
+__all__ = [
+    "build_voice_pipeline",
+    "EventSpool",
+    "PublishBatchResult",
+    "SpoolCapacity",
+    "SpoolCapacityError",
+    "SpoolCorruptionError",
+    "SpoolRecord",
+]

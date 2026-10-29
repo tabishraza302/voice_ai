@@ -31,6 +31,14 @@ from platform_api.agents.models import (
     IdempotencyRecord,
     PlatformPromptVersion,
 )
+from platform_api.events.models import (
+    EventQuarantine,
+    ProcessedEvent,
+    ProviderUsage,
+    TranscriptGap,
+    TranscriptSegment,
+    TranscriptState,
+)
 
 __all__ = [
     "Base",
@@ -54,4 +62,10 @@ __all__ = [
     "AgentTemplateVersion",
     "PlatformPromptVersion",
     "IdempotencyRecord",
+    "ProcessedEvent",
+    "TranscriptSegment",
+    "ProviderUsage",
+    "TranscriptState",
+    "TranscriptGap",
+    "EventQuarantine",
 ]

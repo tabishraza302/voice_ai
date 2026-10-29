@@ -147,7 +147,11 @@ def charge_minor(rate_minor_per_minute: int, cumulative_billable_ms: int) -> int
 
 - [ ] Write restart/replay, conflicting payload, after-commit/before-ACK, delayed transcript, DB/broker outage and retry-destination-down cases. Test loss after original producer copy removal, not just duplicate insertion.
 - [ ] Implement atomic spool sequence allocation, durable publishes/mandatory routing/confirm, transactional dedupe/effect and confirmed retry/quarantine transfer before source ACK. Consumer cannot mutate wallet tables.
-- [ ] Implement revision-bound transcript pagination and explicit gaps/processing. Apply storage ceilings/admission drain before disk exhaustion. Run actual broker/Postgres fault gates and commit.
+- [ ] Run the history consumer with `PLATFORM_EVENT_CONSUMER_DATABASE_URL`, a distinct `NOINHERIT` login on the exact same PostgreSQL host, port, and database as `DATABASE_URL`; do not treat loopback aliases as the same endpoint. Missing, mismatched, or overprivileged credentials fail before broker setup. Grant `CONNECT`, `USAGE` on the effective schema, `SELECT, INSERT` on `processed_events`, `transcript_segments`, `transcript_gaps`, and `event_quarantine`, `INSERT` on `provider_usage`, and `SELECT, INSERT, UPDATE` on `transcript_state`. Require full table-level privileges only, with no column-only grants, `WITH GRANT OPTION`, wallet-table privileges, schema/database `CREATE`, elevated role attributes, or role memberships.
+  If this PostgreSQL database grants `CREATE` on `public` to `PUBLIC`, revoke that grant in this database before starting the consumer.
+  Compare the live server address, port, and postmaster start time from the platform and consumer connections before opening the broker. Reject PUBLIC table and column grants, including grants duplicating allowed projection privileges.
+- [ ] Implement revision-bound transcript pagination and explicit gaps/processing. Apply storage ceilings/admission drain before disk exhaustion. Reclaim confirmed journal history with fsynced same-directory compaction and atomic replacement, preserving pending order and per-session sequence watermarks across restart. Run actual broker/Postgres fault gates and commit.
+- [ ] Have the consumer CLI exit with status 0 on successful stop, including `--once` after a delivery, log the handled count separately, and return nonzero on failure.
 
 ## Task 9: Conversations, wallet and admin experience
 

@@ -80,6 +80,8 @@ dependencies = [
     "sqlalchemy==2.0.38",
     "asyncpg==0.30.0",
     "greenlet==3.5.6",
+    # RabbitMQ client for durable platform events.
+    "aio-pika==9.5.8",
 ]
 
 [project.optional-dependencies]

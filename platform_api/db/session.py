@@ -24,19 +24,32 @@ def create_engine(
     settings_or_url: PlatformSettings | str | None = None,
     *,
     schema: str | None = None,
+    database_url: str | None = None,
     **engine_kwargs,
 ) -> AsyncEngine:
-    """Create an AsyncEngine for the platform database with search_path and schema translation."""
+    """Create an AsyncEngine for the platform database with schema translation."""
     if isinstance(settings_or_url, str):
+        if database_url is not None:
+            raise ValueError("database_url override requires PlatformSettings.")
         url = settings_or_url
         target_schema = schema or DEFAULT_PLATFORM_SCHEMA
     elif isinstance(settings_or_url, PlatformSettings):
-        url = settings_or_url.database_url
-        target_schema = schema or getattr(settings_or_url, "postgres_schema", DEFAULT_PLATFORM_SCHEMA)
+        url = (
+            database_url
+            if database_url is not None
+            else settings_or_url.database_url
+        )
+        target_schema = schema or getattr(
+            settings_or_url, "postgres_schema", DEFAULT_PLATFORM_SCHEMA
+        )
     else:
+        if database_url is not None:
+            raise ValueError("database_url override requires PlatformSettings.")
         current_settings = get_settings()
         url = current_settings.database_url
-        target_schema = schema or getattr(current_settings, "postgres_schema", DEFAULT_PLATFORM_SCHEMA)
+        target_schema = schema or getattr(
+            current_settings, "postgres_schema", DEFAULT_PLATFORM_SCHEMA
+        )
 
     defaults: dict = {
         "echo": False,

@@ -1,0 +1,18 @@
+services:
+  rabbitmq:
+    image: rabbitmq:4.1.3-alpine
+    user: "100:101"
+    ports:
+      - "127.0.0.1:${RABBITMQ_PORT:-0}:5672"
+    environment:
+      RABBITMQ_DEFAULT_USER: voice_ai
+      RABBITMQ_DEFAULT_PASS: voice_ai
+    mem_limit: 256m
+    tmpfs:
+      - /var/lib/rabbitmq:rw,nodev,nosuid,noexec,size=128m,mode=0700,uid=100,gid=101
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
