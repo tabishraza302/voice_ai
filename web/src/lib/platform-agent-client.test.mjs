@@ -114,6 +114,20 @@ describe("PlatformAgentClient", () => {
     });
     expect(calls[0].headers.get("X-CSRF-Token")).toBe("csrf-platform-agent");
   });
+  test("accepts the server-derived snapshot from GET and PATCH without computing it", async () => {
+    const serverSnapshotHash = "c".repeat(64);
+    mockFetch(async () => jsonResponse({ ...draft, snapshot_hash: serverSnapshotHash }));
+
+    const loaded = await client.getDraft(agent.id);
+    const saved = await client.patchDraft(agent.id, {
+      expected_revision: 1,
+      config: draft.config,
+    });
+
+    expect(loaded.snapshot_hash).toBe(serverSnapshotHash);
+    expect(saved.snapshot_hash).toBe(serverSnapshotHash);
+    expect(JSON.parse(calls[1].init.body)).not.toHaveProperty("snapshot_hash");
+  });
 
   test("preserves a null server snapshot for a draft that cannot be tested", async () => {
     mockFetch(async () => jsonResponse({ ...draft, snapshot_hash: null }));
@@ -188,16 +202,16 @@ describe("PlatformAgentClient", () => {
     );
     expect(calls.every(({ url }) => !new URL(url).pathname.endsWith("/agents"))).toBe(true);
   });
-  test("cancels an owned generation job through the typed route", async () => {
+  test("keeps an owned generation job active while provider cancellation is pending", async () => {
     const jobId = "00000000-0000-0000-0000-000000000002";
     mockFetch(async (_url, init) => {
       expect(init.method).toBe("POST");
-      return jsonResponse({ job_id: jobId, status: "CANCELLED" });
+      return jsonResponse({ job_id: jobId, status: "CANCELLING" });
     });
 
     const result = await client.cancelGenerationJob(jobId);
 
-    expect(result).toEqual({ job_id: jobId, status: "CANCELLED" });
+    expect(result).toEqual({ job_id: jobId, status: "CANCELLING" });
     expect(new URL(calls[0].url).pathname).toBe(
       `/api/v1/generation-jobs/${jobId}/cancel`
     );
@@ -228,6 +242,7 @@ describe("PlatformAgentClient", () => {
           { id: "assistant-1", turn_sequence: 1, role: "assistant", content: "I can help with that.", created_at: stamp },
         ],
         flow_state: { active_step_id: "ask_name", outcome: "in_progress" },
+        pending_turn_sequence: null,
         trace: [],
         outcome: "in_progress",
       });
@@ -252,6 +267,55 @@ describe("PlatformAgentClient", () => {
     expect(new URL(calls[1].url).pathname).toBe(`/api/v1/agents/${agent.id}/test/chat/${testId}`);
     expect(transcript.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
     expect(transcript.snapshot_hash).toBe(draft.snapshot_hash);
+  });
+  test("recovers a persisted pending user message at its original sequence", async () => {
+    const testId = "00000000-0000-0000-0000-000000000004";
+    const pendingText = "Please keep checking the same pending turn.";
+    mockFetch(async (_url, init) => {
+      if (init.method === "POST") {
+        return jsonResponse({
+          test_id: testId,
+          turn_sequence: 2,
+          reply: "The turn resumed.",
+          flow_state: {},
+          trace: [],
+          outcome: "in_progress",
+        });
+      }
+      return jsonResponse({
+        test_id: testId,
+        snapshot_hash: draft.snapshot_hash,
+        turn_sequence: 1,
+        pending_turn_sequence: 2,
+        messages: [
+          { id: "user-pending", turn_sequence: 2, role: "user", content: pendingText, created_at: stamp },
+        ],
+        flow_state: {},
+        trace: [],
+        outcome: "in_progress",
+      });
+    });
+
+    const transcript = await client.getChatTest(agent.id, testId);
+    const pendingMessage = transcript.messages.find((message) =>
+      message.role === "user" && message.turn_sequence === transcript.pending_turn_sequence
+    );
+    expect(transcript.pending_turn_sequence).toBe(2);
+    expect(pendingMessage?.content).toBe(pendingText);
+
+    await client.sendChatTurn(agent.id, {
+      snapshot_hash: transcript.snapshot_hash,
+      test_id: transcript.test_id,
+      expected_turn_sequence: transcript.pending_turn_sequence,
+      text: pendingMessage.content,
+    });
+
+    expect(JSON.parse(calls[1].init.body)).toEqual({
+      snapshot_hash: draft.snapshot_hash,
+      test_id: testId,
+      expected_turn_sequence: 2,
+      text: pendingText,
+    });
   });
 
   test("preserves typed API conflicts for the workspace to resolve", async () => {
