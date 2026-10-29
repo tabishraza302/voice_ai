@@ -46,6 +46,8 @@ def test_platform_settings(fresh_pg: FreshPostgres, tmp_path) -> PlatformSetting
         csrf_cookie_name="platform_csrf",
         auth_mail_mode="file",
         auth_mail_dir=mail_dir,
+        billing_slice_ms=1000,
+        billing_permit_ttl_ms=5000,
     )
 
 
