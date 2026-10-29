@@ -164,6 +164,7 @@ export interface ChatTraceDiagnostic {
   code: string;
   path: string;
   severity: "error" | "warning";
+  message?: string;
 }
 
 export interface ChatTraceEntry {
@@ -475,6 +476,7 @@ function parseTraceDiagnostic(value: unknown): ChatTraceDiagnostic {
   return {
     code: requireString(row.code, "trace diagnostic.code"),
     path: requireString(row.path, "trace diagnostic.path"),
+    ...(row.message === undefined ? {} : { message: requireString(row.message, "trace diagnostic.message") }),
     severity,
   };
 }
