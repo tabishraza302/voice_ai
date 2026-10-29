@@ -7,6 +7,9 @@ Run it with the Pipecat development runner:
 
 **The pipeline.** transport.input -> STT -> user aggregator -> LLM ->
 language routing -> TTS -> transport.output -> assistant aggregator.
+The composition lives in ``bot.runtime.pipeline_builder`` so the local
+runner and the authorized runtime build the same pipeline; this module
+adds only the local runner's observer and app-message wiring.
 
 The assistant aggregator goes *after* transport.output() so that the
 context records what was actually spoken: if the user interrupts
@@ -27,50 +30,29 @@ import shutil
 import subprocess
 import time
 import urllib.request
-import uuid
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlparse
 
 from loguru import logger
-from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
-from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
     STTUpdateSettingsFrame,
 )
-from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.worker import PipelineParams, PipelineWorker
-from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import (
-    LLMContextAggregatorPair,
-    LLMUserAggregatorParams,
-)
 from pipecat.runner.utils import create_transport
 from pipecat.transports.base_output import TransportParams
-from pipecat.turns.user_start.min_words_user_turn_start_strategy import (
-    MinWordsUserTurnStartStrategy,
-)
-from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
-from pipecat.turns.user_turn_strategies import UserTurnStrategies
-from pipecat.workers.runner import WorkerRunner
 
 from bot.config import Settings
-from bot.context import ContextShapingProcessor
 from bot.control import apply_mode, mount_control
 from bot.language import parse_language_request
-from bot.observers import LatencyBridge, PrometheusObserver, mount_metrics
-from bot.session_settings import resolve_session_settings
-from bot.transcripts import BotTranscriptForwarder, UserTranscriptForwarder, queue_client_utterance
-from bot.pipeline import LanguageRoutingProcessor
-from bot.services import (
-    build_llm,
-    build_stt,
-    build_stt_language_router,
-    build_tts,
-    build_voice_router,
-    resolve_models,
+from bot.observers import PrometheusObserver, mount_metrics
+from bot.runtime.pipeline_builder import (
+    build_turn_strategies,
+    build_vad_analyzer,
+    build_voice_pipeline,
 )
+from bot.services import build_stt_language_router
+from bot.session_settings import resolve_session_settings
+from bot.transcripts import queue_client_utterance
 
 # The dev runner's audio rates. 16 kHz in for Silero VAD's sake, 24 kHz
 # out for the TTS engines.
@@ -112,39 +94,22 @@ def transport_params() -> dict[str, Callable]:
     }
 
 
-def build_turn_strategies() -> UserTurnStrategies:
-    """Explicit turn strategies, rather than Pipecat's defaults.
-
-    ``MinWordsUserTurnStartStrategy(min_words=2)`` is the anti-echo
-    guard: a single stray word — a cough, a laptop speaker leaking one
-    syllable — cannot interrupt the bot. It only applies while the bot is
-    speaking; one word still starts a turn when the bot is idle.
-
-    The stop strategy is Smart Turn v3, which decides the turn has ended
-    from the *meaning* of the audio rather than from a silence timer.
-    It runs the bundled `smart-turn-v3.2-cpu.onnx` through onnxruntime,
-    so it is local, needs no download, and covers Hindi.
-    """
-    return UserTurnStrategies(
-        start=[MinWordsUserTurnStartStrategy(min_words=2)],
-        stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=LocalSmartTurnAnalyzerV3())],
-    )
-
-
-def build_vad_analyzer(settings: Settings) -> SileroVADAnalyzer:
-    """The VAD that segments user turns, configured from settings.
-
-    The stop window is what decides whether a pause ends the turn.
-    Pipecat's 0.2 s default closed a real question at its first "uh";
-    ``Settings.vad_stop_secs`` is the one place that window is set.
-    """
-    return SileroVADAnalyzer(
-        params=VADParams(
-            stop_secs=settings.vad_stop_secs,
-            confidence=settings.vad_confidence,
-            min_volume=settings.vad_min_volume,
-        )
-    )
+# Re-exported for the turn benchmark and the settings tests; the
+# implementations live with the pipeline they configure.
+__all__ = [
+    "build_turn_strategies",
+    "build_vad_analyzer",
+    "bot",
+    "build_model_resolver",
+    "build_voice_pipeline",
+    "get_prometheus_observer",
+    "mount_api",
+    "mount_observability",
+    "needs_mlx_audio_server",
+    "run_bot",
+    "start_mlx_audio_server",
+    "transport_params",
+]
 
 
 def _server_answers(root: str) -> bool:
@@ -258,82 +223,26 @@ async def run_bot(transport, settings: Settings, runner_args=None) -> None:
 
 
 async def _run_pipeline(transport, settings: Settings, runner_args=None) -> None:
-    """Build and run the pipeline on the given transport."""
-    context = LLMContext()
-    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
-        context,
-        user_params=LLMUserAggregatorParams(
-            vad_analyzer=build_vad_analyzer(settings),
-            user_turn_strategies=build_turn_strategies(),
-        ),
+    """Build the one voice pipeline and run it on the given transport.
+
+    The composition lives in ``bot.runtime.pipeline_builder`` so the local
+    entrypoint and the authorized runtime build the same pipeline. This
+    function owns only what is specific to the local runner: the
+    process-wide Prometheus observer (so ``/metrics`` and the pipeline
+    share a registry) and the browser client's app-message channel.
+    """
+    assembly = build_voice_pipeline(
+        transport,
+        settings,
+        instruments=get_prometheus_observer(settings),
+        runner_args=runner_args,
     )
 
-    stt = build_stt(settings)
-    llm = build_llm(settings)
-    tts = build_tts(settings)
+    # The client's language switch and text box ride on the transport's
+    # app-message channel. Wire it before the runner starts the worker.
+    _register_app_message_handler(transport, assembly.pipeline, settings)
 
-    context_shaper = ContextShapingProcessor()
-
-    router = LanguageRoutingProcessor(
-        voice_router=build_voice_router(settings),
-        deadline_seconds=settings.first_chunk_deadline_seconds,
-    )
-
-    # Observers. The Prometheus observer turns Pipecat's metrics frames
-    # into the series that observability/prometheus.yml, alerts.yml and
-    # the dashboard all reference; the latency bridge feeds it the
-    # end-to-end user->bot number, which is the SLO metric.
-    #
-    # It is a process-wide singleton: the /metrics endpoint and the
-    # pipeline must expose the same registry, or the endpoint would serve
-    # an empty set of series.
-    prometheus_observer = get_prometheus_observer(settings)
-    latency_bridge = LatencyBridge(prometheus_observer)
-
-    pipeline = Pipeline(
-        [
-            transport.input(),
-            stt,
-            UserTranscriptForwarder(transport),
-            user_aggregator,
-            # Between the aggregator and the LLM: the history is rewritten
-            # here, so the model never sees two user messages in a row.
-            context_shaper,
-            llm,
-            router,
-            tts,
-            transport.output(),
-            BotTranscriptForwarder(transport),
-            assistant_aggregator,
-        ]
-    )
-
-    worker = PipelineWorker(
-        pipeline,
-        enable_tracing=settings.enable_tracing,
-        enable_turn_tracking=True,
-        conversation_id=uuid.uuid4().hex,
-        params=PipelineParams(
-            enable_metrics=settings.enable_metrics,
-            enable_usage_metrics=settings.enable_metrics,
-        ),
-        observers=[prometheus_observer, latency_bridge.observer],
-    )
-
-    _register_app_message_handler(transport, pipeline, settings)
-
-    # WorkerRunner owns the task manager the pipeline and its processors
-    # share. Calling worker.run() directly would mean constructing the
-    # WorkerParams yourself, and the transport's task manager would be
-    # read before it is set.
-    runner = WorkerRunner(handle_sigint=getattr(runner_args, "handle_sigint", True))
-    await runner.add_workers(worker)
-
-    await prometheus_observer.start_memory_sampling()
-    try:
-        await runner.run()
-    finally:
-        await prometheus_observer.stop_memory_sampling()
+    await assembly.run()
 
 
 def _register_app_message_handler(transport, pipeline, settings: Settings) -> None:
