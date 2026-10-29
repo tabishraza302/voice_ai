@@ -37,12 +37,13 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from bot.flow.canonical import canonical_json_v1
 from bot.flow.compiler import compile_flow
 from bot.flow.controller import initial_session_state, reduce_event
 from bot.flow.model_probe import ProbeObservation, probe_model_qualification
 from bot.flow.qualification import (
+    AgentQualificationSettings,
     REQUIRED_SCENARIO_CLASSES,
     CapabilityReport,
     ScenarioClass,
@@ -789,15 +790,42 @@ async def run_qualification(
     flow: dict[str, Any] | None = None,
     extra_unsupported: list[str] | None = None,
     timeout_seconds: float = 10.0,
+    agent_settings: AgentQualificationSettings | None = None,
+    adapter_version: str | None = None,
+    locales: list[Literal["en", "hi"]] | None = None,
 ) -> QualificationReport:
     """Execute real model and live transport probes with explicit parameters.
 
     Never defaults user or development ports (e.g. 7860 or 11434) implicitly.
-    If endpoints or revisions are missing, fails closed with explicit unsupported
-    reasons.
+    If endpoints, revisions, or exact agent/adapter/locale identity are missing,
+    fails closed with explicit unsupported reasons.
     """
     unsupported_reasons: list[str] = []
     missing_evidence: list[str] = []
+
+    if agent_settings is None:
+        reason = "Exact selected agent settings were not supplied."
+        unsupported_reasons.append(reason)
+        missing_evidence.append(reason)
+    elif model_name is not None and agent_settings.llm_model != model_name.strip():
+        reason = "Agent llm_model does not match the model selected for qualification."
+        unsupported_reasons.append(reason)
+        missing_evidence.append(reason)
+
+    if not isinstance(adapter_version, str) or not adapter_version.strip():
+        reason = "Exact transport adapter version was not supplied."
+        unsupported_reasons.append(reason)
+        missing_evidence.append(reason)
+
+    if (
+        not isinstance(locales, list)
+        or not locales
+        or any(not isinstance(locale, str) or locale not in ("en", "hi") for locale in locales)
+        or len(set(locales)) != len(locales)
+    ):
+        reason = "Exact supported locales were not supplied."
+        unsupported_reasons.append(reason)
+        missing_evidence.append(reason)
 
     if extra_unsupported:
         unsupported_reasons.extend(extra_unsupported)
@@ -972,6 +1000,22 @@ async def run_qualification(
                         else False
                     ),
                     timeout_seconds=timeout_seconds,
+                    adapter_version=adapter_version,
+                    model_revision=(
+                        model_obs.pinned_model_revision
+                        if model_obs is not None and model_obs.revision_pinned
+                        else None
+                    ),
+                    agent_settings=(
+                        agent_settings
+                        if agent_settings is not None
+                        and (
+                            model_name is None
+                            or agent_settings.llm_model == model_name.strip()
+                        )
+                        else None
+                    ),
+                    locales=locales,
                 )
                 if transport_res.evidence.unsupported_reasons:
                     unsupported_reasons.extend(
@@ -1017,6 +1061,11 @@ async def run_qualification(
             "unsupported_reasons": transport_res.evidence.unsupported_reasons,
         }
         capability_rep = transport_res.report
+        if capability_rep is None:
+            missing_evidence.append(
+                "A combined capability report was not produced because exact pinned model, "
+                "agent, adapter, locale, source, or profile identity was incomplete."
+            )
         if capability_rep is not None:
             try:
                 rep_diags = validate_capability_report(capability_rep.model_dump(mode="json"))
@@ -1221,6 +1270,9 @@ async def main_async(args: list[str] | None = None) -> int:
     source_revision = parsed.source_revision
     profile_hash = parsed.profile_hash
     profile_path = parsed.profile
+    agent_settings: AgentQualificationSettings | None = None
+    adapter_version: str | None = None
+    locales: list[Literal["en", "hi"]] | None = None
 
     extra_unsupported: list[str] = []
     if profile_path:
@@ -1230,6 +1282,8 @@ async def main_async(args: list[str] | None = None) -> int:
             try:
                 with open(profile_path, "r", encoding="utf-8") as f:
                     profile_data = json.load(f)
+                if not isinstance(profile_data, dict):
+                    raise ValueError("Qualification profile must be a JSON object.")
                 if not profile_hash:
                     profile_hash = hashlib.sha256(
                         b"voice-ai/qualification-profile/v1\0" + canonical_json_v1(profile_data)
@@ -1242,6 +1296,37 @@ async def main_async(args: list[str] | None = None) -> int:
                     transport_endpoint = profile_data["transport_endpoint"]
                 if not source_revision and "source_revision" in profile_data:
                     source_revision = profile_data["source_revision"]
+                raw_agent_settings = profile_data.get("agent_settings")
+                if raw_agent_settings is not None:
+                    try:
+                        agent_settings = AgentQualificationSettings.model_validate(
+                            raw_agent_settings
+                        )
+                    except ValidationError as exc:
+                        extra_unsupported.append(
+                            f"Qualification profile agent_settings is invalid: {exc}"
+                        )
+                raw_adapter_version = profile_data.get("adapter_version")
+                if raw_adapter_version is not None:
+                    if isinstance(raw_adapter_version, str) and raw_adapter_version.strip():
+                        adapter_version = raw_adapter_version
+                    else:
+                        extra_unsupported.append(
+                            "Qualification profile adapter_version must be a non-empty string."
+                        )
+                raw_locales = profile_data.get("locales")
+                if raw_locales is not None:
+                    if (
+                        isinstance(raw_locales, list)
+                        and raw_locales
+                        and all(locale in ("en", "hi") for locale in raw_locales)
+                        and len(set(raw_locales)) == len(raw_locales)
+                    ):
+                        locales = raw_locales
+                    else:
+                        extra_unsupported.append(
+                            "Qualification profile locales must be a non-empty unique list of en/hi."
+                        )
             except Exception as exc:
                 extra_unsupported.append(f"Failed to read qualification profile file: {exc}")
 
@@ -1254,6 +1339,9 @@ async def main_async(args: list[str] | None = None) -> int:
         profile_path=profile_path,
         extra_unsupported=extra_unsupported if extra_unsupported else None,
         timeout_seconds=parsed.timeout,
+        agent_settings=agent_settings,
+        adapter_version=adapter_version,
+        locales=locales,
     )
 
     report_json = report.to_json()

@@ -1353,10 +1353,16 @@ class TestContractReviewerInvariants:
         ]
 
         valid_report = CapabilityReport(
-            protocol_version=1,
+            protocol_version=2,
             adapter_id="webrtc_browser_transport",
             adapter_version="1.0.0",
             model_revision="pinned/qwen-3.5",
+            agent_settings={
+                "llm_model": "qwen3.5:4b",
+                "stt_provider": "mlx-audio",
+                "tts_voice_en": "af_heart",
+                "tts_voice_hi": "hf_alpha",
+            },
             metadata="separate_stream",
             speech_gating=True,
             cancel_generation=True,
@@ -1368,7 +1374,7 @@ class TestContractReviewerInvariants:
             cases=all_7_cases,
             measurements={"p95_ttft_ms": 120, "p99_playback_ms": 300},
             budgets={"max_ttft_ms": 500, "max_playback_ms": 1000},
-            raw_evidence={"run_id": "qual_run_01", "pcap_evidence": "packet_capture_ref"},
+            raw_evidence_references=["sha256:qualification-evidence"],
             playback_boundary_description="WebRTC data-channel correlated render ack",
             limitations=["Requires Chrome 120+"],
         )
@@ -1419,12 +1425,12 @@ class TestContractReviewerInvariants:
         diags_no_hash = validate_capability_report(no_hash_dump)
         assert any(d.code == "QUALIFICATION_INVALID" and d.path == "/report_hash" for d in diags_no_hash)
 
-        # 4. Missing required measurements or raw evidence produces QUALIFICATION_INVALID
+        # 4. Missing required measurements or raw evidence references produces QUALIFICATION_INVALID
         no_evidence_dump = dict(valid_dump)
-        no_evidence_dump["raw_evidence"] = {}
+        no_evidence_dump["raw_evidence_references"] = []
         no_evidence_dump["report_hash"] = CapabilityReport(**no_evidence_dump).compute_hash()
         diags_no_evidence = validate_capability_report(no_evidence_dump)
-        assert any(d.code == "QUALIFICATION_INVALID" and d.path == "/raw_evidence" for d in diags_no_evidence)
+        assert any(d.code == "QUALIFICATION_INVALID" and d.path == "/raw_evidence_references" for d in diags_no_evidence)
 
         # 5. Omitting any of the 7 mandatory scenario groups produces QUALIFICATION_INCOMPLETE
         for omitted_class in REQUIRED_SCENARIO_CLASSES:

@@ -105,6 +105,12 @@ async def test_run_qualification_composes_real_model_and_transport_probe_observa
         adapter_id="webrtc_daily",
         adapter_version="1.0.0",
         model_revision="qwen3.5:4b@sha256:abc123def456",
+        agent_settings={
+            "llm_model": "qwen3.5:4b",
+            "stt_provider": "mlx-audio",
+            "tts_voice_en": "af_heart",
+            "tts_voice_hi": "hf_alpha",
+        },
         metadata="none",
         speech_gating=False,
         cancel_generation=False,

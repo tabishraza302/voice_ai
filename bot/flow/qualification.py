@@ -1,10 +1,10 @@
 """Qualification harness contracts and report validation per flow contract section 9.
 
 Validates immutable qualification reports:
-- protocol_version: 1
-- Immutable capability tuple
+- protocol_version: 2
+- Immutable deployment capability and selected agent settings tuple
 - Required seven scenario groups executed and passed
-- Verified actual latency/resource measurements and raw evidence
+- Verified actual latency/resource measurements and raw evidence references
 - Measurements strictly canonical: safe integers (e.g. integer microseconds) or decimal strings (e.g. '12.5'), never floats
 """
 
@@ -101,9 +101,8 @@ def _validate_measurements_dict(measurements: dict[str, Any]) -> dict[str, Canon
             raise TypeError(f"Measurement '{k}' must be safe integer or decimal string, got {type(v).__name__}")
     return validated
 
-
 class ScenarioResult(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     scenario_id: str
     scenario_class: ScenarioClass
@@ -119,13 +118,25 @@ class ScenarioResult(BaseModel):
         return _validate_measurements_dict(v)
 
 
-class CapabilityReport(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+class AgentQualificationSettings(BaseModel):
+    """Exact model, STT, and voice settings covered by a deployment report."""
 
-    protocol_version: int = 1
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    llm_model: str = Field(min_length=1, max_length=64)
+    stt_provider: str = Field(min_length=1, max_length=32)
+    tts_voice_en: str = Field(min_length=1, max_length=32)
+    tts_voice_hi: str = Field(min_length=1, max_length=32)
+
+
+class CapabilityReport(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    protocol_version: int = 2
     adapter_id: str
     adapter_version: str
     model_revision: str
+    agent_settings: AgentQualificationSettings
     metadata: Literal["separate_stream", "complete_tool", "none"]
     speech_gating: bool
     cancel_generation: bool
@@ -137,7 +148,7 @@ class CapabilityReport(BaseModel):
     cases: list[ScenarioResult] = Field(default_factory=list)
     measurements: dict[str, CanonicalMeasurement] = Field(default_factory=dict)
     budgets: dict[str, CanonicalMeasurement] = Field(default_factory=dict)
-    raw_evidence: dict[str, Any] = Field(default_factory=dict)
+    raw_evidence_references: list[str] = Field(default_factory=list)
     playback_boundary_description: str
     limitations: list[str] = Field(default_factory=list)
     report_hash: str = ""
@@ -154,20 +165,24 @@ class CapabilityReport(BaseModel):
             _validate_measurements_dict(case.measurements)
         dump = self.model_dump()
         dump.pop("report_hash", None)
-        return hashlib.sha256(b"voice-ai/capability-report/v1\0" + canonical_json_v1(dump)).hexdigest()
+        return hashlib.sha256(
+            b"voice-ai/capability-report/v2\0" + canonical_json_v1(dump)
+        ).hexdigest()
 
 
 def validate_capability_report(report_data: dict[str, Any]) -> list[FlowDiagnostic]:
     """Validate qualification report format, required seven scenario groups, and report hash."""
     diagnostics: list[FlowDiagnostic] = []
 
-    protocol_version = report_data.get("protocol_version")
-    if isinstance(protocol_version, bool) or protocol_version != 1:
+    if (
+        type(report_data.get("protocol_version")) is not int
+        or report_data.get("protocol_version") != 2
+    ):
         diagnostics.append(
             FlowDiagnostic(
                 code="QUALIFICATION_INVALID",
                 path="/protocol_version",
-                message="Qualification report must have integer protocol_version: 1",
+                message="Qualification report must have integer protocol_version: 2",
             )
         )
 
@@ -175,6 +190,7 @@ def validate_capability_report(report_data: dict[str, Any]) -> list[FlowDiagnost
         "adapter_id",
         "adapter_version",
         "model_revision",
+        "agent_settings",
         "playback",
         "profile_hash",
         "source_revision",
@@ -210,7 +226,7 @@ def validate_capability_report(report_data: dict[str, Any]) -> list[FlowDiagnost
                 )
             )
 
-    for dict_field in ("fixture_hashes", "measurements", "raw_evidence"):
+    for dict_field in ("fixture_hashes", "measurements"):
         val = report_data.get(dict_field)
         if not val or not isinstance(val, dict):
             diagnostics.append(
@@ -221,6 +237,22 @@ def validate_capability_report(report_data: dict[str, Any]) -> list[FlowDiagnost
                 )
             )
 
+    raw_evidence_references = report_data.get("raw_evidence_references")
+    if (
+        not isinstance(raw_evidence_references, list)
+        or not raw_evidence_references
+        or any(
+            not isinstance(reference, str) or not reference.strip()
+            for reference in raw_evidence_references
+        )
+    ):
+        diagnostics.append(
+            FlowDiagnostic(
+                code="QUALIFICATION_INVALID",
+                path="/raw_evidence_references",
+                message="Missing or invalid non-empty raw evidence references",
+            )
+        )
     # Validate measurements canonical representation (safe integers or decimal strings, no floats)
     report_meas = report_data.get("measurements")
     if isinstance(report_meas, dict):
@@ -355,6 +387,44 @@ def validate_capability_report(report_data: dict[str, Any]) -> list[FlowDiagnost
                     )
                 )
 
+        if report_data.get("playback") == "qualified_fragment_completion":
+            required_evidence = (
+                ("fixture_hashes", report_data.get("fixture_hashes")),
+                ("measurements", report_data.get("measurements")),
+                ("budgets", report_data.get("budgets")),
+                ("raw_evidence_references", report_data.get("raw_evidence_references")),
+                (
+                    "playback_boundary_description",
+                    report_data.get("playback_boundary_description"),
+                ),
+            )
+            for field, value in required_evidence:
+                if not value:
+                    diagnostics.append(
+                        FlowDiagnostic(
+                            code="QUALIFICATION_INCOMPLETE",
+                            path=f"/{field}",
+                            message=f"Qualified playback report is missing '{field}' evidence",
+                        )
+                    )
+            for c_idx, case in enumerate(cases):
+                if not case.get("trace_id"):
+                    diagnostics.append(
+                        FlowDiagnostic(
+                            code="QUALIFICATION_INCOMPLETE",
+                            path=f"/cases/{c_idx}/trace_id",
+                            message="Qualified playback case is missing its trace ID",
+                        )
+                    )
+                if not case.get("measurements"):
+                    diagnostics.append(
+                        FlowDiagnostic(
+                            code="QUALIFICATION_INCOMPLETE",
+                            path=f"/cases/{c_idx}/measurements",
+                            message="Qualified playback case is missing measurements",
+                        )
+                    )
+
     # Check report hash against canonical bytes
     given_hash = report_data.get("report_hash")
     if (
@@ -374,7 +444,7 @@ def validate_capability_report(report_data: dict[str, Any]) -> list[FlowDiagnost
         clean_data.pop("report_hash", None)
         try:
             expected_hash = hashlib.sha256(
-                b"voice-ai/capability-report/v1\0" + canonical_json_v1(clean_data)
+                b"voice-ai/capability-report/v2\0" + canonical_json_v1(clean_data)
             ).hexdigest()
             if given_hash != expected_hash:
                 diagnostics.append(

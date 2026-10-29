@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from bot.flow.qualification import validate_capability_report
+from bot.flow.qualification import AgentQualificationSettings, validate_capability_report
 from bot.flow.schemas import AdapterCapabilities
 from bot.flow.transport_probe import (
     ExpectedReceiptBinding,
@@ -149,12 +149,18 @@ def test_probe_existing_webrtc_transport_without_model_identity_omits_combined_r
 
 
 def test_probe_existing_webrtc_transport_with_explicit_identity_binds_report_with_not_run_cases():
-    """When explicit real model and locale identity is supplied, report is bound and cases are NOT RUN."""
+    """When exact model, agent settings, and locale identity are supplied, report is bound and cases are NOT RUN."""
     result = probe_existing_webrtc_transport_behavior(
         observed_messages=[{"type": "transcript", "role": "assistant", "text": "Hello"}],
         has_audio_track=True,
         adapter_version="1.0.0",
         model_revision="qwen3.5:4b@sha256:abc123def456",
+        agent_settings=AgentQualificationSettings(
+            llm_model="qwen3.5:4b",
+            stt_provider="mlx-audio",
+            tts_voice_en="af_heart",
+            tts_voice_hi="hf_alpha",
+        ),
         locales=["en", "hi"],
         source_revision="test-commit-sha",
         profile_hash="profile:test_hash",
@@ -195,6 +201,12 @@ def test_probe_existing_webrtc_transport_canonicalizes_sink_latency_measurement(
         measured_sink_latency_ms=12.5,
         adapter_version="1.0.0",
         model_revision="qwen3.5:4b@sha256:abc123def456",
+        agent_settings=AgentQualificationSettings(
+            llm_model="qwen3.5:4b",
+            stt_provider="mlx-audio",
+            tts_voice_en="af_heart",
+            tts_voice_hi="hf_alpha",
+        ),
         locales=["en", "hi"],
         source_revision="test-commit-sha",
         profile_hash="profile:test_hash",
