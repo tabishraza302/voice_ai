@@ -21,14 +21,25 @@ from platform_api.config import PlatformSettings, get_settings
 
 def create_engine(
     settings_or_url: PlatformSettings | str | None = None,
+    *,
+    database_url: str | None = None,
     **engine_kwargs,
 ) -> AsyncEngine:
-    """Create an AsyncEngine for the platform database."""
-    if isinstance(settings_or_url, str):
+    """Create an AsyncEngine for the platform database or a restricted login."""
+    settings = (
+        settings_or_url
+        if isinstance(settings_or_url, PlatformSettings)
+        else None
+    )
+    if settings is not None:
+        url = database_url if database_url is not None else settings.database_url
+    elif isinstance(settings_or_url, str):
+        if database_url is not None:
+            raise ValueError("database_url override requires PlatformSettings.")
         url = settings_or_url
-    elif isinstance(settings_or_url, PlatformSettings):
-        url = settings_or_url.database_url
     else:
+        if database_url is not None:
+            raise ValueError("database_url override requires PlatformSettings.")
         url = get_settings().database_url
 
     defaults = {
