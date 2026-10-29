@@ -5,8 +5,15 @@ import Link from "next/link";
 import { AlertCircle, Bot, Check, Copy, Plus, RefreshCw, SlidersHorizontal, Trash2 } from "lucide-react";
 import { api } from "@/lib/api-client";
 import type { Agent } from "@/types/agent";
+import { useAuth } from "@/lib/auth-state";
+import { PlatformAgentDirectory } from "@/components/PlatformAgentDirectory";
 
 export default function AgentsPage() {
+  const { isLocalMode } = useAuth();
+  return isLocalMode ? <LocalAgentsPage /> : <PlatformAgentDirectory />;
+}
+
+function LocalAgentsPage() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);

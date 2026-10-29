@@ -5,8 +5,15 @@ import Link from "next/link";
 import { ArrowRight, Bot, Mic, RefreshCw, ScrollText, SlidersHorizontal } from "lucide-react";
 import { api } from "@/lib/api-client";
 import type { Agent } from "@/types/agent";
+import { useAuth } from "@/lib/auth-state";
+import { PlatformCustomerDashboard } from "@/components/PlatformCustomerDashboard";
 
 export default function OverviewPage() {
+  const { isLocalMode } = useAuth();
+  return isLocalMode ? <LocalOverviewPage /> : <PlatformCustomerDashboard />;
+}
+
+function LocalOverviewPage() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
