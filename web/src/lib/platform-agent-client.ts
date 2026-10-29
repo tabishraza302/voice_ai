@@ -107,6 +107,7 @@ export interface PublishRequest {
 export type GenerationStatus =
   | "QUEUED"
   | "RUNNING"
+  | "CANCELLING"
   | "COMPLETED"
   | "FAILED"
   | "CANCELLED"
@@ -202,6 +203,7 @@ export interface ChatTestView {
   test_id: string;
   snapshot_hash: string;
   turn_sequence: number;
+  pending_turn_sequence: number | null;
   messages: ChatMessage[];
   flow_state: JsonObject;
   trace: ChatTraceEntry[];
@@ -216,6 +218,7 @@ export interface ListOptions {
 const GENERATION_STATUSES = new Set<GenerationStatus>([
   "QUEUED",
   "RUNNING",
+  "CANCELLING",
   "COMPLETED",
   "FAILED",
   "CANCELLED",
@@ -253,6 +256,10 @@ function requireNumber(value: unknown, name: string): number {
     throw new Error(`Invalid platform response: ${name} must be a number.`);
   }
   return value;
+}
+function requireNullableNumber(value: unknown, name: string): number | null {
+  if (value === null) return null;
+  return requireNumber(value, name);
 }
 
 function requireBoolean(value: unknown, name: string): boolean {
@@ -524,7 +531,7 @@ function parseChatTest(value: unknown): ChatTestView {
   return {
     test_id: requireString(row.test_id, "chat_test.test_id"),
     snapshot_hash: requireString(row.snapshot_hash, "chat_test.snapshot_hash"),
-    turn_sequence: requireNumber(row.turn_sequence, "chat_test.turn_sequence"),
+    pending_turn_sequence: requireNullableNumber(row.pending_turn_sequence, "chat_test.pending_turn_sequence"),
     messages: row.messages.map(parseChatMessage),
     flow_state: requireJsonObject(row.flow_state, "chat_test.flow_state"),
     trace: parseTrace(row.trace),

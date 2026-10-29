@@ -78,10 +78,12 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
   const [config, setConfig] = useState<JsonObject | null>(null);
   const [versions, setVersions] = useState<VersionView[]>([]);
   const [versionsError, setVersionsError] = useState<string | null>(null);
+  const [versionsLoading, setVersionsLoading] = useState(true);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const [dirty, setDirty] = useState(false);
+  const [flowJsonDirty, setFlowJsonDirty] = useState(false);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("saved");
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saveConflict, setSaveConflict] = useState(false);
@@ -112,6 +114,23 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
   const saveTimerRef = useRef<number | null>(null);
   const pendingSaveCountRef = useRef(0);
   const publishKeyRef = useRef<IdempotencyRecord | null>(null);
+  const versionsRequestRef = useRef(0);
+  const activeWorkspaceUrlRef = useRef<string | null>(null);
+  const activeWorkspaceHistoryStateRef = useRef<unknown>(null);
+
+  const refreshVersions = useCallback(async () => {
+    const requestId = ++versionsRequestRef.current;
+    setVersionsLoading(true);
+    setVersionsError(null);
+    try {
+      const loadedVersions = await platformAgentApi.listAllVersions(agentId);
+      if (requestId === versionsRequestRef.current) setVersions(loadedVersions);
+    } catch (error: unknown) {
+      if (requestId === versionsRequestRef.current) setVersionsError(errorMessage(error));
+    } finally {
+      if (requestId === versionsRequestRef.current) setVersionsLoading(false);
+    }
+  }, [agentId]);
 
   useEffect(() => {
     setMobileTab(searchParams.get("tab") === "test" ? "test" : "editor");
@@ -121,17 +140,12 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
     let current = true;
     setLoading(true);
     setLoadError(null);
-    setVersionsError(null);
+    void refreshVersions();
     const load = async () => {
       try {
-        const versionRequest = platformAgentApi.listAllVersions(agentId).catch((error: unknown) => {
-          if (current) setVersionsError(errorMessage(error));
-          return [];
-        });
-        const [loadedAgent, loadedDraft, loadedVersions] = await Promise.all([
+        const [loadedAgent, loadedDraft] = await Promise.all([
           platformAgentApi.getAgent(agentId),
           platformAgentApi.getDraft(agentId),
-          versionRequest,
         ]);
         if (!current) return;
         draftRef.current = loadedDraft;
@@ -141,7 +155,6 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
         setAgent(loadedAgent);
         setDraft(loadedDraft);
         setConfig(loadedDraft.config);
-        setVersions(loadedVersions);
         setIdentityName(loadedAgent.name);
         setIdentityDescription(loadedAgent.description);
         setIdentityPersona(loadedAgent.persona_prompt);
@@ -156,8 +169,11 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
       }
     };
     void load();
-    return () => { current = false; };
-  }, [agentId, refreshKey]);
+    return () => {
+      current = false;
+      versionsRequestRef.current += 1;
+    };
+  }, [agentId, refreshKey, refreshVersions]);
 
   const configKey = useMemo(() => config ? JSON.stringify(config) : "", [config]);
   const currentValidation = Boolean(
@@ -175,6 +191,70 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
     ? Array.from(new Set(validation.warnings.map((warning) => warning.code)))
     : [];
   const allWarningsAcknowledged = warningCodes.every((code) => acknowledgedWarnings.includes(code));
+  const identityDirty = Boolean(agent && (
+    identityName !== agent.name ||
+    identityDescription !== agent.description ||
+    identityPersona !== agent.persona_prompt
+  ));
+  const workspacePath = `/agents/${agentId}`;
+  const hasUnsavedWorkspaceChanges = identityDirty ||
+    identitySaving ||
+    flowJsonDirty ||
+    dirty ||
+    dirtyRef.current ||
+    pendingSaveCountRef.current > 0 ||
+    saveStatus === "saving" ||
+    saveStatus === "error" ||
+    saveError !== null ||
+    publishLoading ||
+    restoringVersionId !== null;
+  useEffect(() => {
+    if (window.location.pathname === workspacePath) {
+      activeWorkspaceUrlRef.current = window.location.href;
+      activeWorkspaceHistoryStateRef.current = window.history.state;
+    }
+  }, [searchParams, workspacePath]);
+
+  useEffect(() => {
+    if (!hasUnsavedWorkspaceChanges) return;
+    const warnBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeUnload);
+    return () => window.removeEventListener("beforeunload", warnBeforeUnload);
+  }, [hasUnsavedWorkspaceChanges]);
+
+  useEffect(() => {
+    if (!hasUnsavedWorkspaceChanges) return;
+    const warnBeforeInternalNavigation = (event: MouseEvent) => {
+      if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      if (!(event.target instanceof Element)) return;
+      const link = event.target.closest<HTMLAnchorElement>("a[href]");
+      if (!link || link.target && link.target !== "_self" || link.hasAttribute("download")) return;
+      const destination = new URL(link.href, window.location.href);
+      if (destination.origin !== window.location.origin || destination.pathname === workspacePath) return;
+      if (window.confirm("You have unsaved agent changes. Leave without saving?")) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    };
+    const warnBeforeHistoryNavigation = (event: PopStateEvent) => {
+      if (window.location.pathname === workspacePath || window.confirm("You have unsaved agent changes. Leave without saving?")) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      const workspaceUrl = activeWorkspaceUrlRef.current;
+      if (workspaceUrl) {
+        window.history.pushState(activeWorkspaceHistoryStateRef.current, "", workspaceUrl);
+      }
+    };
+    document.addEventListener("click", warnBeforeInternalNavigation, true);
+    window.addEventListener("popstate", warnBeforeHistoryNavigation, true);
+    return () => {
+      document.removeEventListener("click", warnBeforeInternalNavigation, true);
+      window.removeEventListener("popstate", warnBeforeHistoryNavigation, true);
+    };
+  }, [hasUnsavedWorkspaceChanges, workspacePath]);
+
   const eligibleToPublish = Boolean(currentValidation && validation?.eligible_for_publish);
 
   let flow: FlowDocument | null = null;
@@ -394,6 +474,10 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
       setIdentityDescription(updated.description);
       setIdentityPersona(updated.persona_prompt);
       if (updated.persona_prompt !== agent?.persona_prompt || snapshotRefreshNeeded) {
+        setValidation(null);
+        setValidationConfigKey(null);
+        setValidationRevision(null);
+        setAcknowledgedWarnings([]);
         setDraft((current) => current ? { ...current, snapshot_hash: null } : current);
         setSnapshotRefreshNeeded(true);
         await refreshDraftSnapshot(true);
@@ -420,7 +504,7 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
   };
 
   const handleValidate = async () => {
-    if (!draft || !config) return;
+    if (!draft || !config || identityDirty || identitySaving || publishLoading || snapshotRefreshNeeded || snapshotRefreshLoading) return;
     setValidationLoading(true);
     setWorkspaceError(null);
     try {
@@ -439,7 +523,7 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
   };
 
   const handlePublish = async () => {
-    if (!draft || !config || !validation || !currentValidation || !validation.eligible_for_publish || !allWarningsAcknowledged || !changelog.trim()) return;
+    if (!draft || !config || identityDirty || identitySaving || publishLoading || snapshotRefreshNeeded || snapshotRefreshLoading || !validation || !currentValidation || !validation.eligible_for_publish || !allWarningsAcknowledged || !changelog.trim()) return;
     setPublishLoading(true);
     setWorkspaceError(null);
     try {
@@ -507,11 +591,6 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
     router.replace(tab === "test" ? `/agents/${agentId}?tab=test` : `/agents/${agentId}`, { scroll: false });
   };
 
-  const identityDirty = Boolean(agent && (
-    identityName !== agent.name ||
-    identityDescription !== agent.description ||
-    identityPersona !== agent.persona_prompt
-  ));
 
   if (loading) {
     return <div role="status" className="flex min-h-[40vh] items-center justify-center gap-3 text-sm text-limestone-400"><RefreshCw className="h-4 w-4 animate-spin text-copper-400" />Loading agent workspace…</div>;
@@ -532,8 +611,20 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
 
   const latestVersion = versions.find((version) => version.version_id === agent.published_version_id) ?? null;
   const runtimeSettings = summarizeRuntimeSettings(config);
-  const draftStatusLabel = saveStatus === "saving" ? "Saving draft…" : saveStatus === "unsaved" ? "Unsaved changes" : saveStatus === "error" ? "Save failed" : `Saved r${draft.draft_revision}`;
-  const publishDisabled = publishLoading || dirty || saveStatus === "saving" || !eligibleToPublish || !allWarningsAcknowledged || !changelog.trim();
+  const draftStatusLabel = identitySaving
+    ? "Saving agent details…"
+    : identityDirty
+      ? "Unsaved agent details"
+      : flowJsonDirty
+        ? "Unapplied Flow JSON"
+        : saveStatus === "saving"
+          ? "Saving draft…"
+          : saveStatus === "unsaved"
+            ? "Unsaved changes"
+            : saveStatus === "error"
+              ? "Save failed"
+              : `Saved r${draft.draft_revision}`;
+  const publishDisabled = publishLoading || identityDirty || identitySaving || snapshotRefreshNeeded || snapshotRefreshLoading || dirty || saveStatus === "saving" || !eligibleToPublish || !allWarningsAcknowledged || !changelog.trim();
 
   return (
     <div className="mx-auto max-w-[1600px] space-y-5">
@@ -578,9 +669,9 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
         </div>
       ) : null}
 
-      <div role="tablist" aria-label="Agent workspace section" className="flex gap-2 lg:hidden">
-        <button type="button" role="tab" aria-selected={mobileTab === "editor"} className={mobileTab === "editor" ? "button-primary flex-1" : "button-secondary flex-1"} onClick={() => setMobileMode("editor")}>Workspace</button>
-        <button type="button" role="tab" aria-selected={mobileTab === "test"} className={mobileTab === "test" ? "button-primary flex-1" : "button-secondary flex-1"} onClick={() => setMobileMode("test")}>Test agent</button>
+      <div role="group" aria-label="Agent workspace section" className="flex gap-2 lg:hidden">
+        <button type="button" aria-pressed={mobileTab === "editor"} className={mobileTab === "editor" ? "button-primary flex-1" : "button-secondary flex-1"} onClick={() => setMobileMode("editor")}>Workspace</button>
+        <button type="button" aria-pressed={mobileTab === "test"} className={mobileTab === "test" ? "button-primary flex-1" : "button-secondary flex-1"} onClick={() => setMobileMode("test")}>Test agent</button>
       </div>
 
       <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(22rem,28rem)]">
@@ -596,15 +687,15 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
             <form className="space-y-4" onSubmit={handleSaveIdentity}>
               <div>
                 <label className="field-label" htmlFor="workspace-agent-name">Agent name</label>
-                <input id="workspace-agent-name" className="field-control" value={identityName} onChange={(event) => { setIdentityName(event.currentTarget.value); setIdentityError(null); }} required disabled={identitySaving || snapshotRefreshLoading} />
+                <input id="workspace-agent-name" className="field-control" value={identityName} onChange={(event) => { setIdentityName(event.currentTarget.value); setIdentityError(null); }} required disabled={identitySaving || snapshotRefreshLoading || publishLoading} />
               </div>
               <div>
                 <label className="field-label" htmlFor="workspace-agent-description">Purpose</label>
-                <textarea id="workspace-agent-description" className="field-control min-h-20" value={identityDescription} onChange={(event) => { setIdentityDescription(event.currentTarget.value); setIdentityError(null); }} disabled={identitySaving || snapshotRefreshLoading} />
+                <textarea id="workspace-agent-description" className="field-control min-h-20" value={identityDescription} onChange={(event) => { setIdentityDescription(event.currentTarget.value); setIdentityError(null); }} disabled={identitySaving || snapshotRefreshLoading || publishLoading} />
               </div>
               <div>
                 <label className="field-label" htmlFor="workspace-agent-persona">Persona instructions</label>
-                <textarea id="workspace-agent-persona" className="field-control min-h-32 font-mono text-sm" value={identityPersona} onChange={(event) => { setIdentityPersona(event.currentTarget.value); setIdentityError(null); }} disabled={identitySaving || snapshotRefreshLoading} />
+                <textarea id="workspace-agent-persona" className="field-control min-h-32 font-mono text-sm" value={identityPersona} onChange={(event) => { setIdentityPersona(event.currentTarget.value); setIdentityError(null); }} disabled={identitySaving || snapshotRefreshLoading || publishLoading} />
               </div>
               {identityError ? <p role="alert" className="text-sm text-rust-200">{identityError}</p> : null}
               {snapshotRefreshNeeded ? (
@@ -612,7 +703,7 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
                   {snapshotRefreshLoading ? "Refreshing…" : "Refresh draft snapshot"}
                 </button>
               ) : null}
-              <button type="submit" className="button-secondary" disabled={identitySaving || snapshotRefreshLoading || !identityDirty}>
+              <button type="submit" className="button-secondary" disabled={identitySaving || snapshotRefreshLoading || publishLoading || !identityDirty}>
                 {identitySaving ? "Saving details…" : "Save agent details"}
               </button>
             </form>
@@ -666,7 +757,7 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
           </section>
 
           {flow ? (
-            <ConversationFlowEditor flow={flow} diagnostics={visibleDiagnostics} onChange={updateFlow} />
+            <ConversationFlowEditor flow={flow} diagnostics={visibleDiagnostics} onChange={updateFlow} onDirtyChange={setFlowJsonDirty} />
           ) : (
             <section className="surface space-y-3 p-5">
               <h2 className="text-lg font-semibold text-limestone-100">Flow document unavailable</h2>
@@ -681,7 +772,7 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
                 <h2 className="text-lg font-semibold text-limestone-100">Validate and publish</h2>
                 <p className="mt-1 text-sm text-limestone-400">Validation uses the current schema. Publishing creates an immutable version; it never edits the saved source.</p>
               </div>
-              <button type="button" className="button-secondary" onClick={() => void handleValidate()} disabled={validationLoading || saveStatus === "saving"}>
+              <button type="button" className="button-secondary" onClick={() => void handleValidate()} disabled={validationLoading || identityDirty || identitySaving || snapshotRefreshNeeded || snapshotRefreshLoading || publishLoading || saveStatus === "saving"}>
                 {validationLoading ? "Validating…" : "Validate current draft"}
               </button>
             </div>
@@ -727,13 +818,17 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
                 <h2 className="text-lg font-semibold text-limestone-100">Version history</h2>
                 <p className="mt-1 text-sm text-limestone-400">Restore a published version into the mutable draft without changing its original version.</p>
               </div>
-              <span className="inline-flex items-center gap-1 text-xs text-limestone-500"><Clock3 className="h-3.5 w-3.5" />{versions.length} versions</span>
+              <span className="inline-flex items-center gap-1 text-xs text-limestone-500"><Clock3 className="h-3.5 w-3.5" />{versionsLoading ? "Loading…" : `${versions.length} versions`}</span>
             </div>
             {versionsError ? (
               <div role="alert" className="flex flex-wrap items-center justify-between gap-3 text-sm text-rust-200">
                 <span>Could not load version history: {versionsError}</span>
-                <button type="button" className="button-secondary" onClick={() => setRefreshKey((value) => value + 1)}>Retry</button>
+                <button type="button" className="button-secondary" onClick={() => void refreshVersions()} disabled={versionsLoading}>
+                  {versionsLoading ? "Retrying…" : "Retry version history"}
+                </button>
               </div>
+            ) : versionsLoading ? (
+              <p role="status" className="text-sm text-limestone-400">Loading version history…</p>
             ) : versions.length === 0 ? (
               <p className="text-sm text-limestone-400">No published versions yet.</p>
             ) : (

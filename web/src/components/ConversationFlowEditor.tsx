@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Plus, Trash2 } from "lucide-react";
-import type { AgentDiagnostic, JsonObject, JsonValue } from "@/lib/platform-agent-client";
+import type { AgentDiagnostic, JsonValue } from "@/lib/platform-agent-client";
 import {
   addFlowStep,
   deriveFlowGraph,
@@ -18,6 +18,7 @@ interface ConversationFlowEditorProps {
   flow: FlowDocument;
   diagnostics: AgentDiagnostic[];
   onChange: (flow: FlowDocument) => void;
+  onDirtyChange: (dirty: boolean) => void;
 }
 
 const STEP_TYPES = ["ask", "collect", "inform", "action", "summary", "end"] as const;
@@ -30,14 +31,29 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : "The flow could not be read.";
 }
 
-export function ConversationFlowEditor({ flow, diagnostics, onChange }: ConversationFlowEditorProps) {
+export function ConversationFlowEditor({ flow, diagnostics, onChange, onDirtyChange }: ConversationFlowEditorProps) {
   const [view, setView] = useState<"steps" | "flow-json" | "flow-map">("steps");
-  const [rawJson, setRawJson] = useState(() => JSON.stringify(flow, null, 2));
+  const serializedFlow = JSON.stringify(flow, null, 2);
+  const [rawJson, setRawJson] = useState(serializedFlow);
   const [rawError, setRawError] = useState<string | null>(null);
+  const [flowJsonDirty, setFlowJsonDirty] = useState(false);
+  const [flowChangedWhileEditing, setFlowChangedWhileEditing] = useState(false);
+  const previousFlowTextRef = useRef(serializedFlow);
+
   useEffect(() => {
-    setRawJson(JSON.stringify(flow, null, 2));
+    if (flowJsonDirty) {
+      if (previousFlowTextRef.current !== serializedFlow) {
+        previousFlowTextRef.current = serializedFlow;
+        setFlowChangedWhileEditing(true);
+      }
+      return;
+    }
+    previousFlowTextRef.current = serializedFlow;
+    setRawJson(serializedFlow);
     setRawError(null);
-  }, [flow]);
+    setFlowChangedWhileEditing(false);
+    onDirtyChange(false);
+  }, [flowJsonDirty, onDirtyChange, serializedFlow]);
 
   let steps: FlowStep[] = [];
   let graph: FlowGraph = { nodes: [], edges: [] };
@@ -62,15 +78,39 @@ export function ConversationFlowEditor({ flow, diagnostics, onChange }: Conversa
     if (currentSteps.length >= 128) return;
     onChange(addFlowStep(flow));
   };
+  const updateRawJson = (next: string) => {
+    setRawJson(next);
+    const isDirty = next !== serializedFlow;
+    setFlowJsonDirty(isDirty);
+    onDirtyChange(isDirty);
+    if (!isDirty) {
+      setRawError(null);
+      setFlowChangedWhileEditing(false);
+    }
+  };
+
+  const loadCurrentFlowIntoJson = () => {
+    if (!window.confirm("Discard the unapplied Flow JSON and load the current Steps/Flow view?")) return;
+    previousFlowTextRef.current = serializedFlow;
+    setRawJson(serializedFlow);
+    setRawError(null);
+    setFlowJsonDirty(false);
+    setFlowChangedWhileEditing(false);
+    onDirtyChange(false);
+  };
 
   const applyJson = () => {
+    if (flowChangedWhileEditing && !window.confirm("Applying this JSON will replace the newer Steps/Flow view changes. Continue?")) return;
     try {
       const parsed: unknown = JSON.parse(rawJson);
       if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
         throw new Error("The flow must be a JSON object.");
       }
-      onChange(parsed as JsonObject);
+      onChange(parsed as FlowDocument);
       setRawError(null);
+      setFlowJsonDirty(false);
+      setFlowChangedWhileEditing(false);
+      onDirtyChange(false);
     } catch (error: unknown) {
       setRawError(errorText(error));
     }
@@ -83,10 +123,10 @@ export function ConversationFlowEditor({ flow, diagnostics, onChange }: Conversa
           <h2 id="flow-editor-heading" className="text-xl font-semibold text-limestone-100">Conversation flow</h2>
           <p className="mt-1 text-sm text-limestone-400">Edit and validate the same versioned flow document used by Chat Test and publishing.</p>
         </div>
-        <div role="tablist" aria-label="Flow editor view" className="flex flex-wrap gap-2">
-          <button type="button" role="tab" aria-selected={view === "steps"} className={view === "steps" ? "button-primary" : "button-secondary"} onClick={() => setView("steps")}>Steps</button>
-          <button type="button" role="tab" aria-selected={view === "flow-map"} className={view === "flow-map" ? "button-primary" : "button-secondary"} onClick={() => setView("flow-map")}>Flow view</button>
-          <button type="button" role="tab" aria-selected={view === "flow-json"} className={view === "flow-json" ? "button-primary" : "button-secondary"} onClick={() => setView("flow-json")}>Flow JSON</button>
+        <div role="group" aria-label="Flow editor view" className="flex flex-wrap gap-2">
+          <button type="button" aria-pressed={view === "steps"} className={view === "steps" ? "button-primary" : "button-secondary"} onClick={() => setView("steps")}>Steps</button>
+          <button type="button" aria-pressed={view === "flow-map"} className={view === "flow-map" ? "button-primary" : "button-secondary"} onClick={() => setView("flow-map")}>Flow view</button>
+          <button type="button" aria-pressed={view === "flow-json"} className={view === "flow-json" ? "button-primary" : "button-secondary"} onClick={() => setView("flow-json")}>Flow JSON</button>
         </div>
       </div>
 
@@ -205,13 +245,19 @@ export function ConversationFlowEditor({ flow, diagnostics, onChange }: Conversa
       {view === "flow-json" ? (
         <div className="surface space-y-3 p-4 sm:p-5">
           <p className="text-sm text-limestone-400">This is the authoring flow object. It uses schema version 1 and is preserved as JSON, including advanced captures, conditions, and messages.</p>
+          {flowChangedWhileEditing ? (
+            <div role="status" className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-copper-900/70 bg-copper-950/20 p-3 text-sm text-copper-200">
+              <p>The Flow changed while this JSON draft was unapplied. Your JSON text is preserved; applying it will replace the newer Steps/Flow view changes.</p>
+              <button type="button" className="button-secondary" onClick={loadCurrentFlowIntoJson}>Load current flow into JSON</button>
+            </div>
+          ) : null}
           <label htmlFor="flow-json-editor" className="field-label">Flow document</label>
           <textarea
             id="flow-json-editor"
             className="field-control min-h-[28rem] font-mono text-xs leading-5"
             spellCheck={false}
             value={rawJson}
-            onChange={(event) => setRawJson(event.currentTarget.value)}
+            onChange={(event) => updateRawJson(event.currentTarget.value)}
             aria-describedby={rawError ? "flow-json-error" : undefined}
           />
           {rawError ? <p id="flow-json-error" role="alert" className="text-sm text-rust-200">{rawError}</p> : null}
