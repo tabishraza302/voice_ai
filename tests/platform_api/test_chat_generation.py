@@ -192,6 +192,7 @@ async def _create_user_session(
             updated_at=now,
         )
         db.add(user)
+        await db.flush()
         _, secret = await create_authenticated_session(
             db,
             settings,
@@ -1151,10 +1152,9 @@ async def test_chat_rejects_new_tests_with_stale_policy_but_pins_existing_sessio
     assert policy_text not in str(model_client.calls[-1]["messages"])
 
 
-@pytest.mark.asyncio
-async def test_model_client_omits_unsupported_structured_output_option(monkeypatch):
-    settings = PlatformSettings(
-        runtime_llm_base_url="http://127.0.0.1:11434/v1"
+async def test_model_client_omits_unsupported_structured_output_option(monkeypatch, test_platform_settings: PlatformSettings):
+    settings = test_platform_settings.model_copy(
+        update={"runtime_llm_base_url": "http://127.0.0.1:11434/v1"}
     )
     model_client = OpenAICompatibleModelClient(settings)
     requests: list[dict[str, object]] = []
@@ -1201,10 +1201,9 @@ async def test_model_client_omits_unsupported_structured_output_option(monkeypat
     assert "response_format" not in requests[0]
 
 
-@pytest.mark.asyncio
-async def test_model_client_exposes_safe_upstream_http_status(monkeypatch):
-    settings = PlatformSettings(
-        runtime_llm_base_url="http://127.0.0.1:11434/v1"
+async def test_model_client_exposes_safe_upstream_http_status(monkeypatch, test_platform_settings: PlatformSettings):
+    settings = test_platform_settings.model_copy(
+        update={"runtime_llm_base_url": "http://127.0.0.1:11434/v1"}
     )
     model_client = OpenAICompatibleModelClient(settings)
 
