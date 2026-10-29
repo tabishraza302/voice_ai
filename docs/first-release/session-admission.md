@@ -1,0 +1,76 @@
+# Task 6 platform session admission
+
+This document describes the implemented platform control-plane boundary for owner-only voice-test sessions. It does **not** claim that the local SaaS runtime or media pipeline is present: that runtime is an external prerequisite and must implement the bridge described below before voice-test admission can be enabled.
+
+## Scope and storage
+
+The platform creates only `voice_test` sessions. It uses the existing canonical `platform_api.models.session.Session` row and the same PostgreSQL database and configured platform schema as auth, agents, and billing. Runner capacity, registration, owner participant, join JTI, peer, and slot records are added in that schema; they are not a second session store. User, wallet, and agent-version data remain in place. Public calls and real-paid calls are rejected by admission configuration and remain disabled.
+
+The first-release schema contract is fresh-schema-only. The initializer creates a new platform schema or verifies an identical schema and fails closed on a metadata mismatch. No migration, backfill, or Alembic path is included. Use a disposable fresh PostgreSQL database for tests; never reset or drop an existing user database, use SQLite, or modify the shared `public` schema.
+
+## Owner API
+
+The owner API is mounted under `/api/v1`:
+
+| Method and path | Purpose |
+| --- | --- |
+| `POST /api/v1/agents/{agent_id}/test/voice-sessions` | Reserve a voice-test session for a caller-owned enabled immutable `agent_version_id`. |
+| `GET /api/v1/sessions/{session_id}` | Read the safe session state for its owner only. |
+| `POST /api/v1/sessions/{session_id}/join` | Issue/reissue the owner-bound, short-lived join credential for the existing live session. |
+| `POST /api/v1/sessions/{session_id}/end` | Request idempotent owner teardown. |
+
+Create, join, and end require an authenticated owner, the configured exact `Origin`, CSRF protection, and an `Idempotency-Key`. They use the existing auth cookie and CSRF contract. The body contains only the immutable version ID; it cannot choose a runner, URL, price, capacity, model, or provider. Create is feature-gated by `PLATFORM_ENABLE_VOICE_TEST`, and does not enable public or real-paid calls. Session responses are private/no-store and expose no other owner's session data.
+
+The owner must have a funded wallet for a first permit. The selected published version must have at least one voice and match the trusted, pinned adapter capability and qualification settings for both EN and HI fragment playback, metadata, gating, and cancellation. Missing, stale, or mismatched qualification fails closed; mutable draft/profile/default configuration is not consulted to construct a runtime snapshot.
+
+## Admission and compensation
+
+Admission uses the configured local runner only. The database transaction locks the owner and runner capacity records, checks the distinct owner and runner limits, and durably creates the canonical session, execution slot, pending registration, owner participant, and idempotency record with stable session and registration IDs. The HTTP call to the runner occurs only after that transaction commits.
+
+The platform then persists the runner's bound registration acknowledgement, creates the call budget, and reserves the first funded permit. Only after a live permit is confirmed does it move the session to `REGISTERED`, persist the single-use join JTI and its complete binding, and return the signed token. An unresolved bridge or database outcome is retried against the same durable session, registration, and idempotency IDs; it is not converted to success. A definitive registration rejection, setup timeout, or funding denial follows compensation. If a runner reservation may exist, execution capacity is not released until the runner confirms release. Any open budget is closed with the matching stop evidence; a terminal failed session is written only after compensation completes. An unresolved compensation remains retryable and continues to hold capacity.
+
+Owner capacity and runner capacity are independently configured and enforced. A confirmed runtime release frees execution capacity, but does not by itself close billing. The registration remains `REGISTERED` while the runtime provides the final stop attestation, so `close_budget` can authenticate the stop against the assigned runner and exact session version.
+
+## Join and runtime lifecycle
+
+Join tokens are EdDSA-signed and short lived. Each JTI is stored as a single-use row; the token itself is not stored. The token and database record bind the owner auth session, participant, session and exact session version, immutable config version, assigned runner, registration, configured signaling URL, exact web origin, key fingerprint, issuer, audience, scope, and expiry. Runtime consumption verifies the signed token and every stored binding before atomically consuming the JTI and assigning the sole peer. A wrong origin, runner, session, configuration, registration, or peer replay is rejected. A released peer may reconnect only within the stored grace window; reconnect gaps are not billed.
+
+The runtime may advance the session with version-checked state transitions. Entering `ACTIVE` requires an open budget and unexpired funded permit. For teardown, the platform first moves the session to `ENDING`, sends a version-bound local release command, and marks the execution slot released only after an explicit acknowledgement. The runtime must stop media before it submits a `voice-runtime` stop attestation for that same `ENDING` version. The platform closes the budget from cumulative proven usage; only then may a version-checked terminal transition set the registration to `RELEASED` and the canonical session to `COMPLETED`, `FAILED`, or `EXPIRED`. If budget closure or terminal persistence is retried, the committed stop and billing facts remain durable.
+
+The internal API is mounted under `/internal/sessions` and is authenticated with the configured runtime bearer token and `X-Runner-ID`. It exposes:
+
+- `GET /internal/sessions/{session_id}/runtime-config`
+- `POST /internal/sessions/{session_id}/join/consume`
+- `POST /internal/sessions/{session_id}/peer/release`
+- `POST /internal/sessions/{session_id}/state`
+
+The runtime uses the same bearer and runner identity for synchronous budget metering at `POST /internal/sessions/{session_id}/budget/checkpoint` and `POST /internal/sessions/{session_id}/budget/close`. The first permit is reserved by the platform before join credentials are issued; runtime checkpoints extend only cumulative, verified usage. Budget close requires the final cumulative usage and, while a permit remains live, a stop attestation bound to the `ENDING` session version.
+
+Runtime configuration is built only from the immutable version snapshot and current budget facts. It never falls back to mutable agent state or shared global provider selection.
+
+## Local runner bridge contract
+
+The platform's authenticated, outbound bridge sends a registration command to `POST {PLATFORM_SESSION_RUNNER_URL}/internal/runtime/sessions/{session_id}/register` and an idempotent release command to `POST {PLATFORM_SESSION_RUNNER_URL}/internal/runtime/sessions/{session_id}/release`. Requests carry `Authorization: Bearer <PLATFORM_RUNTIME_SERVICE_TOKEN>`, `X-Runner-ID`, and JSON. The bridge disables ambient proxy configuration and redirects, uses a bounded timeout, and accepts only the exact bound response shape.
+
+Registration command fields are `session_id`, `runner_id`, `registration_id`, `config_version_id`, `session_version`, `connect_deadline`, and `hard_end_deadline`. The runner must return `session_id`, `runner_id`, the same `registration_id`, and an `expires_at` no later than `connect_deadline`. The runner must make registration idempotent by the same IDs. A timeout, malformed acknowledgement, or other uncertain response is unresolved and must be retried without allocating a second session.
+
+Release command fields are `session_id`, `runner_id`, `registration_id`, and the exact `session_version`. Only an HTTP 200 response with matching session, runner, registration, and version plus `released: true` frees platform execution capacity. An absent, malformed, stale, or ambiguous acknowledgement keeps the slot reserved for retry.
+
+The platform accepts only exact loopback runner and signaling endpoints. It does not resolve a hosted runtime by DNS, download code or models, or expose a configurable public runner URL. The local runtime must authenticate the configured platform service token and runner identity, verify the join JWT and origin before allocating a media/provider session, load only the immutable published config, enforce permit/hard-end boundaries, report peer/lifecycle changes, and provide the stop attestation. Those runtime-side endpoints and media behaviors are not implemented in this platform worktree.
+
+## Configuration and external prerequisites
+
+All session configuration is unset in `.env.example`; `PLATFORM_ENABLE_VOICE_TEST` remains false. To enable a local deployment, an operator must provide all of the following from the actual installed environment:
+
+1. PostgreSQL with a fresh platform schema initialized for this code version. Test only against a disposable fresh database; do not reset an existing user database or use an incompatible schema.
+2. `PLATFORM_SESSION_RUNNER_ID` and `PLATFORM_SESSION_RUNNER_URL`, with the latter pointing to the real local loopback runtime bridge.
+3. `PLATFORM_RUNTIME_SERVICE_TOKEN`, a private token shared only by the platform and assigned local runner.
+4. Positive `PLATFORM_SESSION_OWNER_CAPACITY` and `PLATFORM_SESSION_RUNNER_CAPACITY` limits.
+5. `PLATFORM_SESSION_SIGNALING_URL` at a real local loopback signaling endpoint and `PLATFORM_WEB_ORIGIN` set to the exact owner browser origin.
+6. `PLATFORM_SESSION_JOIN_ISSUER`, `PLATFORM_SESSION_JOIN_PRIVATE_KEY_B64`, and `PLATFORM_SESSION_JOIN_PUBLIC_KEY_B64` containing a matching platform-owned Ed25519 pair; keep the private key on the platform side.
+7. Positive `PLATFORM_SESSION_JOIN_TTL_SECONDS`, `PLATFORM_SESSION_MAX_DURATION_MS`, `PLATFORM_SESSION_SETUP_TIMEOUT_SECONDS`, `PLATFORM_SESSION_RECONNECT_GRACE_SECONDS`, `PLATFORM_SESSION_RUNTIME_TIMEOUT_SECONDS`, `PLATFORM_BILLING_SLICE_MS`, and `PLATFORM_BILLING_PERMIT_TTL_MS`; plus nonnegative `PLATFORM_SESSION_RATE_MINOR_PER_MINUTE` and a nonempty versioned `PLATFORM_SESSION_TARIFF_VERSION`. These are required and have no code defaults.
+8. A real trusted qualification report and stable deployment identity from `PLATFORM_ADAPTER_CAPABILITY_REPORT_PATH`, `PLATFORM_ADAPTER_CAPABILITY_REPORT_HASH`, `PLATFORM_DEPLOYMENT_ADAPTER_ID`, `PLATFORM_DEPLOYMENT_ADAPTER_VERSION`, `PLATFORM_DEPLOYMENT_MODEL_REVISION`, `PLATFORM_DEPLOYMENT_PROFILE_HASH`, and `PLATFORM_DEPLOYMENT_SOURCE_REVISION`, matching the actual qualified EN/HI adapter and published voice settings.
+9. A funded owner wallet for each admitted session.
+10. The real runtime registration/release bridge, token/origin/JTI verification, immutable-config loading, permit enforcement, peer lifecycle, and version-bound stop attestation installed and verified in the intended air-gapped/loopback environment.
+
+Do not enable `PLATFORM_ENABLE_VOICE_TEST` until these prerequisites are present. No credentials, provider downloads, DNS-discovered services, hosted-media fallbacks, or fake successful acknowledgements are supplied by this code.

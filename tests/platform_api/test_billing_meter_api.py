@@ -21,12 +21,14 @@ import uuid
 
 import httpx
 import pytest
+from fastapi import Response
 from sqlalchemy import select, update
 from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from platform_api.app import create_app
 from platform_api.billing import routes as billing_routes
+from platform_api.billing.schemas import CloseBudgetRequest, RuntimeStopAttestation
 from platform_api.auth.errors import ForbiddenError
 from platform_api.auth.passwords import get_password_hasher
 from platform_api.auth.sessions import create_authenticated_session
@@ -1003,6 +1005,51 @@ async def test_deployment_configured_slice_and_ttl_enforced(fresh_pg: FreshPostg
                 permit_ttl_ms=-50,
             )
 
+@pytest.mark.asyncio
+async def test_budget_close_route_forwards_stop_attestation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = uuid.uuid4()
+    attestation = RuntimeStopAttestation(
+        source="voice-runtime",
+        stop_id=uuid.uuid4(),
+        session_id=session_id,
+        runner_id="runner-alpha",
+        registration_id=uuid.uuid4(),
+        session_version=3,
+        stopped_at=datetime.now(timezone.utc),
+        reason="OWNER_STOP",
+    )
+    payload = CloseBudgetRequest(
+        operation_id="http-close-attested",
+        expected_budget_version=2,
+        cumulative_billable_ms=0,
+        stop_attestation=attestation,
+    )
+    sentinel = object()
+    observed: dict[str, object] = {}
+
+    async def capture_billing_call(service_call, db, **kwargs):
+        observed["service_call"] = service_call
+        observed["db"] = db
+        observed.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(billing_routes, "_billing_db_call", capture_billing_call)
+    result = await billing_routes.session_budget_close(
+        session_id=session_id,
+        payload=payload,
+        response=Response(),
+        principal=RuntimePrincipal(runner_id=attestation.runner_id),
+        db=object(),
+    )
+
+    assert result is sentinel
+    assert observed["service_call"] is close_budget
+    assert observed["stop_attestation"] == attestation
+    assert observed["stop_evidence"] == attestation.model_dump(mode="json")
+
+
 @pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_http_internal_routes_fail_closed_without_task6_transport_auth(
@@ -1788,7 +1835,7 @@ async def test_billing_route_surface_matches_contract(
                 "/api/v1/wallet/entries",
             }
             or path.endswith("/wallet-adjustments")
-            or path.startswith("/internal/sessions/")
+            or (path.startswith("/internal/sessions/") and "/budget/" in path)
         ):
             billing_paths[path] = frozenset(
                 method

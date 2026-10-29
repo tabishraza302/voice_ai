@@ -41,10 +41,15 @@ from platform_api.qualification import (
     DeploymentIdentity,
     load_deployment_capability_report,
 )
+from platform_api.sessions.routes import (
+    internal_router as internal_sessions_router,
+    owner_router as sessions_router,
+)
 import platform_api.models  # Register complete platform models onto Base.metadata
 
 AUTH_ROUTE_BODY_LIMIT = 8192  # 8 KiB
 AGENT_REQUEST_BODY_LIMIT = DEFAULT_AGENT_CONFIG_MAX_BYTES + 1024
+SESSION_REQUEST_BODY_LIMIT = 8192
 
 
 class RequestContextMiddleware:
@@ -84,9 +89,23 @@ class RequestContextMiddleware:
             (path == "/api/v1/agents" or path.startswith("/api/v1/agents/"))
             and request.method in {"POST", "PATCH", "PUT", "DELETE"}
         )
+        is_session_body_request = (
+            (
+                path.startswith("/api/v1/sessions/")
+                or path.startswith("/internal/sessions/")
+                or (
+                    path.startswith("/api/v1/agents/")
+                    and path.endswith("/test/voice-sessions")
+                )
+            )
+            and request.method == "POST"
+        )
         if path.startswith("/api/v1/auth"):
             body_limit = AUTH_ROUTE_BODY_LIMIT
             too_large_message = "Request body exceeds 8 KiB limit"
+        elif is_session_body_request:
+            body_limit = SESSION_REQUEST_BODY_LIMIT
+            too_large_message = "Session request body exceeds 8 KiB limit"
         elif is_agent_body_request:
             body_limit = AGENT_REQUEST_BODY_LIMIT
             too_large_message = (
@@ -273,11 +292,13 @@ def create_app(settings: PlatformSettings | None = None) -> FastAPI:
     api_v1.include_router(billing_router)
     api_v1.include_router(health_router)
     api_v1.include_router(agents_router)
+    api_v1.include_router(sessions_router)
 
     app.include_router(api_v1)
     # Mount internal routes under /internal
     internal = APIRouter(prefix="/internal")
     internal.include_router(internal_billing_router)
+    internal.include_router(internal_sessions_router)
     app.include_router(internal)
 
     # Also include health_router at root for /health/live, /health/ready, /catalog
