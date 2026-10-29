@@ -55,6 +55,7 @@ from tests.support.billing import (
     create_funded_wallet,
     create_test_session,
     create_test_user,
+    statement_selects_entity,
 )
 from tests.support.postgres import FreshPostgres
 
@@ -220,8 +221,9 @@ async def test_locked_session_refresh_rejects_runner_reassignment_before_financi
         async def execute(self, statement, *args, **kwargs):
             nonlocal pause_once
             result = await super().execute(statement, *args, **kwargs)
-            query = str(statement).lower()
-            if pause_once and "from sessions" in query and "for update" not in query:
+            if pause_once and statement_selects_entity(
+                statement, Session, for_update=False
+            ):
                 pause_once = False
                 initial_session_read.set()
                 await continue_request.wait()
@@ -366,8 +368,9 @@ async def test_meter_replay_revalidates_runner_after_initial_session_read(
         async def execute(self, statement, *args, **kwargs):
             nonlocal pause_once
             result = await super().execute(statement, *args, **kwargs)
-            query = str(statement).lower()
-            if pause_once and "from sessions" in query and "for update" not in query:
+            if pause_once and statement_selects_entity(
+                statement, Session, for_update=False
+            ):
                 pause_once = False
                 initial_session_read.set()
                 await continue_request.wait()
@@ -609,11 +612,8 @@ async def test_owner_reassigned_after_wallet_lock_cannot_mutate_previous_wallet(
         async def execute(self, statement, *args, **kwargs):
             nonlocal pause_once
             result = await super().execute(statement, *args, **kwargs)
-            query = str(statement).lower()
-            if (
-                pause_once
-                and "from wallet_accounts" in query
-                and "for update" in query
+            if pause_once and statement_selects_entity(
+                statement, WalletAccount, for_update=True
             ):
                 pause_once = False
                 wallet_row_locked.set()
