@@ -6265,6 +6265,7 @@ dependencies = [
     { name = "email-validator" },
     { name = "fastapi" },
     { name = "greenlet" },
+    { name = "httpx" },
     { name = "indic-nlp-library" },
     { name = "indic-transliteration" },
     { name = "jiwer" },
@@ -6290,7 +6291,6 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
-    { name = "httpx" },
     { name = "jinja2" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -6311,7 +6311,7 @@ requires-dist = [
     { name = "email-validator", specifier = "==2.3.0" },
     { name = "fastapi", specifier = "==0.141.1" },
     { name = "greenlet", specifier = "==3.5.6" },
-    { name = "httpx", marker = "extra == 'dev'", specifier = "==0.28.1" },
+    { name = "httpx", specifier = "==0.28.1" },
     { name = "indic-nlp-library", specifier = "==0.92" },
     { name = "indic-transliteration", specifier = "==2.3.82" },
     { name = "jinja2", marker = "extra == 'dev'", specifier = "==3.1.6" },
