@@ -43,6 +43,7 @@ import time
 from pipecat.frames.frames import (
     EndFrame,
     Frame,
+    InterruptionFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
@@ -81,6 +82,7 @@ class LanguageRoutingProcessor(FrameProcessor):
         # Whether this reply's first chunk has been spoken yet. Until it
         # has, the deadline can cut the reply short.
         self._first_chunk_spoken = False
+        self._flow_model_preview = False
 
     @property
     def current_script(self) -> Script | None:
@@ -89,13 +91,32 @@ class LanguageRoutingProcessor(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+        if isinstance(frame, InterruptionFrame):
+            self._chunker = SentenceChunker()
+            self._start_response()
+            await self.push_frame(frame, direction)
+            return
 
         if isinstance(frame, LLMFullResponseStartFrame):
             self._start_response()
             await self.push_frame(frame, direction)
             return
 
+        if isinstance(frame, TextFrame) and direction == FrameDirection.DOWNSTREAM:
+            marker = frame.metadata.get("flow_fragment")
+            if (
+                isinstance(marker, dict)
+                and marker.get("manifest_id")
+                and marker.get("fragment_id")
+            ):
+                await self._set_script(detect_script(frame.text), direction)
+                await self.push_frame(frame, direction)
+                self._first_chunk_spoken = True
+                await self._report_aggregation_time()
+                return
         if isinstance(frame, LLMTextFrame):
+            if frame.metadata.get("flow_model_preview"):
+                self._flow_model_preview = True
             if self._first_token_at is None and not self._aggregation_reported:
                 self._first_token_at = time.monotonic()
             chunks = self._chunker.feed(frame.text)
@@ -119,14 +140,7 @@ class LanguageRoutingProcessor(FrameProcessor):
     async def _speak(self, sentence: str) -> None:
         """Route one sentence: set the voice if it changed, then send it."""
         script = detect_script(sentence)
-
-        if script != self._current_script:
-            delta = self._router.delta_for(script)
-            # A control frame: processed in order, never dropped by an
-            # interruption, so the voice is always set before the text it
-            # belongs to reaches the TTS.
-            await self.push_frame(TTSUpdateSettingsFrame(delta=delta))
-            self._current_script = script
+        await self._set_script(script)
 
         # Not an ``LLMTextFrame``, deliberately. Pipecat's RTVI observer
         # reports every LLM text frame the moment it is pushed — and the
@@ -136,7 +150,11 @@ class LanguageRoutingProcessor(FrameProcessor):
         # the sentences that are actually spoken. The spoken sentences are
         # plain text; the model's frames keep their meaning as the model's
         # text.
-        await self.push_frame(TextFrame(sentence))
+        speech_frame = TextFrame(sentence)
+        if self._flow_model_preview:
+            speech_frame.append_to_context = False
+            speech_frame.metadata["flow_model_preview"] = True
+        await self.push_frame(speech_frame)
         self._first_chunk_spoken = True
 
         # After the sentence, not before: the delta-then-text order is a
@@ -145,6 +163,18 @@ class LanguageRoutingProcessor(FrameProcessor):
         # between them.
         await self._report_aggregation_time()
 
+    async def _set_script(
+        self,
+        script: Script,
+        direction: FrameDirection = FrameDirection.DOWNSTREAM,
+    ) -> None:
+        """Set the TTS voice before speaking text in a different script."""
+        if script == self._current_script:
+            return
+        delta = self._router.delta_for(script)
+        await self.push_frame(TTSUpdateSettingsFrame(delta=delta), direction)
+        self._current_script = script
+
     # -- aggregation time ---------------------------------------------------
 
     def _start_response(self) -> None:
@@ -152,6 +182,7 @@ class LanguageRoutingProcessor(FrameProcessor):
         self._first_token_at = None
         self._aggregation_reported = False
         self._first_chunk_spoken = False
+        self._flow_model_preview = False
 
     def _first_chunk_pending(self) -> bool:
         """Whether this reply's first chunk has not been spoken yet."""
