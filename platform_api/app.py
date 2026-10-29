@@ -19,6 +19,8 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from platform_api.accounts.admin_routes import router as admin_router
 from platform_api.accounts.routes import router as account_router
+from platform_api.admin.routes import router as platform_admin_api_router
+from platform_api.sessions.history_routes import router as session_history_router
 from platform_api.agents.config import DEFAULT_AGENT_CONFIG_MAX_BYTES
 from platform_api.agents.routes import router as agents_router
 from platform_api.generation.routes import router as generation_router
@@ -308,12 +310,14 @@ def create_app(settings: PlatformSettings | None = None) -> FastAPI:
     api_v1.include_router(auth_router)
     api_v1.include_router(account_router)
     api_v1.include_router(admin_router)
+    api_v1.include_router(platform_admin_api_router)
     api_v1.include_router(admin_billing_router)
     api_v1.include_router(billing_router)
     api_v1.include_router(health_router)
     api_v1.include_router(agents_router)
     api_v1.include_router(generation_router)
     api_v1.include_router(chat_test_router)
+    api_v1.include_router(session_history_router)
 
     app.include_router(api_v1)
     # Mount internal routes under /internal
