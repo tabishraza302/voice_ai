@@ -15,8 +15,15 @@ from platform_api.models.auth import (
     AuthToken,
     User,
 )
-from platform_api.models.session import Session
-from platform_api.models.wallet import WalletAccount
+from platform_api.sessions.models import (
+    RunnerCapacity,
+    RuntimeRegistration,
+    Session,
+    SessionJoinJti,
+    SessionParticipant,
+    SessionPeer,
+    SessionSlot,
+)
 from platform_api.billing.models import (
     BillingOperation,
     CallBudget,
@@ -47,7 +54,13 @@ __all__ = [
     "CallBudget",
     "BillingOperation",
     "MeterCheckpoint",
+    "RunnerCapacity",
     "Session",
+    "RuntimeRegistration",
+    "SessionParticipant",
+    "SessionJoinJti",
+    "SessionPeer",
+    "SessionSlot",
     "Agent",
     "AgentDraft",
     "AgentVersion",

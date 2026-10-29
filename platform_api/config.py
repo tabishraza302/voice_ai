@@ -13,13 +13,14 @@ and never imports bot.db.
 from __future__ import annotations
 
 import base64
+import hmac
 from functools import lru_cache
 import ipaddress
 import re
 from typing import Any
 from urllib.parse import urlsplit
 
-from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
 
@@ -445,10 +446,202 @@ class PlatformSettings(BaseSettings):
         validation_alias=AliasChoices("PLATFORM_BILLING_PERMIT_TTL_MS", "billing_permit_ttl_ms"),
         description="Deployment-derived permit validity duration in ms; required when billing is active, no universal default",
     )
+
+    # --- Voice-session admission ---------------------------------------------
+    session_runner_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+        validation_alias=AliasChoices("PLATFORM_SESSION_RUNNER_ID", "session_runner_id"),
+    )
+    session_runner_url: str | None = Field(
+        default=None,
+        max_length=512,
+        validation_alias=AliasChoices("PLATFORM_SESSION_RUNNER_URL", "session_runner_url"),
+    )
+    runtime_service_token: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("PLATFORM_RUNTIME_SERVICE_TOKEN", "runtime_service_token"),
+    )
+    session_runner_capacity: int | None = Field(
+        default=None,
+        gt=0,
+        validation_alias=AliasChoices("PLATFORM_SESSION_RUNNER_CAPACITY", "session_runner_capacity"),
+    )
+    session_owner_capacity: int | None = Field(
+        default=None,
+        gt=0,
+        validation_alias=AliasChoices("PLATFORM_SESSION_OWNER_CAPACITY", "session_owner_capacity"),
+    )
+    session_signaling_url: str | None = Field(
+        default=None,
+        max_length=512,
+        validation_alias=AliasChoices("PLATFORM_SESSION_SIGNALING_URL", "session_signaling_url"),
+    )
+    session_join_issuer: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        validation_alias=AliasChoices("PLATFORM_SESSION_JOIN_ISSUER", "session_join_issuer"),
+    )
+    session_join_private_key_b64: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "PLATFORM_SESSION_JOIN_PRIVATE_KEY_B64",
+            "session_join_private_key_b64",
+        ),
+    )
+    session_join_public_key_b64: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "PLATFORM_SESSION_JOIN_PUBLIC_KEY_B64",
+            "session_join_public_key_b64",
+        ),
+    )
+    session_join_ttl_seconds: int | None = Field(
+        default=None,
+        gt=0,
+        validation_alias=AliasChoices(
+            "PLATFORM_SESSION_JOIN_TTL_SECONDS",
+            "session_join_ttl_seconds",
+        ),
+    )
+    session_max_duration_ms: int | None = Field(
+        default=None,
+        gt=0,
+        le=(1 << 63) - 1,
+        validation_alias=AliasChoices(
+            "PLATFORM_SESSION_MAX_DURATION_MS",
+            "session_max_duration_ms",
+        ),
+    )
+    session_setup_timeout_seconds: int | None = Field(
+        default=None,
+        gt=0,
+        validation_alias=AliasChoices(
+            "PLATFORM_SESSION_SETUP_TIMEOUT_SECONDS",
+            "session_setup_timeout_seconds",
+        ),
+    )
+    session_reconnect_grace_seconds: int | None = Field(
+        default=None,
+        gt=0,
+        validation_alias=AliasChoices(
+            "PLATFORM_SESSION_RECONNECT_GRACE_SECONDS",
+            "session_reconnect_grace_seconds",
+        ),
+    )
+    session_rate_minor_per_minute: int | None = Field(
+        default=None,
+        ge=0,
+        le=(1 << 63) - 1,
+        validation_alias=AliasChoices(
+            "PLATFORM_SESSION_RATE_MINOR_PER_MINUTE",
+            "session_rate_minor_per_minute",
+        ),
+    )
+    session_tariff_version: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        validation_alias=AliasChoices(
+            "PLATFORM_SESSION_TARIFF_VERSION",
+            "session_tariff_version",
+        ),
+    )
+    session_runtime_timeout_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        le=30,
+        validation_alias=AliasChoices(
+            "PLATFORM_SESSION_RUNTIME_TIMEOUT_SECONDS",
+            "session_runtime_timeout_seconds",
+        ),
+    )
     amqp_url: str | None = Field(
         default=None,
         validation_alias=AliasChoices("PLATFORM_AMQP_URL", "amqp_url"),
     )
+
+    @field_validator("session_runner_url", "session_signaling_url")
+    @classmethod
+    def validate_local_voice_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        raw = value.strip()
+        try:
+            parsed = urlsplit(raw)
+            host = parsed.hostname
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("Voice URLs must be valid local HTTP(S) URLs") from exc
+        if (
+            parsed.scheme not in {"http", "https"}
+            or host is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("Voice URLs must be local HTTP(S) URLs without credentials, query, or fragment")
+        host = host.lower()
+        try:
+            address = ipaddress.ip_address(host)
+            local_host = address.is_loopback or address.is_private or address.is_link_local
+        except ValueError:
+            local_host = (
+                host == "localhost"
+                or host.endswith(".localhost")
+                or host.endswith(".local")
+                or host.endswith(".internal")
+                or "." not in host
+            )
+        if not local_host:
+            raise ValueError("Voice service URLs must target an explicitly local deployment host")
+        if parsed.scheme == "http" and not _is_loopback_host(host):
+            raise ValueError("Unencrypted voice service URLs are limited to loopback")
+        if port is not None and not 1 <= port <= 65535:
+            raise ValueError("Voice URL port is outside the valid range")
+        return raw.rstrip("/")
+
+    @field_validator("runtime_service_token")
+    @classmethod
+    def validate_runtime_service_token(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None and len(value.get_secret_value()) < 32:
+            raise ValueError("runtime_service_token must contain at least 32 characters")
+        return value
+
+    @field_validator("session_join_private_key_b64", "session_join_public_key_b64")
+    @classmethod
+    def validate_join_key_encoding(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None:
+            _decode_b64url_32(value.get_secret_value())
+        return value
+
+    @model_validator(mode="after")
+    def validate_join_key_pair(self) -> PlatformSettings:
+        private_value = self.session_join_private_key_b64
+        public_value = self.session_join_public_key_b64
+        if private_value is None and public_value is None:
+            return self
+        if private_value is None or public_value is None:
+            raise ValueError("Both session join Ed25519 keys must be configured together")
+
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        private_key = Ed25519PrivateKey.from_private_bytes(
+            _decode_b64url_32(private_value.get_secret_value())
+        )
+        derived_public = private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        configured_public = _decode_b64url_32(public_value.get_secret_value())
+        if not hmac.compare_digest(derived_public, configured_public):
+            raise ValueError("session join public key does not match the configured private key")
+        return self
 
     @field_validator("database_url")
     @classmethod
