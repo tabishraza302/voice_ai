@@ -698,7 +698,10 @@ function TraceEntry({ entry }: { entry: ChatTraceEntry }) {
       {entry.diagnostics.length > 0 ? (
         <ul className="mt-1 space-y-1 text-rust-200">
           {entry.diagnostics.map((diagnostic, index) => (
-            <li key={`${diagnostic.code}-${index}`}>{diagnostic.severity} {diagnostic.code} at {diagnostic.path || "/"}</li>
+            <li key={`${diagnostic.code}-${index}`}>
+              {diagnostic.severity} {diagnostic.code} at {diagnostic.path || "/"}
+              {diagnostic.message ? `: ${diagnostic.message}` : ""}
+            </li>
           ))}
         </ul>
       ) : null}
