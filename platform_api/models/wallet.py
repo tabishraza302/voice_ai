@@ -57,4 +57,8 @@ class WalletAccount(Base):
             "posted_minor >= reserved_minor AND reserved_minor >= 0",
             name="ck_wallet_balance_invariants",
         ),
+        CheckConstraint(
+            "currency = 'INR'",
+            name="ck_wallet_currency_inr",
+        ),
     )

@@ -15,7 +15,14 @@ from platform_api.models.auth import (
     AuthToken,
     User,
 )
+from platform_api.models.session import Session
 from platform_api.models.wallet import WalletAccount
+from platform_api.billing.models import (
+    BillingOperation,
+    CallBudget,
+    MeterCheckpoint,
+    WalletEntry,
+)
 
 __all__ = [
     "Base",
@@ -28,4 +35,9 @@ __all__ = [
     "AuthMail",
     "AuditLog",
     "WalletAccount",
+    "WalletEntry",
+    "CallBudget",
+    "BillingOperation",
+    "MeterCheckpoint",
+    "Session",
 ]
