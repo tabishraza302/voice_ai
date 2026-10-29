@@ -16,6 +16,14 @@ from platform_api.models.auth import (
     User,
 )
 from platform_api.models.wallet import WalletAccount
+from platform_api.agents.models import (
+    Agent,
+    AgentDraft,
+    AgentTemplateVersion,
+    AgentVersion,
+    IdempotencyRecord,
+    PlatformPromptVersion,
+)
 
 __all__ = [
     "Base",
@@ -28,4 +36,10 @@ __all__ = [
     "AuthMail",
     "AuditLog",
     "WalletAccount",
+    "Agent",
+    "AgentDraft",
+    "AgentVersion",
+    "AgentTemplateVersion",
+    "PlatformPromptVersion",
+    "IdempotencyRecord",
 ]
