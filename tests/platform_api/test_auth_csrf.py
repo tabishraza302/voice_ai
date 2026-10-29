@@ -15,6 +15,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from platform_api.agents.config import DEFAULT_AGENT_CONFIG_MAX_BYTES
 from platform_api.config import PlatformSettings
 from tests.support.postgres import FreshPostgres
 
@@ -272,6 +273,46 @@ async def test_auth_route_body_limit(
     )
     assert res.status_code == 413
     assert res.json()["error"]["code"] == "REQUEST_TOO_LARGE"
+
+
+@pytest.mark.parametrize(
+    ("method", "endpoint"),
+    (
+        ("POST", "/api/v1/agents"),
+        ("PATCH", "/api/v1/agents/00000000-0000-0000-0000-000000000001"),
+        ("PATCH", "/api/v1/agents/00000000-0000-0000-0000-000000000001/draft"),
+        ("POST", "/api/v1/agents/00000000-0000-0000-0000-000000000001/validate"),
+        ("POST", "/api/v1/agents/00000000-0000-0000-0000-000000000001/publish"),
+        ("POST", "/api/v1/agents/00000000-0000-0000-0000-000000000001/restore-draft"),
+        ("POST", "/api/v1/agents/00000000-0000-0000-0000-000000000001/duplicate"),
+    ),
+)
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_agent_request_body_limit_checks_stream_before_parse(
+    app_client: httpx.AsyncClient,
+    method: str,
+    endpoint: str,
+):
+    """All body-bearing agent requests are bounded before JSON parsing."""
+    request_limit = DEFAULT_AGENT_CONFIG_MAX_BYTES + 1024
+
+    async def oversized_body():
+        remaining = request_limit + 1
+        while remaining:
+            chunk_size = min(16_384, remaining)
+            yield b"x" * chunk_size
+            remaining -= chunk_size
+
+    response = await app_client.request(
+        method,
+        endpoint,
+        content=oversized_body(),
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "REQUEST_TOO_LARGE"
 
 
 @pytest.mark.postgres
