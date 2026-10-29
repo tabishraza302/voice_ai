@@ -63,6 +63,83 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
+def validate_event_consumer_database_url(
+    database_url: str, event_consumer_database_url: str | None
+) -> str:
+    """Require a distinct PostgreSQL login on the exact platform database endpoint."""
+    if not event_consumer_database_url or not event_consumer_database_url.strip():
+        raise ValueError(
+            "PLATFORM_EVENT_CONSUMER_DATABASE_URL is required for the history consumer."
+        )
+    consumer_url_value = event_consumer_database_url.strip()
+    try:
+        platform_url = make_url(database_url)
+        consumer_url = make_url(consumer_url_value)
+    except Exception as exc:
+        raise ValueError("Invalid PLATFORM_EVENT_CONSUMER_DATABASE_URL.") from exc
+    if (
+        platform_url.get_backend_name() != "postgresql"
+        or platform_url.get_driver_name() != "asyncpg"
+    ):
+        raise ValueError(
+            "DATABASE_URL must use PostgreSQL with asyncpg for consumer separation."
+        )
+    connection_identity_keys = {
+        "db",
+        "database",
+        "dbname",
+        "host",
+        "hostaddr",
+        "port",
+        "user",
+        "username",
+    }
+    for label, url in (
+        ("DATABASE_URL", platform_url),
+        ("PLATFORM_EVENT_CONSUMER_DATABASE_URL", consumer_url),
+    ):
+        if any(key.lower() in connection_identity_keys for key in url.query):
+            raise ValueError(
+                f"{label} must specify its database endpoint outside connection query parameters."
+            )
+
+    if (
+        consumer_url.get_backend_name() != "postgresql"
+        or consumer_url.get_driver_name() != "asyncpg"
+    ):
+        raise ValueError(
+            "PLATFORM_EVENT_CONSUMER_DATABASE_URL must use PostgreSQL with asyncpg."
+        )
+    if not platform_url.username:
+        raise ValueError(
+            "DATABASE_URL must name a database role to verify consumer separation."
+        )
+    if not consumer_url.username:
+        raise ValueError(
+            "PLATFORM_EVENT_CONSUMER_DATABASE_URL must name a restricted database role."
+        )
+    if consumer_url.username == platform_url.username:
+        raise ValueError(
+            "PLATFORM_EVENT_CONSUMER_DATABASE_URL must use a different database role "
+            "from DATABASE_URL."
+        )
+    if not platform_url.database or not consumer_url.database:
+        raise ValueError(
+            "DATABASE_URL and PLATFORM_EVENT_CONSUMER_DATABASE_URL must explicitly name the same PostgreSQL database."
+        )
+
+    def endpoint(url) -> tuple[str, int, str]:
+        host = (url.host or "<unix-socket>").lower()
+        return host, url.port if url.port is not None else 5432, url.database or ""
+
+    if endpoint(consumer_url) != endpoint(platform_url):
+        raise ValueError(
+            "PLATFORM_EVENT_CONSUMER_DATABASE_URL must target the same PostgreSQL "
+            "database as DATABASE_URL."
+        )
+    return consumer_url_value
+
+
 class PlatformSettings(BaseSettings):
     """Platform API control plane settings.
 
@@ -95,6 +172,13 @@ class PlatformSettings(BaseSettings):
             "postgres_schema",
         ),
         description="PostgreSQL schema name isolating platform tables within the database",
+    )
+    event_consumer_database_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "PLATFORM_EVENT_CONSUMER_DATABASE_URL", "event_consumer_database_url"
+        ),
+        description="Restricted PostgreSQL login for event-history consumption",
     )
 
     # --- Server and Networking ------------------------------------------------
@@ -449,6 +533,62 @@ class PlatformSettings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("PLATFORM_AMQP_URL", "amqp_url"),
     )
+    event_exchange: str = Field(
+        default="voice.session.events",
+        validation_alias=AliasChoices("PLATFORM_EVENT_EXCHANGE", "event_exchange"),
+    )
+    event_history_queue: str = Field(
+        default="voice.session.events.history",
+        validation_alias=AliasChoices(
+            "PLATFORM_EVENT_HISTORY_QUEUE", "event_history_queue"
+        ),
+    )
+    event_retry_queue: str = Field(
+        default="voice.session.events.retry",
+        validation_alias=AliasChoices(
+            "PLATFORM_EVENT_RETRY_QUEUE", "event_retry_queue"
+        ),
+    )
+    event_quarantine_queue: str = Field(
+        default="voice.session.events.quarantine",
+        validation_alias=AliasChoices(
+            "PLATFORM_EVENT_QUARANTINE_QUEUE", "event_quarantine_queue"
+        ),
+    )
+    event_spool_path: str = Field(
+        default="data/runtime/spool",
+        validation_alias=AliasChoices(
+            "PLATFORM_EVENT_SPOOL_PATH", "event_spool_path"
+        ),
+    )
+    event_spool_max_events: int = Field(
+        default=100_000,
+        gt=0,
+        validation_alias=AliasChoices(
+            "PLATFORM_EVENT_SPOOL_MAX_EVENTS", "event_spool_max_events"
+        ),
+    )
+    event_spool_max_bytes: int = Field(
+        default=512 * 1024 * 1024,
+        gt=0,
+        validation_alias=AliasChoices(
+            "PLATFORM_EVENT_SPOOL_MAX_BYTES", "event_spool_max_bytes"
+        ),
+    )
+    event_spool_min_free_bytes: int = Field(
+        default=64 * 1024 * 1024,
+        ge=0,
+        validation_alias=AliasChoices(
+            "PLATFORM_EVENT_SPOOL_MIN_FREE_BYTES", "event_spool_min_free_bytes"
+        ),
+    )
+    event_retry_delay_seconds: float = Field(
+        default=30.0,
+        ge=0.0,
+        validation_alias=AliasChoices(
+            "PLATFORM_EVENT_RETRY_DELAY_SECONDS", "event_retry_delay_seconds"
+        ),
+    )
 
     @field_validator("database_url")
     @classmethod
@@ -800,6 +940,10 @@ class PlatformSettings(BaseSettings):
                 f"Platform schema cannot be '{self.postgres_schema}'. A dedicated schema is required to share the database safely."
             )
 
+        if self.event_consumer_database_url:
+            validate_event_consumer_database_url(
+                self.database_url, self.event_consumer_database_url
+            )
         return self
 
 

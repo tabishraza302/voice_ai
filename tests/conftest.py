@@ -11,11 +11,13 @@ import pytest
 from tests.support.clock import fake_clock
 from tests.support.models import fake_models
 from tests.support.postgres import fresh_pg
+from tests.support.broker import rabbitmq_broker
 
 __all__ = [
     "fake_clock",
     "fake_models",
     "fresh_pg",
+    "rabbitmq_broker",
 ]
 
 
@@ -27,6 +29,12 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "qualification: test is a formal qualification gate")
     config.addinivalue_line("markers", "broker: test requires message broker (RabbitMQ)")
 
+
+@pytest.fixture(autouse=True)
+def _auto_broker(request: pytest.FixtureRequest) -> None:
+    """Ensure broker tests request rabbitmq_broker fixture, skipping or failing cleanly."""
+    if request.node.get_closest_marker("broker"):
+        request.getfixturevalue("rabbitmq_broker")
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]) -> None:

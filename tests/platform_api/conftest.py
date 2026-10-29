@@ -19,8 +19,7 @@ import pytest_asyncio
 
 from platform_api.app import create_app
 from platform_api.config import PlatformSettings
-from platform_api.db.base import Base
-from platform_api.db.schema import compute_metadata_hash, initialize_schema
+from platform_api.db.session import create_engine, get_session_factory
 from tests.support.postgres import FreshPostgres
 
 TEST_CSRF_KEY = base64.urlsafe_b64encode(b"C" * 32).decode("ascii")
@@ -51,9 +50,18 @@ def test_platform_settings(fresh_pg: FreshPostgres, tmp_path) -> PlatformSetting
 
 
 @pytest_asyncio.fixture
-async def initialized_pg(fresh_pg: FreshPostgres) -> FreshPostgres:
-    """Initialize platform schema on fresh_pg database and verify."""
-    await fresh_pg.initialize()
+async def initialized_pg(
+    fresh_pg: FreshPostgres,
+    test_platform_settings: PlatformSettings,
+) -> FreshPostgres:
+    """Initialize the configured platform schema on fresh_pg and verify it."""
+    await fresh_pg.engine.dispose()
+    fresh_pg.engine = create_engine(test_platform_settings)
+    fresh_pg.sessions = get_session_factory(fresh_pg.engine)
+    await fresh_pg.initialize(
+        schema=test_platform_settings.postgres_schema,
+        expected_version=test_platform_settings.schema_version,
+    )
     return fresh_pg
 
 
