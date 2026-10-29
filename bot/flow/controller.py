@@ -34,6 +34,7 @@ from bot.flow.schemas import (
     FlowDiagnostic,
     FlowEvent,
     FragmentPlayedOutputEvent,
+    GenerationFailedModelEvent,
     Origin,
     Outcome,
     Reduction,
@@ -1415,8 +1416,27 @@ def reduce_event(
                             )
                             break
         return Reduction(state=new_state, commands=commands, diagnostics=diagnostics)
+    # 5. Failed generation events are terminal for the current model turn only.
+    elif event_type == "generation_failed":
+        if state.teardown_emitted:
+            return Reduction(state=new_state, commands=[], diagnostics=[])
+        if event.generation_id != state.generation_id:
+            return Reduction(state=new_state, commands=[], diagnostics=[])
+        if event.turn_id != state.last_accepted_turn_id:
+            return Reduction(state=new_state, commands=[], diagnostics=[])
+        evt_epoch = getattr(event, "transport_epoch", None)
+        if state.transport_epoch and evt_epoch and evt_epoch != state.transport_epoch:
+            return Reduction(state=new_state, commands=[], diagnostics=[])
+        new_state.version += 1
+        new_state.outcome = "failed"
+        new_state.teardown_emitted = True
+        new_state.generation_id = None
+        commands.append(
+            TeardownCommand(outcome="failed", reason="generation_failed")
+        )
+        return Reduction(state=new_state, commands=commands, diagnostics=[])
 
-    # 5. Playback or Chat delivery events
+    # 6. Playback or Chat delivery events
     elif event_type in ("fragment_played", "chat_committed"):
         if state.teardown_emitted:
             return Reduction(state=new_state, commands=[], diagnostics=[])
