@@ -90,9 +90,11 @@ request, and that profile applies to that session only. Explicitly requesting
 an unavailable or deleted profile id fails the session request instead of
 falling back to a different profile. Prebuilt clients with no profile id keep
 the measured `.env` settings. The studio indicates when a profile's selected
-LLM model is unavailable in the local catalog. A control-page STT mode
-override takes precedence over a selected profile's STT choice. In-call text
-turns sent from the client are limited to 4,000 Unicode characters.
+LLM model is unavailable in the local catalog. Built-in profiles use batch STT
+(`mlx-audio`), which supports pinned languages; the default `.env` configuration
+uses realtime STT. A control-page STT mode override takes precedence over a
+selected profile's STT choice. In-call text turns sent from the client are
+limited to 4,000 Unicode characters.
 The studio uses the local PostgreSQL service started by Docker Compose. Install
 the web dependencies once, then start the studio alongside the stack:
 
@@ -122,16 +124,18 @@ management endpoints have no authentication.
 
 PostgreSQL is published on loopback port 5439 by default. Set `POSTGRES_PORT`
 to move the Compose port, and set `DATABASE_URL` in `.env` to the same host
-port. A configured PostgreSQL failure fails closed by default: the agent
-refuses to start rather than silently writing to a different store. If a
-local-only SQLite store is acceptable, set `ALLOW_SQLITE_FALLBACK=1`; its
+port. A configured PostgreSQL failure fails closed by default: storage
+requests fail rather than silently writing to a different store. Storage is
+initialized on first use, so the server can start before a connection attempt.
+If a local-only SQLite store is acceptable, set `ALLOW_SQLITE_FALLBACK=1`; its
 default location remains the existing `voice_ai.db` file, and
 `SQLITE_DATABASE_URL` chooses another. `GET /api/storage` reports
-`{"backend": "postgres"|"sqlite", "fallback": bool}` without exposing URLs or
-credentials. While the fallback is active, a session that requests a saved
-agent profile is rejected with 503 because that profile may exist only in
-PostgreSQL. The fallback's data is independent from PostgreSQL and does not
-synchronize automatically; `scripts/voice-ai.sh start` sets
+`{"backend": "uninitialized"|"postgres"|"sqlite", "fallback": bool}` without
+exposing URLs or credentials. While the fallback is active, a session that
+requests a saved agent profile is rejected with 503 because that profile may
+exist only in PostgreSQL; later storage requests retry PostgreSQL. The fallback
+data is independent and does not synchronize automatically;
+`scripts/voice-ai.sh start` sets
 `ALLOW_SQLITE_FALLBACK=1` explicitly and prints a warning when it chooses to
 continue without PostgreSQL.
 

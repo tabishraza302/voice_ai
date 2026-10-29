@@ -40,6 +40,7 @@ async def api_client():
     await engine.dispose()
 
 def test_storage_endpoint_reports_the_backend_without_credentials(api_client, monkeypatch):
+    monkeypatch.setattr(db_session, "_engine", object())
     monkeypatch.setattr(db_session, "_is_sqlite", True)
     monkeypatch.setattr(db_session, "_fallback_active", True)
 
@@ -51,7 +52,6 @@ def test_storage_endpoint_reports_the_backend_without_credentials(api_client, mo
     assert "postgresql" not in body
     assert "sqlite://" not in body
     assert "password" not in body
-
 
 def test_list_agents(api_client):
     res = api_client.get("/api/agents")

@@ -42,8 +42,14 @@ def storage_state() -> dict[str, object]:
     Deliberately carries no URL, host, user or credential: this is served
     by the unauthenticated local API.
     """
+    if _engine is None:
+        backend = "uninitialized"
+    elif _is_sqlite:
+        backend = "sqlite"
+    else:
+        backend = "postgres"
     return {
-        "backend": "sqlite" if _is_sqlite else "postgres",
+        "backend": backend,
         "fallback": _fallback_active,
     }
 
@@ -157,7 +163,7 @@ async def get_engine():
 
 async def get_session_factory():
     global _session_factory
-    if _session_factory is None:
+    if _session_factory is None or _fallback_active:
         await init_engine()
     return _session_factory
 

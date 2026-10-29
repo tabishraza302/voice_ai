@@ -149,7 +149,7 @@ async def test_postgres_failure_fails_closed_by_default(monkeypatch, tmp_path):
     assert attempts == ["postgres"]
     assert db_session._engine is None
     assert db_session._session_factory is None
-    assert db_session.storage_state() == {"backend": "postgres", "fallback": False}
+    assert db_session.storage_state() == {"backend": "uninitialized", "fallback": False}
 
 
 @pytest.mark.asyncio
@@ -241,3 +241,80 @@ async def test_repeated_init_retries_postgres_instead_of_reusing_fallback(monkey
     finally:
         if db_session._engine is not None:
             await db_session._engine.dispose()
+
+@pytest.mark.asyncio
+async def test_get_session_factory_retries_postgres_when_fallback_active(monkeypatch, tmp_path):
+    _reset_engine_state(monkeypatch)
+    monkeypatch.setattr(db_session, "ALLOW_SQLITE_FALLBACK", True)
+    fallback_url = f"sqlite+aiosqlite:///{tmp_path / 'recovery.db'}"
+    monkeypatch.setattr(db_session, "SQLITE_FALLBACK_URL", fallback_url)
+    attempts = []
+    monkeypatch.setattr(
+        db_session,
+        "create_async_engine",
+        _failing_postgres_engine(db_session.create_async_engine, attempts),
+    )
+
+    try:
+        # 1. First initialization fails PostgreSQL, falls back to SQLite
+        factory1 = await db_session.get_session_factory()
+        assert factory1 is not None
+        assert db_session.storage_state() == {"backend": "sqlite", "fallback": True}
+        assert attempts == ["postgres"]
+
+        # 2. Simulate PostgreSQL recovery by restoring real create_async_engine with an in-memory SQLite store pretending to be postgres URL
+        postgres_recovered = []
+        real_create_engine = db_session.create_async_engine
+
+        class RecoveredConnection:
+            async def __aenter__(self):
+                postgres_recovered.append("recovered")
+                return self
+
+            async def __aexit__(self, exc_type, exc_val, exc_tb):
+                pass
+
+            async def execute(self, *args, **kwargs):
+                class Result:
+                    def scalar_one_or_none(self):
+                        return 1
+                    def scalars(self):
+                        class Scalars:
+                            def all(self):
+                                return []
+                        return Scalars()
+                return Result()
+
+            async def run_sync(self, fn, *args, **kwargs):
+                pass
+
+        class RecoveredEngine:
+            def connect(self):
+                return RecoveredConnection()
+
+            def begin(self):
+                return RecoveredConnection()
+
+            async def dispose(self):
+                pass
+
+        def create_recovered(target_url, *args, **kwargs):
+            if "postgresql" in str(target_url):
+                return RecoveredEngine()
+            return real_create_engine(target_url, *args, **kwargs)
+
+        monkeypatch.setattr(db_session, "create_async_engine", create_recovered)
+
+        # 3. get_session_factory() detects fallback is active and retries init_engine()
+        factory2 = await db_session.get_session_factory()
+        assert "recovered" in postgres_recovered
+        assert db_session.storage_state() == {"backend": "postgres", "fallback": False}
+    finally:
+        if db_session._engine is not None:
+            await db_session._engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_storage_state_reports_uninitialized_before_engine_init(monkeypatch):
+    _reset_engine_state(monkeypatch)
+    assert db_session.storage_state() == {"backend": "uninitialized", "fallback": False}
