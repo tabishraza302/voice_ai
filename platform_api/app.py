@@ -10,65 +10,139 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 import uuid
 
-from fastapi import APIRouter, FastAPI, Request, Response, status
+from fastapi import APIRouter, FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from platform_api.accounts.admin_routes import router as admin_router
 from platform_api.accounts.routes import router as account_router
+from platform_api.agents.config import DEFAULT_AGENT_CONFIG_MAX_BYTES
+from platform_api.agents.routes import router as agents_router
 from platform_api.auth.errors import (
     PlatformError,
     RequestTooLargeError,
     platform_error_response,
 )
 from platform_api.auth.routes import router as auth_router
+from platform_api.catalog import load_catalog
 from platform_api.config import PlatformSettings, get_settings
 from platform_api.db.base import Base
 from platform_api.db.schema import check_schema_readiness
 from platform_api.db.session import create_engine, get_session_factory
 from platform_api.health import router as health_router
+from platform_api.qualification import (
+    DeploymentIdentity,
+    load_deployment_capability_report,
+)
 import platform_api.models  # Register complete platform models onto Base.metadata
 
 AUTH_ROUTE_BODY_LIMIT = 8192  # 8 KiB
+AGENT_REQUEST_BODY_LIMIT = DEFAULT_AGENT_CONFIG_MAX_BYTES + 1024
 
 
-class RequestContextMiddleware(BaseHTTPMiddleware):
-    """Enforces Request ID tracking and request body limits before route handlers."""
+class RequestContextMiddleware:
+    """Enforces request IDs and bounded request bodies before FastAPI parsing."""
 
-    async def dispatch(self, request: Request, call_next):
-        # 1. Resolve or generate valid Request UUID
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(
+        self, scope: Scope, receive: Receive, send: Send
+    ) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope, receive)
         req_id_header = request.headers.get("x-request-id")
         try:
             req_id = uuid.UUID(req_id_header) if req_id_header else uuid.uuid4()
         except ValueError:
             req_id = uuid.uuid4()
+        scope.setdefault("state", {})["request_id"] = req_id
 
-        request.state.request_id = req_id
+        async def send_with_request_id(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name.lower() != b"x-request-id"
+                ]
+                headers.append((b"x-request-id", str(req_id).encode("ascii")))
+                message = {**message, "headers": headers}
+            await send(message)
 
-        if request.url.path.startswith("/api/v1/auth"):
+        path = request.url.path
+        is_agent_body_request = (
+            (path == "/api/v1/agents" or path.startswith("/api/v1/agents/"))
+            and request.method in {"POST", "PATCH", "PUT", "DELETE"}
+        )
+        if path.startswith("/api/v1/auth"):
+            body_limit = AUTH_ROUTE_BODY_LIMIT
+            too_large_message = "Request body exceeds 8 KiB limit"
+        elif is_agent_body_request:
+            body_limit = AGENT_REQUEST_BODY_LIMIT
+            too_large_message = (
+                "Agent request body exceeds "
+                f"{AGENT_REQUEST_BODY_LIMIT} byte limit"
+            )
+        else:
+            body_limit = None
+            too_large_message = ""
+        original_receive = receive
+        if body_limit is not None:
             settings = getattr(request.app.state, "settings", None) or get_settings()
             content_length = request.headers.get("content-length")
-            if content_length and int(content_length) > AUTH_ROUTE_BODY_LIMIT:
-                return platform_error_response(
-                    RequestTooLargeError("Request body exceeds 8 KiB limit"),
+            try:
+                declared_length = int(content_length) if content_length else None
+            except ValueError:
+                declared_length = None
+
+            if declared_length is not None and declared_length > body_limit:
+                response = platform_error_response(
+                    RequestTooLargeError(too_large_message),
                     req_id,
                     settings,
                 )
+                await response(scope, original_receive, send_with_request_id)
+                return
 
-            # Consume and verify body size
-            body = await request.body()
-            if len(body) > AUTH_ROUTE_BODY_LIMIT:
-                return platform_error_response(
-                    RequestTooLargeError("Request body exceeds 8 KiB limit"),
-                    req_id,
-                    settings,
-                )
+            request_messages: list[Message] = []
+            received_bytes = 0
+            while True:
+                message = await original_receive()
+                if message["type"] == "http.disconnect":
+                    return
+                if message["type"] != "http.request":
+                    continue
+                received_bytes += len(message.get("body", b""))
+                if received_bytes > body_limit:
+                    response = platform_error_response(
+                        RequestTooLargeError(too_large_message),
+                        req_id,
+                        settings,
+                    )
+                    await response(scope, original_receive, send_with_request_id)
+                    return
+                request_messages.append(message)
+                if not message.get("more_body", False):
+                    break
 
-        response: Response = await call_next(request)
-        response.headers["X-Request-ID"] = str(req_id)
-        return response
+            request_message_index = 0
+
+            async def replay_request_body() -> Message:
+                nonlocal request_message_index
+                if request_message_index < len(request_messages):
+                    message = request_messages[request_message_index]
+                    request_message_index += 1
+                    return message
+                return await original_receive()
+
+            receive = replay_request_body
+
+        await self.app(scope, receive, send_with_request_id)
 
 
 @asynccontextmanager
@@ -76,6 +150,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Lifespan context manager owning DB connection pools and clean shutdown."""
     settings: PlatformSettings = getattr(app.state, "settings", None) or get_settings()
     app.state.settings = settings
+    app.state.deployment_identity = DeploymentIdentity.from_settings(settings)
+    app.state.adapter_capability_report = None
+    app.state.catalog = None
 
     engine = create_engine(settings)
     session_factory = get_session_factory(engine)
@@ -83,6 +160,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.session_factory = session_factory
 
     try:
+        app.state.catalog = load_catalog(settings.catalog_path)
+        app.state.adapter_capability_report = load_deployment_capability_report(
+            settings.adapter_capability_report_path,
+            settings.adapter_capability_report_hash,
+        )
+
         try:
             app.state.schema_ready = await check_schema_readiness(
                 engine,
@@ -93,6 +176,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
         yield
     finally:
+        app.state.adapter_capability_report = None
+        app.state.deployment_identity = None
+        app.state.catalog = None
+
         if hasattr(app.state, "engine") and app.state.engine is not None:
             await app.state.engine.dispose()
 
@@ -107,6 +194,9 @@ def create_app(settings: PlatformSettings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = resolved_settings
+    app.state.adapter_capability_report = None
+    app.state.deployment_identity = None
+    app.state.catalog = None
 
     # Request ID and body limit middleware
     app.add_middleware(RequestContextMiddleware)
@@ -174,6 +264,7 @@ def create_app(settings: PlatformSettings | None = None) -> FastAPI:
     api_v1.include_router(account_router)
     api_v1.include_router(admin_router)
     api_v1.include_router(health_router)
+    api_v1.include_router(agents_router)
 
     app.include_router(api_v1)
     # Also include health_router at root for /health/live, /health/ready, /catalog

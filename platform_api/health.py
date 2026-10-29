@@ -147,5 +147,8 @@ async def readiness(
 @router.get("/catalog")
 async def get_catalog(request: Request) -> ModelCatalog:
     """Fake-safe model catalog loaded from JSON without GPU dependencies."""
+    catalog = getattr(request.app.state, "catalog", None)
+    if catalog is not None:
+        return catalog
     settings: PlatformSettings = getattr(request.app.state, "settings", None) or get_settings()
     return load_catalog(settings.catalog_path)
