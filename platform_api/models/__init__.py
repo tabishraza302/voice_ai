@@ -24,6 +24,9 @@ from platform_api.agents.models import (
     IdempotencyRecord,
     PlatformPromptVersion,
 )
+from platform_api.generation.models import GenerationJob
+from platform_api.testing.models import ChatMessage, ChatTestSession
+
 
 __all__ = [
     "Base",
@@ -42,4 +45,7 @@ __all__ = [
     "AgentTemplateVersion",
     "PlatformPromptVersion",
     "IdempotencyRecord",
+    "GenerationJob",
+    "ChatTestSession",
+    "ChatMessage",
 ]
