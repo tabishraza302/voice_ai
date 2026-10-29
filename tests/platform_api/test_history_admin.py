@@ -53,8 +53,8 @@ async def _authenticated_headers(
             now=now,
             mfa_verified=role == "admin",
         )
-        if role == "admin" and step_up:
-            auth_session.step_up_at = now
+        if role == "admin":
+            auth_session.step_up_at = now if step_up else None
         await db.commit()
 
     cookie_header = f"{settings.session_cookie_name}={secret}"
