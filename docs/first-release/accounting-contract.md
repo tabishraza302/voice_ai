@@ -39,7 +39,8 @@ checkpoint_and_reserve(runtime_principal, session_id, operation_id,
                        expected_budget_version, cumulative_billable_ms,
                        requested_future_ms) -> BudgetPermit
 close_budget(runtime_principal, session_id, operation_id,
-             expected_budget_version, cumulative_billable_ms, stop_evidence) -> BudgetView
+             expected_budget_version, cumulative_billable_ms,
+             stop_evidence, stop_attestation) -> BudgetView
 expire_stopped_budget(session_id, operation_id, now) -> BudgetView
 ```
 
@@ -47,7 +48,7 @@ Owner identity is derived from the stored session, never from an internal reques
 
 A session that exists without its required call budget is a conflict (409), not a missing session (404).
 
-`POST /internal/sessions/{id}/budget/checkpoint` accepts exactly `operation_id`, `expected_budget_version`, `cumulative_billable_ms`, `requested_future_ms`. Response `BudgetPermit` contains `session_id`, `budget_version`, `proven_ms`, `authorized_through_ms`, `reserved_minor`, `permit_id`, `expires_at`, `funds_exhausted`. `POST /internal/sessions/{id}/budget/close` accepts the same identity/version/time fields plus `stop_evidence` and no requested future time. `GET /api/v1/wallet` and `/wallet/entries` are owner-only. `POST /api/v1/admin/users/{id}/wallet-adjustments` requires admin step-up, signed amount, reason and an Idempotency-Key; it cannot reduce posted funds below outstanding reservations.
+`POST /internal/sessions/{id}/budget/checkpoint` accepts exactly `operation_id`, `expected_budget_version`, `cumulative_billable_ms`, `requested_future_ms`. Response `BudgetPermit` contains `session_id`, `budget_version`, `proven_ms`, `authorized_through_ms`, `reserved_minor`, `permit_id`, `expires_at`, `funds_exhausted`. `POST /internal/sessions/{id}/budget/close` accepts `operation_id`, `expected_budget_version`, `cumulative_billable_ms`, optional `stop_evidence`, and optional `stop_attestation`, with no requested future time. While a permit is live, `stop_attestation` must bind the authenticated runner, session, registration, and current ending-session version. `GET /api/v1/wallet` and `/wallet/entries` are owner-only. `POST /api/v1/admin/users/{id}/wallet-adjustments` requires admin step-up, signed amount, reason and an Idempotency-Key; it cannot reduce posted funds below outstanding reservations.
 
 ## Checkpoint/reservation transaction
 
