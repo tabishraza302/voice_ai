@@ -105,7 +105,11 @@ def _reset_engine_state(monkeypatch):
     monkeypatch.setattr(db_session, "_requested_url", None)
     monkeypatch.setattr(db_session, "_is_sqlite", False)
     monkeypatch.setattr(db_session, "_fallback_active", False)
-
+    monkeypatch.setattr(
+        db_session,
+        "POSTGRES_URL",
+        "postgresql+asyncpg://synthetic:synthetic@127.0.0.1:5432/synthetic",
+    )
 
 def _failing_postgres_engine(real_create_engine, attempts):
     class FailingConnection:
@@ -134,6 +138,11 @@ def _failing_postgres_engine(real_create_engine, attempts):
 @pytest.mark.asyncio
 async def test_postgres_failure_fails_closed_by_default(monkeypatch, tmp_path):
     _reset_engine_state(monkeypatch)
+    monkeypatch.setattr(
+        db_session,
+        "POSTGRES_URL",
+        "postgresql+asyncpg://synthetic:synthetic@127.0.0.1:5432/synthetic",
+    )
     monkeypatch.setattr(db_session, "ALLOW_SQLITE_FALLBACK", False)
     monkeypatch.setattr(db_session, "SQLITE_FALLBACK_URL", f"sqlite+aiosqlite:///{tmp_path / 'never.db'}")
     attempts = []
@@ -318,3 +327,128 @@ async def test_get_session_factory_retries_postgres_when_fallback_active(monkeyp
 async def test_storage_state_reports_uninitialized_before_engine_init(monkeypatch):
     _reset_engine_state(monkeypatch)
     assert db_session.storage_state() == {"backend": "uninitialized", "fallback": False}
+
+
+@pytest.mark.asyncio
+async def test_repeated_failed_retries_preserve_memory_sqlite_data(monkeypatch):
+    _reset_engine_state(monkeypatch)
+    monkeypatch.setattr(
+        db_session,
+        "POSTGRES_URL",
+        "postgresql+asyncpg://synthetic:synthetic@127.0.0.1:5432/synthetic",
+    )
+    monkeypatch.setattr(db_session, "ALLOW_SQLITE_FALLBACK", True)
+    monkeypatch.setattr(db_session, "SQLITE_FALLBACK_URL", "sqlite+aiosqlite:///:memory:")
+    attempts = []
+    monkeypatch.setattr(
+        db_session,
+        "create_async_engine",
+        _failing_postgres_engine(db_session.create_async_engine, attempts),
+    )
+
+    try:
+        # Initial call fails PostgreSQL, falls back to in-memory SQLite
+        engine = await db_session.init_engine()
+        assert engine is not None
+        assert db_session.storage_state() == {"backend": "sqlite", "fallback": True}
+
+        from bot.db.models.agent import Agent
+        from sqlalchemy import select
+
+        # Insert data into the active in-memory SQLite fallback
+        factory = await db_session.get_session_factory()
+        async with factory() as session:
+            async with session.begin():
+                session.add(Agent(slug="preserved-memory-agent", name="Preserved Memory Agent"))
+
+        # Verify data is readable before retry
+        async with factory() as session:
+            result = (
+                await session.execute(
+                    select(Agent).where(Agent.slug == "preserved-memory-agent")
+                )
+            ).scalar_one()
+            assert result.name == "Preserved Memory Agent"
+
+        # Retries via init_engine: fails PostgreSQL again, must keep existing engine
+        engine_after_retry = await db_session.init_engine()
+        assert engine_after_retry is engine
+        assert db_session.storage_state() == {"backend": "sqlite", "fallback": True}
+
+        # Retries via get_session_factory: fails PostgreSQL again, must keep existing fallback factory
+        factory_after_retry = await db_session.get_session_factory()
+        assert db_session.storage_state() == {"backend": "sqlite", "fallback": True}
+
+        # Crucial check: verify in-memory SQLite consumer data was retained across failed retries
+        async with factory_after_retry() as session:
+            result = (
+                await session.execute(
+                    select(Agent).where(Agent.slug == "preserved-memory-agent")
+                )
+            ).scalar_one()
+            assert result.name == "Preserved Memory Agent"
+            assert result.slug == "preserved-memory-agent"
+    finally:
+        if db_session._engine is not None:
+            await db_session._engine.dispose()
+
+@pytest.mark.asyncio
+async def test_configured_primary_sqlite_equal_to_fallback_url_not_flagged_fallback(monkeypatch, tmp_path):
+    _reset_engine_state(monkeypatch)
+    sqlite_url = f"sqlite+aiosqlite:///{tmp_path / 'primary.db'}"
+    monkeypatch.setattr(db_session, "POSTGRES_URL", sqlite_url)
+    monkeypatch.setattr(db_session, "SQLITE_FALLBACK_URL", sqlite_url)
+    monkeypatch.setattr(db_session, "ALLOW_SQLITE_FALLBACK", True)
+
+    try:
+        engine = await db_session.init_engine()
+        assert engine is not None
+        assert db_session.storage_state() == {"backend": "sqlite", "fallback": False}
+        assert db_session._fallback_active is False
+        assert db_session._requested_url == sqlite_url
+
+        from bot.db.models.agent import Agent
+        from sqlalchemy import select
+
+        factory = await db_session.get_session_factory()
+        async with factory() as session:
+            async with session.begin():
+                session.add(Agent(slug="primary-agent", name="Primary Agent"))
+
+        # Subsequent initialization calls must reuse the primary engine without flagging fallback
+        engine2 = await db_session.init_engine()
+        assert engine2 is engine
+        assert db_session.storage_state() == {"backend": "sqlite", "fallback": False}
+
+        factory2 = await db_session.get_session_factory()
+        async with factory2() as session:
+            result = (
+                await session.execute(
+                    select(Agent).where(Agent.slug == "primary-agent")
+                )
+            ).scalar_one()
+            assert result.name == "Primary Agent"
+            assert result.slug == "primary-agent"
+    finally:
+        if db_session._engine is not None:
+            await db_session._engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_configured_primary_sqlite_not_flagged_fallback(monkeypatch, tmp_path):
+    _reset_engine_state(monkeypatch)
+    primary_url = f"sqlite+aiosqlite:///{tmp_path / 'primary_custom.db'}"
+    fallback_url = f"sqlite+aiosqlite:///{tmp_path / 'fallback_custom.db'}"
+    monkeypatch.setattr(db_session, "POSTGRES_URL", primary_url)
+    monkeypatch.setattr(db_session, "SQLITE_FALLBACK_URL", fallback_url)
+    monkeypatch.setattr(db_session, "ALLOW_SQLITE_FALLBACK", True)
+
+    try:
+        engine = await db_session.init_engine()
+        assert engine is not None
+        assert db_session.storage_state() == {"backend": "sqlite", "fallback": False}
+        assert db_session._fallback_active is False
+        assert db_session._engine_url == primary_url
+    finally:
+        if db_session._engine is not None:
+            await db_session._engine.dispose()

@@ -80,8 +80,15 @@ async def init_engine(url: str | None = None):
     requested_url = url or POSTGRES_URL
     target_url = requested_url
     # Only the implicit default URL may fall back, and only when the
-    # deployment opted in. An explicit URL always means exactly that URL.
-    allow_fallback = url is None and target_url == POSTGRES_URL and ALLOW_SQLITE_FALLBACK
+    # deployment opted in and the primary store is not already SQLite.
+    # An explicit URL always means exactly that URL.
+    allow_fallback = (
+        url is None
+        and target_url == POSTGRES_URL
+        and not target_url.startswith("sqlite")
+        and target_url != SQLITE_FALLBACK_URL
+        and ALLOW_SQLITE_FALLBACK
+    )
     async with _init_lock_for_loop():
         # A fallback engine is never reused as if it satisfied a request for
         # PostgreSQL: _requested_url records the store actually opened, so
@@ -96,6 +103,7 @@ async def init_engine(url: str | None = None):
             return _engine
 
         engine = create_async_engine(target_url, echo=False)
+        fell_back = False
         try:
             async with engine.connect() as conn:
                 await conn.execute(text("SELECT 1"))
@@ -109,6 +117,18 @@ async def init_engine(url: str | None = None):
                     type(exc).__name__,
                 )
                 raise
+            if _fallback_active and _engine is not None and _engine_url == SQLITE_FALLBACK_URL:
+                logger.warning(
+                    "Configured database still unavailable (%s); ALLOW_SQLITE_FALLBACK=1 is set, "
+                    "retaining active SQLite fallback. Agent edits made now will not appear "
+                    "in PostgreSQL.",
+                    type(exc).__name__,
+                )
+                if _session_factory is None:
+                    _session_factory = async_sessionmaker(
+                        _engine, expire_on_commit=False, class_=AsyncSession
+                    )
+                return _engine
             logger.warning(
                 "Configured database unavailable (%s); ALLOW_SQLITE_FALLBACK=1 is set, "
                 "falling back to local SQLite. Agent edits made now will not appear "
@@ -123,7 +143,7 @@ async def init_engine(url: str | None = None):
             except Exception:
                 await engine.dispose()
                 raise
-
+            fell_back = True
         # Schema errors (including legacy duplicate rows blocking a new
         # uniqueness index) must surface; they are not a database outage.
         try:
@@ -142,7 +162,7 @@ async def init_engine(url: str | None = None):
         # default init_engine() sees SQLite here and retries PostgreSQL.
         _requested_url = target_url
         _is_sqlite = "sqlite" in target_url
-        _fallback_active = allow_fallback and target_url == SQLITE_FALLBACK_URL
+        _fallback_active = fell_back
         _session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
         if previous is not None and previous is not engine:
             await previous.dispose()
@@ -156,7 +176,7 @@ async def init_engine(url: str | None = None):
 
 async def get_engine():
     global _engine
-    if _engine is None:
+    if _engine is None or _fallback_active:
         await init_engine()
     return _engine
 
