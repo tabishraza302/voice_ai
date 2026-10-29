@@ -3,7 +3,10 @@
 import { use, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { ArrowLeft, AlertCircle, RefreshCw } from "lucide-react";
+import { Suspense } from "react";
 import { AgentForm } from "@/components/AgentForm";
+import { PlatformAgentWorkspace } from "@/components/PlatformAgentWorkspace";
+import { useAuth } from "@/lib/auth-state";
 import { api } from "@/lib/api-client";
 import { describeAgentLoadError, type AgentLoadFailure } from "@/lib/agent-errors";
 import type { Agent } from "@/types/agent";
@@ -13,7 +16,22 @@ interface PageProps {
 }
 
 export default function EditAgentPage({ params }: PageProps) {
+  return (
+    <Suspense fallback={<div role="status" className="p-6 text-sm text-limestone-400">Loading agent workspace…</div>}>
+      <EditAgentPageContent params={params} />
+    </Suspense>
+  );
+}
+
+function EditAgentPageContent({ params }: PageProps) {
   const resolvedParams = use(params);
+  const { isLocalMode } = useAuth();
+  return isLocalMode
+    ? <LocalEditAgentPage agentId={resolvedParams.id} />
+    : <PlatformAgentWorkspace agentId={resolvedParams.id} />;
+}
+
+function LocalEditAgentPage({ agentId }: { agentId: string }) {
   const [agent, setAgent] = useState<Agent | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<AgentLoadFailure | null>(null);
@@ -35,7 +53,7 @@ export default function EditAgentPage({ params }: PageProps) {
       setLoading(true);
       setError(null);
       try {
-        const fetched = await api.getAgent(resolvedParams.id);
+        const fetched = await api.getAgent(agentId);
         if (isStale()) return;
         setAgent(fetched);
       } catch (err: unknown) {
@@ -46,7 +64,7 @@ export default function EditAgentPage({ params }: PageProps) {
       }
     }
     void loadAgent();
-  }, [resolvedParams.id]);
+  }, [agentId]);
 
   if (loading) {
     return (
