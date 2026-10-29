@@ -20,7 +20,6 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
-    JSON,
     LargeBinary,
     String,
     Text,
@@ -111,7 +110,7 @@ class AuthSession(Base):
     state: Mapped[str] = mapped_column(String(24), nullable=False)
     user_agent_label: Mapped[str | None] = mapped_column(String(160), nullable=True)
     created_ip: Mapped[str | None] = mapped_column(
-        postgresql.INET().with_variant(String(45), "sqlite"),
+        postgresql.INET(),
         nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(
@@ -322,12 +321,12 @@ class AuditLog(Base):
         postgresql.UUID(as_uuid=True), nullable=True
     )
     source_ip: Mapped[str | None] = mapped_column(
-        postgresql.INET().with_variant(String(45), "sqlite"),
+        postgresql.INET(),
         nullable=True,
     )
     result: Mapped[str] = mapped_column(String(16), nullable=False)
     change_summary: Mapped[dict[str, Any] | None] = mapped_column(
-        postgresql.JSONB().with_variant(JSON(), "sqlite"),
+        postgresql.JSONB(),
         nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(
