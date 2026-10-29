@@ -126,6 +126,27 @@ class MfaStateConflictError(PlatformError):
     message = "MFA operation not allowed in current session state"
 
 
+
+class ConflictError(PlatformError):
+    status_code = 409
+    code = "CONFLICT"
+    message = "Request conflicts with current state"
+
+
+class RevisionConflictError(ConflictError):
+    code = "REVISION_CONFLICT"
+    message = "Revision conflict: resource was modified concurrently"
+
+
+class IdempotencyConflictError(ConflictError):
+    code = "IDEMPOTENCY_CONFLICT"
+    message = "Idempotency key reused with different request payload"
+
+
+class AuthoringHashMismatchError(ConflictError):
+    code = "AUTHORING_HASH_STALE"
+    message = "Draft authoring hash does not match expected state"
+
 class RequestTooLargeError(PlatformError):
     status_code = 413
     code = "REQUEST_TOO_LARGE"

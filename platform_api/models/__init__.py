@@ -23,6 +23,14 @@ from platform_api.billing.models import (
     MeterCheckpoint,
     WalletEntry,
 )
+from platform_api.agents.models import (
+    Agent,
+    AgentDraft,
+    AgentTemplateVersion,
+    AgentVersion,
+    IdempotencyRecord,
+    PlatformPromptVersion,
+)
 
 __all__ = [
     "Base",
@@ -40,4 +48,10 @@ __all__ = [
     "BillingOperation",
     "MeterCheckpoint",
     "Session",
+    "Agent",
+    "AgentDraft",
+    "AgentVersion",
+    "AgentTemplateVersion",
+    "PlatformPromptVersion",
+    "IdempotencyRecord",
 ]

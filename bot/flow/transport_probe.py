@@ -31,11 +31,11 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 from bot.flow.qualification import (
+    AgentQualificationSettings,
     CapabilityReport,
     ScenarioResult,
     canonicalize_measurement,
 )
-from bot.flow.schemas import AdapterCapabilities
 
 
 def is_loopback_host(host: str) -> bool:
@@ -185,6 +185,7 @@ def probe_existing_webrtc_transport_behavior(
     expected_receipt_binding: ExpectedReceiptBinding | None = None,
     adapter_version: str | None = None,
     model_revision: str | None = None,
+    agent_settings: AgentQualificationSettings | None = None,
     metadata_strategy: Literal["separate_stream", "complete_tool", "none"] = "none",
     speech_gating: bool = False,
     cancel_generation: bool = False,
@@ -201,7 +202,7 @@ def probe_existing_webrtc_transport_behavior(
     - `expected_receipt_binding` when the caller knows the exact
       session/epoch/fragment/hash that should have been acknowledged. Without
       it, a receipt is only *observed*, never called an exact binding.
-    - Caller may optionally provide bound full-system identity (`model_revision`, `locales`,
+    - Caller may optionally provide bound full-system identity (`model_revision`, `agent_settings`, locales,
       `adapter_version`, `source_revision`, `profile_hash`) to construct a full `CapabilityReport`.
       If omitted, `report` and `capabilities` remain None, avoiding invented model or locale values.
 
@@ -299,14 +300,15 @@ def probe_existing_webrtc_transport_behavior(
     capabilities: AdapterCapabilities | None = None
     report: CapabilityReport | None = None
 
-    # Only construct a combined CapabilityReport when real model identity, locales,
-    # and profile info are explicitly supplied by the caller/harness.
+    # Only construct a combined CapabilityReport when pinned model, selected agent,
+    # adapter, locale, source, and profile identities are all explicitly supplied.
     if (
         model_revision is not None
         and adapter_version is not None
         and locales is not None
         and source_revision is not None
         and profile_hash is not None
+        and agent_settings is not None
     ):
         measurements: dict[str, Any] = {
             "data_channel_message_count": len(messages),
@@ -401,10 +403,11 @@ def probe_existing_webrtc_transport_behavior(
         evidence_hash = hashlib.sha256(raw_evidence_bytes).hexdigest()
 
         rep = CapabilityReport(
-            protocol_version=1,
+            protocol_version=2,
             adapter_id=adapter_id,
             adapter_version=adapter_version,
             model_revision=model_revision,
+            agent_settings=agent_settings,
             metadata=metadata_strategy,
             speech_gating=speech_gating,
             cancel_generation=cancel_generation,
@@ -415,11 +418,7 @@ def probe_existing_webrtc_transport_behavior(
             fixture_hashes={"transport_evidence": evidence_hash},
             cases=cases,
             measurements=measurements,
-            raw_evidence={
-                "transport_evidence_sha256": evidence_hash,
-                "data_channel_receipt_observed": data_channel_receipt_observed,
-                "bound_fragment_receipt_count": bound_receipts,
-            },
+            raw_evidence_references=[f"sha256:{evidence_hash}"],
             playback_boundary_description=evidence.playback_boundary_description,
             limitations=unsupported_reasons,
         )
@@ -454,6 +453,7 @@ async def probe_live_webrtc_loopback(
     adapter_id: str = "small_webrtc_transport",
     adapter_version: str | None = None,
     model_revision: str | None = None,
+    agent_settings: AgentQualificationSettings | None = None,
     metadata_strategy: Literal["separate_stream", "complete_tool", "none"] = "none",
     speech_gating: bool = False,
     cancel_generation: bool = False,
@@ -483,6 +483,7 @@ async def probe_live_webrtc_loopback(
             measured_sink_latency_ms=None,
             adapter_version=adapter_version,
             model_revision=model_revision,
+            agent_settings=agent_settings,
             metadata_strategy=metadata_strategy,
             speech_gating=speech_gating,
             cancel_generation=cancel_generation,
@@ -527,6 +528,7 @@ async def probe_live_webrtc_loopback(
                         adapter_version=adapter_version,
                         model_revision=model_revision,
                         metadata_strategy=metadata_strategy,
+                        agent_settings=agent_settings,
                         speech_gating=speech_gating,
                         cancel_generation=cancel_generation,
                         locales=locales,
@@ -584,6 +586,7 @@ async def probe_live_webrtc_loopback(
                         adapter_version=adapter_version,
                         model_revision=model_revision,
                         metadata_strategy=metadata_strategy,
+                        agent_settings=agent_settings,
                         speech_gating=speech_gating,
                         cancel_generation=cancel_generation,
                         locales=locales,
@@ -616,6 +619,7 @@ async def probe_live_webrtc_loopback(
             has_audio_track=audio_track_observed,
             adapter_version=adapter_version,
             model_revision=model_revision,
+            agent_settings=agent_settings,
             metadata_strategy=metadata_strategy,
             speech_gating=speech_gating,
             cancel_generation=cancel_generation,
@@ -645,7 +649,11 @@ async def probe_live_webrtc_loopback(
         has_audio_track=audio_track_observed,
         adapter_version=adapter_version,
         model_revision=model_revision,
+        agent_settings=agent_settings,
         locales=locales,
         source_revision=source_revision,
+        metadata_strategy=metadata_strategy,
+        speech_gating=speech_gating,
+        cancel_generation=cancel_generation,
         profile_hash=profile_hash,
     )

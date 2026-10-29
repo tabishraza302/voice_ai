@@ -82,17 +82,18 @@ class ModelCatalog(BaseModel):
 
 
 def load_catalog(catalog_path: str | Path | None = None) -> ModelCatalog:
-    """Load model catalog from JSON file or return qualified baseline catalog.
+    """Load the configured catalog, using the baseline only when none is set.
 
     Pure file reader; does not contact external services or load GPU weights.
     """
-    if catalog_path:
-        path = Path(catalog_path)
-        if path.is_file():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                return ModelCatalog.model_validate(data)
-            except Exception as e:
-                raise ValueError(f"Failed to load model catalog from {path}: {e}") from e
+    if catalog_path is None:
+        return ModelCatalog.model_validate(DEFAULT_QUALIFIED_CATALOG)
 
-    return ModelCatalog.model_validate(DEFAULT_QUALIFIED_CATALOG)
+    path = Path(catalog_path)
+    if not path.is_file():
+        raise ValueError("Configured model catalog file does not exist")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return ModelCatalog.model_validate(data)
+    except Exception as e:
+        raise ValueError(f"Failed to load model catalog from {path}: {e}") from e

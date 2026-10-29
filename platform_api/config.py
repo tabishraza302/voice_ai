@@ -376,6 +376,61 @@ class PlatformSettings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("PLATFORM_CATALOG_PATH", "catalog_path"),
     )
+    adapter_capability_report_path: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "PLATFORM_ADAPTER_CAPABILITY_REPORT_PATH",
+            "adapter_capability_report_path",
+        ),
+    )
+    adapter_capability_report_hash: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "PLATFORM_ADAPTER_CAPABILITY_REPORT_HASH",
+            "adapter_capability_report_hash",
+        ),
+    )
+    deployment_adapter_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        validation_alias=AliasChoices(
+            "PLATFORM_DEPLOYMENT_ADAPTER_ID", "deployment_adapter_id"
+        ),
+    )
+    deployment_adapter_version: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        validation_alias=AliasChoices(
+            "PLATFORM_DEPLOYMENT_ADAPTER_VERSION", "deployment_adapter_version"
+        ),
+    )
+    deployment_model_revision: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        validation_alias=AliasChoices(
+            "PLATFORM_DEPLOYMENT_MODEL_REVISION", "deployment_model_revision"
+        ),
+    )
+    deployment_profile_hash: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        validation_alias=AliasChoices(
+            "PLATFORM_DEPLOYMENT_PROFILE_HASH", "deployment_profile_hash"
+        ),
+    )
+    deployment_source_revision: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        validation_alias=AliasChoices(
+            "PLATFORM_DEPLOYMENT_SOURCE_REVISION", "deployment_source_revision"
+        ),
+    )
+
 
     # --- Accounting and Events ------------------------------------------------
     billing_slice_ms: int | None = Field(
@@ -524,6 +579,73 @@ class PlatformSettings(BaseSettings):
                 f"Invalid PLATFORM_AUTH_MAIL_MODE '{v}'. Must be 'file' or 'smtp'."
             )
         return mode
+
+    @field_validator(
+        "adapter_capability_report_path",
+        "adapter_capability_report_hash",
+        mode="before",
+    )
+    @classmethod
+    def normalize_optional_capability_source(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    @field_validator("adapter_capability_report_hash")
+    @classmethod
+    def validate_capability_report_hash(cls, value: str | None) -> str | None:
+        if value is not None and (
+            len(value) != 64
+            or any(char not in "0123456789abcdef" for char in value)
+        ):
+            raise ValueError(
+                "PLATFORM_ADAPTER_CAPABILITY_REPORT_HASH must be a lowercase "
+                "SHA-256 digest."
+            )
+        return value
+
+    @model_validator(mode="after")
+    def validate_capability_report_source(self) -> PlatformSettings:
+        if (self.adapter_capability_report_path is None) != (
+            self.adapter_capability_report_hash is None
+        ):
+            raise ValueError(
+                "PLATFORM_ADAPTER_CAPABILITY_REPORT_PATH and "
+                "PLATFORM_ADAPTER_CAPABILITY_REPORT_HASH must be configured together."
+            )
+        return self
+
+    @field_validator(
+        "deployment_adapter_id",
+        "deployment_adapter_version",
+        "deployment_model_revision",
+        "deployment_profile_hash",
+        "deployment_source_revision",
+        mode="before",
+    )
+    @classmethod
+    def normalize_optional_deployment_identity(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    @model_validator(mode="after")
+    def validate_deployment_identity(self) -> PlatformSettings:
+        identity_values = (
+            self.deployment_adapter_id,
+            self.deployment_adapter_version,
+            self.deployment_model_revision,
+            self.deployment_profile_hash,
+            self.deployment_source_revision,
+        )
+        if any(value is not None for value in identity_values) and not all(
+            value is not None for value in identity_values
+        ):
+            raise ValueError(
+                "All PLATFORM_DEPLOYMENT_* identity fields must be configured together."
+            )
+        return self
+
 
     @model_validator(mode="after")
     def validate_key_separation(self) -> PlatformSettings:
