@@ -58,7 +58,7 @@ Fetches the STT, TTS, and LLM model checkpoints locally. The demo runs entirely 
 ```bash
 scripts/voice-ai.sh start
 ```
-Brings up Phoenix on the host, the container stack (OpenTelemetry Collector, Prometheus, Grafana), the local `mlx-audio` server, and the voice agent, verifying readiness at each stage.
+Brings up the container stack (OpenTelemetry Collector, Prometheus, Grafana, PostgreSQL), Phoenix on the host, the local `mlx-audio` server, and the voice agent, verifying readiness at each stage.
 
 ### 4. Talk to the Agent
 Open **http://localhost:7860/client** in your browser. Speak in English or Hindi; the agent detects the language and responds in the same language.
@@ -86,10 +86,15 @@ trusted user on the same machine. They have no sign-in, authorization, or
 multi-user isolation. Keep the Studio, agent API, and database bound to
 loopback. The API lets the browser edit local agent profiles and
 prompts. The browser sends the selected saved profile id with its WebRTC
-request, and that profile applies to that session only. Prebuilt clients with
-no profile id keep the measured `.env` settings. A control-page STT mode
-override takes precedence over a selected profile's STT choice.
-
+request, and that profile applies to that session only. Explicitly requesting
+an unavailable or deleted profile id fails the session request instead of
+falling back to a different profile. Prebuilt clients with no profile id keep
+the measured `.env` settings. The studio indicates when a profile's selected
+LLM model is unavailable in the local catalog. Built-in profiles use batch STT
+(`mlx-audio`), which supports pinned languages; the default `.env` configuration
+uses realtime STT. A control-page STT mode override takes precedence over a
+selected profile's STT choice. In-call text turns sent from the client are
+limited to 4,000 Unicode characters.
 The studio uses the local PostgreSQL service started by Docker Compose. Install
 the web dependencies once, then start the studio alongside the stack:
 
@@ -113,16 +118,21 @@ Set `WEB_PORT=3010` before invoking the script to select another port; the
 agent and Studio use the same exported value for the CORS allowlist.
 The local management API is under `/api` (including `/api/agents`,
 `/api/prompts/base`, and `/api/catalog`); the runner's OpenAPI page is at
-`http://localhost:7860/docs`.
+`http://localhost:7860/docs`. The runner's `--host` setting must stay
+`localhost` or a literal loopback IP (such as `127.0.0.1` or `::1`) because
+management endpoints have no authentication.
 
-PostgreSQL is published on loopback port 5439 by default. Set `POSTGRES_PORT`
-to move the Compose port, and set `DATABASE_URL` in `.env` to the same host
-port. The agent falls back to local SQLite when PostgreSQL is unavailable;
-its default location remains the existing `voice_ai.db` file. Set
-`SQLITE_DATABASE_URL` to choose another file location. The fallback is useful
-for a single local user, but its data is independent from PostgreSQL and does
-not synchronize automatically.
-
+PostgreSQL is the single runtime database for the project (including Arize Phoenix).
+It is published on loopback port 5439 by default. Set `POSTGRES_PORT` to move the
+Compose port, and set `DATABASE_URL` in `.env` to the same host port.
+PostgreSQL is required: there is no SQLite fallback mode. If PostgreSQL is unavailable,
+`scripts/voice-ai.sh start` and storage requests fail loudly rather than silently
+writing to a temporary store. Storage is initialized on first use, so the server
+can start before a connection attempt. `GET /api/storage` reports
+`{"backend": "uninitialized"|"postgres"}` without exposing URLs or credentials.
+Phoenix connects to the same configured PostgreSQL database using schema isolation
+(`PHOENIX_SQL_DATABASE_SCHEMA=phoenix`), preventing table and migration collisions
+with agent storage.
 The Studio, API, database, and preset prompts are new code paths; the published
 STT, TTS, memory, and turn-latency tables describe the original measured
 configuration. The profile prompt check below used the compiled built-in
@@ -202,11 +212,16 @@ STT, TTS, and LLM backends are selected entirely by configuration without touchi
 | Layer | Default | Swap to | Real Cost / Tradeoff | When to Use |
 |---|---|---|---|---|
 | **STT** | `mlx-audio-realtime` + Nemotron 3.5 ASR 0.6B | `mlx-whisper` + `whisper-large-v3-turbo` | Weights: 1.28 GB → 1.61 GB. FLEURS WER: **Hindi 7.18 % → 35.92 %**, English 8.56 % → 4.98 %. | When English precision is primary and Hindi is secondary. |
-| **STT** | `mlx-audio-realtime` + Nemotron 3.5 ASR 0.6B | `mlx-audio` + Nemotron 3.5 ASR 0.6B | Batch HTTP endpoint (`/v1/audio/transcriptions`) instead of WebSocket: TTFS p50/p99 increases from 0.89s/0.99s to 0.94s/1.06s (en) and 1.00s/1.45s to 1.26s/1.80s (hi). Supports explicit language pinning (`stt_language=en|hi`). | When mid-session language pinning or explicit locale overrides are required. |
+| **STT** | `mlx-audio-realtime` + Nemotron 3.5 ASR 0.6B | `mlx-audio` + Nemotron 3.5 ASR 0.6B | Batch HTTP endpoint (`/v1/audio/transcriptions`) instead of WebSocket: TTFS p50/p99 0.843s/0.993s (en) and 1.022s/1.724s (hi). Supports explicit language pinning (`stt_language=en|hi`). | When mid-session language pinning or explicit locale overrides are required. |
 | **TTS** | `mlx-audio` + `Kokoro-82M-4bit` (Metal) | `kokoro` (in-process ONNX CPU) | Time to first audio: **0.28 s vs 0.71 s** (p50). In-process ONNX adds 0.48 GB to agent process but eliminates dependency on `mlx-audio` server. | When running without the local HTTP server or optimizing process boundaries. |
 | **LLM** | `ollama` + `qwen3.5:4b` | `ollama` + `gemma3:4b` | Gemma 3 is non-thinking, so it needs no reasoning policy; the memory baseline measured it at 2.62 GB resident. | When running in a tighter memory tier or preferring Gemma 3 Devanagari styling. |
 | **LLM** | `ollama` | `openai-compatible` + llama.cpp / vLLM / LM Studio | Alternative local inference runtime. | When deploying with non-Ollama runtimes. |
 | **LLM** | `ollama` + `qwen3.5:4b` | `openai-compatible` + Cloud API (`gpt-5.4-mini`) | Requires a network, so it breaks the air-gapped property. Not measured against the local default. | When testing cloud frontier model reasoning capabilities. |
+
+Batch TTFS was remeasured on the Apple M5 MacBook Air (16 GB unified memory)
+on 2026-10-29 with `scripts/voice-ai.sh bench`, using cached FLEURS clips and a
+local isolated speech server: 9 English and 10 Hindi measured clips, after one
+English warm-up. These small-sample timings are not deployment budgets.
 
 To swap backends, edit `.env`:
 ```bash
@@ -333,8 +348,16 @@ scripts/voice-ai.sh lookahead-bench # Streaming WER/CER at 13, 6, 3 and 0 frames
 scripts/voice-ai.sh tts-bench     # Benchmark TTS backends
 scripts/voice-ai.sh turn-bench    # Measure end-to-end turn latency
 scripts/voice-ai.sh eval          # Run FLEURS WER/CER evaluation
-scripts/voice-ai.sh test          # Run full regression test suite
+scripts/voice-ai.sh test          # Run the regression suite
 ```
+
+PostgreSQL integration tests require an owned disposable cluster. Set
+`TEST_DATABASE_URL` to its async PostgreSQL URL and
+`TEST_DATABASE_OWNERSHIP_TOKEN` to a secret token stored in
+`public._verification_cluster_ownership(token)` on that cluster. Tests create
+and drop temporary schemas only after checking the token. Without
+`TEST_DATABASE_URL`, those tests are skipped; never point them at a live
+database.
 
 ---
 
@@ -350,7 +373,7 @@ scripts/voice-ai.sh test          # Run full regression test suite
 | **Grafana** | Container | 3003 | Port 3003 chosen to avoid default port 3000 collisions. |
 | **`mlx-audio` Server** | Host | 8020 | Serves STT WebSocket & TTS endpoints on Metal GPU. |
 | **Ollama** | Host | 11434 | Standard Ollama inference port. |
-| **PostgreSQL** | Container | 5439 (configurable) | Local agent configuration; loopback only, with a SQLite fallback. |
+| **PostgreSQL** | Container | 5439 (configurable) | Single runtime database for agent configuration and Phoenix traces; loopback only. |
 | **Studio/API** | Host | 3001 / 7860 `/api` | Optional single-user local management interface; no authentication. |
 
 ### The Metrics Contract

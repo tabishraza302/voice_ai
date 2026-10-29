@@ -12,8 +12,16 @@ built by per-backend routers (see ``bot/language.py``).
 
 from __future__ import annotations
 
-from pydantic import AliasChoices, Field
+import ipaddress
+from urllib.parse import urlsplit
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# The only scheme agent configuration storage accepts. PostgreSQL is the
+# runtime database, reached through SQLAlchemy's async driver, so the URL
+# must name that driver explicitly: ``postgresql://`` alone selects the
+# synchronous driver, and ``sqlite`` is not a runtime store at all.
+ASYNC_POSTGRES_SCHEME = "postgresql+asyncpg"
 
 # The bot's behaviour, in one place. Shared by every LLM backend so that
 # swapping the LLM cannot silently change what the bot says.
@@ -104,10 +112,38 @@ class Settings(BaseSettings):
     # Compiled or default system instruction passed to the LLM backend
     system_instruction: str = SYSTEM_PROMPT
 
-    # Local agent configuration storage. The service falls back to SQLite
-    # if the loopback PostgreSQL database cannot be reached.
+    # --- Agent storage ---------------------------------------------------
+    # Agent profiles and prompt revisions live in PostgreSQL, and only there.
+    # There is no SQLite mode and no fallback store: a configured database
+    # that cannot be reached is a startup failure, because silently writing
+    # agent edits somewhere else makes them disappear when PostgreSQL comes
+    # back. /api/storage reports whether the engine has been opened.
     database_url: str = "postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai"
-    sqlite_database_url: str = "sqlite+aiosqlite:///voice_ai.db"
+
+    @field_validator("database_url")
+    @classmethod
+    def validate_database_url_is_async_postgres(cls, value: str) -> str:
+        """Fail closed unless the URL is asynchronous PostgreSQL.
+
+        The schema, the partial unique active-agent index, the savepoints
+        that absorb racing seeders and the ``FOR UPDATE`` locks that
+        serialize activation are PostgreSQL behaviours. A SQLite URL (file
+        or memory), a synchronous PostgreSQL URL, or any other backend
+        would run a different system than the one that was measured, so the
+        scheme is checked before the engine is ever created.
+        """
+        if not isinstance(value, str):
+            raise ValueError("database_url must be a string")
+        candidate = value.strip()
+        scheme = urlsplit(candidate).scheme
+        if scheme not in (ASYNC_POSTGRES_SCHEME, "postgres+asyncpg"):
+            raise ValueError(
+                f"DATABASE_URL must use {ASYNC_POSTGRES_SCHEME}:// "
+                f"(asynchronous PostgreSQL); got scheme {scheme or '<empty>'!r}. "
+                "SQLite is not supported as a runtime database."
+            )
+        return candidate
+
 
     # --- TTS layer -------------------------------------------------------
     # "mlx-audio" is the default, and it is a measured choice: the median
@@ -150,6 +186,31 @@ class Settings(BaseSettings):
     # --- Server ----------------------------------------------------------
     host: str = "localhost"
     port: int = 7860
+
+    @field_validator("host")
+    @classmethod
+    def validate_host_is_literal_loopback(cls, value: str) -> str:
+        """Fail closed unless the host is a literal loopback address or localhost.
+
+        Management routes (/api, /, /settings, /metrics) are unauthenticated in this
+        local air-gapped system. Binding to wildcards, non-loopback addresses, or
+        arbitrary domain names without DNS lookups is strictly forbidden.
+        """
+        if not isinstance(value, str):
+            raise ValueError("host must be a string")
+        candidate = value.strip()
+        if candidate.lower() == "localhost":
+            return candidate
+        try:
+            parsed = ipaddress.ip_address(candidate)
+            if parsed.is_loopback:
+                return candidate
+        except ValueError:
+            pass
+        raise ValueError(
+            f"host {value!r} is not allowed: unauthenticated local management routes "
+            "must only bind to localhost or a literal loopback IP (127.0.0.1, ::1)"
+        )
 
     # --- Measured behaviour ----------------------------------------------
     # P99 latency from end-of-speech to final transcript, in seconds.

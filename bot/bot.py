@@ -21,6 +21,7 @@ harness — there is one pipeline, not two.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import shutil
@@ -28,7 +29,7 @@ import subprocess
 import time
 import urllib.request
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import urlparse
 
@@ -60,16 +61,19 @@ from bot.context import ContextShapingProcessor
 from bot.control import apply_mode, mount_control
 from bot.language import parse_language_request
 from bot.observers import LatencyBridge, PrometheusObserver, mount_metrics
-from bot.session_settings import resolve_session_settings
+from bot.session_settings import InvalidAgentIdError, resolve_session_settings
 from bot.transcripts import BotTranscriptForwarder, UserTranscriptForwarder, queue_client_utterance
 from bot.pipeline import LanguageRoutingProcessor
 from bot.services import (
+    LlmModelNotAvailableError,
+    SttLanguageNotSupportedError,
     build_llm,
     build_stt,
     build_stt_language_router,
     build_tts,
     build_voice_router,
     resolve_models,
+    validate_stt_language,
 )
 
 # The dev runner's audio rates. 16 kHz in for Silero VAD's sake, 24 kHz
@@ -393,27 +397,233 @@ def _parse_app_message(message: Any) -> dict[str, Any] | None:
     return None
 
 
+async def close_peer_connection(connection: Any) -> None:
+    """Close a failed SmallWebRTC peer connection so the browser is not left connected."""
+    if connection is None:
+        return
+    try:
+        if hasattr(connection, "disconnect") and callable(connection.disconnect):
+            await connection.disconnect()
+        elif hasattr(connection, "_close") and callable(connection._close):
+            await connection._close()
+        elif hasattr(connection, "pc") and connection.pc and callable(getattr(connection.pc, "close", None)):
+            res = connection.pc.close()
+            if asyncio.iscoroutine(res):
+                await res
+    except Exception as exc:
+        logger.warning(f"Failed to cleanly disconnect WebRTC peer: {exc}")
+
+
+class InvalidSessionBodyError(ValueError):
+    """The session payload put configuration where the runner cannot read it."""
+
+
+def extract_session_body(data: Any, *, source: str) -> dict[str, Any] | None:
+    """Extract the session body from the route-correct field.
+
+    Pipecat reads ``request_data`` on ``/api/offer`` and ``body`` on
+    ``/start``; a top-level ``agent_id`` is accepted by neither. Similarly,
+    sending ``agent_id`` in ``request_data`` to ``/start`` or in ``body`` to
+    ``/api/offer`` is ignored by the runner and causes the bot to silently
+    fall back to the default profile. Reject wrong nested fields as well as
+    top-level ``agent_id``.
+    """
+    if source not in {"offer", "start"}:
+        raise ValueError(f"unknown session body source {source!r}")
+    if not isinstance(data, dict):
+        return None
+    if "agent_id" in data:
+        raise InvalidSessionBodyError(
+            "agent_id must be sent inside request_data for /api/offer "
+            "or inside body for /start, not at the top level"
+        )
+    wrong_field = "body" if source == "offer" else "request_data"
+    wrong_nested = data.get(wrong_field)
+    if isinstance(wrong_nested, dict) and "agent_id" in wrong_nested:
+        correct_field = "request_data" if source == "offer" else "body"
+        route_name = "/api/offer" if source == "offer" else "/start"
+        raise InvalidSessionBodyError(
+            f"agent_id must be sent inside {correct_field} for {route_name}, "
+            f"not inside {wrong_field}"
+        )
+    field = "request_data" if source == "offer" else "body"
+    nested = data.get(field)
+    return nested if isinstance(nested, dict) else None
+
+
+async def preflight_session_settings(
+    body: object,
+    settings: Settings,
+    profile_resolver: Callable[..., Awaitable[Settings]] | None = None,
+) -> Settings:
+    """Preflight validate session settings before WebRTC offer negotiation."""
+    if profile_resolver is None:
+        from bot.agents.service import apply_active_agent_to_settings
+
+        profile_resolver = apply_active_agent_to_settings
+
+    resolved = await resolve_session_settings(settings, body, profile_resolver)
+    resolved = apply_mode(resolved)
+    validate_stt_language(resolved)
+    return resolved
+
+
+def mount_offer_guard(
+    app: Any,
+    settings: Settings,
+    profile_resolver: Callable[..., Awaitable[Settings]] | None = None,
+) -> None:
+    """Mount preflight validation on WebRTC offer routes.
+
+    Validates explicitly requested agent profiles before the Pipecat runner
+    negotiates an SDP answer. When an agent ID is missing, malformed, or
+    rejected by the database or provider configuration, the offer request
+    fails closed immediately with a user-visible HTTP status code (400, 404,
+    503, or 500) rather than leaving the browser in a connected state with no
+    running backend session. An unreachable PostgreSQL is a 503: the selected
+    profile may still exist, so it is not reported as missing.
+    """
+    if getattr(app.state, "offer_guard_mounted", False):
+        return
+    app.state.offer_guard_mounted = True
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+    from sqlalchemy.exc import InterfaceError, OperationalError, SQLAlchemyError
+    from bot.agents.service import AgentNotFoundError
+    from bot.db.session import StorageUnavailableError
+
+    allowed_origins = {
+        f"http://localhost:{settings.web_port}",
+        f"http://127.0.0.1:{settings.web_port}",
+    }
+
+    class WebRTCOfferPreflightMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            if request.method == "POST" and (
+                request.url.path == "/api/offer"
+                or request.url.path.endswith("/api/offer")
+                or request.url.path == "/start"
+            ):
+                origin = request.headers.get("origin")
+                headers = {}
+                if origin in allowed_origins:
+                    headers["Access-Control-Allow-Origin"] = origin
+                try:
+                    body_bytes = await request.body()
+                    if body_bytes:
+                        data = json.loads(body_bytes)
+                        source = "start" if request.url.path == "/start" else "offer"
+                        session_body = extract_session_body(data, source=source)
+                        if session_body and "agent_id" in session_body:
+                            await preflight_session_settings(
+                                session_body, settings, profile_resolver=profile_resolver
+                            )
+                except json.JSONDecodeError:
+                    pass
+                except InvalidSessionBodyError as exc:
+                    logger.warning(f"WebRTC offer preflight rejected misplaced session body: {exc}")
+                    return JSONResponse(
+                        status_code=400,
+                        content={"detail": str(exc)},
+                        headers=headers,
+                    )
+                except InvalidAgentIdError as exc:
+                    logger.warning(f"WebRTC offer preflight rejected invalid agent id: {exc}")
+                    return JSONResponse(
+                        status_code=400,
+                        content={"detail": f"Invalid agent ID: {exc}"},
+                        headers=headers,
+                    )
+                except SttLanguageNotSupportedError as exc:
+                    logger.warning(f"WebRTC offer preflight rejected incompatible STT settings: {exc}")
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "detail": (
+                                "Incompatible speech recognition settings: mlx-audio-realtime does not support "
+                                "pinned languages. Set language to auto or switch speech recognition to mlx-audio."
+                            )
+                        },
+                        headers=headers,
+                    )
+                except LlmModelNotAvailableError as exc:
+                    logger.warning(f"WebRTC offer preflight rejected unavailable LLM model: {exc}")
+                    return JSONResponse(
+                        status_code=503,
+                        content={"detail": f"Selected language model is unavailable: {exc}"},
+                        headers=headers,
+                    )
+                except (StorageUnavailableError, OperationalError, InterfaceError) as exc:
+                    logger.warning(f"WebRTC offer preflight could not reach agent storage: {exc}")
+                    return JSONResponse(
+                        status_code=503,
+                        content={
+                            "detail": (
+                                "Agent storage is unavailable: PostgreSQL is not reachable, "
+                                "so the requested agent profile cannot be verified. "
+                                "Reconnect PostgreSQL and try again."
+                            )
+                        },
+                        headers=headers,
+                    )
+                except AgentNotFoundError as exc:
+                    logger.warning(f"WebRTC offer preflight rejected missing agent: {exc}")
+                    return JSONResponse(
+                        status_code=404,
+                        content={"detail": "The requested agent profile was not found or has been deleted."},
+                        headers=headers,
+                    )
+                except SQLAlchemyError as exc:
+                    logger.error(f"WebRTC offer preflight failed on database error: {exc}")
+                    return JSONResponse(
+                        status_code=500,
+                        content={"detail": "Database error: Unable to load agent configuration."},
+                        headers=headers,
+                    )
+                except Exception:
+                    logger.exception("WebRTC offer preflight failed unexpectedly")
+                    return JSONResponse(
+                        status_code=500,
+                        content={"detail": "Voice session initialization failed: The server encountered an unexpected error configuring the session."},
+                        headers=headers,
+                    )
+
+            return await call_next(request)
+
+    app.add_middleware(WebRTCOfferPreflightMiddleware)
+    logger.info("WebRTC offer preflight guard mounted")
+
+
 async def bot(runner_args) -> None:
     """The entrypoint the Pipecat dev runner discovers."""
-    # Only Studio sessions that explicitly send an agent id receive a
-    # profile. The prebuilt runner stays on the measured .env configuration.
-    settings = Settings()
-    from bot.agents.service import apply_active_agent_to_settings
-    settings = await resolve_session_settings(
-        settings, getattr(runner_args, "body", None), apply_active_agent_to_settings
-    )
-    # An explicit process-wide control-page STT mode override takes
-    # precedence over a selected profile's STT provider.
-    settings = apply_mode(settings)
-    logger.info(
-        f"voice-ai starting: stt={settings.stt_provider}/{settings.stt_model} "
-        f"llm={settings.llm_provider}/{settings.llm_model} "
-        f"tts={settings.tts_provider}/{settings.tts_model}"
-    )
+    webrtc_connection = getattr(runner_args, "webrtc_connection", None)
+    try:
+        # Only Studio sessions that explicitly send an agent id receive a
+        # profile. The prebuilt runner stays on the measured .env configuration.
+        settings = Settings()
+        from bot.agents.service import apply_active_agent_to_settings
 
-    transport = await create_transport(runner_args, transport_params())
-    await run_bot(transport, settings, runner_args)
+        settings = await resolve_session_settings(
+            settings, getattr(runner_args, "body", None), apply_active_agent_to_settings
+        )
+        # An explicit process-wide control-page STT mode override takes
+        # precedence over a selected profile's STT provider.
+        settings = apply_mode(settings)
+        validate_stt_language(settings)
+        logger.info(
+            f"voice-ai starting: stt={settings.stt_provider}/{settings.stt_model} "
+            f"llm={settings.llm_provider}/{settings.llm_model} "
+            f"tts={settings.tts_provider}/{settings.tts_model}"
+        )
 
+        transport = await create_transport(runner_args, transport_params())
+        await run_bot(transport, settings, runner_args)
+    except Exception as exc:
+        logger.error(f"voice session failed to start or run: {exc}")
+        if webrtc_connection is not None:
+            await close_peer_connection(webrtc_connection)
+        raise
 
 def build_model_resolver(settings: Settings):
     """Map a processor name to the model id configured behind it.
@@ -473,23 +683,71 @@ def mount_observability(settings: Settings) -> None:
     mount_metrics(app, get_prometheus_observer(settings).registry)
     logger.info(f"prometheus metrics mounted at http://localhost:{settings.port}/metrics/")
 
-def mount_api(app, settings: Settings) -> None:
-    """Mount the multi-agent REST API and CORS middleware on the runner's app."""
+def mount_api(
+    app,
+    settings: Settings,
+    profile_resolver: Callable[..., Awaitable[Settings]] | None = None,
+) -> None:
     from fastapi.middleware.cors import CORSMiddleware
     from bot.api.router import create_api_router
+    from bot.local_guard import mount_local_state_guard
 
+    # Mount preflight validation before local state guard so that the local
+    # security guard is added last and runs outermost (Starlette LIFO order).
+    mount_offer_guard(app, settings, profile_resolver=profile_resolver)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
             f"http://localhost:{settings.web_port}",
             f"http://127.0.0.1:{settings.web_port}",
         ],
-        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
     app.include_router(create_api_router(settings), prefix="/api")
+    mount_local_state_guard(app, settings)
+    # Guarantee LocalStateGuardMiddleware is outermost (index 0 in user_middleware)
+    # even if another component (like mount_control) mounted it earlier.
+    if hasattr(app, "user_middleware"):
+        for idx, m in enumerate(app.user_middleware):
+            if getattr(m.cls, "__name__", "") == "LocalStateGuardMiddleware":
+                if idx > 0:
+                    guard_m = app.user_middleware.pop(idx)
+                    app.user_middleware.insert(0, guard_m)
+                break
     logger.info("multi-agent REST API mounted at /api")
+
+def validate_runner_bind_host(host: str) -> str:
+    """Validate the final host Pipecat will bind, using Settings' guard.
+
+    The dev runner registers its own ``--host`` flag, so the CLI value is
+    the actual bind address and would otherwise bypass the field validator
+    on ``Settings.host``. Reusing that validator keeps one definition of
+    loopback — including its rejection of wildcards, non-loopback IPs,
+    domain names and bracketed IPv6 forms.
+
+    Returns the normalized host so the caller binds the value that was
+    validated, not the raw CLI string.
+    """
+    return Settings(_env_file=None, host=host).host
+
+
+class _LoopbackBindParser(argparse.ArgumentParser):
+    """Argument parser that rejects a non-loopback final ``--host``.
+
+    Pipecat adds its own ``--host``/``--port`` flags to this parser and
+    parses them immediately before starting uvicorn, so validating here
+    covers the actual value that will be bound, regardless of whether it
+    came from ``Settings.host`` or an explicit CLI override.
+    """
+
+    def parse_args(self, args=None, namespace=None):
+        parsed = super().parse_args(args, namespace)
+        try:
+            parsed.host = validate_runner_bind_host(parsed.host)
+        except ValueError as exc:
+            self.error(str(exc))
+        return parsed
 
 
 if __name__ == "__main__":
@@ -504,21 +762,18 @@ if __name__ == "__main__":
 
         setup_tracing(settings)
 
+    # Mount the multi-agent REST API for web/
+    mount_api(runner.app, settings)
     # The STT switch owns "/" and "/settings". It is registered before
     # the runner mounts its own "/" -> "/client/" redirect, so route
     # order puts this page first.
     mount_control(runner.app, settings)
-    # Mount the multi-agent REST API for web/
-    mount_api(runner.app, settings)
-
-
-    # Mount the metrics endpoint before the runner starts serving.
     mount_observability(settings)
 
     # The runner takes its host and port from its module globals, and
-    # registers --host/--port itself, so a custom argparse parser would
-    # collide with them.
+    # registers --host/--port itself. The parser subclass only validates
+    # the final --host value; it does not add or replace those flags.
     runner.RUNNER_HOST = settings.host
     runner.RUNNER_PORT = settings.port
 
-    runner.main()
+    runner.main(parser=_LoopbackBindParser(description="Pipecat Development Runner"))

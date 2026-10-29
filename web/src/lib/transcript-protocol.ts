@@ -33,6 +33,22 @@ export function joinTranscriptText(left: string, right: string): string {
   return `${first} ${second}`;
 }
 
+/**
+ * Validates a client text turn against the backend utterance character limit.
+ * Character count is evaluated using Unicode code points to match backend Python `len(text)`.
+ */
+export function validateClientUtterance(
+  text: string,
+  maxChars = 4000
+): { valid: true; text: string } | { valid: false; text: string; codePointCount: number; maxChars: number } {
+  const trimmed = text.trim();
+  const codePointCount = Array.from(trimmed).length;
+  if (codePointCount === 0 || codePointCount > maxChars) {
+    return { valid: false, text: trimmed, codePointCount, maxChars };
+  }
+  return { valid: true, text: trimmed };
+}
+
 export interface TranscriptLine {
   id: string;
   role: TranscriptRole;

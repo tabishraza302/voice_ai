@@ -1,5 +1,5 @@
 # Virtualenv / build artifacts
-.venv/
+.venv
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -25,7 +25,7 @@ logs/
 *.sqlite*
 
 # Evaluation harness and local fixtures
-evals/
+evals
 *.wav
 *.flac
 *.mp3

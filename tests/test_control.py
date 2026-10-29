@@ -28,7 +28,7 @@ def client() -> TestClient:
     app = FastAPI()
     settings = Settings(_env_file=None)
     mount_control(app, settings)
-    return TestClient(app)
+    return TestClient(app, base_url="http://127.0.0.1:7860")
 
 
 class TestControlEndpoints:

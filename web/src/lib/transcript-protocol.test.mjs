@@ -11,6 +11,7 @@ import {
   replaceTranscriptLine,
   transcriptFromDataChannel,
   userPartialFromDataChannel,
+  validateClientUtterance,
 } from "./transcript-protocol.ts";
 
 function message(payload) {
@@ -493,6 +494,46 @@ describe("classifyUserDeltaAfterFinal", () => {
     expect(classifyUserDeltaAfterFinal("", "Hello", "Next")).toEqual({
       late: false,
       liveText: "",
+    });
+  });
+});
+
+describe("validateClientUtterance", () => {
+  test("accepts input within limit and trims boundary whitespace", () => {
+    const result = validateClientUtterance("  hello world  ");
+    expect(result).toEqual({ valid: true, text: "hello world" });
+  });
+
+  test("rejects blank or empty input", () => {
+    expect(validateClientUtterance("   ")).toEqual({
+      valid: false,
+      text: "",
+      codePointCount: 0,
+      maxChars: 4000,
+    });
+  });
+
+  test("counts Unicode code points rather than UTF-16 code units for supplementary characters", () => {
+    // "🎉" is 2 UTF-16 code units (surrogate pair) but exactly 1 Unicode code point.
+    const emoji = "🎉";
+    expect(emoji.length).toBe(2);
+    expect(Array.from(emoji).length).toBe(1);
+
+    // Exactly 4000 emoji code points (8000 UTF-16 code units) must be valid.
+    const exact4000 = emoji.repeat(4000);
+    expect(exact4000.length).toBe(8000);
+    expect(validateClientUtterance(exact4000)).toEqual({
+      valid: true,
+      text: exact4000,
+    });
+
+    // 4001 emoji code points must be rejected.
+    const overLimit = emoji.repeat(4001);
+    expect(validateClientUtterance(overLimit)).toEqual({
+      valid: false,
+      text: overLimit,
+      codePointCount: 4001,
+      maxChars: 4000,
     });
   });
 });

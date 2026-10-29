@@ -145,6 +145,10 @@ with LLM text nearly simultaneous, so both bubbles showed a receipt time.
 
 ## Completed (prior pass)
 
+SQLite support and the historical verification below are superseded by the
+PostgreSQL-only cutover; they do not describe the current runtime or qualify
+the current release.
+
 - [x] **Audit and preserve existing work — owner: parent.** Read repository
   instructions and reference material; reviewed the staged and unstaged work
   without discarding it. Recorded the existing verification baselines: 15

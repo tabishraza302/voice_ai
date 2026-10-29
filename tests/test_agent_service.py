@@ -1,27 +1,18 @@
 import pytest
 import pytest_asyncio
 import asyncio
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-from bot.db.base import Base
+from sqlalchemy.ext.asyncio import AsyncSession
 from bot.db.models import Agent, BasePrompt, PromptRevision, VoiceSession, SessionTurn
 from bot.agents.service import AgentService
 from bot.agents.schemas import AgentCreate, AgentUpdate, BasePromptUpdate
 from bot.db.seeds.presets import DEFAULT_BASE_PROMPT
-
+from tests.support.postgres import disposable_postgres_schema
 
 @pytest_asyncio.fixture
 async def async_session():
-    # In-memory SQLite async engine for tests
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-    async with session_factory() as session:
-        yield session
-
-    await engine.dispose()
-
+    async with disposable_postgres_schema() as (_engine, factory, _schema):
+        async with factory() as session:
+            yield session
 
 @pytest.mark.asyncio
 async def test_seed_initialization(async_session: AsyncSession):
@@ -43,17 +34,12 @@ async def test_seed_initialization(async_session: AsyncSession):
 
 
 @pytest.mark.asyncio
-async def test_concurrent_preset_seeding_is_idempotent(tmp_path):
-    db_path = tmp_path / "seed-race.db"
-    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-    async def seed():
-        async with factory() as session:
-            await AgentService(session).seed_default_presets()
+async def test_concurrent_preset_seeding_is_idempotent():
+    async with disposable_postgres_schema() as (_engine, factory, _schema):
+        async def seed():
+            async with factory() as session:
+                await AgentService(session).seed_default_presets()
 
-    try:
         await asyncio.gather(seed(), seed())
         async with factory() as session:
             agents = await AgentService(session).list_agents()
@@ -61,18 +47,10 @@ async def test_concurrent_preset_seeding_is_idempotent(tmp_path):
             assert sum(agent.is_active for agent in agents) == 1
             revisions = await AgentService(session).get_base_prompt_revisions()
             assert [revision.version for revision in revisions] == [1]
-    finally:
-        await engine.dispose()
-
 
 @pytest.mark.asyncio
-async def test_concurrent_base_prompt_updates_allocate_distinct_versions(tmp_path):
-    db_path = tmp_path / "prompt-update-race.db"
-    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-    try:
+async def test_concurrent_base_prompt_updates_allocate_distinct_versions():
+    async with disposable_postgres_schema() as (_engine, factory, _schema):
         async with factory() as session:
             await AgentService(session).seed_default_presets()
 
@@ -89,18 +67,10 @@ async def test_concurrent_base_prompt_updates_allocate_distinct_versions(tmp_pat
             assert {revision.prompt_text for revision in revisions} == {
                 DEFAULT_BASE_PROMPT.strip(), "revision A", "revision B"
             }
-    finally:
-        await engine.dispose()
-
 
 @pytest.mark.asyncio
-async def test_activation_reloads_agent_after_waiting_session_change(tmp_path):
-    db_path = tmp_path / "activation-refresh.db"
-    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-    try:
+async def test_activation_reloads_agent_after_waiting_session_change():
+    async with disposable_postgres_schema() as (_engine, factory, _schema):
         async with factory() as seed_session:
             service = AgentService(seed_session)
             await service.seed_default_presets()
@@ -117,9 +87,6 @@ async def test_activation_reloads_agent_after_waiting_session_change(tmp_path):
         async with factory() as verify_session:
             active_agents = [agent for agent in await AgentService(verify_session).list_agents() if agent.is_active]
             assert [agent.id for agent in active_agents] == [original.id]
-    finally:
-        await engine.dispose()
-
 
 @pytest.mark.asyncio
 async def test_agent_crud(async_session: AsyncSession):
@@ -188,7 +155,11 @@ async def test_base_prompt_revisions(async_session: AsyncSession):
     assert updated_base.prompt_text == "New updated base prompt content"
     assert updated_base.version == 2
 
-    # Check revisions
+    # Check revisions: newest first, and the newest must be the v2 update.
     revisions = await service.get_base_prompt_revisions()
     assert len(revisions) >= 1
-    assert revisions[0].prompt_text == orig_text or revisions[0].prompt_text == "New updated base prompt content"
+    assert revisions[0].version == 2
+    assert revisions[0].prompt_text == "New updated base prompt content"
+    assert revisions[0].change_reason == "Sharpen conversational boundaries"
+    # The seed revision still records the original text at v1.
+    assert any(revision.prompt_text == orig_text for revision in revisions)
