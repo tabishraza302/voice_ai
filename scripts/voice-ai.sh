@@ -11,7 +11,8 @@
 #   scripts/voice-ai.sh status        # what is running, and where
 #   scripts/voice-ai.sh help         # the full list
 #
-# The order of `start` matters: Phoenix on the host, then the container stack,
+# The order of `start` matters: the container stack (including PostgreSQL),
+# then Phoenix on the host (which stores traces in PostgreSQL),
 # then the STT server, then the agent (which needs the STT server).
 set -euo pipefail
 
@@ -28,7 +29,8 @@ PHOENIX_GRPC_PORT="${PHOENIX_GRPC_PORT:-6007}"
 PROMETHEUS_PORT="${PROMETHEUS_PORT:-9091}"
 GRAFANA_PORT="${GRAFANA_PORT:-3003}"
 COLLECTOR_PORT="${COLLECTOR_PORT:-9464}"
-POSTGRES_PORT="${POSTGRES_PORT:-5439}"
+CONFIGURED_POSTGRES_PORT="$(grep -E '^[[:space:]]*(postgres_port|POSTGRES_PORT)=' "$REPO_ROOT/.env" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '"\047[:space:]' || true)"
+POSTGRES_PORT="${POSTGRES_PORT:-${CONFIGURED_POSTGRES_PORT:-5439}}"
 CONFIGURED_WEB_PORT="$(grep -E '^[[:space:]]*(web_port|WEB_PORT)=' "$REPO_ROOT/.env" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '"\047[:space:]' || true)"
 WEB_PORT="${WEB_PORT:-${CONFIGURED_WEB_PORT:-3001}}"
 # The STT lookahead belongs to the model deployment, not the agent. A blank
@@ -39,6 +41,48 @@ export WEB_PORT
 export STT_LOOKAHEAD_FRAMES
 export POSTGRES_PORT
 
+DATABASE_URL_RESOLVED=0
+
+# Lazily resolve and validate DATABASE_URL exactly once using the project's
+# actual Settings. Fails loudly on any validation or import error.
+ensure_database_url() {
+  [ "$DATABASE_URL_RESOLVED" -eq 1 ] && return 0
+
+  local py_bin=""
+  if [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+    py_bin="$REPO_ROOT/.venv/bin/python"
+  elif [ -x "$REPO_ROOT/.venv/bin/python3" ]; then
+    py_bin="$REPO_ROOT/.venv/bin/python3"
+  elif command -v python3 >/dev/null 2>&1; then
+    py_bin="python3"
+  elif command -v python >/dev/null 2>&1; then
+    py_bin="python"
+  fi
+
+  [ -n "$py_bin" ] || die "Python is not available; run '$0 install' first"
+
+  local output
+  if ! output="$("$py_bin" -c '
+import sys, os
+from urllib.parse import urlsplit, urlunsplit
+from bot.config import Settings
+
+s = Settings()
+if "database_url" in s.model_fields_set:
+    print(s.database_url)
+else:
+    port = os.environ.get("POSTGRES_PORT", "5439")
+    parts = urlsplit(s.database_url)
+    netloc = f"voice_ai:voice_ai@127.0.0.1:{port}"
+    print(urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment)))
+  ' 2>/dev/null)"; then
+    die "Failed to validate database settings; check DATABASE_URL and the installed dependencies"
+  fi
+
+  DATABASE_URL="$output"
+  export DATABASE_URL
+  DATABASE_URL_RESOLVED=1
+}
 RUN_DIR="$REPO_ROOT/data/run"
 LOG_DIR="$REPO_ROOT/logs"
 PHOENIX_DIR="$REPO_ROOT/data/phoenix"
@@ -87,6 +131,7 @@ start_web_background() {
   web_port_is_listening && die "port $WEB_PORT is already in use; refusing to start the web studio"
   [ -x "$WEB_BIN" ] || die "Next.js is not installed in web/node_modules; run the web setup first"
   log "starting the Next.js web studio on $WEB_PORT"
+  export NEXT_TELEMETRY_DISABLED=1
   ( cd "$REPO_ROOT/web" && exec node "$WEB_BIN" dev --hostname 127.0.0.1 -p "$WEB_PORT" ) > "$WEB_LOG" 2>&1 &
   local pid="$!" started attempt
   for attempt in $(seq 1 10); do
@@ -151,11 +196,18 @@ cmd_install() {
   log "installing the dependencies"
   uv sync --extra dev
   # Phoenix runs on the host, in its own tool environment, so the
-  # collector can reach it. Skip it if it is already there.
+  # collector can reach it. Install with PostgreSQL driver support ([pg]).
   if command -v phoenix >/dev/null 2>&1 || [ -x "$HOME/.local/bin/phoenix" ]; then
-    ok "arize-phoenix already installed"
+    local py_bin
+    py_bin="$(head -n 1 "$PHOENIX_BIN" 2>/dev/null | sed 's/^#!//' | awk '{print $1}')"
+    if [ -x "$py_bin" ] && "$py_bin" -c "import asyncpg" >/dev/null 2>&1; then
+      ok "arize-phoenix already installed with postgres support"
+    else
+      log "updating arize-phoenix with postgres support ([pg])"
+      uv tool install --force "arize-phoenix[pg]==20.23.0"
+    fi
   else
-    uv tool install "arize-phoenix==20.23.0"
+    uv tool install "arize-phoenix[pg]==20.23.0"
   fi
 }
 
@@ -207,13 +259,18 @@ cmd_others_start() {
 # --- observability ---------------------------------------------------------
 
 cmd_phoenix() {
+  ensure_database_url
   mkdir -p "$PHOENIX_DIR" "$(dirname "$PHOENIX_LOG")"
   if [ -f "$PHOENIX_PID" ] && kill -0 "$(cat "$PHOENIX_PID")" 2>/dev/null; then
     ok "Phoenix already running (pid $(cat "$PHOENIX_PID"))"
   else
     log "starting Phoenix on port $PHOENIX_PORT"
+    local phoenix_db_url="$DATABASE_URL"
+    phoenix_db_url="${phoenix_db_url/#postgresql+asyncpg:\/\//postgresql://}"
+    phoenix_db_url="${phoenix_db_url/#postgres+asyncpg:\/\//postgresql://}"
     PHOENIX_WORKING_DIR="$PHOENIX_DIR" \
-    PHOENIX_SQL_DATABASE_URL="sqlite:///$PHOENIX_DIR/phoenix.db" \
+    PHOENIX_SQL_DATABASE_URL="$phoenix_db_url" \
+    PHOENIX_SQL_DATABASE_SCHEMA="phoenix" \
     PHOENIX_ALLOW_EXTERNAL_RESOURCES=false \
     PHOENIX_TELEMETRY_ENABLED=false \
     PHOENIX_HOST=0.0.0.0 \
@@ -235,7 +292,7 @@ cmd_phoenix_down() {
 }
 
 cmd_obs_up() {
-  cmd_phoenix
+  ensure_database_url
   log "starting the observability stack"
   docker compose up -d
   wait_for "http://localhost:$PROMETHEUS_PORT/-/ready" "Prometheus" 60 \
@@ -245,6 +302,8 @@ cmd_obs_up() {
   wait_for "http://localhost:$COLLECTOR_PORT/metrics" "the collector's metrics exporter" 60 \
     || die "the collector did not come up; docker compose logs otel-collector"
   wait_for_postgres || die "PostgreSQL did not become ready; docker compose logs postgres"
+  log "starting Phoenix"
+  cmd_phoenix
 }
 
 cmd_obs_down() {
@@ -276,6 +335,7 @@ cmd_stt_unload() {
 }
 
 cmd_run() {
+  ensure_database_url
   log "the agent on $AGENT_PORT — Ctrl-C to stop"
   exec uv run python -m bot.bot
 }
@@ -283,6 +343,7 @@ cmd_run() {
 # --- the whole stack -------------------------------------------------------
 
 cmd_start() {
+  ensure_database_url
   local background=false with_agent=true keep_others=false with_web=false
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -305,11 +366,7 @@ cmd_start() {
       cmd_others_stop
     fi
   fi
-  # 2. Phoenix, on the host.
-  log "starting Phoenix"
-  cmd_phoenix
-
-  # 3. The observability stack.
+  # 2. The observability container stack (including PostgreSQL).
   log "starting the observability stack"
   docker compose up -d
   wait_for "http://localhost:$PROMETHEUS_PORT/-/ready" "Prometheus" 60 \
@@ -319,6 +376,11 @@ cmd_start() {
   wait_for "http://localhost:$COLLECTOR_PORT/metrics" "the collector's metrics exporter" 60 \
     || die "the collector did not come up; docker compose logs otel-collector"
   wait_for_postgres || die "PostgreSQL did not become ready; docker compose logs postgres"
+
+  # 3. Phoenix, on the host (connects to PostgreSQL).
+  log "starting Phoenix"
+  cmd_phoenix
+
 
   # Web studio (if requested via --web)
   if [ "$with_web" = true ]; then
@@ -367,6 +429,7 @@ cmd_web() {
   [ -x "$WEB_BIN" ] || die "Next.js is not installed in web/node_modules; run the web setup first"
   web_port_is_listening && die "port $WEB_PORT is already in use; refusing to start the web studio"
   cd "$REPO_ROOT/web"
+  export NEXT_TELEMETRY_DISABLED=1
   exec node "$WEB_BIN" dev --hostname 127.0.0.1 -p "$WEB_PORT"
 }
 cmd_stop() {

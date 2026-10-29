@@ -4,6 +4,7 @@ from bot.api.routes_prompts import router as prompts_router
 from bot.api.routes_models import create_models_router, list_models
 from bot.api.routes_voices import router as voices_router, KOKORO_VOICES
 from bot.config import Settings
+from bot.db import session as db_session
 
 
 def create_api_router(settings: Settings) -> APIRouter:
@@ -12,6 +13,11 @@ def create_api_router(settings: Settings) -> APIRouter:
     api.include_router(prompts_router)
     api.include_router(create_models_router(settings))
     api.include_router(voices_router)
+
+    @api.get("/storage")
+    async def get_storage_state():
+        """Report the store actually in use, without URLs or credentials."""
+        return db_session.storage_state()
 
     @api.get("/catalog")
     async def get_catalog():

@@ -3,41 +3,55 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-from sqlalchemy.pool import StaticPool
 from bot.api.router import create_api_router
 from bot.config import Settings
-from bot.db.base import Base
+from bot.db import session as db_session
 from bot.db.session import get_db_session
-import bot.db.models  # noqa: F401
-
+from tests.support.postgres import disposable_postgres_schema
 
 @pytest_asyncio.fixture
 async def api_client():
-    engine = create_async_engine(
-        "sqlite+aiosqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    async with disposable_postgres_schema() as (_engine, session_factory, _schema):
+        async def override_get_db_session():
+            async with session_factory() as session:
+                yield session
 
-    session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+        app = FastAPI()
+        router = create_api_router(Settings(_env_file=None))
+        app.include_router(router, prefix="/api")
+        app.dependency_overrides[get_db_session] = override_get_db_session
 
-    async def override_get_db_session():
-        async with session_factory() as session:
-            yield session
+        with TestClient(app, base_url="http://127.0.0.1:7860") as client:
+            yield client
+def test_storage_endpoint_reports_the_backend_without_credentials(monkeypatch):
+    monkeypatch.setattr(db_session, "_engine", object())
 
     app = FastAPI()
-    router = create_api_router(Settings())
-    app.include_router(router, prefix="/api")
-    app.dependency_overrides[get_db_session] = override_get_db_session
+    app.include_router(create_api_router(Settings(_env_file=None)), prefix="/api")
+    with TestClient(app, base_url="http://127.0.0.1:7860") as client:
+        res = client.get("/api/storage")
 
-    with TestClient(app) as client:
-        yield client
+    assert res.status_code == 200
+    assert res.json() == {"backend": "postgres"}
+    body = res.text.lower()
+    assert "postgresql+asyncpg://" not in body
+    assert "sqlite" not in body
+    assert "password" not in body
+    assert "fallback" not in body
 
-    await engine.dispose()
 
+def test_storage_endpoint_reports_uninitialized_before_engine_init(monkeypatch):
+    monkeypatch.setattr(db_session, "_engine", None)
+
+    app = FastAPI()
+    app.include_router(create_api_router(Settings(_env_file=None)), prefix="/api")
+    with TestClient(app, base_url="http://127.0.0.1:7860") as client:
+        res = client.get("/api/storage")
+
+    assert res.status_code == 200
+    assert res.json() == {"backend": "uninitialized"}
+    body = res.text.lower()
+    assert "fallback" not in body
 def test_list_agents(api_client):
     res = api_client.get("/api/agents")
     assert res.status_code == 200

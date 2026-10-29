@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import {
@@ -18,8 +18,11 @@ import {
   TEMPERATURE,
 } from "@/lib/constants";
 import {
+  defaultAgentFormValues,
   formFromAgent,
   isDirty,
+  reconcileCatalogSelection,
+  resolveModelOptions,
   slugify,
   toCreatePayload,
   toUpdatePayload,
@@ -44,39 +47,48 @@ export function AgentForm({ initialAgent, isNew = false }: AgentFormProps) {
   const [currentAgent, setCurrentAgent] = useState<Agent | undefined>(
     initialAgent
   );
+  const initialFormValues = useMemo(
+    () =>
+      initialAgent
+        ? formFromAgent(initialAgent)
+        : defaultAgentFormValues(DEFAULT_CATALOG),
+    [initialAgent]
+  );
+  const [formData, setFormData] = useState<AgentFormValues>(initialFormValues);
+  const [slugTouched, setSlugTouched] = useState(!isNew);
+  const modelTouchedRef = useRef(!isNew);
 
   useEffect(() => {
     async function loadCatalog() {
       try {
         const remote = await api.getModelCatalog();
-        if (remote) setCatalog(remote);
+        if (remote) {
+          setCatalog(remote);
+          if (isNew && remote.llm_models?.length) {
+            setFormData((prev) => {
+              const reconciled = reconcileCatalogSelection({
+                currentModel: prev.llm_model,
+                initialModel: initialFormValues.llm_model,
+                modelTouched: modelTouchedRef.current,
+                catalogModels: remote.llm_models,
+              });
+              if (reconciled === prev.llm_model) {
+                return prev;
+              }
+              return {
+                ...prev,
+                llm_model: reconciled,
+              };
+            });
+          }
+        }
       } catch {
         // Keep default catalog
       }
     }
     loadCatalog();
-  }, []);
+  }, [isNew, initialFormValues.llm_model]);
 
-  const [formData, setFormData] = useState<AgentFormValues>(() =>
-    initialAgent
-      ? formFromAgent(initialAgent)
-      : {
-          slug: slugify("New Voice Agent"),
-          name: "New Voice Agent",
-          description: "",
-          persona_prompt:
-            "You are a friendly, knowledgeable, and quick voice assistant. Respond with brevity and natural speech rhythm.",
-          llm_model: "qwen3.5:4b",
-          llm_temperature: 0.6,
-          llm_reasoning_effort: "none",
-          llm_max_tokens: 256,
-          stt_provider: "mlx-audio-realtime",
-          tts_voice_en: "af_heart",
-          tts_voice_hi: "hf_alpha",
-          tts_speed: 1.0,
-        }
-  );
-  const [slugTouched, setSlugTouched] = useState(!isNew);
 
   const estimatedTokens = useMemo(() => {
     return Math.ceil((formData.persona_prompt || "").length / 4);
@@ -475,16 +487,19 @@ export function AgentForm({ initialAgent, isNew = false }: AgentFormProps) {
                 <select
                   id="agent-model"
                   value={formData.llm_model}
-                  onChange={(e) =>
-                    setFormData({ ...formData, llm_model: e.target.value })
-                  }
+                  onChange={(e) => {
+                    modelTouchedRef.current = true;
+                    setFormData({ ...formData, llm_model: e.target.value });
+                  }}
                   className="field-control"
                 >
-                  {catalog.llm_models.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.name}
-                    </option>
-                  ))}
+                  {resolveModelOptions(formData.llm_model, catalog.llm_models).map(
+                    (m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.name}
+                      </option>
+                    )
+                  )}
                 </select>
                 <p className="text-[11px] text-limestone-500 mt-1.5">
                   Model used when this agent handles a new session.

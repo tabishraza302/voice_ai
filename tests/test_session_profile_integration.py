@@ -1,24 +1,26 @@
 import pytest
 import pytest_asyncio
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from bot.agents.schemas import AgentCreate
 from bot.agents.service import AgentNotFoundError, AgentService, apply_active_agent_to_settings
 from bot.config import SYSTEM_PROMPT, Settings
-from bot.db.base import Base
 from bot.session_settings import resolve_session_settings
+from tests.support.postgres import disposable_postgres_schema
+@pytest.fixture(autouse=True)
+def isolate_ollama_catalog(monkeypatch):
+    """Isolate non-live profile integration tests from actual Ollama by injecting catalog."""
+    async def fake_fetch_local_llm_models(settings, *, timeout=2.0):
+        return {"qwen3.5:4b", "configured-local-model"}
+
+    monkeypatch.setattr("bot.services.fetch_local_llm_models", fake_fetch_local_llm_models)
+
 
 
 @pytest_asyncio.fixture
 async def session():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
-    async with factory() as database_session:
-        yield database_session
-    await engine.dispose()
-
+    async with disposable_postgres_schema() as (_engine, factory, _schema):
+        async with factory() as database_session:
+            yield database_session
 
 @pytest.mark.asyncio
 async def test_selected_profile_changes_only_the_requested_voice_session(session):

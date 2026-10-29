@@ -5,6 +5,10 @@ from collections.abc import Awaitable, Callable
 from bot.config import Settings
 
 
+class InvalidAgentIdError(ValueError):
+    """The session body carried an agent id that cannot be looked up."""
+
+
 async def resolve_session_settings(
     settings: Settings,
     body: object,
@@ -17,5 +21,7 @@ async def resolve_session_settings(
         return settings
     agent_id = body.get("agent_id")
     if not isinstance(agent_id, str) or not agent_id.strip() or len(agent_id.strip()) > 128:
-        raise ValueError("request body agent_id must be a nonblank string of at most 128 characters")
+        raise InvalidAgentIdError(
+            "request body agent_id must be a nonblank string of at most 128 characters"
+        )
     return await profile_resolver(settings, agent_id=agent_id.strip())

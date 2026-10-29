@@ -23,7 +23,7 @@ async def list_models(settings: Settings | None = None):
         tags_url = None
     try:
         if tags_url:
-            async with httpx.AsyncClient(timeout=2.0) as client:
+            async with httpx.AsyncClient(timeout=2.0, trust_env=False) as client:
                 resp = await client.get(tags_url)
             if resp.status_code == 200:
                 payload = resp.json()
@@ -56,6 +56,3 @@ def create_models_router(settings: Settings) -> APIRouter:
         return await list_models(settings)
 
     return router
-
-
-router = create_models_router(Settings())

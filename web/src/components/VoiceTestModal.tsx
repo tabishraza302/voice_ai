@@ -18,6 +18,7 @@ import {
   Send,
 } from "lucide-react";
 import { api } from "@/lib/api-client";
+import { MAX_CLIENT_UTTERANCE_CHARS } from "@/lib/constants";
 import { VoiceSession } from "@/lib/voice-session";
 import { TranscriptLog } from "@/lib/transcript-log";
 import { wallClockFromPerformance } from "@/lib/format";
@@ -33,6 +34,7 @@ import {
   replaceTranscriptLine,
   transcriptFromDataChannel,
   userPartialFromDataChannel,
+  validateClientUtterance,
 } from "@/lib/transcript-protocol";
 import type { Agent } from "@/types/agent";
 
@@ -68,6 +70,26 @@ function clockTime(date: Date): string {
   });
 }
 
+const PREFERRED_MUTE_STORAGE_KEY = "voice_ai.microphone_muted";
+
+function readInitialMuteState(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.sessionStorage.getItem(PREFERRED_MUTE_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function persistMuteState(muted: boolean): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem(PREFERRED_MUTE_STORAGE_KEY, muted ? "true" : "false");
+  } catch {
+    // Ignore storage quota or disabled storage errors in restricted contexts.
+  }
+}
+
 export function VoiceTestModal({
   agent,
   isOpen,
@@ -79,6 +101,7 @@ export function VoiceTestModal({
   const [isMuted, setIsMuted] = useState(false);
   const [duration, setDuration] = useState(0);
   const [textInput, setTextInput] = useState("");
+  const [textInputError, setTextInputError] = useState<string | null>(null);
   const [transcripts, setTranscripts] = useState<TranscriptItem[]>([]);
   const [isBotSpeaking, setIsBotSpeaking] = useState(false);
   const [audioBlocked, setAudioBlocked] = useState(false);
@@ -87,6 +110,15 @@ export function VoiceTestModal({
   agentRef.current = agent;
   const onActivatedRef = useRef(onActivated);
   onActivatedRef.current = onActivated;
+  const isMutedRef = useRef(isMuted);
+  isMutedRef.current = isMuted;
+
+  // Read the persisted preference after mount. Reading storage in the state
+  // initializer makes the server render (false) and a muted client render
+  // (true) disagree, which React reports as a hydration mismatch.
+  useEffect(() => {
+    setIsMuted(readInitialMuteState());
+  }, []);
   const isSessionStartingRef = useRef(false);
   const sessionGenerationRef = useRef(0);
   // One dedupe log per mounted modal; reset when a call is torn down.
@@ -461,6 +493,7 @@ export function VoiceTestModal({
     const generation = sessionGenerationRef.current;
     const isCurrent = () => generation === sessionGenerationRef.current;
     setErrorMessage(null);
+    setTextInputError(null);
     setDuration(0);
     setTranscripts([]);
     assistantSourceRef.current = "none";
@@ -470,7 +503,6 @@ export function VoiceTestModal({
     finalizedUserLiveRef.current = "";
     finalizedUserTextRef.current = "";
     setAudioBlocked(false);
-
     const session = new VoiceSession({
       getUserMedia: (constraints) => navigator.mediaDevices.getUserMedia(constraints),
       createPeerConnection: (configuration) => new RTCPeerConnection(configuration),
@@ -490,6 +522,7 @@ export function VoiceTestModal({
         });
       },
     });
+    session.setMuted(isMutedRef.current);
     voiceSessionRef.current = session;
 
     try {
@@ -584,9 +617,11 @@ export function VoiceTestModal({
   }, [isOpen]);
 
   const handleToggleMute = () => {
-    if (!voiceSessionRef.current) return;
-    voiceSessionRef.current.setMuted(!isMuted);
-    setIsMuted(!isMuted);
+    const nextMuted = !isMuted;
+    setIsMuted(nextMuted);
+    isMutedRef.current = nextMuted;
+    persistMuteState(nextMuted);
+    voiceSessionRef.current?.setMuted(nextMuted);
   };
 
   const handleClearTranscript = () => {
@@ -607,8 +642,15 @@ export function VoiceTestModal({
   };
   const handleSendMessage = (e: React.FormEvent) => {
     e.preventDefault();
-    const trimmed = textInput.trim();
-    if (!trimmed) return;
+    const validation = validateClientUtterance(textInput, MAX_CLIENT_UTTERANCE_CHARS);
+    if (!validation.valid) {
+      if (!validation.text) return;
+      setTextInputError(
+        `Message exceeds the ${validation.maxChars.toLocaleString()}-character limit (${validation.codePointCount.toLocaleString()} characters). Shorten the message and try again.`
+      );
+      return;
+    }
+    const trimmed = validation.text;
 
     const now = clockTime(new Date());
 
@@ -617,6 +659,7 @@ export function VoiceTestModal({
       return;
     }
 
+    setTextInputError(null);
     appendTranscript("user", trimmed, now);
     setTextInput("");
   };
@@ -889,25 +932,35 @@ export function VoiceTestModal({
             {/* Text message fallback input bar */}
             <form
               onSubmit={handleSendMessage}
-              className="flex shrink-0 items-center gap-2 border-t border-ink-800 bg-ink-900 p-3"
+              className="flex shrink-0 flex-col gap-1.5 border-t border-ink-800 bg-ink-900 p-3"
             >
-              <input
-                type="text"
-                aria-label="Message the agent"
-                value={textInput}
-                onChange={(e) => setTextInput(e.target.value)}
-                placeholder="Type a message or speak into your microphone..."
-                disabled={status !== "connected"}
-                className="field-control flex-1 disabled:opacity-50"
-              />
-              <button
-                type="submit"
-                disabled={status !== "connected" || !textInput.trim()}
-                className="button-primary min-h-10 px-3"
-              >
-                <Send className="w-3.5 h-3.5" />
-                <span>Send</span>
-              </button>
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  aria-label="Message the agent"
+                  value={textInput}
+                  onChange={(e) => {
+                    setTextInput(e.target.value);
+                    if (textInputError) setTextInputError(null);
+                  }}
+                  placeholder="Type a message or speak into your microphone..."
+                  disabled={status !== "connected"}
+                  className="field-control flex-1 disabled:opacity-50"
+                />
+                <button
+                  type="submit"
+                  disabled={status !== "connected" || !textInput.trim()}
+                  className="button-primary min-h-10 px-3"
+                >
+                  <Send className="w-3.5 h-3.5" />
+                  <span>Send</span>
+                </button>
+              </div>
+              {textInputError && (
+                <p role="alert" className="text-xs text-rust-300">
+                  {textInputError}
+                </p>
+              )}
             </form>
           </div>
 

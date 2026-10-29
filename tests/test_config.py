@@ -10,9 +10,12 @@ import pytest
 from pydantic import ValidationError
 
 from bot.config import SYSTEM_PROMPT, Settings
+from tests.test_voice_live_integration import validate_loopback_base_url
 
 
-def test_defaults():
+def test_defaults(monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("database_url", raising=False)
     s = Settings(_env_file=None)
     assert s.stt_provider == "mlx-audio-realtime"
     assert s.stt_model == "mlx-community/nemotron-3.5-asr-streaming-0.6b"
@@ -29,9 +32,9 @@ def test_defaults():
     assert s.vad_stop_secs == 0.8
     assert s.vad_min_volume == 0.6
     assert s.vad_confidence == 0.7
-    assert s.sqlite_database_url == "sqlite+aiosqlite:///voice_ai.db"
+    assert s.database_url == "postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai"
     assert s.web_port == 3001
-
+    assert s.host == "localhost"
 
 @pytest.mark.parametrize(
     "field,value",
@@ -48,6 +51,21 @@ def test_runtime_thresholds_and_web_port_reject_out_of_range_values(field, value
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **{field: value})
 
+
+@pytest.mark.parametrize(
+    "invalid_url",
+    [
+        "sqlite+aiosqlite:///voice_ai.db",
+        "sqlite:///voice_ai.db",
+        "postgresql://voice_ai:voice_ai@127.0.0.1:5439/voice_ai",
+        "mysql://localhost/db",
+        "",
+    ],
+)
+def test_database_url_rejects_non_async_postgres(invalid_url):
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(_env_file=None, database_url=invalid_url)
+    assert "postgresql+asyncpg" in str(exc_info.value)
 
 def test_every_field_has_a_default():
     """A field with no default would make a missing .env fatal."""
@@ -120,3 +138,89 @@ def test_system_prompt_is_shared_and_says_no_markdown():
     assert "read aloud" in SYSTEM_PROMPT
     assert "Never use emoji" in SYSTEM_PROMPT
     assert "markdown" in SYSTEM_PROMPT.lower()
+
+
+@pytest.mark.parametrize(
+    "allowed_host",
+    [
+        "localhost",
+        "LOCALHOST",
+        "127.0.0.1",
+        "127.0.0.2",
+        "::1",
+    ],
+)
+def test_runner_host_allows_literal_loopback(allowed_host):
+    s = Settings(_env_file=None, host=allowed_host)
+    assert s.host == allowed_host
+
+
+@pytest.mark.parametrize(
+    "rejected_host",
+    [
+        "0.0.0.0",
+        "::",
+        "[::]",
+        "[::1]",
+        "192.168.1.100",
+        "10.0.0.5",
+        "0.0.0.0.nip.io",
+        "local.test",
+        "example.com",
+        "",
+        "   ",
+    ],
+)
+def test_runner_host_rejects_non_loopback_and_wildcard(rejected_host):
+    with pytest.raises(ValidationError) as excinfo:
+        Settings(_env_file=None, host=rejected_host)
+    assert "unauthenticated local management routes" in str(excinfo.value)
+
+
+def test_runner_cli_host_cannot_bypass_the_loopback_guard():
+    """The dev runner's --host is the final bind address, not a suggestion."""
+    from bot.bot import _LoopbackBindParser
+
+    parser = _LoopbackBindParser(add_help=False)
+    parser.add_argument("--host", default="localhost")
+    parser.add_argument("--port", type=int, default=7860)
+
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(["--host", "0.0.0.0"])
+    assert excinfo.value.code == 2
+
+    parsed = parser.parse_args(["--host", "127.0.0.1", "--port", "9001"])
+    assert parsed.host == "127.0.0.1"
+    assert parsed.port == 9001
+
+
+@pytest.mark.parametrize(
+    "valid_url,expected",
+    [
+        ("http://127.0.0.1:7860", "http://127.0.0.1:7860"),
+        ("http://127.0.0.1:7860/", "http://127.0.0.1:7860"),
+        ("http://localhost:8000", "http://localhost:8000"),
+        ("http://127.0.0.2:9000", "http://127.0.0.2:9000"),
+        ("http://[::1]:7860", "http://[::1]:7860"),
+        ("https://127.0.0.1:8443", "https://127.0.0.1:8443"),
+    ],
+)
+def test_voice_live_endpoint_validation_accepts_loopback(valid_url, expected):
+    assert validate_loopback_base_url(valid_url) == expected
+
+
+@pytest.mark.parametrize(
+    "invalid_url",
+    [
+        "ftp://127.0.0.1:7860",
+        "http://example.com:7860",
+        "http://192.168.1.50:7860",
+        "http://10.0.0.1:7860",
+        "http://0.0.0.0:7860",
+        "http://8.8.8.8:7860",
+        "not-a-url",
+    ],
+)
+def test_voice_live_endpoint_validation_rejects_non_loopback(invalid_url):
+    with pytest.raises(ValueError):
+        validate_loopback_base_url(invalid_url)

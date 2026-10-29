@@ -103,3 +103,6 @@ export const DEFAULT_CATALOG: ModelCatalog = {
 export const SPEED = { min: 0.5, max: 2.0, step: 0.05 } as const;
 export const TEMPERATURE = { min: 0, max: 2.0, step: 0.05 } as const;
 export const MAX_TOKENS = { min: 1, max: 4096, step: 1 } as const;
+
+// Text turn character limit enforced by the backend runtime (bot/transcripts.py).
+export const MAX_CLIENT_UTTERANCE_CHARS = 4000;

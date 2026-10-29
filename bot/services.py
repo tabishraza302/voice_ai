@@ -25,7 +25,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import urlsplit
 
+import httpx
 from loguru import logger
 from pipecat.services.llm_service import LLMService
 from pipecat.services.ollama.llm import OLLamaLLMService
@@ -76,6 +78,7 @@ def build_stt_mlx_audio(settings: Settings) -> STTService:
     `language is not None` assertion — see ``bot/stt_service.py`` for the
     other two upstream mismatches it fixes.
     """
+    settings = resolve_models(settings)
     language = _parse_language(settings.stt_language)
     return LocalMlxSTTService(
         model=settings.stt_model,
@@ -83,6 +86,154 @@ def build_stt_mlx_audio(settings: Settings) -> STTService:
         language=language,
         ttfs_p99_latency=settings.ttfs_p99_latency,
     )
+
+
+class SttLanguageNotSupportedError(ValueError):
+    """The selected STT transport cannot honour the configured language."""
+
+
+class LlmModelNotAvailableError(ValueError):
+    """The configured LLM model is not installed on the local model server."""
+
+
+def local_llm_tags_url(settings: Settings) -> str | None:
+    """Return the loopback Ollama tags URL, or None when discovery does not apply.
+
+    Model discovery stays local: a non-loopback base URL is never queried,
+    because this project's runtime is air-gapped.
+    """
+    if settings.llm_provider != "ollama":
+        return None
+    parsed = urlsplit(settings.llm_base_url)
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    if parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}/api/tags"
+
+
+def _cut_last(s: str, sep: str) -> tuple[str, str, bool]:
+    idx = s.rfind(sep)
+    if idx >= 0:
+        return s[:idx], s[idx + len(sep):], True
+    return s, "", False
+
+
+def _normalize_ollama_model_name(name: str) -> str:
+    """Normalize an Ollama model name into canonical host/namespace/model:tag format.
+
+    Follows Ollama's `types/model/name.go` rules:
+    - Tag is extracted after the last ':' if after the last '/'.
+    - Model is extracted after the last '/'.
+    - Namespace is extracted after the next last '/'.
+    - Preceding part is registry host (stripping optional 'scheme://' prefix).
+    - Defaults: host 'registry.ollama.ai', namespace 'library', tag 'latest'.
+    """
+    s = name.strip()
+    if not s:
+        raise ValueError("empty model name")
+
+    tag = ""
+    if s.rfind(":") > s.rfind("/"):
+        s, tag, _ = _cut_last(s, ":")
+        if not tag:
+            raise ValueError(f"invalid ollama model name: explicit empty tag in {name!r}")
+    s, model, promised = _cut_last(s, "/")
+    if not promised:
+        host = "registry.ollama.ai"
+        namespace = "library"
+        model = s
+    else:
+        s, namespace, promised = _cut_last(s, "/")
+        if not promised:
+            host = "registry.ollama.ai"
+            namespace = s
+        else:
+            scheme, sep, rest = s.partition("://")
+            host = (rest if sep else scheme) or "registry.ollama.ai"
+            namespace = namespace or "library"
+    if not model or not namespace or not host:
+        raise ValueError(f"invalid ollama model name: {name!r}")
+
+    final_tag = tag or "latest"
+    return f"{host.lower()}/{namespace.lower()}/{model.lower()}:{final_tag.lower()}"
+
+async def fetch_local_llm_models(
+    settings: Settings, *, timeout: float = 2.0
+) -> set[str] | None:
+    """Return locally installed model names, or None when the catalog is unavailable.
+
+    ``trust_env=False`` matters: proxy environment variables must not
+    redirect a request that is supposed to stay on loopback.
+    """
+    url = local_llm_tags_url(settings)
+    if url is None:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+            response = await client.get(url)
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models, list):
+        return None
+    return {
+        entry["name"]
+        for entry in models
+        if isinstance(entry, dict)
+        and isinstance(entry.get("name"), str)
+        and entry["name"]
+    }
+
+
+async def validate_llm_model_available(settings: Settings) -> None:
+    """Reject a session whose model the local server does not list.
+
+    This is best-effort by design: when the catalog cannot be fetched the
+    session is not rejected here, so the provider's own error stays the
+    truthful report. When the catalog *is* readable, an unknown model fails
+    before the call starts instead of on the first turn.
+    """
+    try:
+        target = _normalize_ollama_model_name(settings.llm_model)
+    except ValueError as exc:
+        raise LlmModelNotAvailableError(
+            f"invalid llm_model {settings.llm_model!r}: {exc}"
+        ) from exc
+
+    available = await fetch_local_llm_models(settings)
+    if available is not None:
+        normalized_available = set()
+        for name in available:
+            try:
+                normalized_available.add(_normalize_ollama_model_name(name))
+            except ValueError:
+                pass
+        if target not in normalized_available:
+            installed_desc = ", ".join(sorted(available)) if available else "none"
+            raise LlmModelNotAvailableError(
+                f"llm_model {settings.llm_model!r} is not installed on the local "
+                f"model server; installed: {installed_desc}"
+            )
+
+
+def validate_stt_language(settings: Settings) -> None:
+    """Validate that the configured STT provider supports the configured language.
+
+    The realtime backend accepts model, format and turn-detection only — no
+    language — so a pinned ``stt_language`` is refused rather than sent and
+    ignored. Use ``mlx-audio`` when the language must be pinned.
+    """
+    if settings.stt_provider == "mlx-audio-realtime" and _parse_language(settings.stt_language) is not None:
+        raise SttLanguageNotSupportedError(
+            "stt_provider=mlx-audio-realtime has no language switch: "
+            "/v1/realtime takes model, format and turn_detection only. "
+            "Set stt_language=auto, or use stt_provider=mlx-audio, whose "
+            "Nemotron prompt conditioning does take one."
+        )
 
 
 def build_stt_mlx_audio_realtime(settings: Settings) -> STTService:
@@ -94,14 +245,7 @@ def build_stt_mlx_audio_realtime(settings: Settings) -> STTService:
     language — so a pinned ``stt_language`` is refused here rather than
     sent and ignored. Use ``mlx-audio`` when the language must be pinned.
     """
-    if _parse_language(settings.stt_language) is not None:
-        raise ValueError(
-            "stt_provider=mlx-audio-realtime has no language switch: "
-            "/v1/realtime takes model, format and turn_detection only. "
-            "Set stt_language=auto, or use stt_provider=mlx-audio, whose "
-            "Nemotron prompt conditioning does take one."
-        )
-
+    validate_stt_language(settings)
     settings = resolve_models(settings)
     return LocalMlxRealtimeSTTService(
         model=settings.stt_model,
@@ -344,6 +488,7 @@ def build_voice_router(settings: Settings) -> VoiceRouter:
 
 def build_stt_language_router(settings: Settings) -> SttLanguageRouter:
     """Build the STT language router that matches the configured provider."""
+    settings = resolve_models(settings)
     return select_stt_language_router(settings)
 
 

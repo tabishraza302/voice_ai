@@ -25,6 +25,7 @@ export class VoiceSession {
   private localStream: MediaStream | null = null;
   private dataChannel: RTCDataChannel | null = null;
   private pcId: string | null = null;
+  private muted = false;
 
   constructor(private readonly dependencies: VoiceSessionDependencies) {}
 
@@ -57,6 +58,9 @@ export class VoiceSession {
         throw new Error("Voice session connection was cancelled.");
       }
       this.localStream = stream;
+      if (this.muted) {
+        stream.getAudioTracks().forEach((track) => { track.enabled = false; });
+      }
 
       if (!options.isActive && options.activate) {
         this.dependencies.onStatus?.("activating");
@@ -83,7 +87,7 @@ export class VoiceSession {
         if (!isCurrent()) return;
         this.sendMessage({
           type: "signalling",
-          message: { type: "trackStatus", receiver_index: 0, enabled: true },
+          message: { type: "trackStatus", receiver_index: 0, enabled: !this.muted },
         });
         this.sendMessage({
           label: "rtvi-ai",
@@ -173,7 +177,16 @@ export class VoiceSession {
   }
 
   setMuted(muted: boolean): void {
+    this.muted = muted;
     this.localStream?.getAudioTracks().forEach((track) => { track.enabled = !muted; });
+    this.sendMessage({
+      type: "signalling",
+      message: { type: "trackStatus", receiver_index: 0, enabled: !muted },
+    });
+  }
+
+  isMuted(): boolean {
+    return this.muted;
   }
 
   getLocalStream(): MediaStream | null {

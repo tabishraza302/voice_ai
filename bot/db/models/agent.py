@@ -7,12 +7,13 @@ from bot.db.base import Base
 
 class Agent(Base):
     __tablename__ = "agents"
+    # At most one active agent, enforced by PostgreSQL's partial unique
+    # index. There is no SQLite predicate: SQLite is not a runtime store.
     __table_args__ = (
         Index(
             "uq_agents_single_active",
             "is_active",
             unique=True,
-            sqlite_where=text("is_active = 1"),
             postgresql_where=text("is_active = true"),
         ),
     )
