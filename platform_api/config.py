@@ -430,6 +430,10 @@ class PlatformSettings(BaseSettings):
         default=False,
         validation_alias=AliasChoices("PLATFORM_ENABLE_GENERATION", "enable_generation"),
     )
+    enable_chat_test: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("PLATFORM_ENABLE_CHAT_TEST", "enable_chat_test"),
+    )
     enable_voice_test: bool = Field(
         default=False,
         validation_alias=AliasChoices("PLATFORM_ENABLE_VOICE_TEST", "enable_voice_test"),
@@ -440,7 +444,9 @@ class PlatformSettings(BaseSettings):
     )
     enable_real_paid_calls: bool = Field(
         default=False,
-        validation_alias=AliasChoices("PLATFORM_ENABLE_REAL_PAID_CALLS", "enable_real_paid_calls"),
+        validation_alias=AliasChoices(
+            "PLATFORM_ENABLE_REAL_PAID_CALLS", "enable_real_paid_calls"
+        ),
     )
     enable_qa: bool = Field(
         default=False,
@@ -450,6 +456,53 @@ class PlatformSettings(BaseSettings):
         default=False,
         validation_alias=AliasChoices("PLATFORM_ENABLE_GATEWAY", "enable_gateway"),
     )
+
+    # --- Operator-owned OpenAI-compatible model endpoints -------------------
+    runtime_llm_base_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "PLATFORM_RUNTIME_LLM_BASE_URL", "runtime_llm_base_url"
+        ),
+    )
+    runtime_llm_api_key: str | None = Field(
+        default=None,
+        repr=False,
+        validation_alias=AliasChoices(
+            "PLATFORM_RUNTIME_LLM_API_KEY", "runtime_llm_api_key"
+        ),
+    )
+    generation_llm_base_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "PLATFORM_GENERATION_LLM_BASE_URL", "generation_llm_base_url"
+        ),
+    )
+    generation_llm_api_key: str | None = Field(
+        default=None,
+        repr=False,
+        validation_alias=AliasChoices(
+            "PLATFORM_GENERATION_LLM_API_KEY", "generation_llm_api_key"
+        ),
+    )
+    runtime_llm_timeout_seconds: int = Field(default=30, ge=1, le=300)
+    generation_llm_timeout_seconds: int = Field(default=90, ge=1, le=300)
+    runtime_llm_max_tokens: int = Field(default=256, ge=1, le=4096)
+    runtime_llm_temperature: float = Field(default=0.2, ge=0, le=2)
+    runtime_llm_reasoning_effort: str | None = "none"
+    runtime_llm_max_tokens_parameter: str = "max_tokens"
+    generation_llm_temperature: float = Field(default=0.2, ge=0, le=2)
+    generation_llm_reasoning_effort: str | None = None
+    generation_llm_max_tokens_parameter: str = "max_tokens"
+    generation_max_token_budget: int = Field(default=4096, ge=64, le=4096)
+    generation_daily_token_budget: int = Field(default=16384, ge=64)
+    generation_max_queued_jobs: int = Field(default=64, ge=1, le=10000)
+    generation_max_running_jobs: int = Field(default=2, ge=1, le=64)
+    generation_max_active_jobs_per_user: int = Field(default=2, ge=1, le=100)
+    generation_job_timeout_seconds: int = Field(default=120, ge=1, le=900)
+    generation_job_max_age_seconds: int = Field(default=3600, ge=60, le=86400)
+    generation_worker_poll_seconds: float = Field(default=0.5, ge=0.05, le=10)
+    generation_poll_after_seconds: int = Field(default=2, ge=1, le=30)
+
 
     # --- Schema and Catalog ---------------------------------------------------
     schema_version: str = Field(
@@ -868,6 +921,85 @@ class PlatformSettings(BaseSettings):
                 raise ValueError("PLATFORM_AUTH_MAIL_FROM is required when auth_mail_mode is 'smtp'.")
             if not self.auth_smtp_tls_mode or self.auth_smtp_tls_mode.lower() not in {"starttls", "tls"}:
                 raise ValueError("PLATFORM_AUTH_SMTP_TLS_MODE must be 'starttls' or 'tls' when auth_mail_mode is 'smtp'.")
+        return self
+
+    @field_validator("runtime_llm_base_url", "generation_llm_base_url")
+    @classmethod
+    def validate_model_base_url(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        raw = value.strip().rstrip("/")
+        try:
+            parsed = urlsplit(raw)
+            hostname = parsed.hostname
+        except ValueError as exc:
+            raise ValueError("Model endpoint must be a valid HTTP(S) base URL") from exc
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or not hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "Model endpoint must be an HTTP(S) base URL without credentials, "
+                "query, or fragment"
+            )
+        if raw.endswith("/chat/completions"):
+            raise ValueError("Model endpoint must be a base URL, not a completion path")
+        return raw
+
+    @field_validator("runtime_llm_api_key", "generation_llm_api_key")
+    @classmethod
+    def normalize_model_api_key(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        key = value.strip()
+        if not key:
+            return None
+        if len(key) > 4096:
+            raise ValueError("Model API key exceeds the configured length limit")
+        return key
+
+    @model_validator(mode="after")
+    def validate_model_execution_configuration(self) -> PlatformSettings:
+        if self.enable_chat_test and self.runtime_llm_base_url is None:
+            raise ValueError(
+                "PLATFORM_RUNTIME_LLM_BASE_URL is required when chat testing is enabled."
+            )
+        if self.enable_generation and self.generation_llm_base_url is None:
+            raise ValueError(
+                "PLATFORM_GENERATION_LLM_BASE_URL is required when generation is enabled."
+            )
+        if self.generation_llm_timeout_seconds > self.generation_job_timeout_seconds:
+            raise ValueError(
+                "generation_llm_timeout_seconds cannot exceed generation_job_timeout_seconds."
+            )
+        if self.runtime_llm_max_tokens_parameter not in {
+            "max_tokens",
+            "max_completion_tokens",
+        }:
+            raise ValueError(
+                "runtime_llm_max_tokens_parameter must be max_tokens or max_completion_tokens."
+            )
+        if self.generation_llm_max_tokens_parameter not in {
+            "max_tokens",
+            "max_completion_tokens",
+        }:
+            raise ValueError(
+                "generation_llm_max_tokens_parameter must be max_tokens or max_completion_tokens."
+            )
+        reasoning_levels = {None, "none", "low", "medium", "high"}
+        if self.runtime_llm_reasoning_effort not in reasoning_levels:
+            raise ValueError(
+                "runtime_llm_reasoning_effort must be none, low, medium, high, or unset."
+            )
+        if self.generation_llm_reasoning_effort not in reasoning_levels:
+            raise ValueError(
+                "generation_llm_reasoning_effort must be none, low, medium, high, or unset."
+            )
         return self
 
     @model_validator(mode="after")

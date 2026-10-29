@@ -43,6 +43,10 @@ from platform_api.agents.models import (
     IdempotencyRecord,
 )
 from platform_api.agents.publishing import publish_agent_version
+from platform_api.agents.snapshots import (
+    active_policy_snapshot,
+    compute_draft_chat_snapshot_hash,
+)
 from platform_api.agents.schemas import (
     AgentCreate,
     AgentListResponse,
@@ -68,6 +72,7 @@ from platform_api.agents.validation import (
     diagnostics_to_views,
     secret_diagnostics,
     validate_catalog_eligibility,
+    validate_chat_test_eligibility,
     validate_draft_semantics,
     validate_draft_structure,
 )
@@ -205,6 +210,44 @@ def _validation_summary(
             secret_errors + catalog_errors + semantic_errors
         ),
         warnings=diagnostics_to_views(warnings),
+    )
+
+
+def _chat_validation_summary(
+    config: dict[str, Any],
+    catalog: ModelCatalog | None = None,
+) -> ValidationSummaryView:
+    """Return diagnostics for the inputs required by text-only Chat Test."""
+    errors, warnings = validate_chat_test_eligibility(config, catalog)
+    return ValidationSummaryView(
+        errors=diagnostics_to_views(errors),
+        warnings=diagnostics_to_views(warnings),
+    )
+
+
+async def _draft_snapshot_hash(
+    db: AsyncSession,
+    *,
+    authoring_hash: str,
+    persona_prompt: str,
+    chat_summary: ValidationSummaryView,
+    policy_snapshot: dict[str, Any] | None = None,
+) -> str | None:
+    if chat_summary.errors:
+        return None
+    policy = policy_snapshot
+    if policy is None:
+        try:
+            policy = await active_policy_snapshot(db)
+        except ValueError as exc:
+            raise ValidationError(
+                "Active platform policy hash does not match its prompt text",
+                fields=[{"field": "snapshot_hash", "code": "POLICY_HASH_INVALID"}],
+            ) from exc
+    return compute_draft_chat_snapshot_hash(
+        authoring_hash=authoring_hash,
+        persona_prompt=persona_prompt,
+        policy_hash=policy["policy_hash"],
     )
 
 
@@ -536,9 +579,10 @@ async def get_draft(
     catalog: ModelCatalog | None = None,
     capabilities: AdapterCapabilities | None = None,
     qualification_settings: AgentQualificationSettings | None = None,
+    policy_snapshot: dict[str, Any] | None = None,
 ) -> DraftView:
     """Get mutable draft with live executable validation summary. Owner-scoped."""
-    await get_agent(db, agent_id=agent_id, owner_user_id=owner_user_id)
+    agent = await get_agent(db, agent_id=agent_id, owner_user_id=owner_user_id)
 
     stmt = select(AgentDraft).where(AgentDraft.agent_id == agent_id)
     res = await db.execute(stmt)
@@ -549,11 +593,20 @@ async def get_draft(
     summary = _validation_summary(
         draft.authoring_json, catalog, capabilities, qualification_settings
     )
+    chat_summary = _chat_validation_summary(draft.authoring_json, catalog)
+    snapshot_hash = await _draft_snapshot_hash(
+        db,
+        authoring_hash=draft.authoring_hash,
+        persona_prompt=agent.persona_prompt,
+        chat_summary=chat_summary,
+        policy_snapshot=policy_snapshot,
+    )
 
     return DraftView(
         agent_id=draft.agent_id,
         draft_revision=draft.revision,
         authoring_hash=draft.authoring_hash,
+        snapshot_hash=snapshot_hash,
         config=draft.authoring_json,
         validation=summary,
         updated_at=draft.updated_at,
@@ -659,11 +712,19 @@ async def update_draft(
     summary = _validation_summary(
         payload.config, catalog, capabilities, qualification_settings
     )
+    chat_summary = _chat_validation_summary(payload.config, catalog)
+    snapshot_hash = await _draft_snapshot_hash(
+        db,
+        authoring_hash=new_authoring_hash,
+        persona_prompt=agent.persona_prompt,
+        chat_summary=chat_summary,
+    )
 
     return DraftView(
         agent_id=agent.id,
         draft_revision=next_revision,
         authoring_hash=new_authoring_hash,
+        snapshot_hash=snapshot_hash,
         config=payload.config,
         validation=summary,
         updated_at=now,
@@ -977,11 +1038,19 @@ async def restore_draft(
     summary = _validation_summary(
         new_config, catalog, capabilities, qualification_settings
     )
+    chat_summary = _chat_validation_summary(new_config, catalog)
+    snapshot_hash = await _draft_snapshot_hash(
+        db,
+        authoring_hash=new_authoring_hash,
+        persona_prompt=agent.persona_prompt,
+        chat_summary=chat_summary,
+    )
 
     return DraftView(
         agent_id=agent.id,
         draft_revision=next_revision,
         authoring_hash=new_authoring_hash,
+        snapshot_hash=snapshot_hash,
         config=new_config,
         validation=summary,
         updated_at=now,

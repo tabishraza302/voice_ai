@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
+import asyncio
 import uuid
 
 from fastapi import APIRouter, FastAPI, Request, status
@@ -20,6 +21,9 @@ from platform_api.accounts.admin_routes import router as admin_router
 from platform_api.accounts.routes import router as account_router
 from platform_api.agents.config import DEFAULT_AGENT_CONFIG_MAX_BYTES
 from platform_api.agents.routes import router as agents_router
+from platform_api.generation.routes import router as generation_router
+from platform_api.generation.service import generation_worker_loop
+from platform_api.model_client import OpenAICompatibleModelClient
 from platform_api.auth.errors import (
     PlatformError,
     RequestTooLargeError,
@@ -33,6 +37,7 @@ from platform_api.billing.routes import (
 )
 from platform_api.catalog import load_catalog
 from platform_api.config import PlatformSettings, get_settings
+from platform_api.testing.routes import router as chat_test_router
 from platform_api.db.base import Base
 from platform_api.db.schema import check_schema_readiness
 from platform_api.db.session import create_engine, get_session_factory
@@ -152,17 +157,21 @@ class RequestContextMiddleware:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Lifespan context manager owning DB connection pools and clean shutdown."""
+    """Lifespan context manager owning DB pools, model clients, and workers."""
     settings: PlatformSettings = getattr(app.state, "settings", None) or get_settings()
     app.state.settings = settings
     app.state.deployment_identity = DeploymentIdentity.from_settings(settings)
     app.state.adapter_capability_report = None
     app.state.catalog = None
+    app.state.generation_worker_task = None
+    app.state.generation_job_tasks = {}
 
     engine = create_engine(settings)
     session_factory = get_session_factory(engine)
     app.state.engine = engine
     app.state.session_factory = session_factory
+    created_model_client = False
+    worker_task: asyncio.Task[None] | None = None
 
     try:
         app.state.catalog = load_catalog(settings.catalog_path)
@@ -180,15 +189,42 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception:
             app.state.schema_ready = False
 
+        if getattr(app.state, "model_client", None) is None and (
+            settings.runtime_llm_base_url is not None
+            or settings.generation_llm_base_url is not None
+        ):
+            app.state.model_client = OpenAICompatibleModelClient(settings)
+            created_model_client = True
+
+        if (
+            settings.enable_generation
+            and app.state.schema_ready
+            and not getattr(app.state, "disable_generation_worker", False)
+        ):
+            worker_task = asyncio.create_task(
+                generation_worker_loop(app),
+                name="platform-generation-worker",
+            )
+            app.state.generation_worker_task = worker_task
+
         yield
     finally:
+        if worker_task is not None:
+            worker_task.cancel()
+            await asyncio.gather(worker_task, return_exceptions=True)
+        app.state.generation_worker_task = None
+        app.state.generation_job_tasks = {}
+
+        if created_model_client:
+            await app.state.model_client.aclose()
+            app.state.model_client = None
+
         app.state.adapter_capability_report = None
         app.state.deployment_identity = None
         app.state.catalog = None
 
         if hasattr(app.state, "engine") and app.state.engine is not None:
             await app.state.engine.dispose()
-
 
 def create_app(settings: PlatformSettings | None = None) -> FastAPI:
     """Create and configure FastAPI platform application instance."""
@@ -201,6 +237,9 @@ def create_app(settings: PlatformSettings | None = None) -> FastAPI:
     )
     app.state.settings = resolved_settings
     app.state.adapter_capability_report = None
+    app.state.model_client = None
+    app.state.generation_worker_task = None
+    app.state.generation_job_tasks = {}
     app.state.deployment_identity = None
     app.state.catalog = None
 
@@ -273,6 +312,8 @@ def create_app(settings: PlatformSettings | None = None) -> FastAPI:
     api_v1.include_router(billing_router)
     api_v1.include_router(health_router)
     api_v1.include_router(agents_router)
+    api_v1.include_router(generation_router)
+    api_v1.include_router(chat_test_router)
 
     app.include_router(api_v1)
     # Mount internal routes under /internal

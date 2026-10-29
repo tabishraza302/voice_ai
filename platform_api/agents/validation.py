@@ -94,6 +94,7 @@ def validate_draft_semantics(
     capabilities: AdapterCapabilities | None = None,
     tools: ToolRegistry | None = None,
     qualification_settings: AgentQualificationSettings | None = None,
+    require_voice_capability: bool = True,
 ) -> tuple[list[FlowDiagnostic], list[FlowDiagnostic]]:
     """Normalize and validate executable semantics.
 
@@ -125,9 +126,10 @@ def validate_draft_semantics(
 
     errors = [d for d in diagnostics if d.severity == "error"]
     warnings = [d for d in diagnostics if d.severity == "warning"]
-    errors.extend(
-        validate_voice_capability(config, capabilities, qualification_settings)
-    )
+    if require_voice_capability:
+        errors.extend(
+            validate_voice_capability(config, capabilities, qualification_settings)
+        )
     return (errors, warnings)
 
 
@@ -191,6 +193,35 @@ def validate_catalog_eligibility(
             )
 
     return diagnostics
+
+
+def validate_chat_test_eligibility(
+    config: dict[str, Any],
+    catalog: ModelCatalog | None = None,
+    limits: FlowLimits | None = None,
+) -> tuple[list[FlowDiagnostic], list[FlowDiagnostic]]:
+    """Validate only the inputs needed by text-only Chat Test.
+
+    Voice, speech-provider, and playback-capability qualification remains
+    required for publication, but Chat Test uses only the runtime LLM.
+    """
+    secret_errors = secret_diagnostics(config)
+    structural = validate_draft_structure(config, limits)
+    structural_errors = [d for d in structural if d.severity == "error"]
+    if structural_errors:
+        return (secret_errors + structural_errors, [])
+
+    catalog_errors = [
+        diagnostic
+        for diagnostic in validate_catalog_eligibility(config, catalog)
+        if diagnostic.path == "/llm_model"
+    ]
+    semantic_errors, warnings = validate_draft_semantics(
+        config,
+        limits,
+        require_voice_capability=False,
+    )
+    return (secret_errors + catalog_errors + semantic_errors, warnings)
 
 
 def validate_voice_capability(

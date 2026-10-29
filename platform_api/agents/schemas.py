@@ -113,6 +113,7 @@ class DraftView(BaseModel):
     agent_id: uuid.UUID
     draft_revision: int
     authoring_hash: str
+    snapshot_hash: str | None = None
     config: dict[str, Any]
     validation: ValidationSummaryView
     updated_at: datetime
