@@ -64,19 +64,16 @@ from bot.transcripts import BotTranscriptForwarder, UserTranscriptForwarder
 
 @runtime_checkable
 class FlowHooks(Protocol):
-    """Provider-neutral flow processors a runtime installs before the LLM.
+    """Provider-neutral flow processors at the pipeline's frame boundaries.
 
-    This module deliberately defines no flow semantics. An implementation
-    belongs to the runtime that owns the flow engine; it returns the frame
-    processors to install after context shaping and before the LLM. The
-    local entrypoint passes ``None``, so the local pipeline is exactly the
-    pre-flow pipeline.
+    ``processors`` runs after context shaping and before the LLM. Optional
+    hook methods can observe finalized user input, bind model output, observe
+    TTS/audio frames, and close a flow runtime at pipeline teardown.
     """
 
     def processors(self) -> Sequence[FrameProcessor]:
-        """Return the processors to insert, in pipeline order."""
+        """Return processors inserted after context shaping and before the LLM."""
         ...
-
 
 @dataclass(frozen=True)
 class VoicePipelineAssembly:
@@ -114,11 +111,16 @@ class VoicePipelineAssembly:
         # A constructed-but-unregistered worker is never started, and the
         # runner then waits for a shutdown that no worker can produce.
         await self.runner.add_workers(self.worker)
-        await self.prometheus_observer.start_memory_sampling()
         try:
+            await self.prometheus_observer.start_memory_sampling()
             await self.runner.run()
         finally:
-            await self.prometheus_observer.stop_memory_sampling()
+            try:
+                close_flow = getattr(self.flow_hooks, "close", None)
+                if callable(close_flow):
+                    await close_flow()
+            finally:
+                await self.prometheus_observer.stop_memory_sampling()
 
 
 def build_turn_strategies() -> UserTurnStrategies:
@@ -192,7 +194,9 @@ def build_voice_pipeline(
     )
 
     flow_processors = _flow_processors(flow_hooks)
-
+    flow_input_processor = _optional_flow_processor(flow_hooks, "input_processor")
+    flow_output_processors = _optional_flow_processors(flow_hooks, "output_processors")
+    flow_audio_processor = _optional_flow_processor(flow_hooks, "audio_processor")
     # The Prometheus observer turns Pipecat's metrics frames into the
     # series that observability/prometheus.yml, alerts.yml and the
     # dashboard all reference; the latency bridge feeds it the
@@ -208,14 +212,17 @@ def build_voice_pipeline(
             transport.input(),
             stt,
             UserTranscriptForwarder(transport),
+            *((flow_input_processor,) if flow_input_processor is not None else ()),
             user_aggregator,
             # Between the aggregator and the LLM: the history is rewritten
             # here, so the model never sees two user messages in a row.
             context_shaper,
             *flow_processors,
             llm,
+            *flow_output_processors,
             router,
             tts,
+            *((flow_audio_processor,) if flow_audio_processor is not None else ()),
             transport.output(),
             BotTranscriptForwarder(transport),
             assistant_aggregator,
@@ -261,6 +268,45 @@ def _flow_processors(flow_hooks: FlowHooks | None) -> tuple[FrameProcessor, ...]
         if not isinstance(processor, FrameProcessor):
             raise TypeError(
                 "flow_hooks.processors() must return FrameProcessor instances; "
+                f"got {type(processor).__name__}"
+            )
+    return processors
+
+
+def _optional_flow_processor(
+    flow_hooks: FlowHooks | None, method_name: str
+) -> FrameProcessor | None:
+    """Read and validate one optional flow processor hook."""
+    if flow_hooks is None:
+        return None
+    method = getattr(flow_hooks, method_name, None)
+    if method is None:
+        return None
+    processor = method()
+    if processor is None:
+        return None
+    if not isinstance(processor, FrameProcessor):
+        raise TypeError(
+            f"flow_hooks.{method_name}() must return a FrameProcessor or None; "
+            f"got {type(processor).__name__}"
+        )
+    return processor
+
+
+def _optional_flow_processors(
+    flow_hooks: FlowHooks | None, method_name: str
+) -> tuple[FrameProcessor, ...]:
+    """Read and validate an optional ordered flow processor hook."""
+    if flow_hooks is None:
+        return ()
+    method = getattr(flow_hooks, method_name, None)
+    if method is None:
+        return ()
+    processors = tuple(method())
+    for processor in processors:
+        if not isinstance(processor, FrameProcessor):
+            raise TypeError(
+                f"flow_hooks.{method_name}() must return FrameProcessor instances; "
                 f"got {type(processor).__name__}"
             )
     return processors
