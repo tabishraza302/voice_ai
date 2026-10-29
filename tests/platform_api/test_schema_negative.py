@@ -180,6 +180,10 @@ def test_cli_and_app_import_identical_metadata():
     cli_tables = set(platform_api.cli.Base.metadata.tables.keys())
     app_tables = set(platform_api.app.Base.metadata.tables.keys())
     assert cli_tables == app_tables
-    assert "users" in app_tables
-    assert "wallet_accounts" in app_tables
-    assert "schema_info" in app_tables
+    table_names = {t.name for t in platform_api.app.Base.metadata.tables.values()}
+    assert "users" in table_names
+    assert "wallet_accounts" in table_names
+    assert "schema_info" in table_names
+    assert "platform.users" in app_tables
+    assert "platform.wallet_accounts" in app_tables
+    assert "platform.schema_info" in app_tables

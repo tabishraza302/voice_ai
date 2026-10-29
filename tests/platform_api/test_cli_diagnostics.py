@@ -26,7 +26,7 @@ def test_cli_config_error_suppresses_secrets(monkeypatch, capsys):
     secret_pw = "super_secret_operator_password_xyz123"
     secret_url = f"postgresql+asyncpg://voice_ai:{secret_pw}@127.0.0.1:5439/voice_ai_platform"
 
-    monkeypatch.setenv("PLATFORM_DATABASE_URL", secret_url)
+    monkeypatch.setenv("DATABASE_URL", secret_url)
     monkeypatch.delenv("PLATFORM_AUTH_CSRF_KEY", raising=False)
     monkeypatch.delenv("PLATFORM_AUTH_RATE_KEY", raising=False)
     monkeypatch.delenv("PLATFORM_AUTH_MFA_KEY", raising=False)

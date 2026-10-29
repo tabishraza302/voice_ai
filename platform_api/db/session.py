@@ -17,27 +17,50 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from platform_api.config import PlatformSettings, get_settings
+from platform_api.db.base import DEFAULT_PLATFORM_SCHEMA
 
 
 def create_engine(
     settings_or_url: PlatformSettings | str | None = None,
+    *,
+    schema: str | None = None,
     **engine_kwargs,
 ) -> AsyncEngine:
-    """Create an AsyncEngine for the platform database."""
+    """Create an AsyncEngine for the platform database with search_path and schema translation."""
     if isinstance(settings_or_url, str):
         url = settings_or_url
+        target_schema = schema or DEFAULT_PLATFORM_SCHEMA
     elif isinstance(settings_or_url, PlatformSettings):
         url = settings_or_url.database_url
+        target_schema = schema or getattr(settings_or_url, "postgres_schema", DEFAULT_PLATFORM_SCHEMA)
     else:
-        url = get_settings().database_url
+        current_settings = get_settings()
+        url = current_settings.database_url
+        target_schema = schema or getattr(current_settings, "postgres_schema", DEFAULT_PLATFORM_SCHEMA)
 
-    defaults = {
+    defaults: dict = {
         "echo": False,
         "pool_pre_ping": True,
     }
     defaults.update(engine_kwargs)
-    return create_async_engine(url, **defaults)
 
+    connect_args = dict(defaults.pop("connect_args", None) or {})
+    server_settings = dict(connect_args.get("server_settings") or {})
+    if "search_path" not in server_settings and target_schema:
+        server_settings["search_path"] = target_schema
+    if server_settings:
+        connect_args["server_settings"] = server_settings
+    if connect_args:
+        defaults["connect_args"] = connect_args
+
+    if target_schema:
+        exec_options = dict(defaults.pop("execution_options", None) or {})
+        schema_map = dict(exec_options.get("schema_translate_map") or {})
+        schema_map.setdefault(DEFAULT_PLATFORM_SCHEMA, target_schema)
+        exec_options["schema_translate_map"] = schema_map
+        defaults["execution_options"] = exec_options
+
+    return create_async_engine(url, **defaults)
 
 def get_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
     """Create an async sessionmaker for the given engine."""
