@@ -24,6 +24,15 @@ from scripts.verify import (
     is_port_in_use,
 )
 
+def test_broker_tests_run_in_postgres_gate_not_unit_gate() -> None:
+    unit_markers = build_gate_command("unit", REPO_ROOT)
+    unit_expression = unit_markers[unit_markers.index("-m") + 1]
+    assert "not broker" in unit_expression
+
+    postgres_markers = build_gate_command("postgres", REPO_ROOT)
+    postgres_expression = postgres_markers[postgres_markers.index("-m") + 1]
+    assert postgres_expression == "postgres or broker"
+
 
 
 def test_busy_port_never_reuses_foreign_server() -> None:

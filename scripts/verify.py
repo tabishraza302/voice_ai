@@ -322,7 +322,7 @@ def build_gate_command(gate: str, repo_root: Path) -> list[str]:
             "pytest",
             "tests",
             "-m",
-            "not postgres and not browser and not live_voice and not qualification",
+            "not postgres and not browser and not broker and not live_voice and not qualification",
             "--strict-markers",
         ]
     elif gate == "postgres":
@@ -336,7 +336,7 @@ def build_gate_command(gate: str, repo_root: Path) -> list[str]:
             "pytest",
             *targets,
             "-m",
-            "postgres",
+            "postgres or broker",
             "--strict-markers",
         ]
     elif gate == "voice_local_offline":
