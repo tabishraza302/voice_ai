@@ -1347,7 +1347,8 @@ class TestContractReviewerInvariants:
                 scenario_class=sc_class,
                 passed=True,
                 measurements={"latency_ms": 12, "buffer_drain_ms": 4},
-                raw_evidence={"trace_id": f"tr_{sc_class}", "audio_sha256": "abc123"},
+                raw_evidence={"audio_sha256": "abc123"},
+                trace_id=f"tr_{sc_class}",
             )
             for sc_class in REQUIRED_SCENARIO_CLASSES
         ]
