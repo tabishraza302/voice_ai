@@ -18,6 +18,24 @@ from platform_api.models.auth import User
 from platform_api.models.session import Session
 
 
+def statement_selects_entity(
+    statement: object,
+    entity: type,
+    *,
+    for_update: bool | None = None,
+) -> bool:
+    """Match ORM entities structurally so schema qualification cannot hide them."""
+    column_descriptions = getattr(statement, "column_descriptions", ())
+    if not any(
+        description.get("entity") is entity
+        for description in column_descriptions
+    ):
+        return False
+    if for_update is None:
+        return True
+    return (getattr(statement, "_for_update_arg", None) is not None) == for_update
+
+
 def reference_cost(rate: int, cumulative_ms: int) -> int:
     """Independent specification reference oracle using Decimal ROUND_CEILING."""
     if rate < 0 or cumulative_ms < 0:

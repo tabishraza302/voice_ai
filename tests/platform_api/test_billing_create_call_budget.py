@@ -22,7 +22,11 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from platform_api.auth.errors import NotFoundError
-from platform_api.billing.models import BillingOperation, CallBudget
+from platform_api.billing.models import (
+    BillingOperation,
+    CallBudget,
+    WalletAccount,
+)
 from platform_api.billing.schemas import BudgetView
 from platform_api.billing.service import (
     BillingValidationError,
@@ -34,7 +38,12 @@ from platform_api.billing.service import (
     create_call_budget,
 )
 from platform_api.models.session import Session
-from tests.support.billing import create_funded_wallet, create_test_session, create_test_user
+from tests.support.billing import (
+    create_funded_wallet,
+    create_test_session,
+    create_test_user,
+    statement_selects_entity,
+)
 from tests.support.postgres import FreshPostgres
 
 
@@ -367,8 +376,7 @@ async def test_create_and_meter_operations_use_consistent_row_lock_order(
     class PausingMeterSession(AsyncSession):
         async def execute(self, statement, *args, **kwargs):
             result = await super().execute(statement, *args, **kwargs)
-            query = str(statement).lower()
-            if "for update" in query and "from call_budgets" in query:
+            if statement_selects_entity(statement, CallBudget, for_update=True):
                 meter_budget_locked.set()
                 await release_meter_operation.wait()
             return result
@@ -376,11 +384,10 @@ async def test_create_and_meter_operations_use_consistent_row_lock_order(
     class ObservedCreateSession(AsyncSession):
         async def execute(self, statement, *args, **kwargs):
             nonlocal create_first_lock_table
-            query = str(statement).lower()
-            if "for update" in query and create_first_lock_table is None:
-                for table in ("wallet_accounts", "call_budgets", "sessions"):
-                    if f"from {table}" in query:
-                        create_first_lock_table = table
+            if create_first_lock_table is None:
+                for entity in (WalletAccount, CallBudget, Session):
+                    if statement_selects_entity(statement, entity, for_update=True):
+                        create_first_lock_table = entity.__tablename__
                         create_first_lock_started.set()
                         break
             return await super().execute(statement, *args, **kwargs)
@@ -512,8 +519,9 @@ async def test_create_call_budget_replay_revalidates_session_owner(
         async def execute(self, statement, *args, **kwargs):
             nonlocal pause_once
             result = await super().execute(statement, *args, **kwargs)
-            query = str(statement).lower()
-            if pause_once and "from sessions" in query and "for update" not in query:
+            if pause_once and statement_selects_entity(
+                statement, Session, for_update=False
+            ):
                 pause_once = False
                 initial_session_read.set()
                 await continue_request.wait()
