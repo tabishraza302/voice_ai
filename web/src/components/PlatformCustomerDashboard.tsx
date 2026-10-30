@@ -7,6 +7,7 @@ import { PlatformAgentDirectory } from "@/components/PlatformAgentDirectory";
 import { useAuth } from "@/lib/auth-state";
 import { PlatformApiError, platformApi } from "@/lib/platform-api-client";
 import { formatMinorCurrency, formatPlatformDate } from "@/lib/platform-format";
+import type { OwnerUsagePage, WalletView } from "@/types/platform";
 
 
 export function PlatformCustomerDashboard() {
@@ -123,7 +124,7 @@ export function PlatformCustomerDashboard() {
                 </span>
                 <span className="text-right">
                   <span className="block font-medium tabular-nums text-limestone-200">
-                    {billing ? formatMinorCurrency(billing.charge_status === "provisional" ? billing.authorized_estimate_minor : billing.charged_minor) : "No usage record"}
+                    {billing ? formatMinorCurrency(billing.charge_status === "provisional" ? (billing.authorized_estimate_minor ?? 0) : billing.charged_minor) : "No usage record"}
                   </span>
                   <span className="mt-1 block text-xs text-limestone-500">
                     {billing ? `${billing.charge_status === "provisional" ? "Authorized estimate" : "Final charge"} · ${billing.billed_ms} ms` : "—"}
