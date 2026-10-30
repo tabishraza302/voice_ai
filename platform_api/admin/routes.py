@@ -146,11 +146,11 @@ def _cached_response(cached: object, view: object) -> JSONResponse:
 
 def _cached_model_response(cached: object, model_type: object, label: str) -> JSONResponse:
     response_json = getattr(cached, "response_json", None)
-    validator = getattr(model_type, "model_validate", None)
+    validator = getattr(model_type, "model_validate_json", None)
     if not isinstance(response_json, dict) or not callable(validator):
         raise ConflictError(f"Stored {label} result is invalid")
     try:
-        view = validator(response_json)
+        view = validator(json.dumps(response_json))
     except (TypeError, ValueError) as exc:
         raise ConflictError(f"Stored {label} result is invalid") from exc
     return _cached_response(cached, view)

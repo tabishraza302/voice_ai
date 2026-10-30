@@ -141,6 +141,8 @@ def charge_minor(rate_minor_per_minute: int, cumulative_billable_ms: int) -> int
 
 The hosted link is `/public/{public_id}`. Guest lifecycle routes are exactly `GET /api/v1/guest/sessions/{session_id}/status`, `POST /api/v1/guest/sessions/{session_id}/reconnect-token`, and `POST /api/v1/guest/sessions/{session_id}/end`; no legacy public-session aliases remain. The guest cookie is scoped to `/api/v1/guest/sessions/{session_id}`.
 
+The guest page retains an admission key until the session is safely stored or the outcome is definitive. After a session ends, starting another clears the old key so the new admission is a distinct operation, even if saving the previous session failed.
+
 The middleware rejects public guest POST bodies over 8 KiB before FastAPI parsing, including streamed/chunked bodies. Admission uses atomic PostgreSQL-backed limits per client IP (`PLATFORM_PUBLIC_ADMISSION_IP_LIMIT`) and per agent (`PLATFORM_PUBLIC_ADMISSION_AGENT_LIMIT`) within `PLATFORM_PUBLIC_ADMISSION_WINDOW_SECONDS`; the agent quota is shared by every public deployment link for that agent. `PLATFORM_PUBLIC_SIGNALING_URL` must be the exact HTTPS `/api/offer` endpoint. Staging/production enablement requires public TLS, TURN, Secure guest cookies, trusted ingress CIDRs, and HTTPS `PLATFORM_WEB_ORIGIN`; preserve the browser's exact origin through the TLS-terminating proxy to the loopback runner. The browser sends the session ID and bound join JWT in Pipecat `request_data`; it reports connected only after WebRTC reaches `connected`.
 
 - [ ] Write cross-guest/owner-history, owner-wallet substitution, disabled deployment, expired capability, reconnect grace, stale JTI/peer, CSRF/origin and rate/zero-credit tests.
@@ -173,7 +175,7 @@ The middleware rejects public guest POST bodies over 8 KiB before FastAPI parsin
 
 - [ ] Write branch coverage, correction/refusal regression, invalid scenario, frozen rerun, quota/time/cancellation, expired-lease reclaim/stale-commit, prompt-plus-completion token boundary, over-limit reachable branches, owner authorization, UI and no-auto-publish assertions.
 - [ ] Implement deterministic scenarios first, then capped model utterance expansion and optional evidence-bearing judge. Reuse the existing validator; do not postpone it to this phase.
-- [ ] Recover expired PostgreSQL leases with rotated fencing tokens; check prompt and completion budgets before each model call, and reject branch catalogs that cannot fit without truncation.
+- [ ] Recover expired PostgreSQL leases with rotated fencing tokens, preserve each job's original runtime deadline across lease recovery, check prompt and completion budgets before each model call, and reject branch catalogs that cannot fit without truncation.
 - [ ] Build the owner QA panel on the scenario/job/result/cancel APIs. Suggestions must be draft-only and require explicit apply or dismiss; never auto-publish.
 - [ ] Run same pinned engine/model tuple with bounded jobs that yield resources to voice. Actual selected-model QA is required before release; fake judge success is not enough. Commit.
 

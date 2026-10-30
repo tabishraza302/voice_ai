@@ -11,6 +11,7 @@ Follows Task 8 specification:
 from __future__ import annotations
 
 import asyncio
+import base64
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import hashlib
@@ -712,10 +713,15 @@ async def test_run_consumer_fails_closed_without_consumer_role_config(
 @pytest.mark.parametrize("identity_field", ["server_address", "server_started_at"])
 @pytest.mark.asyncio
 async def test_run_consumer_rejects_same_endpoint_resolving_to_another_server(
-    test_platform_settings: PlatformSettings,
     monkeypatch: pytest.MonkeyPatch,
     identity_field: Literal["server_address", "server_started_at"],
 ) -> None:
+    test_platform_settings = PlatformSettings(
+        database_url="postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai_test",
+        auth_csrf_key=base64.urlsafe_b64encode(b"C" * 32).decode("ascii"),
+        auth_rate_key=base64.urlsafe_b64encode(b"R" * 32).decode("ascii"),
+        auth_mfa_key=base64.urlsafe_b64encode(b"M" * 32).decode("ascii"),
+    )
 
     class FakeResult:
         def __init__(self, identity) -> None:

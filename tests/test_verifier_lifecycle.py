@@ -24,15 +24,24 @@ from scripts.verify import (
     is_port_in_use,
 )
 
-def test_broker_tests_run_in_postgres_gate_not_unit_gate() -> None:
-    unit_markers = build_gate_command("unit", REPO_ROOT)
-    unit_expression = unit_markers[unit_markers.index("-m") + 1]
-    assert "not broker" in unit_expression
+def test_broker_and_legacy_postgres_tests_run_in_postgres_gate_not_unit_gate() -> None:
+    unit_command = build_gate_command("unit", REPO_ROOT)
+    unit_expression = unit_command[unit_command.index("-m") + 1]
+    assert unit_expression == "not postgres and not browser and not broker and not live_voice and not qualification"
 
-    postgres_markers = build_gate_command("postgres", REPO_ROOT)
-    postgres_expression = postgres_markers[postgres_markers.index("-m") + 1]
+    postgres_command = build_gate_command("postgres", REPO_ROOT)
+    postgres_expression = postgres_command[postgres_command.index("-m") + 1]
     assert postgres_expression == "postgres or broker"
-
+    postgres_targets = postgres_command[postgres_command.index("pytest") + 1:postgres_command.index("-m")]
+    assert {
+        "tests/test_agent_postgres_integration.py",
+        "tests/test_agent_service.py",
+        "tests/test_db_session.py",
+        "tests/test_agent_pipeline_integration.py",
+        "tests/test_routes.py",
+        "tests/test_session_profile_integration.py",
+        "tests/platform_api",
+    }.issubset(postgres_targets)
 
 
 def test_busy_port_never_reuses_foreign_server() -> None:
@@ -442,7 +451,16 @@ def test_release_sequencing_stops_at_failing_lane_and_records_pending_not_run(
     from scripts.verify import VerificationHarness
     from tests.qualification.test_release_evidence import _deployment_config, _local_config
 
+    monkeypatch.delenv("VERIFY_ARTIFACT_DIR", raising=False)
     harness = VerificationHarness(REPO_ROOT)
+    harness.run_dir.rmdir()
+    harness.run_dir = tmp_path / "release-run"
+    harness.run_dir.mkdir()
+    harness.run_id = harness.run_dir.name
+    harness.commands_log = harness.run_dir / "commands.json"
+    harness.manifest_file = harness.run_dir / "manifest.json"
+    harness.result_file = harness.run_dir / "result.json"
+
     real_run = verify.subprocess.run
 
     def clean_checkout_for_lane_test(command, **kwargs):
@@ -461,13 +479,26 @@ def test_release_sequencing_stops_at_failing_lane_and_records_pending_not_run(
     deployment_path.write_text(json.dumps(deployment), encoding="utf-8")
     local_path.write_text(json.dumps(local), encoding="utf-8")
 
+    passing_counts = {
+        "collected": 1,
+        "passed": 1,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+    }
+
     def fake_unit(standalone: bool = True) -> int:
         for gate in ("python_unit", "bun_test", "bun_typecheck", "bun_build"):
-            harness.results[gate] = {"status": "passed"}
+            harness.results[gate] = {"status": "passed", "counts": passing_counts.copy()}
         return 0
 
     def fake_postgres(standalone: bool = True) -> int:
-        harness.results["postgres_gate"] = {"status": "passed"}
+        harness.results["postgres_gate"] = {
+            "status": "passed",
+            "counts": passing_counts.copy(),
+        }
         return 0
 
     def fake_browser(standalone: bool = True) -> int:
@@ -487,6 +518,7 @@ def test_release_sequencing_stops_at_failing_lane_and_records_pending_not_run(
 
     result_data = json.loads(harness.result_file.read_text(encoding="utf-8"))
     assert result_data["overall_success"] is False
+    assert "manifest_validation_error" not in result_data
     assert result_data["gates"]["python_unit"]["status"] == "passed"
     assert result_data["gates"]["postgres_gate"]["status"] == "passed"
     assert result_data["gates"]["browser_gate"]["status"] == "failed"
@@ -573,6 +605,122 @@ def test_deployment_preflight_records_actual_live_flags_and_health(
     )
     assert payload["endpoints"]["flags"]["flags"] == flags
     assert payload["endpoints"]["runner"]["status"] == "ready"
+
+
+def test_post_voice_recheck_records_fresh_authenticated_state_without_overwriting_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json
+
+    from scripts import verify
+    from tests.support import qualification
+
+    harness, config = _preflight_harness(tmp_path)
+    endpoint_counts = {"runner": 0, "api": 0, "flags": 0}
+    flags = {
+        "PLATFORM_ENABLE_PUBLIC_CALLS": False,
+        "PLATFORM_ENABLE_REAL_PAID_CALLS": False,
+        "PLATFORM_ENABLE_GATEWAY": False,
+    }
+
+    def fake_urlopen(request, timeout):
+        assert timeout == 5
+        for name, endpoint in config["runner_api_endpoints"].items():
+            if request.full_url == endpoint:
+                endpoint_counts[name] += 1
+                if name == "flags":
+                    return _JsonResponse(request.full_url, {"flags": flags})
+                status = {
+                    "runner": ("ready", "ok"),
+                    "api": ("ok", "ready"),
+                }[name][endpoint_counts[name] - 1]
+                return _JsonResponse(request.full_url, {"status": status})
+        raise AssertionError(f"unexpected endpoint: {request.full_url}")
+
+    monkeypatch.setattr(verify.urllib.request, "urlopen", fake_urlopen)
+    harness.check_deployment_endpoints(config)
+    preflight_path = harness.run_dir / "deployment-preflight.json"
+    preflight_before = preflight_path.read_bytes()
+    harness.check_deployment_endpoints(config, post_voice_recheck=True)
+
+    assert endpoint_counts == {"runner": 2, "api": 2, "flags": 2}
+    assert preflight_path.read_bytes() == preflight_before
+
+    def authenticated_payload(filename: str, kind: str):
+        envelope = json.loads((harness.run_dir / filename).read_text(encoding="utf-8"))
+        return qualification.validate_live_evidence(
+            envelope,
+            kind=kind,
+            run_id=harness.run_id,
+            profile="deployment",
+            profile_hash=harness.profile_hashes["deployment"],
+            commit="f" * 40,
+            key=harness.evidence_key,
+        )
+
+    preflight = authenticated_payload("deployment-preflight.json", "deployment_preflight")
+    post_voice = authenticated_payload(
+        "deployment-post-voice-recheck.json",
+        "deployment_post_voice_recheck",
+    )
+    assert preflight["endpoints"]["runner"]["status"] == "ready"
+    assert post_voice["endpoints"]["runner"]["status"] == "ok"
+    assert post_voice["endpoints"]["api"]["status"] == "ready"
+    assert post_voice["endpoints"]["flags"]["flags"] == flags
+    assert isinstance(post_voice["checked_at"], str) and post_voice["checked_at"]
+    assert harness.deployment_preflight_complete is True
+
+
+def test_post_voice_recheck_fails_closed_and_records_enabled_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json
+
+    from scripts import verify
+    from tests.support import qualification
+
+    harness, config = _preflight_harness(tmp_path)
+    flags = {
+        "PLATFORM_ENABLE_PUBLIC_CALLS": False,
+        "PLATFORM_ENABLE_REAL_PAID_CALLS": False,
+        "PLATFORM_ENABLE_GATEWAY": False,
+    }
+    flag_checks = 0
+
+    def fake_urlopen(request, timeout):
+        nonlocal flag_checks
+        if request.full_url == config["runner_api_endpoints"]["flags"]:
+            flag_checks += 1
+            actual_flags = dict(flags)
+            if flag_checks == 2:
+                actual_flags["PLATFORM_ENABLE_PUBLIC_CALLS"] = True
+            return _JsonResponse(request.full_url, {"flags": actual_flags})
+        return _JsonResponse(request.full_url, {"status": "ready"})
+
+    monkeypatch.setattr(verify.urllib.request, "urlopen", fake_urlopen)
+    harness.check_deployment_endpoints(config)
+    preflight_path = harness.run_dir / "deployment-preflight.json"
+    preflight_before = preflight_path.read_bytes()
+
+    with pytest.raises(ValueError, match="PLATFORM_ENABLE_PUBLIC_CALLS"):
+        harness.check_deployment_endpoints(config, post_voice_recheck=True)
+
+    assert preflight_path.read_bytes() == preflight_before
+    recheck_envelope = json.loads(
+        (harness.run_dir / "deployment-post-voice-recheck.json").read_text(encoding="utf-8")
+    )
+    recheck = qualification.validate_live_evidence(
+        recheck_envelope,
+        kind="deployment_post_voice_recheck",
+        run_id=harness.run_id,
+        profile="deployment",
+        profile_hash=harness.profile_hashes["deployment"],
+        commit="f" * 40,
+        key=harness.evidence_key,
+    )
+    assert recheck["endpoints"]["flags"]["flags"]["PLATFORM_ENABLE_PUBLIC_CALLS"] is True
 
 
 @pytest.mark.parametrize(

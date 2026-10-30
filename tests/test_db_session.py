@@ -66,6 +66,7 @@ async def test_concurrent_initialization_reuses_one_engine(monkeypatch):
         _reset_engine_state(monkeypatch)
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_schema_upgrade_preserves_existing_rows_and_adds_constraints():
     async with disposable_postgres_schema() as (engine, factory, _schema):

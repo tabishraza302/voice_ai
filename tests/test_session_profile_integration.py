@@ -6,6 +6,8 @@ from bot.agents.service import AgentNotFoundError, AgentService, apply_active_ag
 from bot.config import SYSTEM_PROMPT, Settings
 from bot.session_settings import resolve_session_settings
 from tests.support.postgres import disposable_postgres_schema
+pytestmark = pytest.mark.postgres
+
 @pytest.fixture(autouse=True)
 def isolate_ollama_catalog(monkeypatch):
     """Isolate non-live profile integration tests from actual Ollama by injecting catalog."""

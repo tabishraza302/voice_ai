@@ -37,6 +37,8 @@ Join tokens are EdDSA-signed and short lived. Each JTI is stored as a single-use
 
 The runtime may advance the session with version-checked state transitions. Entering `ACTIVE` requires an open budget and unexpired funded permit. For teardown, the platform first moves the session to `ENDING`, sends a version-bound local release command, and marks the execution slot released only after an explicit acknowledgement. The runtime must stop media before it submits a `voice-runtime` stop attestation for that same `ENDING` version. The platform closes the budget from cumulative proven usage; only then may a version-checked terminal transition set the registration to `RELEASED` and the canonical session to `COMPLETED`, `FAILED`, or `EXPIRED`. If budget closure or terminal persistence is retried, the committed stop and billing facts remain durable.
 
+A terminal flow teardown is not a peer disconnect: after the media connection is confirmed stopped, the runner enters this same `ENDING` path and waits for the version-bound release, durable playback stop record, and budget closure before transitioning to `COMPLETED`; a flow failure uses `FAILED` with `FLOW_FAILED`. A nonterminal transport disconnect continues to use peer release and may return to `ACTIVE` within the reconnect window.
+
 Admin termination uses this same idempotent `ENDING` and version-bound runner-release path. The state change, idempotency result, and audit record commit together before the release command is sent; the admin operation does not directly close billing or release the budget hold.
 
 The internal API is mounted under `/internal/sessions` and is authenticated with the configured runtime bearer token and `X-Runner-ID`. It exposes:

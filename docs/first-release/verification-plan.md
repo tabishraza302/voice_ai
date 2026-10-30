@@ -218,6 +218,10 @@ runtime database; they exercise the same `public`/`platform`/`phoenix` schema
 contract without touching runtime data. Reject SQLite and databases without the
 verified run ownership token. Do not recreate tables on every API request.
 
+The disposable browser database is initialized with a zero-rate synthetic
+tariff and explicit slice and permit TTL. These values are test inputs, not
+production pricing or deployment timeout recommendations.
+
 Every gate owns and closes its HTTP clients, peer connections, app lifespans,
 engines and child processes. In `finally`, terminate only recorded owned
 process groups, wait then force-stop only those groups, dispose DB pools,
@@ -233,18 +237,29 @@ remove unrelated Docker containers. Preserve redacted artifacts on failure.
    `bun run typecheck`, `bun run build`. Existing PostgreSQL/live skips remain
    visible and permitted here. This is a developer regression result only.
 2. **New `verify unit`:** root
-   `uv run --frozen pytest tests -m 'not postgres and not browser and not live_voice and not qualification' --strict-markers --junitxml=<run>/python-unit.xml`;
+   `uv run --frozen pytest tests -m 'not postgres and not browser and not broker and not live_voice and not qualification' --strict-markers --junitxml=<run>/python-unit.xml`;
    web `bun test`, `bun run typecheck`, `bun run build`. Mark existing optional
    PostgreSQL and voice modules appropriately so their prerequisites do not
    leak into this lane. Required selected tests may not skip or xfail. At
    least one Python and one Bun test must run; missing reports fail.
-3. **New `verify postgres`:** provision disposable PostgreSQL, then root
-   `uv run --frozen pytest tests/test_agent_postgres_integration.py tests/platform_api -m postgres --strict-markers --junitxml=<run>/postgres.xml`.
-   Populate the disposable legacy/platform database environment described above. No
-   model server, gateway or browser is needed for this lane. Phase 8 adds its
-   actual disposable RabbitMQ fixture for tests marked `broker`; until then
-   no broker tests exist. Once Phase 8 is present, this gate also executes
-   its required `postgres and broker` cases rather than excluding them.
+3. **New `verify postgres`:** provision disposable PostgreSQL, then root:
+
+   ```sh
+   uv run --frozen pytest \
+     tests/test_agent_postgres_integration.py \
+     tests/test_agent_service.py \
+     tests/test_db_session.py \
+     tests/test_agent_pipeline_integration.py \
+     tests/test_routes.py \
+     tests/test_session_profile_integration.py \
+     tests/platform_api \
+     -m 'postgres or broker' --strict-markers \
+     --junitxml=<run>/postgres.xml
+   ```
+
+   Populate the disposable legacy/platform database environment described above.
+   No model server, gateway, or browser is needed. The `postgres or broker`
+   expression selects PostgreSQL tests and any broker-marked tests.
 4. **New `verify browser`:** provision PostgreSQL, start owned control-plane,
    fake-runner and built Studio servers with temporary settings, then in web
    `bun run test:e2e --project=chromium --reporter=json`. Capture stdout to

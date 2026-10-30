@@ -168,6 +168,7 @@ class DatabaseCatalogInventory:
     custom_types: set[str]
     user_functions: set[str]
     user_schemas: set[str] = field(default_factory=set)
+    sequence_owners: dict[str, tuple[str, str, str] | None] = field(default_factory=dict)
 
     @property
     def total_user_objects(self) -> int:
@@ -208,6 +209,7 @@ async def _inspect_catalog_inventory(
             custom_types=set(),
             user_functions=set(),
             user_schemas=set(),
+            sequence_owners={},
         )
 
     # 2. Relations within the target schema (tables, views, sequences, etc.)
@@ -234,6 +236,38 @@ async def _inspect_catalog_inventory(
             views.add(relname)
         elif relkind == "S":
             sequences.add(relname)
+
+    sequence_owners_res = await conn.execute(
+        text(
+            "SELECT seq.relname::text, owner_ns.nspname::text, "
+            "owner.relname::text, owner_att.attname::text "
+            "FROM pg_class seq "
+            "JOIN pg_namespace seq_ns ON seq_ns.oid = seq.relnamespace "
+            "LEFT JOIN pg_depend dep "
+            "  ON dep.classid = 'pg_class'::regclass "
+            " AND dep.objid = seq.oid "
+            " AND dep.refclassid = 'pg_class'::regclass "
+            " AND dep.deptype::text IN ('a', 'i') "
+            "LEFT JOIN pg_class owner ON owner.oid = dep.refobjid "
+            "LEFT JOIN pg_namespace owner_ns ON owner_ns.oid = owner.relnamespace "
+            "LEFT JOIN pg_attribute owner_att "
+            "  ON owner_att.attrelid = owner.oid AND owner_att.attnum = dep.refobjsubid "
+            "WHERE seq_ns.nspname = :schema AND seq.relkind::text = 'S'"
+        ),
+        {"schema": schema},
+    )
+    sequence_owners: dict[str, tuple[str, str, str] | None] = {}
+    for r in sequence_owners_res.all():
+        sequence_name = _normalize_pg_str(r[0])
+        owner = (
+            (_normalize_pg_str(r[1]), _normalize_pg_str(r[2]), _normalize_pg_str(r[3]))
+            if all(value is not None for value in r[1:])
+            else None
+        )
+        if sequence_name in sequence_owners and sequence_owners[sequence_name] != owner:
+            sequence_owners[sequence_name] = None
+        else:
+            sequence_owners[sequence_name] = owner
 
     # 3. Custom types within the target schema
     types_res = await conn.execute(
@@ -273,7 +307,37 @@ async def _inspect_catalog_inventory(
         custom_types=custom_types,
         user_functions=user_functions,
         user_schemas={schema},
+        sequence_owners=sequence_owners,
     )
+
+
+def _sequence_mismatches(
+    inventory: DatabaseCatalogInventory,
+    *,
+    schema: str,
+) -> tuple[set[str], set[tuple[str, str, str]]]:
+    expected_owners = {
+        (schema, table.name, column.name)
+        for table in Base.metadata.tables.values()
+        if (column := table.autoincrement_column) is not None
+    }
+    actual_by_owner: dict[tuple[str, str, str], set[str]] = {}
+    unexpected: set[str] = set()
+
+    for sequence_name in inventory.sequences:
+        owner = inventory.sequence_owners.get(sequence_name)
+        if owner not in expected_owners:
+            unexpected.add(sequence_name)
+            continue
+        actual_by_owner.setdefault(owner, set()).add(sequence_name)
+
+    for sequence_names in actual_by_owner.values():
+        if len(sequence_names) > 1:
+            unexpected.update(sequence_names)
+
+    missing = expected_owners - actual_by_owner.keys()
+    return unexpected, missing
+
 
 async def initialize_schema(
     engine: AsyncEngine,
@@ -282,15 +346,16 @@ async def initialize_schema(
     expected_version: str = "platform-v1",
     metadata_hash: str | None = None,
     initial_tariff: InitialSessionTariff | None = None,
+    allow_unseeded_restore: bool = False,
 ) -> None:
     """Initialize or verify the platform schema; fresh setup requires an explicit tariff seed.
 
     Serialized with PostgreSQL transaction-level advisory lock.
     - Non-PostgreSQL dialect: raises SchemaMismatch.
-    - Missing or empty platform schema: creates tables and records the schema only
-      after persisting the explicitly supplied initial tariff.
+    - Missing or empty platform schema creates tables and records the schema only after an
+      explicit tariff seed; only backup restore may set `allow_unseeded_restore=True` to import the archived tariff.
     - Non-empty unknown platform schema (lacks schema_info or has unexpected objects): raises SchemaMismatch.
-    - Matching schema_info but missing/extra tables or views: raises SchemaMismatch.
+    - Matching schema_info with missing/extra tables, missing generated sequences, or unexpected objects: raises SchemaMismatch.
     - Identical recorded schema and tables: safe no-op; initial tariff values are ignored.
     """
     if engine.dialect.name != "postgresql":
@@ -318,16 +383,17 @@ async def initialize_schema(
         inventory = await _inspect_catalog_inventory(conn, schema=schema)
 
         if inventory.total_user_objects == 0:
-            if initial_tariff is None:
+            if initial_tariff is None and not allow_unseeded_restore:
                 raise SchemaMismatch(
                     "SCHEMA_MISMATCH: Fresh platform schema initialization requires explicit "
                     "initial session rate, billing slice, and permit TTL values."
                 )
             await conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
             await conn.run_sync(Base.metadata.create_all)
-            from platform_api.billing.tariffs import seed_initial_active_tariff
+            if initial_tariff is not None:
+                from platform_api.billing.tariffs import seed_initial_active_tariff
 
-            await seed_initial_active_tariff(conn, initial_tariff)
+                await seed_initial_active_tariff(conn, initial_tariff)
             await conn.execute(
                 SchemaInfo.__table__.insert().values(
                     version=expected_version,
@@ -386,9 +452,14 @@ async def initialize_schema(
                 f"SCHEMA_MISMATCH: Unexpected views found in platform schema '{schema}': {sorted(inventory.views)}. "
                 "Refusing unknown nonempty schema with views."
             )
-        if inventory.sequences:
+        unexpected_sequences, missing_sequence_owners = _sequence_mismatches(
+            inventory, schema=schema
+        )
+        if unexpected_sequences or missing_sequence_owners:
             raise SchemaMismatch(
-                f"SCHEMA_MISMATCH: Unexpected sequences found in platform schema '{schema}': {sorted(inventory.sequences)}."
+                f"SCHEMA_MISMATCH: Platform schema '{schema}' sequences do not match expected metadata. "
+                f"Unexpected sequences: {sorted(unexpected_sequences)}; "
+                f"Missing generated sequences: {sorted(missing_sequence_owners)}."
             )
         if inventory.custom_types:
             raise SchemaMismatch(
@@ -445,9 +516,13 @@ async def check_schema_readiness(
         if inventory.tables != expected_tables:
             return False
 
+        unexpected_sequences, missing_sequence_owners = _sequence_mismatches(
+            inventory, schema=schema
+        )
         if (
             inventory.views
-            or inventory.sequences
+            or unexpected_sequences
+            or missing_sequence_owners
             or inventory.custom_types
             or inventory.user_functions
         ):

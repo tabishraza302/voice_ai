@@ -15,6 +15,7 @@ from platform_api.db.session import create_engine, get_session_factory
 from platform_api.events.models import TranscriptSegment
 from platform_api.models.auth import AuditLog, User
 from platform_api.models.session import Session
+from platform_api.models.tariff import ActiveSessionTariff, SessionTariffRecord
 from platform_api.models.wallet import WalletAccount
 from platform_api.billing.models import WalletEntry
 from platform_api.ops.backup import (
@@ -172,6 +173,13 @@ async def test_backup_restores_platform_data_into_fresh_owned_database(
                 assert transcript.final_text == "TRANSCRIPT_RESTORED_EXACTLY"
                 entry = (await db.execute(select(WalletEntry))).scalar_one()
                 assert entry.amount_minor == 100
+                active_tariff = await db.get(ActiveSessionTariff, 1)
+                assert active_tariff is not None
+                tariff = await db.get(SessionTariffRecord, active_tariff.current_tariff_id)
+                assert tariff is not None
+                assert tariff.rate_minor_per_minute == 6000
+                assert tariff.billing_slice_ms == 1000
+                assert tariff.permit_ttl_ms == 5000
         finally:
             await target_engine.dispose()
 

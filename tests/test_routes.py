@@ -52,6 +52,7 @@ def test_storage_endpoint_reports_uninitialized_before_engine_init(monkeypatch):
     assert res.json() == {"backend": "uninitialized"}
     body = res.text.lower()
     assert "fallback" not in body
+@pytest.mark.postgres
 def test_list_agents(api_client):
     res = api_client.get("/api/agents")
     assert res.status_code == 200
@@ -63,6 +64,7 @@ def test_list_agents(api_client):
     assert len(active) == 1
 
 
+@pytest.mark.postgres
 def test_create_and_get_agent(api_client):
     uid = uuid.uuid4().hex[:6]
     payload = {
@@ -91,6 +93,7 @@ def test_create_and_get_agent(api_client):
     assert get_res.json()["id"] == agent_id
 
 
+@pytest.mark.postgres
 def test_update_agent(api_client):
     uid = uuid.uuid4().hex[:6]
     create_res = api_client.post(
@@ -113,6 +116,7 @@ def test_update_agent(api_client):
     assert updated["llm_temperature"] == 0.95
 
 
+@pytest.mark.postgres
 def test_activate_agent(api_client):
     uid = uuid.uuid4().hex[:6]
     create_res = api_client.post(
@@ -132,6 +136,7 @@ def test_activate_agent(api_client):
     assert active[0]["id"] == agent_id
 
 
+@pytest.mark.postgres
 def test_get_and_update_base_prompt(api_client):
     get_res = api_client.get("/api/prompts/base")
     assert get_res.status_code == 200
@@ -150,6 +155,7 @@ def test_get_and_update_base_prompt(api_client):
     assert put_res.json()["prompt_text"] == "Updated shared base prompt rules."
 
 
+@pytest.mark.postgres
 def test_preview_prompt(api_client):
     preview_res = api_client.post(
         "/api/prompts/preview",
@@ -167,6 +173,7 @@ def test_preview_prompt(api_client):
     assert "token_estimate" in res_json
     assert res_json["token_estimate"] > 0
 
+@pytest.mark.postgres
 def test_models_and_voices_catalog(api_client):
     models_res = api_client.get("/api/models")
     assert models_res.status_code == 200
@@ -189,6 +196,7 @@ def test_models_and_voices_catalog(api_client):
     assert len(catalog["tts_voices"]) == 8
 
 
+@pytest.mark.postgres
 def test_agent_not_found_statuses(api_client):
     missing = "00000000-0000-0000-0000-000000000000"
     assert api_client.put(f"/api/agents/{missing}", json={"name": "Changed"}).status_code == 404
@@ -197,6 +205,7 @@ def test_agent_not_found_statuses(api_client):
     assert api_client.post("/api/prompts/preview", json={"agent_id": missing}).status_code == 404
 
 
+@pytest.mark.postgres
 def test_duplicate_and_preset_delete_statuses(api_client):
     payload = {"name": "Duplicate", "slug": "duplicate-slug"}
     assert api_client.post("/api/agents", json=payload).status_code == 201
@@ -206,6 +215,7 @@ def test_duplicate_and_preset_delete_statuses(api_client):
     assert api_client.delete(f"/api/agents/{preset['id']}").status_code == 409
 
 
+@pytest.mark.postgres
 @pytest.mark.parametrize("payload", [
     {"name": "   ", "slug": "valid-slug"},
     {"name": "Valid", "slug": "  "},
@@ -219,6 +229,7 @@ def test_create_agent_rejects_invalid_fields(api_client, payload):
     assert api_client.post("/api/agents", json=payload).status_code == 422
 
 
+@pytest.mark.postgres
 def test_update_agent_rejects_explicit_null_and_invalid_fields(api_client):
     created = api_client.post("/api/agents", json={"name": "Valid", "slug": "valid-update"})
     agent_id = created.json()["id"]
@@ -227,6 +238,7 @@ def test_update_agent_rejects_explicit_null_and_invalid_fields(api_client):
     assert api_client.put(f"/api/agents/{agent_id}", json={"llm_reasoning_effort": ""}).status_code == 200
 
 
+@pytest.mark.postgres
 def test_prompt_update_requires_text_but_accepts_empty_string(api_client):
     assert api_client.put("/api/prompts/base", json={"change_reason": "missing text"}).status_code == 422
     response = api_client.put("/api/prompts/base", json={"prompt_text": "", "change_reason": "clear"})

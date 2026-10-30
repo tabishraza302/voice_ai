@@ -25,7 +25,7 @@ from platform_api.billing.schemas import BudgetPermit, RuntimeStopAttestation
 from platform_api.billing.service import RuntimePrincipal, close_budget
 from platform_api.billing.tariffs import append_tariff_version
 from platform_api.config import PlatformSettings
-from platform_api.models.auth import AuditLog
+from platform_api.models.auth import AuditLog, User
 from platform_api.models.session import Session
 from platform_api.sessions import admission, service
 from platform_api.sessions.models import (
@@ -151,9 +151,14 @@ async def _fake_owned_voice_version(*args, **kwargs):
 
 @pytest.mark.asyncio
 async def test_runtime_configuration_fails_closed_and_bridge_binds_acknowledgements(
-    test_platform_settings: PlatformSettings,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    test_platform_settings = PlatformSettings(
+        database_url="postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai_test",
+        auth_csrf_key=base64.urlsafe_b64encode(b"C" * 32).decode("ascii"),
+        auth_rate_key=base64.urlsafe_b64encode(b"R" * 32).decode("ascii"),
+        auth_mfa_key=base64.urlsafe_b64encode(b"M" * 32).decode("ascii"),
+    )
     settings = _session_settings(test_platform_settings)
     config = admission.session_admission_config(settings)
     assert config.runner_id == "runner-task6-test"
@@ -253,6 +258,7 @@ async def test_runtime_configuration_fails_closed_and_bridge_binds_acknowledgeme
     assert error.value.retryable
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_owner_and_runtime_session_routes_are_mounted(
     app_client: httpx.AsyncClient,
@@ -696,7 +702,7 @@ async def test_admission_pause_blocks_new_owner_and_guest_sessions(
     public_settings = settings.model_copy(
         update={
             "enable_public_calls": True,
-            "public_signaling_url": "ws://127.0.0.1:43002/signal",
+            "public_signaling_url": "https://127.0.0.1:43002/api/offer",
         }
     )
     capabilities, qualification_settings = _qualification()
@@ -709,6 +715,7 @@ async def test_admission_pause_blocks_new_owner_and_guest_sessions(
     monkeypatch.setattr(service, "check_admission_pause", reject_paused_admission)
     async with initialized_pg.sessions() as db:
         owner, auth_session, principal = await _owner_auth(db, settings)
+        owner_id = owner.id
 
         async def public_deployment_owner(
             db,
@@ -719,8 +726,10 @@ async def test_admission_pause_blocks_new_owner_and_guest_sessions(
             agent_version_id,
             origin,
         ):
-            assert owner_user_id == owner.id
-            return owner
+            assert owner_user_id == owner_id
+            verified_owner = await db.get(User, owner_id)
+            assert verified_owner is not None
+            return verified_owner
 
         monkeypatch.setattr(
             service, "_verify_public_deployment", public_deployment_owner
@@ -745,7 +754,7 @@ async def test_admission_pause_blocks_new_owner_and_guest_sessions(
         with pytest.raises(ConflictError, match="Admission is paused"):
             await service.reserve_guest_session(
                 db,
-                owner_user_id=owner.id,
+                owner_user_id=owner_id,
                 deployment_id=uuid.uuid4(),
                 origin=public_settings.web_origin,
                 agent_id=guest_agent_id,
@@ -758,12 +767,12 @@ async def test_admission_pause_blocks_new_owner_and_guest_sessions(
             )
         await db.rollback()
         sessions = (
-            await db.execute(select(Session).where(Session.owner_user_id == owner.id))
+            await db.execute(select(Session).where(Session.owner_user_id == owner_id))
         ).scalars().all()
         assert sessions == []
         assert pause_checks == [
-            (owner.id, owner_agent_id),
-            (owner.id, guest_agent_id),
+            (owner_id, owner_agent_id),
+            (owner_id, guest_agent_id),
         ]
 
 

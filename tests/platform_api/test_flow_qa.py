@@ -516,6 +516,153 @@ async def test_flow_qa_reclaims_expired_worker_lease_from_checkpoint(
 
 @pytest.mark.postgres
 @pytest.mark.asyncio
+async def test_flow_qa_recovery_expires_when_runtime_budget_is_exhausted(
+    qa_app_client,
+    initialized_pg: FreshPostgres,
+):
+    client, app, model_client = qa_app_client
+    _, headers = await _create_user_session(
+        initialized_pg, app.state.settings, client, "qa_expired_runtime@example.com"
+    )
+    agent_id, draft = await _create_qa_agent(client, headers)
+    preview = await client.get(
+        "/api/v1/qa/scenarios",
+        params={
+            "agent_id": str(agent_id),
+            "snapshot_hash": draft["snapshot_hash"],
+            "scenario_count": 2,
+        },
+        headers=headers,
+    )
+    scenario_ids = [item["scenario_id"] for item in preview.json()["scenarios"]]
+    queued = await client.post(
+        "/api/v1/qa/jobs",
+        headers=headers,
+        json={
+            "agent_id": str(agent_id),
+            "snapshot_hash": draft["snapshot_hash"],
+            "scenario_count": 2,
+            "scenario_ids": scenario_ids,
+            "max_turns": 2,
+            "max_tokens": 4096,
+            "max_runtime_seconds": 4,
+            "utterance_model_id": "qa-generator",
+        },
+    )
+    assert queued.status_code == 202
+    job_id = uuid.UUID(queued.json()["job_id"])
+    checkpoint = {
+        "scenario_id": scenario_ids[0],
+        "kind": "branch",
+        "status": "PASS",
+        "assertion": "Saved result survives runtime expiration.",
+        "expected_edge": None,
+        "observed_edges": [],
+        "turn_count": 0,
+        "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "artifact_id": None,
+        "failure_code": None,
+    }
+    now = datetime.now(timezone.utc)
+    async with app.state.session_factory() as db:
+        job = await db.get(FlowQAJob, job_id)
+        assert job is not None
+        job.status = "RUNNING"
+        job.lease_token = uuid.uuid4()
+        job.lease_expires_at = now - timedelta(seconds=1)
+        job.started_at = now - timedelta(seconds=5)
+        job.next_scenario_index = 1
+        job.results_json = [checkpoint]
+        await db.commit()
+
+    from platform_api.qa.worker import run_qa_job_once
+
+    await run_qa_job_once(
+        app.state.session_factory,
+        app.state.settings,
+        app.state.catalog,
+        model_client,
+        job_id,
+    )
+
+    recovered = await client.get(
+        f"/api/v1/qa/jobs/{job_id}", headers={"Cookie": headers["Cookie"]}
+    )
+    assert recovered.status_code == 200
+    assert recovered.json()["status"] == "EXPIRED"
+    assert recovered.json()["failure_code"] == "RUNTIME_BUDGET_EXHAUSTED"
+    assert recovered.json()["results"] == [checkpoint]
+    assert model_client.calls == []
+    async with app.state.session_factory() as db:
+        expired = await db.get(FlowQAJob, job_id)
+        assert expired is not None
+        assert expired.next_scenario_index == 1
+        assert expired.lease_token is None
+        assert expired.lease_expires_at is None
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_flow_qa_recovery_uses_only_remaining_runtime_budget(
+    qa_app_client,
+    initialized_pg: FreshPostgres,
+):
+    client, app, model_client = qa_app_client
+    _, headers = await _create_user_session(
+        initialized_pg, app.state.settings, client, "qa_partial_runtime@example.com"
+    )
+    agent_id, draft = await _create_qa_agent(client, headers)
+    queued = await client.post(
+        "/api/v1/qa/jobs",
+        headers=headers,
+        json={
+            "agent_id": str(agent_id),
+            "snapshot_hash": draft["snapshot_hash"],
+            "scenario_count": 1,
+            "max_turns": 2,
+            "max_tokens": 4096,
+            "max_runtime_seconds": 4,
+            "utterance_model_id": "qa-generator",
+        },
+    )
+    assert queued.status_code == 202
+    job_id = uuid.UUID(queued.json()["job_id"])
+    now = datetime.now(timezone.utc)
+    async with app.state.session_factory() as db:
+        job = await db.get(FlowQAJob, job_id)
+        assert job is not None
+        job.status = "RUNNING"
+        job.lease_token = uuid.uuid4()
+        job.lease_expires_at = now - timedelta(seconds=1)
+        job.started_at = now - timedelta(seconds=1)
+        await db.commit()
+
+    from platform_api.qa.worker import run_qa_job_once
+
+    model_client.block_generation = True
+    task = asyncio.create_task(
+        run_qa_job_once(
+            app.state.session_factory,
+            app.state.settings,
+            app.state.catalog,
+            model_client,
+            job_id,
+        )
+    )
+    await asyncio.wait_for(model_client.generation_started.wait(), timeout=3.5)
+    await asyncio.wait_for(task, timeout=3.5)
+
+    recovered = await client.get(
+        f"/api/v1/qa/jobs/{job_id}", headers={"Cookie": headers["Cookie"]}
+    )
+    assert recovered.status_code == 200
+    assert recovered.json()["status"] == "EXPIRED"
+    assert recovered.json()["failure_code"] == "RUNTIME_BUDGET_EXHAUSTED"
+    assert model_client.generation_cancelled.is_set()
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
 async def test_flow_qa_expired_worker_cannot_commit_before_or_after_reclaim(
     qa_app_client,
     initialized_pg: FreshPostgres,

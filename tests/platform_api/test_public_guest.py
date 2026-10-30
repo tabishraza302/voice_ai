@@ -328,6 +328,7 @@ async def test_guest_admission_uses_deployment_owner_and_scopes_capability_to_on
     admitted_a = await _bootstrap_and_admit(client, settings, public_a, key="guest-a")
     admitted_b = await _bootstrap_and_admit(client, settings, public_b, key="guest-b")
     assert admitted_a.status_code == 201, admitted_a.text
+    set_cookie = admitted_a.headers["set-cookie"]
     assert admitted_b.status_code == 201, admitted_b.text
     body_a = admitted_a.json()
     body_b = admitted_b.json()

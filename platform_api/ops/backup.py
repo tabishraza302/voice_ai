@@ -332,6 +332,7 @@ async def restore_backup(
                 schema=schema,
                 expected_version=schema_version,
                 metadata_hash=metadata_hash,
+                allow_unseeded_restore=True,
             )
             target_connection = await asyncpg.connect(dsn=_dsn(target_database_url))
             for table in _tables():
@@ -356,6 +357,11 @@ async def restore_backup(
                         raise ValueError("Restored row count does not match the backup manifest")
                     copied_counts[table.name] = copied
 
+                active_tariff_count = await target_connection.fetchval(
+                    f"SELECT count(*) FROM {_qualified(schema, 'active_session_tariff')}"
+                )
+                if active_tariff_count != 1:
+                    raise ValueError("Backup must contain exactly one active session tariff")
                 for table in _tables():
                     for column in table.columns:
                         if column.identity is None and (

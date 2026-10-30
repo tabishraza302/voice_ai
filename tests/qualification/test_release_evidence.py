@@ -157,6 +157,19 @@ def test_local_and_deployment_profiles_bind_the_exact_model_tuple() -> None:
         validate_local(bad_model)
 
 
+def test_profile_hash_accepts_valid_float_limits_and_is_order_independent() -> None:
+    config = _deployment_config()
+    qualification.validate_deployment_config(config)
+
+    profile_hash = qualification.profile_sha256(config)
+    reordered = dict(reversed(tuple(config.items())))
+    assert qualification.profile_sha256(reordered) == profile_hash
+
+    changed = _deployment_config()
+    changed["limits"]["quality_threshold"] = 0.91
+    assert qualification.profile_sha256(changed) != profile_hash
+
+
 @pytest.mark.parametrize(
     "mutation, message",
     [

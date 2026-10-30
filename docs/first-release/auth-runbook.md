@@ -39,7 +39,7 @@ Run the schema initialization command against the shared database:
 uv run python -m platform_api.cli init-db
 ```
 
-This verifies that the `platform` schema is absent or empty, acquires an exclusive advisory lock, and applies the independent platform metadata and `schema_info` record (version `platform-v1`) atomically. A nonempty unknown `platform` schema or a mismatched recorded schema fails with `SCHEMA_MISMATCH`; the command never repairs or converts local or Phoenix tables.
+This verifies that the `platform` schema is absent or empty, acquires an exclusive advisory lock, and atomically applies the platform metadata, `schema_info` record (version `platform-v1`), and explicitly configured first tariff. For a fresh schema, set `PLATFORM_INITIAL_SESSION_RATE_MINOR_PER_MINUTE`, `PLATFORM_INITIAL_BILLING_SLICE_MS`, and `PLATFORM_INITIAL_BILLING_PERMIT_TTL_MS` together; `init-db` never invents a rate or billing policy. A nonempty unknown `platform` schema or a mismatched recorded schema fails with `SCHEMA_MISMATCH`; the command never repairs or converts local or Phoenix tables.
 
 ### 2.2 Verify Schema Readiness
 

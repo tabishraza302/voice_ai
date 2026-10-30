@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from platform_api.qa.service import derive_scenarios, select_scenarios
+from platform_api.qa.service import QABranchCoverageLimitError, derive_scenarios, select_scenarios
 
 
 FLOW_PATH = Path(__file__).parents[1] / "fixtures" / "flow" / "valid-loan-en-hi.json"
@@ -106,12 +106,11 @@ def test_unknown_frozen_scenario_is_rejected() -> None:
         )
 
 
-def test_scenario_expansion_is_capped_without_reordering_the_regression_prefix() -> None:
+def test_scenario_limit_rejects_incomplete_reachable_branch_coverage() -> None:
     flow = _flow()
-    all_scenarios = derive_scenarios(flow, flow_hash="d" * 64, max_scenarios=64)
-    bounded = derive_scenarios(flow, flow_hash="d" * 64, max_scenarios=3)
+    bounded = derive_scenarios(flow, flow_hash="d" * 64, max_scenarios=10)
+    assert len(bounded) == 10
+    assert all(scenario.kind == "branch" for scenario in bounded)
 
-    assert len(bounded) == 3
-    assert [item.scenario_id for item in bounded] == [
-        item.scenario_id for item in all_scenarios[:3]
-    ]
+    with pytest.raises(QABranchCoverageLimitError):
+        derive_scenarios(flow, flow_hash="d" * 64, max_scenarios=3)

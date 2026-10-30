@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -1152,7 +1153,17 @@ async def test_chat_rejects_new_tests_with_stale_policy_but_pins_existing_sessio
     assert policy_text not in str(model_client.calls[-1]["messages"])
 
 
-async def test_model_client_omits_unsupported_structured_output_option(monkeypatch, test_platform_settings: PlatformSettings):
+def _model_client_settings() -> PlatformSettings:
+    return PlatformSettings(
+        database_url="postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai_test",
+        auth_csrf_key=base64.urlsafe_b64encode(b"C" * 32).decode("ascii"),
+        auth_rate_key=base64.urlsafe_b64encode(b"R" * 32).decode("ascii"),
+        auth_mfa_key=base64.urlsafe_b64encode(b"M" * 32).decode("ascii"),
+    )
+
+
+async def test_model_client_omits_unsupported_structured_output_option(monkeypatch):
+    test_platform_settings = _model_client_settings()
     settings = test_platform_settings.model_copy(
         update={"runtime_llm_base_url": "http://127.0.0.1:11434/v1"}
     )
@@ -1201,7 +1212,8 @@ async def test_model_client_omits_unsupported_structured_output_option(monkeypat
     assert "response_format" not in requests[0]
 
 
-async def test_model_client_exposes_safe_upstream_http_status(monkeypatch, test_platform_settings: PlatformSettings):
+async def test_model_client_exposes_safe_upstream_http_status(monkeypatch):
+    test_platform_settings = _model_client_settings()
     settings = test_platform_settings.model_copy(
         update={"runtime_llm_base_url": "http://127.0.0.1:11434/v1"}
     )

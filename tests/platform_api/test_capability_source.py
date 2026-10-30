@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import json
+
 from dataclasses import replace
 
 import pytest
@@ -71,6 +73,14 @@ def _write_report(tmp_path, report: CapabilityReport):
         encoding="utf-8",
     )
     return path
+
+def _test_settings() -> PlatformSettings:
+    return PlatformSettings(
+        database_url="postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai_test",
+        auth_csrf_key=base64.urlsafe_b64encode(b"C" * 32).decode("ascii"),
+        auth_rate_key=base64.urlsafe_b64encode(b"R" * 32).decode("ascii"),
+        auth_mfa_key=base64.urlsafe_b64encode(b"M" * 32).decode("ascii"),
+    )
 
 
 def test_missing_deployment_report_does_not_create_capabilities() -> None:
@@ -175,9 +185,8 @@ def test_voice_settings_must_match_the_pinned_report_tuple() -> None:
 
 
 
-def test_publication_context_requires_exact_trusted_deployment_identity(
-    test_platform_settings: PlatformSettings,
-) -> None:
+def test_publication_context_requires_exact_trusted_deployment_identity() -> None:
+    test_platform_settings = _test_settings()
     report = _unqualified_report()
     settings = test_platform_settings.model_copy(
         update={
@@ -271,9 +280,8 @@ def test_report_with_boolean_protocol_version_is_rejected(tmp_path) -> None:
         load_deployment_capability_report(str(path), report.report_hash)
 
 
-def test_report_path_and_hash_must_be_configured_together(
-    test_platform_settings: PlatformSettings,
-) -> None:
+def test_report_path_and_hash_must_be_configured_together() -> None:
+    test_platform_settings = _test_settings()
     settings = test_platform_settings.model_dump()
     settings["adapter_capability_report_path"] = "/qualification/report.json"
 

@@ -68,7 +68,7 @@ The backup is a repeatable-read snapshot. Check returned size, table counts, ela
 
 ## Restore drill or recovery
 
-Restore is only into a separate empty target database. The command initializes the current schema, verifies all platform tables are empty, checks archive schema/version/hash/contents and restores in a transaction; it never merges or drops a database. Restore audit `ops.backup.restored` commits with restored rows.
+Restore is only into a separate empty target database. The command validates the archive before creating the current schema in restore-staging mode without a tariff seed, verifies all platform tables are empty, and restores the archived rows—including the active tariff—in one transaction; it never merges or drops a database. Restore audit `ops.backup.restored` commits with restored rows.
 
 1. Obtain incident/change approval. Have the database owner prepare a **new disposable target database**, and provide its URL only through `PLATFORM_RESTORE_DATABASE_URL`. Confirm it is not the app database. Never route live traffic to a drill target.
 2. Use the matching application version and a protected archive path.
@@ -182,8 +182,12 @@ copy, rename, or edit evidence files.
 Review `manifest.json` and `result.json`. Every required gate must be
 `passed`, and every gate must have a status and reason. Confirm the manifest
 commit is the candidate commit, `playwright_dev.json` and
-`playwright_tls.json` are raw reports from the two browser journeys, and
-`deployment-preflight.json` records live endpoint and disabled-flag checks.
+`playwright_tls.json` are raw reports from the two browser journeys.
+`deployment-preflight.json` records the authenticated live endpoint and
+disabled-flag checks before the voice lanes. After both voice profiles pass,
+`deployment-post-voice-recheck.json` must record a separate, fresh authenticated
+check of the same live endpoints and flags; preserve both reports and confirm
+all three public, paid, and gateway flags are explicitly `false`.
 Profile-specific `adapter-qualification-<profile>.json` reports must contain
 all seven actual scenario results and an authenticated live execution ledger:
 a runner-minted execution UUID, per-scenario runtime traces, server event and

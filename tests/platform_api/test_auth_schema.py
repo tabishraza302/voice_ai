@@ -253,7 +253,9 @@ async def test_schema_lifecycle_contract(fresh_pg: FreshPostgres):
     Uses the isolated disposable PostgreSQL database from fresh_pg fixture.
     """
     metadata_hash = compute_metadata_hash(Base.metadata)
-    assert {"session_tariff_versions", "active_session_tariff"} <= set(Base.metadata.tables)
+    assert {"session_tariff_versions", "active_session_tariff"} <= {
+        table.name for table in Base.metadata.tables.values()
+    }
 
     # Missing bootstrap values must not invent a price or create a partial schema.
     with pytest.raises(SchemaMismatch, match="explicit initial session rate"):
@@ -355,7 +357,7 @@ async def test_schema_concurrent_initialization(fresh_pg: FreshPostgres):
 @pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_schema_mismatch_refusal(fresh_pg: FreshPostgres):
-    """Detect and reject missing required tables, extra unexpected tables, and unexpected views within platform schema."""
+    """Detect and reject missing tables, extra tables, views, and sequences in the platform schema."""
     metadata_hash = compute_metadata_hash(Base.metadata)
 
     # Initialize clean schema
@@ -390,6 +392,15 @@ async def test_schema_mismatch_refusal(fresh_pg: FreshPostgres):
 
     assert await check_schema_readiness(fresh_pg.engine) is False
     with pytest.raises(SchemaMismatch):
+        await initialize_schema(fresh_pg.engine, metadata_hash=metadata_hash)
+
+    # 4. Owned sequences for metadata-generated columns are valid; an extra sequence is not.
+    async with fresh_pg.engine.begin() as conn:
+        await conn.execute(text("DROP VIEW platform.unexpected_view"))
+        await conn.execute(text("CREATE SEQUENCE platform.unexpected_extra_sequence"))
+
+    assert await check_schema_readiness(fresh_pg.engine) is False
+    with pytest.raises(SchemaMismatch, match="Unexpected sequences"):
         await initialize_schema(fresh_pg.engine, metadata_hash=metadata_hash)
 
 
