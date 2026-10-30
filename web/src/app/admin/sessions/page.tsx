@@ -6,7 +6,7 @@ import { AdminGate } from "@/components/AdminGate";
 import { useAuth } from "@/lib/auth-state";
 import { PlatformApiError, platformApi } from "@/lib/platform-api-client";
 import { formatMinorCurrency, formatPlatformDate } from "@/lib/platform-format";
-import type { AdminSessionDetail, AdminSessionItem, AdminSessionPage, TranscriptPageView } from "@/types/platform";
+import type { AdminSessionDetail, AdminSessionItem, AdminSessionPage, SessionKind, TranscriptPageView } from "@/types/platform";
 
 const TERMINABLE_STATES: Record<string, true> = {
   REGISTERED: true,
@@ -56,7 +56,7 @@ function AdminSessionsContent() {
         limit: 25,
         owner_user_id: appliedFilters.ownerId || undefined,
         state: appliedFilters.state || undefined,
-        kind: appliedFilters.kind || undefined,
+        kind: (appliedFilters.kind as SessionKind) || undefined,
       });
       setPage(result);
       setSessions((current) => append ? [...current, ...result.items] : result.items);
