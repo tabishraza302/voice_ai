@@ -20,7 +20,6 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Mapped, mapped_column
 
 from platform_api.db.base import Base
-from platform_api.models.session import Session
 
 
 class RunnerCapacity(Base):
@@ -290,6 +289,8 @@ class SessionPeer(Base):
         ),
         CheckConstraint("length(runner_id) BETWEEN 1 AND 64", name="ck_session_peers_runner_id"),
     )
+
+from platform_api.models.session import Session  # noqa: E402
 
 
 __all__ = [

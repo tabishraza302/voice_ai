@@ -1,7 +1,7 @@
 """Session-bound admission and peer lifecycle for the production voice runner."""
 
 from __future__ import annotations
-
+from dataclasses import dataclass, field
 import asyncio
 import hashlib
 import hmac

@@ -487,6 +487,17 @@ async def test_installed_session_flow_hooks_gate_and_preserve_controller_speech(
     runtime.authorize_speech()
     await start_task
     await runtime.accept_transcription("Please begin.")
+    state = runtime.state
+    await runtime.apply_event(
+        LocaleChangedEvent(
+            event_id="locale-hi",
+            session_id="session-1",
+            transport_epoch="epoch-1",
+            turn_id=state.last_accepted_turn_id,
+            generation_id=state.generation_id,
+            locale="hi",
+        )
+    )
     await output.process_frame(LLMFullResponseStartFrame(), FrameDirection.DOWNSTREAM)
     preview = LLMTextFrame("unauthorized model preview")
     await output.process_frame(preview, FrameDirection.DOWNSTREAM)

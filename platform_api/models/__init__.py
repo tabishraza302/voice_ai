@@ -19,10 +19,10 @@ from platform_api.models.auth import (
     AuthToken,
     User,
 )
+from platform_api.models.session import Session
 from platform_api.sessions.models import (
     RunnerCapacity,
     RuntimeRegistration,
-    Session,
     SessionJoinJti,
     SessionParticipant,
     SessionPeer,
