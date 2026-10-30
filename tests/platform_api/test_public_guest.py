@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from datetime import datetime, timedelta, timezone
 import uuid
@@ -14,6 +15,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from pydantic import SecretStr
 from sqlalchemy import select
 
+from platform_api.auth.errors import DependencyUnavailableError
 from platform_api.agents.models import Agent, AgentVersion
 from platform_api.app import create_app
 from platform_api.auth.sessions import create_authenticated_session
@@ -27,6 +29,7 @@ from platform_api.sessions.models import (
     SessionParticipant,
     SessionPeer,
 )
+from platform_api.sessions.admission import public_session_admission_config
 from tests.support.billing import create_funded_wallet, create_test_user
 from tests.support.postgres import FreshPostgres
 
@@ -58,7 +61,7 @@ async def guest_client(
             "session_runner_capacity": 4,
             "session_owner_capacity": 3,
             "session_signaling_url": "http://127.0.0.1:43001/signal",
-            "public_signaling_url": "ws://127.0.0.1:43001/public-signal",
+            "public_signaling_url": "https://127.0.0.1:43001/api/offer",
             "session_join_issuer": "platform-task7-test",
             "session_join_private_key_b64": SecretStr(
                 base64.urlsafe_b64encode(private_bytes).decode("ascii").rstrip("=")
@@ -76,7 +79,7 @@ async def guest_client(
             "billing_slice_ms": 1000,
             "billing_permit_ttl_ms": 60_000,
             "public_admission_ip_limit": 20,
-            "public_admission_deployment_limit": 20,
+            "public_admission_agent_limit": 20,
             "public_admission_window_seconds": 60,
             "public_tls_qualified": True,
             "public_turn_qualified": True,
@@ -134,6 +137,27 @@ async def guest_client(
             base_url="http://127.0.0.1:8000",
         ) as client:
             yield client, settings
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "signaling_url",
+    [
+        "http://127.0.0.1:43001/api/offer",
+        "https://127.0.0.1:43001/signal",
+        "https://127.0.0.1:43001/api/offer?target=runner",
+    ],
+)
+async def test_public_signaling_requires_https_api_offer(
+    guest_client,
+    signaling_url: str,
+):
+    _client, settings = guest_client
+    invalid_settings = settings.model_copy(update={"public_signaling_url": signaling_url})
+
+    with pytest.raises(DependencyUnavailableError):
+        public_session_admission_config(invalid_settings)
 
 
 async def _owner_and_agent(
@@ -282,6 +306,9 @@ async def test_guest_admission_uses_deployment_owner_and_scopes_capability_to_on
         client, agent_id=agent_b, owner_headers=owner_headers_b, key="guest-deploy-b"
     )
     assert public_a != public_b
+
+    browser_bootstrap = await client.get(f"/api/v1/public/deployments/{public_a}")
+    assert browser_bootstrap.status_code == 200
     assert public_a != str(agent_a)
 
     # Caller-supplied owner, agent, and version identifiers are rejected, not trusted.
@@ -310,7 +337,7 @@ async def test_guest_admission_uses_deployment_owner_and_scopes_capability_to_on
     assert "agent_version_id" not in body_a
     assert "participant_id" not in body_a
     assert "auth_session_id" not in body_a
-    assert body_a["signaling_url"].startswith("ws://127.0.0.1:")
+    assert body_a["signaling_url"] == "https://127.0.0.1:43001/api/offer"
 
     session_a_id = uuid.UUID(body_a["session_id"])
     async with initialized_pg.sessions() as db:
@@ -352,20 +379,33 @@ async def test_guest_admission_uses_deployment_owner_and_scopes_capability_to_on
         assert wallet_a.reserved_minor > 0
         assert wallet_b.reserved_minor > 0
 
-    set_cookie = admitted_a.headers["set-cookie"]
     assert "httponly" in set_cookie.lower()
     assert "samesite=strict" in set_cookie.lower()
+    assert (
+        f"path=/api/v1/guest/sessions/{body_a['session_id']}"
+        in set_cookie.lower()
+    )
     assert body_a["csrf_token"]
 
     # A guest capability cannot be moved to another session or an owner-only history route.
     guest_cookie = set_cookie.split(";", 1)[0]
     status_a = await client.get(
+        f"/api/v1/guest/sessions/{body_a['session_id']}/status",
+        headers={"Origin": settings.web_origin},
+    )
+    assert status_a.status_code == 200
+
+    same_origin_status = await client.get(
+        f"/api/v1/guest/sessions/{body_a['session_id']}/status",
+    )
+    assert same_origin_status.status_code == 200
+    legacy_status = await client.get(
         f"/api/v1/public/sessions/{body_a['session_id']}",
         headers={"Origin": settings.web_origin, "Cookie": guest_cookie},
     )
-    assert status_a.status_code == 200
+    assert legacy_status.status_code == 404
     status_b_with_a_capability = await client.get(
-        f"/api/v1/public/sessions/{body_b['session_id']}",
+        f"/api/v1/guest/sessions/{body_b['session_id']}/status",
         headers={"Origin": settings.web_origin, "Cookie": guest_cookie},
     )
     assert status_b_with_a_capability.status_code in {401, 404}
@@ -443,6 +483,96 @@ async def test_public_origin_csrf_disclosure_and_rate_limits_are_enforced(
 
 @pytest.mark.postgres
 @pytest.mark.asyncio
+async def test_guest_agent_quota_is_shared_across_deployment_links(
+    guest_client,
+    initialized_pg: FreshPostgres,
+):
+    client, settings = guest_client
+    _owner, agent_id, _version_id, owner_headers = await _owner_and_agent(
+        initialized_pg,
+        settings,
+        client,
+        email="guest-shared-agent-rate@example.com",
+    )
+    public_a = await _create_deployment(
+        client, agent_id=agent_id, owner_headers=owner_headers, key="shared-link-a"
+    )
+    public_b = await _create_deployment(
+        client, agent_id=agent_id, owner_headers=owner_headers, key="shared-link-b"
+    )
+    assert public_a != public_b
+
+    limited_settings = settings.model_copy(
+        update={"public_admission_agent_limit": 1, "public_admission_ip_limit": 20}
+    )
+    client._transport.app.state.settings = limited_settings
+    first, second = await asyncio.gather(
+        _bootstrap_and_admit(
+            client, limited_settings, public_a, key="shared-agent-a"
+        ),
+        _bootstrap_and_admit(
+            client, limited_settings, public_b, key="shared-agent-b"
+        ),
+    )
+
+    assert sorted((first.status_code, second.status_code)) == [201, 429]
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    [
+        f"/api/v1/public/deployments/{'p' * 32}/sessions",
+        "/api/v1/guest/sessions/00000000-0000-0000-0000-000000000001/reconnect-token",
+    ],
+)
+async def test_oversized_public_guest_posts_are_rejected_before_body_parsing(
+    guest_client,
+    path: str,
+):
+    client, settings = guest_client
+    response = await client.post(
+        path,
+        content=b"not-json-" * 1024,
+        headers={
+            "Origin": settings.web_origin,
+            "Content-Type": "application/json",
+        },
+    )
+
+    assert response.status_code == 413
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_chunked_public_guest_post_is_bounded_before_body_parsing(guest_client):
+    client, settings = guest_client
+
+    class ChunkedBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'{"payload":"' + b"x" * 4096
+            yield b"x" * 4096
+            yield b'"}'
+
+        async def aclose(self) -> None:
+            return None
+
+    response = await client.post(
+        f"/api/v1/public/deployments/{'c' * 32}/sessions",
+        content=ChunkedBody(),
+        headers={
+            "Origin": settings.web_origin,
+            "Content-Type": "application/json",
+            "Transfer-Encoding": "chunked",
+        },
+    )
+
+    assert response.status_code == 413
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
 async def test_disabled_deployment_blocks_new_calls_and_reconnect_but_allows_end(
     guest_client,
     initialized_pg: FreshPostgres,
@@ -500,7 +630,7 @@ async def test_disabled_deployment_blocks_new_calls_and_reconnect_but_allows_end
         await db.commit()
 
     reconnect = await client.post(
-        f"/api/v1/public/sessions/{session_id}/reconnect",
+        f"/api/v1/guest/sessions/{session_id}/reconnect-token",
         headers={
             "Origin": settings.web_origin,
             "Cookie": guest_cookie,
@@ -513,7 +643,7 @@ async def test_disabled_deployment_blocks_new_calls_and_reconnect_but_allows_end
     assert reconnect.status_code == 409
 
     ended = await client.post(
-        f"/api/v1/public/sessions/{session_id}/end",
+        f"/api/v1/guest/sessions/{session_id}/end",
         headers={
             "Origin": settings.web_origin,
             "Cookie": guest_cookie,
@@ -527,7 +657,7 @@ async def test_disabled_deployment_blocks_new_calls_and_reconnect_but_allows_end
     assert ended.json()["state"] == "ENDING"
 
     owner_status = await client.get(
-        f"/api/v1/public/sessions/{session_id}",
+        f"/api/v1/guest/sessions/{session_id}/status",
         headers={"Origin": settings.web_origin, "Cookie": guest_cookie},
     )
     assert owner_status.status_code == 200
@@ -566,7 +696,7 @@ async def test_expired_guest_capability_is_rejected_and_revoked_on_terminal_stat
         await db.commit()
 
     expired = await client.get(
-        f"/api/v1/public/sessions/{session_id}",
+        f"/api/v1/guest/sessions/{session_id}/status",
         headers={"Origin": settings.web_origin, "Cookie": guest_cookie},
     )
     assert expired.status_code == 401

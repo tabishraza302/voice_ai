@@ -132,17 +132,18 @@ def public_session_admission_config(
     production = settings.env in {"staging", "production"}
     if (
         host is None
+        or parsed.scheme != "https"
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
         or parsed.fragment
-        or parsed.path in {"", "/"}
+        or parsed.path != "/api/offer"
         or len(value) > 512
-        or (production and (parsed.scheme != "wss" or loopback))
-        or (not production and (parsed.scheme not in {"ws", "wss"} or not loopback))
+        or (production and loopback)
+        or (not production and not loopback)
     ):
         raise DependencyUnavailableError(
-            "Public signaling must be a qualified WSS endpoint outside development"
+            "Public signaling must be an HTTPS /api/offer endpoint"
         )
     if production and (
         not settings.public_tls_qualified
