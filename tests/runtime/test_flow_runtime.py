@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import pathlib
@@ -443,3 +444,71 @@ async def test_builder_places_flow_processors_on_real_pipeline_boundaries(monkey
     assert llm < index(lambda p: isinstance(p, FlowOutputProcessor)) < router
     assert tts < index(lambda p: isinstance(p, FlowAudioProcessor)) < transport_output
     assert isinstance(processors[-1], PipelineSink)
+
+@pytest.mark.asyncio
+async def test_installed_session_flow_hooks_gate_and_preserve_controller_speech(monkeypatch):
+    fake_stt = FrameProcessor(name="fake-stt")
+    fake_llm = FrameProcessor(name="fake-llm")
+    fake_tts = FrameProcessor(name="fake-tts")
+    monkeypatch.setattr("bot.runtime.pipeline_builder.build_stt", lambda settings: fake_stt)
+    monkeypatch.setattr("bot.runtime.pipeline_builder.build_llm", lambda settings: fake_llm)
+    monkeypatch.setattr("bot.runtime.pipeline_builder.build_tts", lambda settings: fake_tts)
+
+    gate = asyncio.Event()
+    runtime = FlowRuntime(
+        compile_flow(_simple_flow()),
+        "session-1",
+        "epoch-1",
+        session_managed=True,
+        speech_authorization_gate=gate,
+    )
+    assembly = build_voice_pipeline(
+        FakeTransport(),
+        Settings(_env_file=None, enable_tracing=False),
+        flow_hooks=runtime,
+        instruments=PrometheusObserver(),
+    )
+    output = next(
+        processor
+        for processor in assembly.processors
+        if isinstance(processor, FlowOutputProcessor)
+    )
+    forwarded: list[Any] = []
+    _record_push(output, forwarded)
+
+    start_task = asyncio.create_task(
+        output.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
+    )
+    await runtime.wait_for_pipeline_start()
+    await asyncio.sleep(0)
+    assert not start_task.done()
+    assert not any(isinstance(frame, TextFrame) for frame, _ in forwarded)
+
+    runtime.authorize_speech()
+    await start_task
+    await runtime.accept_transcription("Please begin.")
+    await output.process_frame(LLMFullResponseStartFrame(), FrameDirection.DOWNSTREAM)
+    preview = LLMTextFrame("unauthorized model preview")
+    await output.process_frame(preview, FrameDirection.DOWNSTREAM)
+    await output.process_frame(LLMFullResponseEndFrame(), FrameDirection.DOWNSTREAM)
+
+    assert not any(frame is preview for frame, _ in forwarded)
+    assert any(
+        isinstance(frame, TextFrame)
+        and frame.metadata.get("flow_fragment")
+        for frame, _ in forwarded
+    )
+
+def test_flow_runtime_detaches_compiled_input_and_returned_snapshots():
+    compiled = compile_flow(_simple_flow())
+    runtime = FlowRuntime(compiled, "session-1", "epoch-1")
+    original_title = runtime.compiled_snapshot.normalized["steps"][0]["title"]
+
+    compiled.normalized["steps"][0]["title"] = "caller mutation"
+    detached = runtime.compiled_snapshot
+    detached.normalized["steps"][0]["title"] = "snapshot mutation"
+    state = runtime.state
+    state.locale = "hi"
+
+    assert runtime.compiled_snapshot.normalized["steps"][0]["title"] == original_title
+    assert runtime.state.locale == "en"

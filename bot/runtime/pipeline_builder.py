@@ -116,9 +116,9 @@ class VoicePipelineAssembly:
             await self.runner.run()
         finally:
             try:
-                close_flow = getattr(self.flow_hooks, "close", None)
-                if callable(close_flow):
-                    await close_flow()
+                end_pipeline = getattr(self.flow_hooks, "end_pipeline", None)
+                if callable(end_pipeline):
+                    await end_pipeline()
             finally:
                 await self.prometheus_observer.stop_memory_sampling()
 

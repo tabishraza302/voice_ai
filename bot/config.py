@@ -237,3 +237,15 @@ class Settings(BaseSettings):
     # Local browser Studio port. The launch script exports this same setting
     # to both Next.js and the agent's CORS allowlist.
     web_port: int = Field(default=3001, ge=1, le=65535)
+
+    # --- Optional platform session bridge -------------------------------
+    # These settings are read only by the session-owned runtime path. They
+    # remain optional so the legacy local runner is unaffected when the
+    # platform bridge is not installed.
+    platform_api_base_url: str | None = None
+    platform_session_runner_id: str | None = None
+    platform_runtime_service_token: str | None = None
+    platform_web_origin: str | None = None
+    platform_billing_slice_ms: str | None = None
+    platform_billing_permit_ttl_ms: str | None = None
+    platform_session_runtime_timeout_seconds: str | None = None

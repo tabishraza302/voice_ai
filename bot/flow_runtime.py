@@ -97,7 +97,6 @@ _FLOW_CONTEXT_INSTRUCTIONS = (
     "controller-authorized message says so. Ask about the current objective "
     "and use the user's language. Data: "
 )
-_OUTPUT_STEP_TYPES = frozenset({"inform", "summary", "end"})
 
 
 def _event_id() -> str:
@@ -194,6 +193,11 @@ class FlowRuntime:
         state: SessionState | None = None,
         event_store: FlowEventStore | None = None,
         transport_event_verifier: TransportEventVerifier | None = None,
+        session_managed: bool = False,
+        speech_authorization_gate: asyncio.Event | None = None,
+        playback_cursor: Any | None = None,
+        playback_receipt_verifier: Any | None = None,
+        playback_marker_sender: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> None:
         if not session_id or not session_id.strip():
             raise ValueError("FlowRuntime requires a non-empty session_id")
@@ -201,32 +205,48 @@ class FlowRuntime:
             raise ValueError("FlowRuntime requires a non-empty transport_epoch")
         if locale not in ("en", "hi"):
             raise ValueError("FlowRuntime locale must be 'en' or 'hi'")
-
-        self.compiled = compiled
+        self.compiled = compiled.model_copy(deep=True)
         self.session_id = session_id.strip()
         self.transport_epoch = transport_epoch.strip()
         self._event_store = event_store
-        self._transport_event_verifier = transport_event_verifier
+        self._playback_receipt_verifier = playback_receipt_verifier
+        self._transport_event_verifier = (
+            transport_event_verifier
+            if transport_event_verifier is not None
+            else getattr(playback_receipt_verifier, "verify_event", None)
+        )
+        self._playback_cursor = playback_cursor
+        self._playback_marker_sender = playback_marker_sender
+        self._playback_active_generations: set[str] = set()
+        self._session_managed = session_managed
+        self._speech_authorization_gate = speech_authorization_gate
+        self._speech_authorized = speech_authorization_gate is None
+        self._pipeline_ended = False
+        self._pipeline_started = asyncio.Event()
         self._lock = asyncio.Lock()
-        self._state = state or initial_session_state(
-            compiled,
-            self.session_id,
-            transport_epoch=self.transport_epoch,
-            locale=locale,
+        self._state = (
+            state.model_copy(deep=True)
+            if state is not None
+            else initial_session_state(
+                self.compiled,
+                self.session_id,
+                transport_epoch=self.transport_epoch,
+                locale=locale,
+            )
         )
         if self._state.session_id != self.session_id:
             raise ValueError("restored SessionState belongs to a different session")
         if self._state.transport_epoch != self.transport_epoch:
             raise ValueError("restored SessionState belongs to a different transport epoch")
-        if self._state.flow_hash != compiled.flow_hash:
+        if self._state.flow_hash != self.compiled.flow_hash:
             raise ValueError("restored SessionState belongs to a different flow hash")
-        if self._state.artifact_hash != compiled.artifact_hash:
+        if self._state.artifact_hash != self.compiled.artifact_hash:
             raise ValueError("restored SessionState belongs to a different artifact hash")
         if self._state.locale != locale and state is None:
             raise ValueError("initial SessionState locale does not match runtime locale")
 
         self._steps_by_id = {
-            step["id"]: step for step in compiled.normalized.get("steps", [])
+            step["id"]: step for step in self.compiled.normalized.get("steps", [])
         }
         self._turn_sequence = len(self._state.turn_history)
         self._generation_sequence = self._sequence_from_id(
@@ -234,7 +254,7 @@ class FlowRuntime:
         )
         self._event_hashes: dict[str, str] = {}
         self._manifest_hashes: dict[str, str] = {}
-        self._welcome = compiled.normalized.get("welcome")
+        self._welcome = self.compiled.normalized.get("welcome")
         self._welcome_question_step_id = (
             self._welcome.get("question_step_id")
             if isinstance(self._welcome, dict)
@@ -279,6 +299,72 @@ class FlowRuntime:
     def state(self) -> SessionState:
         """A detached snapshot; callers cannot mutate the authoritative state."""
         return self._state.model_copy(deep=True)
+
+    @property
+    def compiled_snapshot(self) -> CompiledFlow:
+        """A detached copy of the compiled artifact owned by this runtime."""
+        return self.compiled.model_copy(deep=True)
+
+    async def wait_for_speech_authorization(self) -> bool:
+        """Wait until the session controller authorizes output speech."""
+        gate = self._speech_authorization_gate
+        if gate is not None:
+            await gate.wait()
+        return self._speech_authorized
+
+    def authorize_speech(self) -> None:
+        """Release startup speech after the platform session is ACTIVE."""
+        self._speech_authorized = True
+        if self._speech_authorization_gate is not None:
+            self._speech_authorization_gate.set()
+
+    def deny_speech(self) -> None:
+        """Unblock startup without authorizing speech during teardown."""
+        self._speech_authorized = False
+        if self._speech_authorization_gate is not None:
+            self._speech_authorization_gate.set()
+
+    def mark_pipeline_started(self) -> None:
+        """Signal that the installed pipeline has delivered its StartFrame."""
+        self._pipeline_started.set()
+
+    async def wait_for_pipeline_start(self) -> None:
+        """Wait for the production pipeline to reach its flow output hook."""
+        await self._pipeline_started.wait()
+
+    async def rebind_transport_epoch(
+        self,
+        transport_epoch: str,
+        speech_authorization_gate: asyncio.Event,
+        *,
+        playback_receipt_verifier: Any | None = None,
+    ) -> None:
+        """Keep flow state across a live-session reconnect but reject old-epoch output."""
+        if not self._session_managed:
+            raise RuntimeError("Only a session-managed FlowRuntime can be rebound")
+        if not transport_epoch or not transport_epoch.strip():
+            raise ValueError("FlowRuntime requires a non-empty transport_epoch")
+        if not self._pipeline_ended:
+            await self.interrupt()
+        async with self._lock:
+            if self._closed or self._state.teardown_emitted:
+                raise RuntimeError("A terminated FlowRuntime cannot be reconnected")
+            self.transport_epoch = transport_epoch.strip()
+            self._state = self._state.model_copy(
+                update={"transport_epoch": self.transport_epoch},
+                deep=True,
+            )
+            self._teardown_callbacks.clear()
+            self._pipeline_ended = False
+            self._speech_authorization_gate = speech_authorization_gate
+            self._speech_authorized = False
+            self._pipeline_started = asyncio.Event()
+            if playback_receipt_verifier is not None:
+                self._playback_receipt_verifier = playback_receipt_verifier
+                self._transport_event_verifier = playback_receipt_verifier.verify_event
+                self._playback_cursor = None
+                self._playback_marker_sender = None
+                self._playback_active_generations.clear()
 
     @property
     def durable(self) -> bool:
@@ -388,6 +474,165 @@ class FlowRuntime:
     def audio_processor(self) -> FrameProcessor:
         """Bind TTS text and audio frames to their controller SpeechFragment."""
         return FlowAudioProcessor(self)
+
+    def configure_playback(
+        self,
+        *,
+        cursor: Any,
+        verifier: Any,
+        marker_sender: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        """Bind actual transport cursor and receipt verifier for this peer."""
+        if not self._session_managed:
+            raise RuntimeError("Only a platform session can install qualified playback")
+        if not self._event_store or not callable(getattr(verifier, "verify_event", None)):
+            raise RuntimeError("Qualified playback requires durable storage and a trusted verifier")
+        if not callable(getattr(cursor, "begin_fragment", None)) or not callable(
+            getattr(cursor, "finish_fragment", None)
+        ):
+            raise RuntimeError("Qualified playback requires a fragment sample cursor")
+        self._playback_cursor = cursor
+        self._playback_receipt_verifier = verifier
+        self._transport_event_verifier = verifier.verify_event
+        self._playback_marker_sender = marker_sender
+        self._playback_active_generations.clear()
+
+    async def begin_playback_fragment(self, fragment: SpeechFragment) -> Any | None:
+        """Bind a controller fragment before its TTS audio enters the transport."""
+        cursor = self._playback_cursor
+        verifier = self._playback_receipt_verifier
+        if cursor is None or verifier is None:
+            if self._session_managed:
+                raise RuntimeError("Session playback verifier was not installed")
+            return None
+        report_hash = self.compiled.manifest.get("adapter_qualification_references")
+        if not isinstance(report_hash, str) or not report_hash or report_hash == "0" * 64:
+            raise RuntimeError("Controller speech has no qualified adapter binding")
+        from bot.flow.playback_receipts import PlaybackBinding
+
+        binding = PlaybackBinding(
+            session_id=fragment.session_id,
+            transport_epoch=fragment.transport_epoch,
+            turn_id=fragment.turn_id,
+            generation_id=fragment.generation_id,
+            manifest_id=fragment.manifest_id,
+            fragment_id=fragment.fragment_id,
+            content_hash=fragment.content_hash,
+            capability_report_hash=report_hash,
+        )
+        if fragment.generation_id not in self._playback_active_generations:
+            result = verifier.activate_generation(fragment.turn_id, fragment.generation_id)
+            if inspect.isawaitable(result):
+                await result
+            self._playback_active_generations.add(fragment.generation_id)
+        result = cursor.begin_fragment(binding)
+        if inspect.isawaitable(result):
+            await result
+        return binding
+
+    async def finish_playback_fragment(
+        self,
+        fragment: SpeechFragment,
+        binding: Any | None,
+    ) -> bool:
+        """Persist a real queued range and publish its receipt marker."""
+        if binding is None:
+            return False
+        cursor = self._playback_cursor
+        verifier = self._playback_receipt_verifier
+        marker_sender = self._playback_marker_sender
+        if cursor is None or verifier is None or marker_sender is None:
+            raise RuntimeError("Session playback integration is incomplete")
+        samples = cursor.finish_fragment(binding)
+        if inspect.isawaitable(samples):
+            samples = await samples
+        if samples is None:
+            return False
+        queue_event = FragmentQueuedOutputEvent(
+            event_id=f"queue_evt:{fragment.fragment_id}",
+            session_id=fragment.session_id,
+            transport_epoch=fragment.transport_epoch,
+            turn_id=fragment.turn_id,
+            generation_id=fragment.generation_id,
+            manifest_id=fragment.manifest_id,
+            fragment_id=fragment.fragment_id,
+        )
+        marker = verifier.register_queued_fragment(queue_event, binding, samples)
+        if inspect.isawaitable(marker):
+            marker = await marker
+        reduction = await self.accept_output_event(queue_event)
+        if reduction.diagnostics:
+            discarded = verifier.discard_queued_fragment(queue_event)
+            if inspect.isawaitable(discarded):
+                await discarded
+            return False
+        confirmed = verifier.confirm_queued_fragment(queue_event)
+        if inspect.isawaitable(confirmed):
+            await confirmed
+        message = marker.to_message()
+        sent = marker_sender(message)
+        if inspect.isawaitable(sent):
+            await sent
+        return True
+
+    async def cancel_playback_generation(self, generation_id: str | None) -> None:
+        """Invalidate old-epoch receipts and send only observed cancellation ranges."""
+        if not generation_id:
+            return
+        self._playback_active_generations.discard(generation_id)
+        verifier = self._playback_receipt_verifier
+        cursor = self._playback_cursor
+        if verifier is None and cursor is None:
+            return
+        from bot.flow.playback_receipts import merge_playback_cancellations
+
+        verifier_cancel = None
+        cursor_cancel = None
+        cancel_verifier = getattr(verifier, "cancel_generation", None)
+        if callable(cancel_verifier):
+            verifier_cancel = cancel_verifier(generation_id)
+            if inspect.isawaitable(verifier_cancel):
+                verifier_cancel = await verifier_cancel
+        cancel_cursor = getattr(cursor, "cancel_generation", None)
+        if callable(cancel_cursor):
+            cursor_cancel = cancel_cursor(generation_id)
+            if inspect.isawaitable(cursor_cancel):
+                cursor_cancel = await cursor_cancel
+        cancellation = merge_playback_cancellations(verifier_cancel, cursor_cancel)
+        if cancellation is None:
+            return
+        sender = self._playback_marker_sender
+        if sender is None:
+            raise RuntimeError("Playback cancellation has no ordered control channel")
+        sent = sender(cancellation.to_message())
+        if inspect.isawaitable(sent):
+            await sent
+    async def accept_playback_receipt(
+        self,
+        raw_message: Any,
+        *,
+        sender_peer_id: str,
+    ) -> Reduction | None:
+        """Accept only verifier-minted render receipts from this transport peer."""
+        verifier = self._playback_receipt_verifier
+        if verifier is None:
+            return None
+        record = verifier.accept_render_receipt(
+            raw_message,
+            sender_peer_id=sender_peer_id,
+        )
+        if inspect.isawaitable(record):
+            record = await record
+        if record is None:
+            return None
+        event = record.event
+        reduction = await self.accept_output_event(event)
+        if reduction.diagnostics:
+            return reduction
+        confirmed = verifier.confirm_event_committed(event)
+        if inspect.isawaitable(confirmed):
+            await confirmed
+        return reduction
 
     def register_teardown_callback(self, callback: TeardownCallback) -> None:
         if callback not in self._teardown_callbacks:
@@ -553,6 +798,7 @@ class FlowRuntime:
 
     async def close(self, reason: str = "shutdown") -> Reduction:
         """Record session termination once; an in-flight terminal frame stays authoritative."""
+        self.deny_speech()
         async with self._lock:
             if self._closed or self._state.teardown_emitted:
                 result = self._no_op_locked()
@@ -571,6 +817,27 @@ class FlowRuntime:
                     self._cancelled_generations.add(self._state.generation_id)
                     self._discard_generation_fragments_locked(self._state.generation_id)
         return result
+
+    async def pipeline_ended(self, reason: str) -> None:
+        """End one transport pipeline without ending a reconnectable session."""
+        async with self._lock:
+            if self._pipeline_ended:
+                return
+            self._pipeline_ended = True
+            terminal = self._state.teardown_emitted
+        self.deny_speech()
+        if self._session_managed:
+            if not terminal:
+                await self.interrupt()
+        else:
+            await self.close(reason)
+
+    async def end_pipeline(self) -> None:
+        """Release pipeline callbacks while retaining session state for reconnect."""
+        try:
+            await self.pipeline_ended("pipeline_ended")
+        finally:
+            self._teardown_callbacks.clear()
 
     async def interrupt(self, generation_id: str | None = None) -> None:
         """Discard unplayed output and persist its cancellation under the session lock."""
@@ -634,13 +901,6 @@ class FlowRuntime:
     async def interruption_seen(self, generation_id: str) -> bool:
         async with self._lock:
             return generation_id in self._interrupted_generations
-
-    async def should_suppress_model_speech(self) -> bool:
-        async with self._lock:
-            step = self._steps_by_id.get(self._state.active_step_id or "")
-            if not step or step.get("type") not in _OUTPUT_STEP_TYPES:
-                return False
-            return bool(self._state.active_manifest_id or step.get("messages"))
 
     async def context_payload(self) -> dict[str, Any]:
         async with self._lock:
@@ -1441,7 +1701,9 @@ class FlowInputProcessor(FrameProcessor):
             await self.push_frame(frame, direction)
             return
         if isinstance(frame, (EndFrame, CancelFrame)):
-            await self._runtime.close("pipeline_ended" if isinstance(frame, EndFrame) else "pipeline_cancelled")
+            await self._runtime.pipeline_ended(
+                "pipeline_ended" if isinstance(frame, EndFrame) else "pipeline_cancelled"
+            )
         await self.push_frame(frame, direction)
 
     def _remember_frame_id(self, frame_id: int) -> bool:
@@ -1518,8 +1780,11 @@ class FlowOutputProcessor(FrameProcessor):
                 await self.push_frame(frame, direction)
             return
         if isinstance(frame, StartFrame) and direction == FrameDirection.DOWNSTREAM:
-            fragments = await self._runtime.start()
             await self.push_frame(frame, direction)
+            self._runtime.mark_pipeline_started()
+            if not await self._runtime.wait_for_speech_authorization():
+                return
+            fragments = await self._runtime.start()
             await self._emit_fragments(fragments, direction)
             return
         if isinstance(frame, LLMFullResponseStartFrame):
@@ -1541,9 +1806,6 @@ class FlowOutputProcessor(FrameProcessor):
             self._speech_sequence += 1
             frame.metadata["flow_model_preview"] = True
             frame.append_to_context = False
-            if await self._runtime.should_suppress_model_speech():
-                return
-            await self.push_frame(frame, direction)
             return
         if isinstance(frame, LLMFullResponseEndFrame):
             generation_id = self._response_generation_id
@@ -1595,6 +1857,7 @@ class FlowAudioProcessor(FrameProcessor):
         super().__init__()
         self._runtime = runtime
         self._active_fragment: SpeechFragment | None = None
+        self._active_binding: Any | None = None
         self._audio_correlation_ambiguous = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -1606,19 +1869,29 @@ class FlowAudioProcessor(FrameProcessor):
             try:
                 await self._runtime.interrupt(target)
             finally:
-                if self._active_fragment and self._active_fragment.generation_id == target:
-                    self._active_fragment = None
-                self._audio_correlation_ambiguous = False
-                await self.push_frame(frame, direction)
+                try:
+                    await self._runtime.cancel_playback_generation(target)
+                finally:
+                    if self._active_fragment and self._active_fragment.generation_id == target:
+                        self._active_fragment = None
+                        self._active_binding = None
+                    self._audio_correlation_ambiguous = False
+                    await self.push_frame(frame, direction)
             return
         if isinstance(frame, TTSTextFrame) and direction == FrameDirection.DOWNSTREAM:
             if self._active_fragment is not None:
                 await self._runtime.finish_audio_fragment(self._active_fragment)
+                if not self._audio_correlation_ambiguous:
+                    await self._runtime.finish_playback_fragment(
+                        self._active_fragment, self._active_binding
+                    )
                 self._active_fragment = None
+                self._active_binding = None
                 self._audio_correlation_ambiguous = True
             fragment = await self._runtime.match_tts_text(frame.text)
             if fragment is not None:
                 self._active_fragment = fragment
+                self._active_binding = await self._runtime.begin_playback_fragment(fragment)
                 frame.metadata["flow_fragment"] = self._runtime.fragment_metadata(fragment)
             await self.push_frame(frame, direction)
             return
@@ -1635,10 +1908,20 @@ class FlowAudioProcessor(FrameProcessor):
         if isinstance(frame, TTSStoppedFrame):
             if self._active_fragment:
                 await self._runtime.finish_audio_fragment(self._active_fragment)
+                if not self._audio_correlation_ambiguous:
+                    await self._runtime.finish_playback_fragment(
+                        self._active_fragment, self._active_binding
+                    )
             self._active_fragment = None
+            self._active_binding = None
             self._audio_correlation_ambiguous = False
         if isinstance(frame, (EndFrame, CancelFrame)):
-            await self._runtime.close(
+            await self._runtime.pipeline_ended(
                 "pipeline_ended" if isinstance(frame, EndFrame) else "pipeline_cancelled"
             )
+            await self._runtime.cancel_playback_generation(
+                self._active_fragment.generation_id if self._active_fragment else None
+            )
+            self._active_fragment = None
+            self._active_binding = None
         await self.push_frame(frame, direction)

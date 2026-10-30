@@ -82,7 +82,6 @@ class LanguageRoutingProcessor(FrameProcessor):
         # Whether this reply's first chunk has been spoken yet. Until it
         # has, the deadline can cut the reply short.
         self._first_chunk_spoken = False
-        self._flow_model_preview = False
 
     @property
     def current_script(self) -> Script | None:
@@ -116,7 +115,7 @@ class LanguageRoutingProcessor(FrameProcessor):
                 return
         if isinstance(frame, LLMTextFrame):
             if frame.metadata.get("flow_model_preview"):
-                self._flow_model_preview = True
+                return
             if self._first_token_at is None and not self._aggregation_reported:
                 self._first_token_at = time.monotonic()
             chunks = self._chunker.feed(frame.text)
@@ -151,9 +150,6 @@ class LanguageRoutingProcessor(FrameProcessor):
         # plain text; the model's frames keep their meaning as the model's
         # text.
         speech_frame = TextFrame(sentence)
-        if self._flow_model_preview:
-            speech_frame.append_to_context = False
-            speech_frame.metadata["flow_model_preview"] = True
         await self.push_frame(speech_frame)
         self._first_chunk_spoken = True
 
@@ -182,7 +178,6 @@ class LanguageRoutingProcessor(FrameProcessor):
         self._first_token_at = None
         self._aggregation_reported = False
         self._first_chunk_spoken = False
-        self._flow_model_preview = False
 
     def _first_chunk_pending(self) -> bool:
         """Whether this reply's first chunk has not been spoken yet."""
