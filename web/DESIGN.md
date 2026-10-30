@@ -94,6 +94,7 @@ introduce remote fonts, assets, runtime services, or a second design system.
   describes that agent's role and tone. The call test shows the selected saved
   profile, connection state, and generated/user text with labels that match
   what the runtime actually emits.
+- Flow QA shares the saved-snapshot testing area: list cases before queueing, keep run status and results readable in a compact panel, and make cancellation explicit. Suggestions are clearly marked draft-only, with separate apply and dismiss actions; never publish as a side effect.
 
 ## Tokens
 

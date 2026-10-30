@@ -153,6 +153,139 @@ export interface StartGenerationRequest {
   token_budget: number;
 }
 
+export type QAScenarioKind =
+  | "branch"
+  | "refusal"
+  | "clarification_exit"
+  | "correction"
+  | "out_of_order"
+  | "multi_answer"
+  | "partial_info"
+  | "dependency_invalidation"
+  | "detour"
+  | "contradiction"
+  | "missing_business_fact"
+  | "early_termination"
+  | "prompt_injection";
+export type QAJobStatus = "QUEUED" | "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED" | "EXPIRED";
+
+export interface QAExpectedEdge {
+  from_step_id: string;
+  transition_index: number;
+  to_step_id: string;
+  when: JsonObject;
+}
+
+export interface QAScenarioView {
+  scenario_id: string;
+  case_key: string;
+  kind: QAScenarioKind;
+  expected_edge: QAExpectedEdge | null;
+  target_step_id: string | null;
+  target_fields: string[];
+  task: string;
+}
+
+export interface QACatalogView {
+  scenarios: QAScenarioView[];
+  scenario_count: number;
+  omitted_scenario_count: number;
+  flow_hash: string;
+}
+
+export interface QAJobAccepted {
+  job_id: string;
+  status: "QUEUED";
+}
+
+export interface QAUsage {
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  total_tokens: number | null;
+}
+
+export interface QAResultView {
+  scenario_id: string;
+  kind: QAScenarioKind;
+  status: "PASS" | "FAIL" | "INCONCLUSIVE" | "ERROR";
+  assertion: string;
+  expected_edge: QAExpectedEdge | null;
+  observed_edges: JsonObject[];
+  turn_count: number;
+  token_usage: QAUsage;
+  artifact_id: string | null;
+  failure_code: string | null;
+}
+
+export interface QASuggestionView {
+  suggestion_id: string;
+  status: "DRAFT" | "APPLIED_TO_DRAFT" | "DISMISSED";
+  draft_only: boolean;
+  title: string;
+  summary: string;
+  target_step_id: string | null;
+  target_fields: string[];
+  evidence: JsonObject;
+  proposed_patch: { path: string; append_text: string } | null;
+}
+
+export interface QAJobView {
+  job_id: string;
+  agent_id: string;
+  snapshot_kind: "draft" | "published";
+  snapshot_hash: string;
+  status: QAJobStatus;
+  config_hash: string;
+  rubric_version: string;
+  models: { runtime: string | null; utterance: string | null; judge: string | null };
+  scenarios: QAScenarioView[];
+  results: QAResultView[];
+  suggestions: QASuggestionView[];
+  coverage: JsonObject;
+  budget: {
+    scenario_count: number;
+    max_turns: number;
+    max_tokens: number;
+    max_runtime_seconds: number;
+  };
+  usage: QAUsage | null;
+  failure_code: string | null;
+  runtime_seconds: number | null;
+  artifacts: JsonObject[];
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+export interface StartQAJobRequest {
+  agent_id: string;
+  snapshot_hash: string;
+  scenario_count: number;
+  scenario_ids: string[];
+  max_turns: number;
+  max_tokens: number;
+  max_runtime_seconds: number;
+  utterance_model_id: string;
+  judge_model_id?: string | null;
+}
+
+export interface QASuggestionApplied {
+  suggestion_id: string;
+  draft_revision: number;
+  authoring_hash: string;
+  applied: true;
+}
+
+export interface QASuggestionDismissed {
+  suggestion_id: string;
+  status: "DISMISSED";
+}
+
+export interface QACancelResult {
+  job_id: string;
+  status: QAJobStatus;
+}
+
 export type ChatOutcome =
   | "in_progress"
   | "completed"
@@ -232,6 +365,29 @@ const CHAT_OUTCOMES = new Set<ChatOutcome>([
   "aborted",
   "failed",
 ]);
+const QA_JOB_STATUSES: Record<QAJobStatus, true> = {
+  QUEUED: true,
+  RUNNING: true,
+  COMPLETED: true,
+  FAILED: true,
+  CANCELLED: true,
+  EXPIRED: true,
+};
+const QA_SCENARIO_KINDS: Record<QAScenarioKind, true> = {
+  branch: true,
+  refusal: true,
+  clarification_exit: true,
+  correction: true,
+  out_of_order: true,
+  multi_answer: true,
+  partial_info: true,
+  dependency_invalidation: true,
+  detour: true,
+  contradiction: true,
+  missing_business_fact: true,
+  early_termination: true,
+  prompt_injection: true,
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -457,6 +613,203 @@ function parseGenerationJob(value: unknown): GenerationJobView {
     unknown_business_facts: requireStringArray(row.unknown_business_facts, "unknown_business_facts"),
     validation_warnings: parseDiagnostics(row.validation_warnings, "validation_warnings"),
     usage: parseGenerationUsage(row.usage),
+  };
+}
+
+function parseQAStatus(value: unknown): QAJobStatus {
+  if (typeof value !== "string" || QA_JOB_STATUSES[value as QAJobStatus] !== true) {
+    throw new Error("Invalid platform response: QA job status is not supported.");
+  }
+  return value as QAJobStatus;
+}
+
+function parseQAKind(value: unknown): QAScenarioKind {
+  if (typeof value !== "string" || QA_SCENARIO_KINDS[value as QAScenarioKind] !== true) {
+    throw new Error("Invalid platform response: QA scenario kind is not supported.");
+  }
+  return value as QAScenarioKind;
+}
+
+function parseQAExpectedEdge(value: unknown): QAExpectedEdge | null {
+  if (value === null) return null;
+  const row = requireRecord(value, "QA expected edge");
+  return {
+    from_step_id: requireString(row.from_step_id, "QA expected edge.from_step_id"),
+    transition_index: requireNumber(row.transition_index, "QA expected edge.transition_index"),
+    to_step_id: requireString(row.to_step_id, "QA expected edge.to_step_id"),
+    when: requireJsonObject(row.when, "QA expected edge.when"),
+  };
+}
+
+function parseQAScenario(value: unknown): QAScenarioView {
+  const row = requireRecord(value, "QA scenario");
+  return {
+    scenario_id: requireString(row.scenario_id, "QA scenario.scenario_id"),
+    case_key: requireString(row.case_key, "QA scenario.case_key"),
+    kind: parseQAKind(row.kind),
+    expected_edge: parseQAExpectedEdge(row.expected_edge),
+    target_step_id: requireNullableString(row.target_step_id, "QA scenario.target_step_id"),
+    target_fields: requireStringArray(row.target_fields, "QA scenario.target_fields"),
+    task: requireString(row.task, "QA scenario.task"),
+  };
+}
+
+function parseQAUsage(value: unknown, name: string): QAUsage | null {
+  if (value === null) return null;
+  const row = requireRecord(value, name);
+  return {
+    prompt_tokens: requireNullableNumber(row.prompt_tokens, `${name}.prompt_tokens`),
+    completion_tokens: requireNullableNumber(row.completion_tokens, `${name}.completion_tokens`),
+    total_tokens: requireNullableNumber(row.total_tokens, `${name}.total_tokens`),
+  };
+}
+
+function parseQACatalog(value: unknown): QACatalogView {
+  const row = requireRecord(value, "QA scenario catalog");
+  if (!Array.isArray(row.scenarios)) {
+    throw new Error("Invalid platform response: QA scenario catalog.scenarios must be an array.");
+  }
+  return {
+    scenarios: row.scenarios.map(parseQAScenario),
+    scenario_count: requireNumber(row.scenario_count, "QA scenario catalog.scenario_count"),
+    omitted_scenario_count: requireNumber(
+      row.omitted_scenario_count,
+      "QA scenario catalog.omitted_scenario_count",
+    ),
+    flow_hash: requireString(row.flow_hash, "QA scenario catalog.flow_hash"),
+  };
+}
+
+function parseQAResult(value: unknown): QAResultView {
+  const row = requireRecord(value, "QA result");
+  const status = row.status;
+  if (status !== "PASS" && status !== "FAIL" && status !== "INCONCLUSIVE" && status !== "ERROR") {
+    throw new Error("Invalid platform response: QA result status is not supported.");
+  }
+  if (!Array.isArray(row.observed_edges)) {
+    throw new Error("Invalid platform response: QA result.observed_edges must be an array.");
+  }
+  const usage = parseQAUsage(row.token_usage, "QA result.token_usage");
+  if (usage === null) throw new Error("Invalid platform response: QA result.token_usage must be an object.");
+  return {
+    scenario_id: requireString(row.scenario_id, "QA result.scenario_id"),
+    kind: parseQAKind(row.kind),
+    status,
+    assertion: requireString(row.assertion, "QA result.assertion"),
+    expected_edge: parseQAExpectedEdge(row.expected_edge),
+    observed_edges: row.observed_edges.map((edge, index) => requireJsonObject(edge, `QA result.observed_edges[${index}]`)),
+    turn_count: requireNumber(row.turn_count, "QA result.turn_count"),
+    token_usage: usage,
+    artifact_id: requireNullableString(row.artifact_id, "QA result.artifact_id"),
+    failure_code: requireNullableString(row.failure_code, "QA result.failure_code"),
+  };
+}
+
+function parseQASuggestion(value: unknown): QASuggestionView {
+  const row = requireRecord(value, "QA suggestion");
+  const status = row.status;
+  if (status !== "DRAFT" && status !== "APPLIED_TO_DRAFT" && status !== "DISMISSED") {
+    throw new Error("Invalid platform response: QA suggestion status is not supported.");
+  }
+  const patch = row.proposed_patch;
+  let proposedPatch: QASuggestionView["proposed_patch"] = null;
+  if (patch !== null) {
+    const patchRow = requireRecord(patch, "QA suggestion.proposed_patch");
+    proposedPatch = {
+      path: requireString(patchRow.path, "QA suggestion.proposed_patch.path"),
+      append_text: requireString(patchRow.append_text, "QA suggestion.proposed_patch.append_text"),
+    };
+  }
+  return {
+    suggestion_id: requireString(row.suggestion_id, "QA suggestion.suggestion_id"),
+    status,
+    draft_only: requireBoolean(row.draft_only, "QA suggestion.draft_only"),
+    title: requireString(row.title, "QA suggestion.title"),
+    summary: requireString(row.summary, "QA suggestion.summary"),
+    target_step_id: requireNullableString(row.target_step_id, "QA suggestion.target_step_id"),
+    target_fields: requireStringArray(row.target_fields, "QA suggestion.target_fields"),
+    evidence: requireJsonObject(row.evidence, "QA suggestion.evidence"),
+    proposed_patch: proposedPatch,
+  };
+}
+
+function parseQAJobAccepted(value: unknown): QAJobAccepted {
+  const row = requireRecord(value, "QA job accepted");
+  if (row.status !== "QUEUED") throw new Error("Invalid platform response: QA job was not queued.");
+  return { job_id: requireString(row.job_id, "QA job.job_id"), status: "QUEUED" };
+}
+
+function parseQACancelResult(value: unknown): QACancelResult {
+  const row = requireRecord(value, "QA cancellation");
+  return {
+    job_id: requireString(row.job_id, "QA cancellation.job_id"),
+    status: parseQAStatus(row.status),
+  };
+}
+
+function parseQAJob(value: unknown): QAJobView {
+  const row = requireRecord(value, "QA job");
+  const models = requireRecord(row.models, "QA job.models");
+  const budget = requireRecord(row.budget, "QA job.budget");
+  const usage = parseQAUsage(row.usage, "QA job.usage");
+  const snapshotKind = row.snapshot_kind;
+  if (snapshotKind !== "draft" && snapshotKind !== "published") {
+    throw new Error("Invalid platform response: QA job.snapshot_kind is not supported.");
+  }
+  if (!Array.isArray(row.scenarios) || !Array.isArray(row.results) ||
+      !Array.isArray(row.suggestions) || !Array.isArray(row.artifacts)) {
+    throw new Error("Invalid platform response: QA job collections must be arrays.");
+  }
+  return {
+    job_id: requireString(row.job_id, "QA job.job_id"),
+    agent_id: requireString(row.agent_id, "QA job.agent_id"),
+    snapshot_kind: snapshotKind,
+    snapshot_hash: requireString(row.snapshot_hash, "QA job.snapshot_hash"),
+    status: parseQAStatus(row.status),
+    config_hash: requireString(row.config_hash, "QA job.config_hash"),
+    rubric_version: requireString(row.rubric_version, "QA job.rubric_version"),
+    models: {
+      runtime: requireNullableString(models.runtime, "QA job.models.runtime"),
+      utterance: requireNullableString(models.utterance, "QA job.models.utterance"),
+      judge: requireNullableString(models.judge, "QA job.models.judge"),
+    },
+    scenarios: row.scenarios.map(parseQAScenario),
+    results: row.results.map(parseQAResult),
+    suggestions: row.suggestions.map(parseQASuggestion),
+    coverage: requireJsonObject(row.coverage, "QA job.coverage"),
+    budget: {
+      scenario_count: requireNumber(budget.scenario_count, "QA job.budget.scenario_count"),
+      max_turns: requireNumber(budget.max_turns, "QA job.budget.max_turns"),
+      max_tokens: requireNumber(budget.max_tokens, "QA job.budget.max_tokens"),
+      max_runtime_seconds: requireNumber(budget.max_runtime_seconds, "QA job.budget.max_runtime_seconds"),
+    },
+    usage,
+    failure_code: requireNullableString(row.failure_code, "QA job.failure_code"),
+    runtime_seconds: requireNullableNumber(row.runtime_seconds, "QA job.runtime_seconds"),
+    artifacts: row.artifacts.map((artifact, index) => requireJsonObject(artifact, `QA job.artifacts[${index}]`)),
+    created_at: requireString(row.created_at, "QA job.created_at"),
+    started_at: requireNullableString(row.started_at, "QA job.started_at"),
+    completed_at: requireNullableString(row.completed_at, "QA job.completed_at"),
+  };
+}
+
+function parseQASuggestionApplied(value: unknown): QASuggestionApplied {
+  const row = requireRecord(value, "applied QA suggestion");
+  if (row.applied !== true) throw new Error("Invalid platform response: QA suggestion was not applied.");
+  return {
+    suggestion_id: requireString(row.suggestion_id, "QA suggestion.suggestion_id"),
+    draft_revision: requireNumber(row.draft_revision, "QA suggestion.draft_revision"),
+    authoring_hash: requireString(row.authoring_hash, "QA suggestion.authoring_hash"),
+    applied: true,
+  };
+}
+
+function parseQASuggestionDismissed(value: unknown): QASuggestionDismissed {
+  const row = requireRecord(value, "dismissed QA suggestion");
+  if (row.status !== "DISMISSED") throw new Error("Invalid platform response: QA suggestion was not dismissed.");
+  return {
+    suggestion_id: requireString(row.suggestion_id, "QA suggestion.suggestion_id"),
+    status: "DISMISSED",
   };
 }
 
@@ -738,6 +1091,58 @@ export class PlatformAgentClient {
       throw new Error("Invalid platform response: generation model list.items must be an array.");
     }
     return value.items.map(parseGenerationModel);
+  }
+
+  async listQAScenarios(
+    agentId: string,
+    snapshotHash: string,
+    scenarioCount: number,
+  ): Promise<QACatalogView> {
+    const query = new URLSearchParams({
+      agent_id: agentId,
+      snapshot_hash: snapshotHash,
+      scenario_count: String(scenarioCount),
+    });
+    return parseQACatalog(await this.api.request<unknown>(`/qa/scenarios?${query.toString()}`));
+  }
+
+  async createQAJob(request: StartQAJobRequest): Promise<QAJobAccepted> {
+    return parseQAJobAccepted(await this.api.request<unknown>("/qa/jobs", {
+      method: "POST",
+      body: JSON.stringify(request),
+    }));
+  }
+
+  async getQAJob(jobId: string): Promise<QAJobView> {
+    return parseQAJob(await this.api.request<unknown>(`/qa/jobs/${segment(jobId)}`));
+  }
+
+  async cancelQAJob(jobId: string): Promise<QACancelResult> {
+    return parseQACancelResult(await this.api.request<unknown>(`/qa/jobs/${segment(jobId)}/cancel`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    }));
+  }
+
+  async applyQASuggestion(
+    jobId: string,
+    suggestionId: string,
+    expectedRevision: number,
+  ): Promise<QASuggestionApplied> {
+    return parseQASuggestionApplied(await this.api.request<unknown>(
+      `/qa/jobs/${segment(jobId)}/suggestions/${segment(suggestionId)}/apply`,
+      { method: "POST", body: JSON.stringify({ expected_revision: expectedRevision }) },
+    ));
+  }
+
+  async dismissQASuggestion(
+    jobId: string,
+    suggestionId: string,
+  ): Promise<QASuggestionDismissed> {
+    return parseQASuggestionDismissed(await this.api.request<unknown>(
+      `/qa/jobs/${segment(jobId)}/suggestions/${segment(suggestionId)}/dismiss`,
+      { method: "POST", body: JSON.stringify({}) },
+    ));
   }
 
   async startGenerationJob(request: StartGenerationRequest): Promise<GenerationJobAccepted> {

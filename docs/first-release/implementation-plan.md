@@ -171,8 +171,10 @@ The middleware rejects public guest POST bodies over 8 KiB before FastAPI parsin
 
 **Files:** `platform_api/qa/{__init__,models,schemas,service,routes,worker}.py`, graph-scenario tests and QA UI. **Consumes:** immutable snapshots and shared validation/reducer/adapters. **Produces:** frozen scenario IDs/assertions, bounded simulations/results and draft-only suggestions.
 
-- [ ] Write branch coverage, correction/refusal regression, invalid scenario, frozen rerun, quota/time/cancellation and no-auto-publish assertions.
+- [ ] Write branch coverage, correction/refusal regression, invalid scenario, frozen rerun, quota/time/cancellation, expired-lease reclaim/stale-commit, prompt-plus-completion token boundary, over-limit reachable branches, owner authorization, UI and no-auto-publish assertions.
 - [ ] Implement deterministic scenarios first, then capped model utterance expansion and optional evidence-bearing judge. Reuse the existing validator; do not postpone it to this phase.
+- [ ] Recover expired PostgreSQL leases with rotated fencing tokens; check prompt and completion budgets before each model call, and reject branch catalogs that cannot fit without truncation.
+- [ ] Build the owner QA panel on the scenario/job/result/cancel APIs. Suggestions must be draft-only and require explicit apply or dismiss; never auto-publish.
 - [ ] Run same pinned engine/model tuple with bounded jobs that yield resources to voice. Actual selected-model QA is required before release; fake judge success is not enough. Commit.
 
 ## Task 11: Retention, backup/restore and measured operations

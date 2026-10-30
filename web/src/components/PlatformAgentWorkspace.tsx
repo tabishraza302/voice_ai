@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { ArrowLeft, Check, Clock3, RefreshCw, RotateCcw } from "lucide-react";
 import { ChatTestPanel } from "@/components/ChatTestPanel";
+import { FlowQAPanel } from "@/components/FlowQAPanel";
 import { ConversationFlowEditor } from "@/components/ConversationFlowEditor";
 import {
   platformAgentApi,
@@ -859,6 +860,27 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
 
         <aside className={`${mobileTab === "test" ? "block" : "hidden"} lg:sticky lg:top-4 lg:block`}>
           <ChatTestPanel key={agentId} agentId={agentId} draft={draft} versions={versions} onRefreshDraftSnapshot={refreshDraftSnapshot} />
+          <FlowQAPanel
+            key={agentId}
+            agentId={agentId}
+            draft={draft}
+            versions={versions}
+            draftReady={
+              !identityDirty &&
+              !identitySaving &&
+              !flowJsonDirty &&
+              !dirty &&
+              !dirtyRef.current &&
+              pendingSaveCountRef.current === 0 &&
+              saveStatus === "saved" &&
+              !saveConflict &&
+              !snapshotRefreshNeeded &&
+              !snapshotRefreshLoading &&
+              !publishLoading &&
+              restoringVersionId === null
+            }
+            onRefreshDraftSnapshot={() => refreshDraftSnapshot(true)}
+          />
         </aside>
       </div>
     </div>
