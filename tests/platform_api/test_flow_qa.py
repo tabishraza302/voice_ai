@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import uuid
@@ -20,6 +20,7 @@ from platform_api.config import PlatformSettings
 from platform_api.model_client import ModelCompletion, ModelUsage
 from platform_api.models.auth import User
 from platform_api.agents.models import AgentDraft, AgentVersion
+from platform_api.qa.models import FlowQAJob
 from tests.support.postgres import FreshPostgres
 
 
@@ -239,20 +240,39 @@ async def test_flow_qa_pins_snapshot_and_keeps_suggestions_draft_only(
     )
     agent_id, draft = await _create_qa_agent(client, owner_headers)
 
+    preview_params = {
+        "agent_id": str(agent_id),
+        "snapshot_hash": draft["snapshot_hash"],
+        "scenario_count": 1,
+    }
+    hidden_scenarios = await client.get(
+        "/api/v1/qa/scenarios",
+        params=preview_params,
+        headers={"Cookie": other_headers["Cookie"]},
+    )
+    assert hidden_scenarios.status_code == 404
+
+    job_request = {
+        "agent_id": str(agent_id),
+        "snapshot_hash": draft["snapshot_hash"],
+        "scenario_count": 1,
+        "max_turns": 2,
+        "max_tokens": 4096,
+        "max_runtime_seconds": 30,
+        "utterance_model_id": "qa-generator",
+    }
     queued = await client.post(
         "/api/v1/qa/jobs",
         headers=owner_headers,
-        json={
-            "agent_id": str(agent_id),
-            "snapshot_hash": draft["snapshot_hash"],
-            "scenario_count": 1,
-            "max_turns": 2,
-            "max_tokens": 256,
-            "max_runtime_seconds": 30,
-            "utterance_model_id": "qa-generator",
-        },
+        json=job_request,
     )
     assert queued.status_code == 202
+    hidden_create = await client.post(
+        "/api/v1/qa/jobs",
+        headers=other_headers,
+        json=job_request,
+    )
+    assert hidden_create.status_code == 404
     from platform_api.qa.worker import run_qa_job_once
 
     job_id = queued.json()["job_id"]
@@ -260,7 +280,10 @@ async def test_flow_qa_pins_snapshot_and_keeps_suggestions_draft_only(
         f"/api/v1/qa/jobs/{job_id}", headers={"Cookie": other_headers["Cookie"]}
     )
     assert hidden.status_code == 404
-
+    hidden_cancel = await client.post(
+        f"/api/v1/qa/jobs/{job_id}/cancel", headers=other_headers
+    )
+    assert hidden_cancel.status_code == 404
     await run_qa_job_once(
         app.state.session_factory,
         app.state.settings,
@@ -285,6 +308,18 @@ async def test_flow_qa_pins_snapshot_and_keeps_suggestions_draft_only(
     assert suggestion["proposed_patch"]["append_text"]
     assert model_client.calls
     assert all(call["model"] in {"qwen3.5:4b", "qa-generator"} for call in model_client.calls)
+
+    hidden_apply = await client.post(
+        f"/api/v1/qa/jobs/{job_id}/suggestions/{suggestion['suggestion_id']}/apply",
+        headers=other_headers,
+        json={"expected_revision": draft["draft_revision"]},
+    )
+    assert hidden_apply.status_code == 404
+    hidden_dismiss = await client.post(
+        f"/api/v1/qa/jobs/{job_id}/suggestions/{suggestion['suggestion_id']}/dismiss",
+        headers=other_headers,
+    )
+    assert hidden_dismiss.status_code == 404
 
     applied = await client.post(
         f"/api/v1/qa/jobs/{job_id}/suggestions/{suggestion['suggestion_id']}/apply",
@@ -341,7 +376,7 @@ async def test_flow_qa_frozen_ids_quotas_and_cancellation(
         "scenario_count": 1,
         "scenario_ids": ["qa_" + "0" * 64],
         "max_turns": 2,
-        "max_tokens": 256,
+        "max_tokens": 4096,
         "max_runtime_seconds": 30,
         "utterance_model_id": "qa-generator",
     }
@@ -392,3 +427,251 @@ async def test_flow_qa_frozen_ids_quotas_and_cancellation(
     assert stopped.json()["status"] == "CANCELLED"
     await asyncio.wait_for(task, timeout=3)
     assert model_client.generation_cancelled.is_set()
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_flow_qa_reclaims_expired_worker_lease_from_checkpoint(
+    qa_app_client,
+    initialized_pg: FreshPostgres,
+):
+    client, app, model_client = qa_app_client
+    _, headers = await _create_user_session(
+        initialized_pg, app.state.settings, client, "qa_reclaim@example.com"
+    )
+    agent_id, draft = await _create_qa_agent(client, headers)
+    preview = await client.get(
+        "/api/v1/qa/scenarios",
+        params={
+            "agent_id": str(agent_id),
+            "snapshot_hash": draft["snapshot_hash"],
+            "scenario_count": 2,
+        },
+        headers=headers,
+    )
+    assert preview.status_code == 200
+    scenario_ids = [item["scenario_id"] for item in preview.json()["scenarios"]]
+    assert len(scenario_ids) == 2
+    queued = await client.post(
+        "/api/v1/qa/jobs",
+        headers=headers,
+        json={
+            "agent_id": str(agent_id),
+            "snapshot_hash": draft["snapshot_hash"],
+            "scenario_count": 2,
+            "scenario_ids": scenario_ids,
+            "max_turns": 2,
+            "max_tokens": 4096,
+            "max_runtime_seconds": 30,
+            "utterance_model_id": "qa-generator",
+        },
+    )
+    assert queued.status_code == 202
+    job_id = uuid.UUID(queued.json()["job_id"])
+    async with app.state.session_factory() as db:
+        job = await db.get(FlowQAJob, job_id)
+        assert job is not None
+        job.status = "RUNNING"
+        job.lease_token = uuid.uuid4()
+        job.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        job.next_scenario_index = 1
+        job.results_json = [
+            {
+                "scenario_id": scenario_ids[0],
+                "kind": "branch",
+                "status": "PASS",
+                "assertion": "The recovered worker retained the saved result.",
+                "expected_edge": None,
+                "observed_edges": [],
+                "turn_count": 0,
+                "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "artifact_id": None,
+                "failure_code": None,
+            }
+        ]
+        job.updated_at = datetime.now(timezone.utc)
+        await db.commit()
+
+    from platform_api.qa.worker import run_qa_job_once
+
+    await run_qa_job_once(
+        app.state.session_factory,
+        app.state.settings,
+        app.state.catalog,
+        model_client,
+        job_id,
+    )
+
+    recovered = await client.get(
+        f"/api/v1/qa/jobs/{job_id}", headers={"Cookie": headers["Cookie"]}
+    )
+    assert recovered.status_code == 200
+    assert recovered.json()["status"] == "COMPLETED"
+    assert [item["scenario_id"] for item in recovered.json()["results"]] == scenario_ids
+    generation_scenarios = [
+        json.loads(call["messages"][-1]["content"])["scenario_id"]
+        for call in model_client.calls
+        if call["endpoint"] == "generation"
+    ]
+    assert generation_scenarios == [scenario_ids[1]]
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_flow_qa_expired_worker_cannot_commit_before_or_after_reclaim(
+    qa_app_client,
+    initialized_pg: FreshPostgres,
+):
+    client, app, _model_client = qa_app_client
+    _, headers = await _create_user_session(
+        initialized_pg, app.state.settings, client, "qa_stale_lease@example.com"
+    )
+    agent_id, draft = await _create_qa_agent(client, headers)
+    queued = await client.post(
+        "/api/v1/qa/jobs",
+        headers=headers,
+        json={
+            "agent_id": str(agent_id),
+            "snapshot_hash": draft["snapshot_hash"],
+            "scenario_count": 1,
+            "max_turns": 2,
+            "max_tokens": 4096,
+            "max_runtime_seconds": 30,
+            "utterance_model_id": "qa-generator",
+        },
+    )
+    assert queued.status_code == 202
+    job_id = uuid.UUID(queued.json()["job_id"])
+    from platform_api.qa.service import (
+        checkpoint_qa_job,
+        claim_qa_job,
+        finish_qa_job,
+        interrupt_qa_job,
+    )
+
+    stale_claim = await claim_qa_job(app.state.session_factory, app.state.settings, job_id=job_id)
+    assert stale_claim is not None
+    async with app.state.session_factory() as db:
+        job = await db.get(FlowQAJob, job_id)
+        assert job is not None
+        job.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        await db.commit()
+
+    assert not await checkpoint_qa_job(
+        app.state.session_factory, stale_claim, results=[{"status": "STALE"}]
+    )
+    assert not await finish_qa_job(
+        app.state.session_factory,
+        stale_claim,
+        status="COMPLETED",
+        results=[{"status": "STALE"}],
+    )
+    assert not await interrupt_qa_job(
+        app.state.session_factory, stale_claim, status="QUEUED"
+    )
+
+    current_claim = await claim_qa_job(app.state.session_factory, app.state.settings, job_id=job_id)
+    assert current_claim is not None
+    assert current_claim.lease_token != stale_claim.lease_token
+    assert not await finish_qa_job(
+        app.state.session_factory,
+        stale_claim,
+        status="COMPLETED",
+        results=[{"status": "STALE"}],
+    )
+    assert await finish_qa_job(
+        app.state.session_factory,
+        current_claim,
+        status="FAILED",
+        failure_code="TEST_FINISHED",
+    )
+    result = await client.get(
+        f"/api/v1/qa/jobs/{job_id}", headers={"Cookie": headers["Cookie"]}
+    )
+    assert result.status_code == 200
+    assert result.json()["status"] == "FAILED"
+    assert result.json()["results"] == []
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_flow_qa_does_not_call_model_when_prompt_exceeds_token_budget(
+    qa_app_client,
+    initialized_pg: FreshPostgres,
+):
+    client, app, model_client = qa_app_client
+    _, headers = await _create_user_session(
+        initialized_pg, app.state.settings, client, "qa_token_boundary@example.com"
+    )
+    agent_id, draft = await _create_qa_agent(client, headers)
+    queued = await client.post(
+        "/api/v1/qa/jobs",
+        headers=headers,
+        json={
+            "agent_id": str(agent_id),
+            "snapshot_hash": draft["snapshot_hash"],
+            "scenario_count": 1,
+            "max_turns": 2,
+            "max_tokens": 64,
+            "max_runtime_seconds": 30,
+            "utterance_model_id": "qa-generator",
+        },
+    )
+    assert queued.status_code == 202
+
+    from platform_api.qa.worker import run_qa_job_once
+
+    await run_qa_job_once(
+        app.state.session_factory,
+        app.state.settings,
+        app.state.catalog,
+        model_client,
+        uuid.UUID(queued.json()["job_id"]),
+    )
+
+    result = await client.get(
+        f"/api/v1/qa/jobs/{queued.json()['job_id']}",
+        headers={"Cookie": headers["Cookie"]},
+    )
+    assert result.status_code == 200
+    payload = result.json()
+    assert model_client.calls == []
+    assert payload["status"] == "EXPIRED"
+    assert payload["failure_code"] == "TOKEN_BUDGET_EXHAUSTED"
+    assert payload["usage"]["total_tokens"] == 0
+    assert payload["results"][0]["status"] == "INCONCLUSIVE"
+    assert payload["results"][0]["failure_code"] == "TOKEN_BUDGET_EXHAUSTED"
+
+
+def test_flow_qa_rejects_reachable_branch_count_above_the_bounded_catalog():
+    from platform_api.qa.service import derive_scenarios
+
+    def source(step_id: str, targets: list[str]) -> dict[str, object]:
+        return {
+            "id": step_id,
+            "transitions": [
+                {
+                    "to": target,
+                    "when": {
+                        "operator": "eq",
+                        "field": f"{step_id}_field_{index}",
+                        "value": index,
+                    },
+                }
+                for index, target in enumerate(targets)
+            ],
+        }
+
+    first_targets = ["source-1", *[f"leaf-{index}" for index in range(31)]]
+    second_targets = ["source-2", *[f"leaf-{index}" for index in range(31, 62)]]
+    steps = [
+        source("source-0", first_targets),
+        source("source-1", second_targets),
+        source("source-2", ["leaf-62"]),
+        *[{"id": f"leaf-{index}", "transitions": []} for index in range(63)],
+    ]
+
+    with pytest.raises(ValueError, match="65 reachable branch scenarios"):
+        derive_scenarios(
+            {"entry_step_id": "source-0", "steps": steps},
+            flow_hash="a" * 64,
+            max_scenarios=64,
+        )

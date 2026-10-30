@@ -7,7 +7,7 @@ import hashlib
 import uuid
 from typing import Any
 
-from sqlalchemy import func, select, text
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bot.flow.schemas import CompiledFlow
@@ -26,6 +26,18 @@ from platform_api.testing.chat import _resolve_new_snapshot
 
 
 MAX_QA_SCENARIOS = 64
+QA_WORKER_LEASE_GRACE_SECONDS = 30
+
+
+class QABranchCoverageLimitError(ValueError):
+    """A graph has more reachable branch cases than the bounded QA catalog."""
+
+
+def _branch_coverage_validation(exc: QABranchCoverageLimitError) -> ValidationError:
+    return ValidationError(
+        str(exc),
+        fields=[{"field": "scenario_count", "code": "BRANCH_COVERAGE_LIMIT"}],
+    )
 
 
 def derive_scenarios(
@@ -110,6 +122,11 @@ def derive_scenarios(
                 ),
             )
 
+    if len(candidates) > max_scenarios:
+        raise QABranchCoverageLimitError(
+            f"{len(candidates)} reachable branch scenarios exceed the Flow QA "
+            f"scenario limit of {max_scenarios}"
+        )
     behavior = flow.get("behavior", {})
     corrections_allowed = not isinstance(behavior, dict) or behavior.get(
         "allow_corrections", True
@@ -313,6 +330,12 @@ def _scenario_id(flow_hash: str, case_key: str) -> str:
 RUBRIC_VERSION = "flow-qa-rubric/1"
 ACTIVE_JOB_STATUSES = ("QUEUED", "RUNNING")
 
+def _expired_lease_filter(now: datetime):
+    return or_(
+        FlowQAJob.lease_token.is_(None),
+        FlowQAJob.lease_expires_at.is_(None),
+        FlowQAJob.lease_expires_at <= now,
+    )
 
 async def preview_qa_scenarios(
     db: AsyncSession,
@@ -338,11 +361,14 @@ async def preview_qa_scenarios(
         snapshot_hash=snapshot_hash,
     )
     compiled = _compiled_snapshot(snapshot)
-    candidates = derive_scenarios(
-        compiled.normalized,
-        flow_hash=compiled.flow_hash,
-        max_scenarios=settings.qa_max_scenarios,
-    )
+    try:
+        candidates = derive_scenarios(
+            compiled.normalized,
+            flow_hash=compiled.flow_hash,
+            max_scenarios=settings.qa_max_scenarios,
+        )
+    except QABranchCoverageLimitError as exc:
+        raise _branch_coverage_validation(exc) from exc
     return candidates[:scenario_count], compiled.flow_hash, len(candidates)
 
 
@@ -406,11 +432,14 @@ async def enqueue_qa_job(
             fields=[{"field": "snapshot_hash", "code": "MODEL_UNAVAILABLE"}],
         )
 
-    candidates = derive_scenarios(
-        compiled.normalized,
-        flow_hash=compiled.flow_hash,
-        max_scenarios=settings.qa_max_scenarios,
-    )
+    try:
+        candidates = derive_scenarios(
+            compiled.normalized,
+            flow_hash=compiled.flow_hash,
+            max_scenarios=settings.qa_max_scenarios,
+        )
+    except QABranchCoverageLimitError as exc:
+        raise _branch_coverage_validation(exc) from exc
     if payload.scenario_ids is None:
         scenarios = candidates[: payload.scenario_count]
     else:
@@ -432,6 +461,7 @@ async def enqueue_qa_job(
             fields=[{"field": "scenario_count", "code": "NO_SCENARIOS"}],
         )
 
+    now = datetime.now(timezone.utc)
     queued_result = await db.execute(
         select(func.count(FlowQAJob.id)).where(FlowQAJob.status == "QUEUED")
     )
@@ -446,7 +476,6 @@ async def enqueue_qa_job(
     if user_active_result.scalar_one() >= settings.qa_max_active_jobs_per_user:
         raise RateLimitedError("The active Flow QA job limit for this account is full")
 
-    now = datetime.now(timezone.utc)
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     await _enforce_token_quotas(
         db,
@@ -545,13 +574,22 @@ async def cancel_qa_job(
     return job
 
 
-async def next_queued_qa_job(
+async def next_claimable_qa_job(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> uuid.UUID | None:
+    now = datetime.now(timezone.utc)
     async with session_factory() as db:
         result = await db.execute(
             select(FlowQAJob.id)
-            .where(FlowQAJob.status == "QUEUED")
+            .where(
+                or_(
+                    FlowQAJob.status == "QUEUED",
+                    and_(
+                        FlowQAJob.status == "RUNNING",
+                        _expired_lease_filter(now),
+                    ),
+                )
+            )
             .order_by(FlowQAJob.created_at, FlowQAJob.id)
             .limit(1)
         )
@@ -569,20 +607,36 @@ async def claim_qa_job(
         async with db.begin():
             result = await db.execute(
                 select(FlowQAJob)
-                .where(FlowQAJob.id == job_id, FlowQAJob.status == "QUEUED")
+                .where(
+                    FlowQAJob.id == job_id,
+                    or_(
+                        FlowQAJob.status == "QUEUED",
+                        and_(
+                            FlowQAJob.status == "RUNNING",
+                            _expired_lease_filter(now),
+                        ),
+                    ),
+                )
                 .with_for_update(skip_locked=True)
             )
             job = result.scalar_one_or_none()
             if job is None or await _voice_session_active(db):
                 return None
             running_result = await db.execute(
-                select(func.count(FlowQAJob.id)).where(FlowQAJob.status == "RUNNING")
+                select(func.count(FlowQAJob.id)).where(
+                    FlowQAJob.status == "RUNNING",
+                    FlowQAJob.lease_token.is_not(None),
+                    FlowQAJob.lease_expires_at.is_not(None),
+                    FlowQAJob.lease_expires_at > now,
+                )
             )
             if running_result.scalar_one() >= settings.qa_max_running_jobs:
                 return None
             if (now - job.created_at).total_seconds() > settings.qa_job_max_age_seconds:
                 job.status = "EXPIRED"
                 job.failure_code = "QUEUE_AGE_LIMIT"
+                job.lease_token = None
+                job.lease_expires_at = None
                 job.completed_at = now
                 job.updated_at = now
                 return None
@@ -594,6 +648,7 @@ async def claim_qa_job(
                     job.max_runtime_seconds,
                     settings.qa_job_timeout_seconds,
                 )
+                + QA_WORKER_LEASE_GRACE_SECONDS
             )
             job.updated_at = now
             await db.flush()
@@ -612,12 +667,15 @@ async def checkpoint_qa_job(
     usage: dict[str, int | None] | None = None,
     next_scenario_index: int | None = None,
 ) -> bool:
+    now = datetime.now(timezone.utc)
     async with session_factory() as db:
         async with db.begin():
             job = await db.get(FlowQAJob, claimed.id, with_for_update=True)
             if (
                 job is None
                 or job.lease_token != claimed.lease_token
+                or job.lease_expires_at is None
+                or job.lease_expires_at <= now
                 or job.status != "RUNNING"
                 or job.cancel_requested_at is not None
             ):
@@ -634,7 +692,7 @@ async def checkpoint_qa_job(
                 job.usage_json = usage
             if next_scenario_index is not None:
                 job.next_scenario_index = next_scenario_index
-            job.updated_at = datetime.now(timezone.utc)
+            job.updated_at = now
             await db.flush()
             return True
 
@@ -659,6 +717,8 @@ async def finish_qa_job(
             if (
                 job is None
                 or job.lease_token != claimed.lease_token
+                or job.lease_expires_at is None
+                or job.lease_expires_at <= now
                 or not (
                     job.status == "RUNNING"
                     or (status == "CANCELLED" and job.status == "CANCELLED")
@@ -701,6 +761,8 @@ async def interrupt_qa_job(
             if (
                 job is None
                 or job.lease_token != claimed.lease_token
+                or job.lease_expires_at is None
+                or job.lease_expires_at <= now
                 or job.status != "RUNNING"
             ):
                 return False
