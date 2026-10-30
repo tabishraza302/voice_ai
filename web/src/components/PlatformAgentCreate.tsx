@@ -284,8 +284,19 @@ export function PlatformAgentCreate({ initialMode, initialJobId = null }: Platfo
     try {
       const cancelled = await platformAgentApi.cancelGenerationJob(job.job_id);
       setJob(cancelled);
-      setJobDetails(null);
-      setPollError(null);
+      if (cancelled.status === "COMPLETED") {
+        try {
+          const details = await platformAgentApi.getGenerationJob(cancelled.job_id);
+          setJob({ ...cancelled, status: details.status });
+          setJobDetails(details);
+          setPollError(null);
+        } catch (error: unknown) {
+          setPollError(errorMessage(error));
+        }
+      } else {
+        setJobDetails(null);
+        setPollError(null);
+      }
     } catch (error: unknown) {
       setPageError(errorMessage(error));
     } finally {
@@ -367,8 +378,15 @@ export function PlatformAgentCreate({ initialMode, initialJobId = null }: Platfo
   };
 
   const recoverPoll = () => {
+    if (!job) return;
     setPollError(null);
-    setPollNonce((value) => value + 1);
+    void platformAgentApi.getGenerationJob(job.job_id).then((details) => {
+      setJobDetails(details);
+      setJob((existing) => existing ? { ...existing, status: details.status } : existing);
+      if (isRunning(details.status)) setPollNonce((value) => value + 1);
+    }).catch((error: unknown) => {
+      setPollError(errorMessage(error));
+    });
   };
 
   return (
@@ -657,10 +675,10 @@ function GenerationJobCard({
           ) : null}
           {details.usage ? (
             <p className="text-xs text-limestone-500">
-              Usage: {details.usage.prompt_tokens} prompt + {details.usage.completion_tokens} completion tokens, {details.usage.total_tokens} total.
+              Usage: {details.usage.prompt_tokens ?? "unknown"} prompt + {details.usage.completion_tokens ?? "unknown"} completion tokens, {details.usage.total_tokens ?? "unknown"} total.
             </p>
           ) : null}
-          {job.status === "COMPLETED" && !proposal ? (
+          {details.status === "COMPLETED" && !proposal ? (
             <p role="alert" className="text-sm text-rust-200">Generation completed without a proposal. No agent draft was created.</p>
           ) : null}
           {proposal ? (

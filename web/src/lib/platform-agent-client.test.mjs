@@ -202,6 +202,41 @@ describe("PlatformAgentClient", () => {
     );
     expect(calls.every(({ url }) => !new URL(url).pathname.endsWith("/agents"))).toBe(true);
   });
+
+  test("accepts generation usage omitted by the provider", async () => {
+    const jobId = "00000000-0000-0000-0000-000000000002";
+    mockFetch(async () => jsonResponse({
+      status: "CANCELLED",
+      proposal: null,
+      unknown_business_facts: [],
+      validation_warnings: [],
+      usage: null,
+    }));
+
+    const result = await client.getGenerationJob(jobId);
+
+    expect(result.usage).toBeNull();
+  });
+
+  test("accepts null token counts when the provider reports unknown generation usage", async () => {
+    const jobId = "00000000-0000-0000-0000-000000000002";
+    mockFetch(async () => jsonResponse({
+      status: "CANCELLED",
+      proposal: null,
+      unknown_business_facts: [],
+      validation_warnings: [],
+      usage: { prompt_tokens: null, completion_tokens: null, total_tokens: null },
+    }));
+
+    const result = await client.getGenerationJob(jobId);
+
+    expect(result.usage).toEqual({
+      prompt_tokens: null,
+      completion_tokens: null,
+      total_tokens: null,
+    });
+  });
+
   test("keeps an owned generation job active while provider cancellation is pending", async () => {
     const jobId = "00000000-0000-0000-0000-000000000002";
     mockFetch(async (_url, init) => {

@@ -133,9 +133,9 @@ export interface AgentProposal {
 }
 
 export interface GenerationUsage {
-  prompt_tokens: number;
-  completion_tokens: number;
-  total_tokens: number;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  total_tokens: number | null;
 }
 
 export interface GenerationJobView {
@@ -434,9 +434,9 @@ function parseGenerationUsage(value: unknown): GenerationUsage | null {
   if (value === null) return null;
   const row = requireRecord(value, "generation usage");
   return {
-    prompt_tokens: requireNumber(row.prompt_tokens, "usage.prompt_tokens"),
-    completion_tokens: requireNumber(row.completion_tokens, "usage.completion_tokens"),
-    total_tokens: requireNumber(row.total_tokens, "usage.total_tokens"),
+    prompt_tokens: requireNullableNumber(row.prompt_tokens, "usage.prompt_tokens"),
+    completion_tokens: requireNullableNumber(row.completion_tokens, "usage.completion_tokens"),
+    total_tokens: requireNullableNumber(row.total_tokens, "usage.total_tokens"),
   };
 }
 
