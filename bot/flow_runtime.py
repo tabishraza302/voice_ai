@@ -1762,7 +1762,7 @@ class FlowOutputProcessor(FrameProcessor):
     """Translate model frames and release immutable fragments through the TTS path."""
 
     def __init__(self, runtime: FlowRuntime) -> None:
-        super().__init__()
+        super().__init__(enable_direct_mode=True)
         self._runtime = runtime
         self._response_generation_id: str | None = None
         self._speech_sequence = 0
