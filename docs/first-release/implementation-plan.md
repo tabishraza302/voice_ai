@@ -137,7 +137,11 @@ def charge_minor(rate_minor_per_minute: int, cumulative_billable_ms: int) -> int
 
 ## Task 7: Guest deployment and prelaunch public security
 
-**Files:** `platform_api/public/{__init__,models,service,routes}.py`, guest route/transport tests, hosted-page UI and deployment fixtures. **Consumes:** registered funded sessions from Task 6 and owner/admin guards. **Produces:** server-resolved owner admission and session-only guest capability/reconnect/end/status.
+**Files:** `platform_api/public/{__init__,models,service,routes}.py`, `platform_api/{app,config}.py`, guest route/transport and privacy-export tests, `platform_api/ops/privacy.py`, `web/src/app/public/[publicId]/page.tsx`, the hosted guest page/client and deployment fixtures. **Consumes:** registered funded sessions from Task 6 and owner/admin guards. **Produces:** server-resolved owner admission and session-only guest capability/reconnect/end/status.
+
+The hosted link is `/public/{public_id}`. Guest lifecycle routes are exactly `GET /api/v1/guest/sessions/{session_id}/status`, `POST /api/v1/guest/sessions/{session_id}/reconnect-token`, and `POST /api/v1/guest/sessions/{session_id}/end`; no legacy public-session aliases remain. The guest cookie is scoped to `/api/v1/guest/sessions/{session_id}`.
+
+The middleware rejects public guest POST bodies over 8 KiB before FastAPI parsing, including streamed/chunked bodies. Admission uses atomic PostgreSQL-backed limits per client IP (`PLATFORM_PUBLIC_ADMISSION_IP_LIMIT`) and per agent (`PLATFORM_PUBLIC_ADMISSION_AGENT_LIMIT`) within `PLATFORM_PUBLIC_ADMISSION_WINDOW_SECONDS`; the agent quota is shared by every public deployment link for that agent. `PLATFORM_PUBLIC_SIGNALING_URL` must be the exact HTTPS `/api/offer` endpoint. Staging/production enablement requires public TLS, TURN, Secure guest cookies, trusted ingress CIDRs, and HTTPS `PLATFORM_WEB_ORIGIN`; preserve the browser's exact origin through the TLS-terminating proxy to the loopback runner. The browser sends the session ID and bound join JWT in Pipecat `request_data`; it reports connected only after WebRTC reaches `connected`.
 
 - [ ] Write cross-guest/owner-history, owner-wallet substitution, disabled deployment, expired capability, reconnect grace, stale JTI/peer, CSRF/origin and rate/zero-credit tests.
 - [ ] Implement opaque deployment IDs, hashed capabilities, token/participant binding and admission disclosure; rate/resource/TLS/TURN/trusted-proxy protections precede public enablement.

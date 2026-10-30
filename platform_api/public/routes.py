@@ -135,7 +135,7 @@ async def get_public_deployment_bootstrap(
     return await get_public_deployment(
         db,
         public_id=public_id,
-        origin=origin or "",
+        origin=origin or settings.web_origin,
         settings=settings,
     )
 
@@ -191,32 +191,34 @@ async def post_public_guest_session(
 
 
 @router.get(
-    "/public/sessions/{session_id}",
+    "/guest/sessions/{session_id}/status",
     response_model=GuestSessionStatus,
 )
-async def get_public_guest_session(
+async def get_guest_session(
     session_id: uuid.UUID,
     request: Request,
     response: Response,
     origin: str | None = Header(None, alias="Origin"),
     db: AsyncSession = Depends(get_db),
 ) -> GuestSessionStatus:
-    """Read the safe state of a guest session using only its own cookie."""
+    """Read safe session state using only this session's guest cookie."""
     response.headers["Cache-Control"] = "no-store"
+    settings = get_request_settings(request)
+    validate_origin(request, settings)
     return await get_guest_session_status(
         db,
         session_id=session_id,
         raw_token=request.cookies.get(guest_cookie_name(session_id)),
-        origin=origin or "",
-        settings=get_request_settings(request),
+        origin=origin or settings.web_origin,
+        settings=settings,
     )
 
 
 @router.post(
-    "/public/sessions/{session_id}/reconnect",
+    "/guest/sessions/{session_id}/reconnect-token",
     response_model=GuestReconnectView,
 )
-async def post_public_guest_reconnect(
+async def post_guest_reconnect_token(
     session_id: uuid.UUID,
     payload: GuestReconnectRequest,
     request: Request,
@@ -227,7 +229,7 @@ async def post_public_guest_reconnect(
     _transaction_isolation: None = Depends(_set_idempotency_transaction_isolation),
     db: AsyncSession = Depends(get_db),
 ) -> GuestReconnectView:
-    """Issue a reconnect token for the same guest within the reconnect window."""
+    """Issue a fresh join token for the same guest within its reconnect window."""
     del payload
     response.headers["Cache-Control"] = "no-store"
     settings = get_request_settings(request)
@@ -245,11 +247,11 @@ async def post_public_guest_reconnect(
 
 
 @router.post(
-    "/public/sessions/{session_id}/end",
+    "/guest/sessions/{session_id}/end",
     status_code=status.HTTP_202_ACCEPTED,
     response_model=GuestEndView,
 )
-async def post_public_guest_end(
+async def post_guest_end(
     session_id: uuid.UUID,
     payload: GuestReconnectRequest,
     request: Request,
@@ -260,7 +262,7 @@ async def post_public_guest_end(
     _transaction_isolation: None = Depends(_set_idempotency_transaction_isolation),
     db: AsyncSession = Depends(get_db),
 ) -> GuestEndView:
-    """Idempotently request session teardown with the guest capability."""
+    """Idempotently request guest-session teardown."""
     del payload
     response.headers["Cache-Control"] = "no-store"
     settings = get_request_settings(request)

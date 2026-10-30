@@ -104,7 +104,12 @@ class RequestContextMiddleware:
         is_session_body_request = (
             (
                 path.startswith("/api/v1/sessions/")
+                or path.startswith("/api/v1/guest/sessions/")
                 or path.startswith("/internal/sessions/")
+                or (
+                    path.startswith("/api/v1/public/deployments/")
+                    and path.endswith("/sessions")
+                )
                 or (
                     path.startswith("/api/v1/agents/")
                     and path.endswith("/test/voice-sessions")

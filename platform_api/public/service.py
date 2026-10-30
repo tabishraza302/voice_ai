@@ -171,8 +171,7 @@ def guest_cookie_name(session_id: uuid.UUID) -> str:
 
 def guest_cookie_path(session_id: uuid.UUID) -> str:
     """Limit the bearer cookie to its own guest-session routes."""
-    return f"/api/v1/public/sessions/{session_id}"
-
+    return f"/api/v1/guest/sessions/{session_id}"
 
 def _derive_capability(
     settings: PlatformSettings,
@@ -453,9 +452,9 @@ async def admit_guest_session(
     await check_and_increment_rate_limit(
         db,
         settings,
-        scope="public_admission_deployment",
-        identifier=str(deployment.id),
-        limit=settings.public_admission_deployment_limit,
+        scope="public_admission_agent",
+        identifier=str(agent.id),
+        limit=settings.public_admission_agent_limit,
         window_seconds=settings.public_admission_window_seconds,
         now=now,
     )

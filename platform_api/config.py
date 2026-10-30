@@ -507,13 +507,13 @@ class PlatformSettings(BaseSettings):
             "PLATFORM_PUBLIC_ADMISSION_IP_LIMIT", "public_admission_ip_limit"
         ),
     )
-    public_admission_deployment_limit: int = Field(
+    public_admission_agent_limit: int = Field(
         default=20,
         ge=1,
         le=10000,
         validation_alias=AliasChoices(
-            "PLATFORM_PUBLIC_ADMISSION_DEPLOYMENT_LIMIT",
-            "public_admission_deployment_limit",
+            "PLATFORM_PUBLIC_ADMISSION_AGENT_LIMIT",
+            "public_admission_agent_limit",
         ),
     )
     public_admission_window_seconds: int = Field(
