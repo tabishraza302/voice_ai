@@ -89,6 +89,11 @@ function isCurrentJobRequest(
     (allowCancellationPending || !current.cancellationPending);
 }
 
+function isCurrentJobSelection(ref: JobRequestRef, token: JobSelectionToken): boolean {
+  const current = ref.current;
+  return current.jobId === token.jobId && current.selectionEpoch === token.selectionEpoch;
+}
+
 function beginCancellation(ref: JobRequestRef, jobId: string): JobRequestToken | null {
   const current = ref.current;
   if (current.jobId !== jobId || current.cancellationPending) return null;
@@ -387,7 +392,7 @@ export function PlatformAgentCreate({ initialMode, initialJobId = null }: Platfo
     try {
       const cancelled = await platformAgentApi.cancelGenerationJob(job.job_id);
       if (!isCurrentJobRequest(jobRequestRef, request, true)) return;
-      setJob((existing) => isCurrentJobRequest(jobRequestRef, request, true) && existing?.job_id === request.jobId
+      setJob((existing) => isCurrentJobSelection(jobRequestRef, request) && existing?.job_id === request.jobId
         ? cancelled
         : existing);
       finishCancellation(jobRequestRef, request);
