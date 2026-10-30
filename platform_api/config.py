@@ -658,18 +658,33 @@ class PlatformSettings(BaseSettings):
     )
 
 
-    # --- Accounting and Events ------------------------------------------------
-    billing_slice_ms: int | None = Field(
+    # --- One-time fresh-schema tariff seed --------------------------------------
+    initial_session_rate_minor_per_minute: int | None = Field(
         default=None,
-        gt=0,
-        validation_alias=AliasChoices("PLATFORM_BILLING_SLICE_MS", "billing_slice_ms"),
-        description="Deployment-derived maximum slice duration in ms; required when billing is active, no universal default",
+        ge=0,
+        le=(1 << 63) - 1,
+        validation_alias=AliasChoices(
+            "PLATFORM_INITIAL_SESSION_RATE_MINOR_PER_MINUTE",
+            "initial_session_rate_minor_per_minute",
+        ),
+        description="Explicit tariff seed used only when init-db creates an empty platform schema.",
     )
-    billing_permit_ttl_ms: int | None = Field(
+    initial_billing_slice_ms: int | None = Field(
         default=None,
         gt=0,
-        validation_alias=AliasChoices("PLATFORM_BILLING_PERMIT_TTL_MS", "billing_permit_ttl_ms"),
-        description="Deployment-derived permit validity duration in ms; required when billing is active, no universal default",
+        le=(1 << 63) - 1,
+        validation_alias=AliasChoices("PLATFORM_INITIAL_BILLING_SLICE_MS", "initial_billing_slice_ms"),
+        description="Explicit initial billing slice copied into the first persisted tariff version.",
+    )
+    initial_billing_permit_ttl_ms: int | None = Field(
+        default=None,
+        gt=0,
+        le=(1 << 63) - 1,
+        validation_alias=AliasChoices(
+            "PLATFORM_INITIAL_BILLING_PERMIT_TTL_MS",
+            "initial_billing_permit_ttl_ms",
+        ),
+        description="Explicit initial permit TTL copied into the first persisted tariff version.",
     )
 
     # --- Voice-session admission ---------------------------------------------
@@ -755,24 +770,6 @@ class PlatformSettings(BaseSettings):
         validation_alias=AliasChoices(
             "PLATFORM_SESSION_RECONNECT_GRACE_SECONDS",
             "session_reconnect_grace_seconds",
-        ),
-    )
-    session_rate_minor_per_minute: int | None = Field(
-        default=None,
-        ge=0,
-        le=(1 << 63) - 1,
-        validation_alias=AliasChoices(
-            "PLATFORM_SESSION_RATE_MINOR_PER_MINUTE",
-            "session_rate_minor_per_minute",
-        ),
-    )
-    session_tariff_version: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=64,
-        validation_alias=AliasChoices(
-            "PLATFORM_SESSION_TARIFF_VERSION",
-            "session_tariff_version",
         ),
     )
     session_runtime_timeout_seconds: float | None = Field(

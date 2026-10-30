@@ -87,11 +87,32 @@ async def _init_db_command(settings: PlatformSettings) -> int:
     engine = create_engine(settings)
     try:
         expected_hash = compute_metadata_hash(Base.metadata)
+        tariff_values = (
+            settings.initial_session_rate_minor_per_minute,
+            settings.initial_billing_slice_ms,
+            settings.initial_billing_permit_ttl_ms,
+        )
+        initial_tariff = None
+        if any(value is not None for value in tariff_values):
+            if any(value is None for value in tariff_values):
+                raise ValueError(
+                    "PLATFORM_INITIAL_SESSION_RATE_MINOR_PER_MINUTE, "
+                    "PLATFORM_INITIAL_BILLING_SLICE_MS, and "
+                    "PLATFORM_INITIAL_BILLING_PERMIT_TTL_MS must be set together."
+                )
+            from platform_api.billing.tariffs import InitialSessionTariff
+
+            initial_tariff = InitialSessionTariff(
+                rate_minor_per_minute=tariff_values[0],
+                billing_slice_ms=tariff_values[1],
+                permit_ttl_ms=tariff_values[2],
+            )
         await initialize_schema(
             engine,
             schema=settings.postgres_schema,
             expected_version=settings.schema_version,
             metadata_hash=expected_hash,
+            initial_tariff=initial_tariff,
         )
         print(f"Platform database schema initialized (revision {settings.schema_version})")
         return 0

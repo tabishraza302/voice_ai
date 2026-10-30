@@ -44,8 +44,6 @@ def test_platform_settings(fresh_pg: FreshPostgres, tmp_path) -> PlatformSetting
         csrf_cookie_name="platform_csrf",
         auth_mail_mode="file",
         auth_mail_dir=mail_dir,
-        billing_slice_ms=1000,
-        billing_permit_ttl_ms=5000,
     )
 
 
@@ -72,6 +70,7 @@ async def app_client(
 ) -> AsyncIterator[httpx.AsyncClient]:
     """Yield httpx.AsyncClient interacting with a fully lifespan-initialized platform app."""
     app = create_app(test_platform_settings)
+    app.state.disable_billing_recovery_worker = True
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
