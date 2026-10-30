@@ -38,6 +38,69 @@ interface GeneratedSaveRecord {
   savedRevision: number | null;
 }
 
+interface JobSelectionToken {
+  jobId: string;
+  selectionEpoch: number;
+}
+interface JobRequestToken extends JobSelectionToken {
+  requestEpoch: number;
+}
+interface JobRequestState {
+  jobId: string | null;
+  selectionEpoch: number;
+  requestEpoch: number;
+  cancellationPending: boolean;
+}
+interface JobRequestRef {
+  current: JobRequestState;
+}
+
+function selectJobIdentity(ref: JobRequestRef, jobId: string | null): boolean {
+  const current = ref.current;
+  if (current.jobId === jobId) return false;
+  current.jobId = jobId;
+  current.selectionEpoch += 1;
+  current.requestEpoch += 1;
+  current.cancellationPending = false;
+  return true;
+}
+
+function beginJobRequest(ref: JobRequestRef, jobId: string, selectionEpoch?: number): JobRequestToken | null {
+  const current = ref.current;
+  if (
+    current.jobId !== jobId ||
+    (selectionEpoch !== undefined && current.selectionEpoch !== selectionEpoch) ||
+    current.cancellationPending
+  ) return null;
+  current.requestEpoch += 1;
+  return { jobId, selectionEpoch: current.selectionEpoch, requestEpoch: current.requestEpoch };
+}
+
+
+function isCurrentJobRequest(
+  ref: JobRequestRef,
+  token: JobRequestToken,
+  allowCancellationPending = false
+): boolean {
+  const current = ref.current;
+  return current.jobId === token.jobId &&
+    current.selectionEpoch === token.selectionEpoch &&
+    current.requestEpoch === token.requestEpoch &&
+    (allowCancellationPending || !current.cancellationPending);
+}
+
+function beginCancellation(ref: JobRequestRef, jobId: string): JobRequestToken | null {
+  const current = ref.current;
+  if (current.jobId !== jobId || current.cancellationPending) return null;
+  current.requestEpoch += 1;
+  current.cancellationPending = true;
+  return { jobId, selectionEpoch: current.selectionEpoch, requestEpoch: current.requestEpoch };
+}
+
+function finishCancellation(ref: JobRequestRef, token: JobRequestToken): void {
+  if (isCurrentJobRequest(ref, token, true)) ref.current.cancellationPending = false;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -147,6 +210,17 @@ export function PlatformAgentCreate({ initialMode, initialJobId = null }: Platfo
   const [createdAgentId, setCreatedAgentId] = useState<string | null>(null);
   const manualKeyRef = useRef<KeyRecord | null>(null);
 
+  const jobRequestRef = useRef<JobRequestState>({
+    jobId: initialJobId,
+    selectionEpoch: 0,
+    requestEpoch: 0,
+    cancellationPending: false,
+  });
+
+  const selectJob = (next: GenerationJobAccepted | null) => {
+    selectJobIdentity(jobRequestRef, next?.job_id ?? null);
+    setJob(next);
+  };
   useEffect(() => {
     let current = true;
     setTemplatesLoading(true);
@@ -182,8 +256,16 @@ export function PlatformAgentCreate({ initialMode, initialJobId = null }: Platfo
     }
   }, [generationModelId, models]);
   useEffect(() => {
+    const identityChanged = selectJobIdentity(jobRequestRef, initialJobId);
+    if (identityChanged) {
+      setJob(null);
+      setJobDetails(null);
+      setPollError(null);
+    }
     if (!initialJobId) return;
     let current = true;
+    const request = beginJobRequest(jobRequestRef, initialJobId);
+    if (!request) return;
     setPageError(null);
     setCreatedAgentId(null);
     try {
@@ -193,27 +275,45 @@ export function PlatformAgentCreate({ initialMode, initialJobId = null }: Platfo
       setPageError(errorMessage(error));
     }
     platformAgentApi.getGenerationJob(initialJobId).then((details) => {
-      if (!current) return;
-      setJob({ job_id: initialJobId, status: details.status });
-      setJobDetails(details);
+      if (!current || !isCurrentJobRequest(jobRequestRef, request)) return;
+      setJob((existing) => isCurrentJobRequest(jobRequestRef, request)
+        ? { job_id: initialJobId, status: details.status }
+        : existing);
+      setJobDetails((existing) => isCurrentJobRequest(jobRequestRef, request) ? details : existing);
+      if (isRunning(details.status)) {
+        setPollNonce((value) => isCurrentJobRequest(jobRequestRef, request) ? value + 1 : value);
+      }
     }).catch((error: unknown) => {
-      if (current) setPageError(`Could not recover generation job ${initialJobId}: ${errorMessage(error)}`);
+      if (!current || !isCurrentJobRequest(jobRequestRef, request)) return;
+      setPageError((existing) => isCurrentJobRequest(jobRequestRef, request)
+        ? `Could not recover generation job ${initialJobId}: ${errorMessage(error)}`
+        : existing);
     });
     return () => { current = false; };
   }, [initialJobId]);
 
   useEffect(() => {
     if (!job || !isRunning(job.status)) return;
+    const selectionEpoch = jobRequestRef.current.selectionEpoch;
+    if (jobRequestRef.current.jobId !== job.job_id) return;
     let current = true;
     const timer = window.setTimeout(() => {
+      const request = beginJobRequest(jobRequestRef, job.job_id, selectionEpoch);
+      if (!request) return;
       platformAgentApi.getGenerationJob(job.job_id).then((details) => {
-        if (!current) return;
-        setJobDetails(details);
-        setJob((existing) => existing ? { ...existing, status: details.status } : existing);
-        setPollError(null);
-        if (isRunning(details.status)) setPollNonce((value) => value + 1);
+        if (!current || !isCurrentJobRequest(jobRequestRef, request)) return;
+        setJobDetails((existing) => isCurrentJobRequest(jobRequestRef, request) ? details : existing);
+        setJob((existing) => isCurrentJobRequest(jobRequestRef, request) && existing?.job_id === request.jobId
+          ? { ...existing, status: details.status }
+          : existing);
+        setPollError((existing) => isCurrentJobRequest(jobRequestRef, request) ? null : existing);
+        if (isRunning(details.status)) {
+          setPollNonce((value) => isCurrentJobRequest(jobRequestRef, request) ? value + 1 : value);
+        }
       }).catch((error: unknown) => {
-        if (current) setPollError(errorMessage(error));
+        if (current) {
+          setPollError((existing) => isCurrentJobRequest(jobRequestRef, request) ? errorMessage(error) : existing);
+        }
       });
     }, 2000);
     return () => {
@@ -221,6 +321,7 @@ export function PlatformAgentCreate({ initialMode, initialJobId = null }: Platfo
       window.clearTimeout(timer);
     };
   }, [job?.job_id, job?.status, pollNonce]);
+
 
   const switchMode = (nextMode: "manual" | "generate") => {
     setMode(nextMode);
@@ -258,7 +359,7 @@ export function PlatformAgentCreate({ initialMode, initialJobId = null }: Platfo
     setSubmitting(true);
     setPageError(null);
     setPollError(null);
-    setJob(null);
+    selectJob(null);
     setJobDetails(null);
     setCreatedAgentId(null);
     try {
@@ -268,7 +369,7 @@ export function PlatformAgentCreate({ initialMode, initialJobId = null }: Platfo
         ...(language ? { language } : {}),
         token_budget: Number(tokenBudget),
       });
-      setJob(accepted);
+      selectJob(accepted);
       router.replace(`/agents/new?mode=generate&job=${encodeURIComponent(accepted.job_id)}`, { scroll: false });
     } catch (error: unknown) {
       setPageError(errorMessage(error));
@@ -279,26 +380,48 @@ export function PlatformAgentCreate({ initialMode, initialJobId = null }: Platfo
 
   const handleCancelGeneration = async () => {
     if (!job || !isRunning(job.status)) return;
+    const request = beginCancellation(jobRequestRef, job.job_id);
+    if (!request) return;
     setSubmitting(true);
     setPageError(null);
     try {
       const cancelled = await platformAgentApi.cancelGenerationJob(job.job_id);
-      setJob(cancelled);
+      if (!isCurrentJobRequest(jobRequestRef, request, true)) return;
+      setJob((existing) => isCurrentJobRequest(jobRequestRef, request, true) && existing?.job_id === request.jobId
+        ? cancelled
+        : existing);
+      finishCancellation(jobRequestRef, request);
       if (cancelled.status === "COMPLETED") {
+        const detailsRequest = beginJobRequest(jobRequestRef, request.jobId, request.selectionEpoch);
+        if (!detailsRequest) return;
         try {
-          const details = await platformAgentApi.getGenerationJob(cancelled.job_id);
-          setJob({ ...cancelled, status: details.status });
-          setJobDetails(details);
-          setPollError(null);
+          const details = await platformAgentApi.getGenerationJob(request.jobId);
+          if (!isCurrentJobRequest(jobRequestRef, detailsRequest)) return;
+          setJob((existing) => isCurrentJobRequest(jobRequestRef, detailsRequest) && existing?.job_id === detailsRequest.jobId
+            ? { ...cancelled, status: details.status }
+            : existing);
+          setJobDetails((existing) => isCurrentJobRequest(jobRequestRef, detailsRequest) ? details : existing);
+          setPollError((existing) => isCurrentJobRequest(jobRequestRef, detailsRequest) ? null : existing);
+          if (isRunning(details.status)) {
+            setPollNonce((value) => isCurrentJobRequest(jobRequestRef, detailsRequest) ? value + 1 : value);
+          }
         } catch (error: unknown) {
-          setPollError(errorMessage(error));
+          setPollError((existing) => isCurrentJobRequest(jobRequestRef, detailsRequest) ? errorMessage(error) : existing);
         }
       } else {
-        setJobDetails(null);
-        setPollError(null);
+        setJobDetails((existing) => isCurrentJobRequest(jobRequestRef, request, true) ? null : existing);
+        setPollError((existing) => isCurrentJobRequest(jobRequestRef, request, true) ? null : existing);
+        if (isRunning(cancelled.status)) {
+          setPollNonce((value) => isCurrentJobRequest(jobRequestRef, request, true) ? value + 1 : value);
+        }
       }
     } catch (error: unknown) {
-      setPageError(errorMessage(error));
+      if (!isCurrentJobRequest(jobRequestRef, request, true)) return;
+      finishCancellation(jobRequestRef, request);
+      setPageError((existing) => isCurrentJobRequest(jobRequestRef, request, true) ? errorMessage(error) : existing);
+      if (isRunning(job.status)) {
+        setPollNonce((value) => isCurrentJobRequest(jobRequestRef, request, true) ? value + 1 : value);
+      }
     } finally {
       setSubmitting(false);
     }
@@ -379,13 +502,20 @@ export function PlatformAgentCreate({ initialMode, initialJobId = null }: Platfo
 
   const recoverPoll = () => {
     if (!job) return;
-    setPollError(null);
+    const request = beginJobRequest(jobRequestRef, job.job_id);
+    if (!request) return;
+    setPollError((existing) => isCurrentJobRequest(jobRequestRef, request) ? null : existing);
     void platformAgentApi.getGenerationJob(job.job_id).then((details) => {
-      setJobDetails(details);
-      setJob((existing) => existing ? { ...existing, status: details.status } : existing);
-      if (isRunning(details.status)) setPollNonce((value) => value + 1);
+      if (!isCurrentJobRequest(jobRequestRef, request)) return;
+      setJobDetails((existing) => isCurrentJobRequest(jobRequestRef, request) ? details : existing);
+      setJob((existing) => isCurrentJobRequest(jobRequestRef, request) && existing?.job_id === request.jobId
+        ? { ...existing, status: details.status }
+        : existing);
+      if (isRunning(details.status)) {
+        setPollNonce((value) => isCurrentJobRequest(jobRequestRef, request) ? value + 1 : value);
+      }
     }).catch((error: unknown) => {
-      setPollError(errorMessage(error));
+      setPollError((existing) => isCurrentJobRequest(jobRequestRef, request) ? errorMessage(error) : existing);
     });
   };
 

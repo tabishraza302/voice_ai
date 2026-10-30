@@ -121,3 +121,123 @@ test("cancellation racing with generation completion reloads the proposal", asyn
   await expect(page.getByText("Generation completed without a proposal. No agent draft was created.")).toHaveCount(0);
   expect(completionReads).toBeGreaterThanOrEqual(2);
 });
+
+test("a delayed status retry cannot replace the newly selected generation", async ({ page }) => {
+  const nextJobId = "00000000-0000-0000-0000-000000000014";
+  let jobReads = 0;
+  const { promise: delayedResponse, resolve: releaseDelayedResponse } = Promise.withResolvers<void>();
+  const { promise: delayedRetryStarted, resolve: signalDelayedRetry } = Promise.withResolvers<void>();
+  await page.route("**/api/v1/**", async (route) => {
+    const pathname = new URL(route.request().url()).pathname;
+    if (pathname.endsWith("/auth/session")) {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(session) });
+      return;
+    }
+    if (pathname.endsWith("/templates")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ items: [], next_cursor: null }),
+      });
+      return;
+    }
+    if (pathname.endsWith("/generation-models")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          items: [{ id: "test-model", name: "Test model", description: "", supports_reasoning: false }],
+        }),
+      });
+      return;
+    }
+    if (pathname.endsWith("/agents/generate")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ job_id: nextJobId, status: "RUNNING" }),
+      });
+      return;
+    }
+    if (pathname.endsWith(`/generation-jobs/${jobId}`)) {
+      jobReads += 1;
+      if (jobReads <= 2) {
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            status: "RUNNING",
+            proposal: null,
+            unknown_business_facts: [],
+            validation_warnings: [],
+            usage: null,
+          }),
+        });
+        return;
+      }
+      if (jobReads === 3) {
+        await route.fulfill({
+          status: 503,
+          contentType: "application/json",
+          body: JSON.stringify({
+            error: {
+              code: "SERVICE_UNAVAILABLE",
+              message: "Temporary job detail failure",
+              request_id: "generation-retry-race",
+              retryable: true,
+              fields: [],
+            },
+          }),
+        });
+        return;
+      }
+      signalDelayedRetry();
+      await delayedResponse;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          ...completedJob,
+          proposal: { ...completedJob.proposal, name: "Old job proposal" },
+        }),
+      });
+      return;
+    }
+    if (pathname.endsWith(`/generation-jobs/${nextJobId}`)) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          status: "RUNNING",
+          proposal: null,
+          unknown_business_facts: [],
+          validation_warnings: [],
+          usage: null,
+        }),
+      });
+      return;
+    }
+    await route.fulfill({ status: 404, contentType: "application/json", body: JSON.stringify({ error: { code: "NOT_FOUND", message: "Unexpected test request" } }) });
+  });
+
+  await page.goto(`/agents/new?mode=generate&job=${jobId}`);
+  await expect(page.getByRole("button", { name: "Retry status check" })).toBeVisible();
+  await page.getByRole("button", { name: "Retry status check" }).click();
+
+  try {
+    await delayedRetryStarted;
+    await page.getByLabel("What should the agent do?").fill("Guide a customer through a loan application.");
+    await page.getByLabel("Generation model").selectOption("test-model");
+    await page.getByLabel("Token budget").fill("64");
+    await page.getByRole("button", { name: "Generate proposal" }).click();
+    await expect(page.getByText(`Job ID: ${nextJobId}`)).toBeVisible();
+    await expect(page.getByRole("heading", { name: "RUNNING", exact: true })).toBeVisible();
+  } finally {
+    releaseDelayedResponse();
+  }
+
+  await expect(page.getByText(`Job ID: ${nextJobId}`)).toBeVisible();
+  await expect(page.getByRole("heading", { name: "RUNNING", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Old job proposal", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Save proposal as draft" })).toHaveCount(0);
+});
