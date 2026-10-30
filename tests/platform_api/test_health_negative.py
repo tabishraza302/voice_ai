@@ -11,6 +11,7 @@ Verifies:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -169,6 +170,50 @@ async def test_lifespan_dispose_in_finally(mock_settings):
             pass
 
         assert mock_engine.dispose.await_count >= 1
+
+
+
+@pytest.mark.asyncio
+async def test_lifespan_cancels_billing_recovery_worker_on_shutdown(mock_settings):
+    app = FastAPI()
+    app.state.settings = mock_settings
+    app.state.disable_generation_worker = True
+    app.state.disable_qa_worker = True
+    mock_engine = MagicMock()
+    mock_engine.dispose = AsyncMock()
+    session_factory = object()
+    worker_started = asyncio.Event()
+    worker_cancelled = asyncio.Event()
+
+    async def billing_worker(worker_app):
+        assert worker_app.state.session_factory is session_factory
+        worker_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            worker_cancelled.set()
+            raise
+
+    with (
+        patch("platform_api.app.create_engine", return_value=mock_engine),
+        patch("platform_api.app.get_session_factory", return_value=session_factory),
+        patch("platform_api.app.load_catalog", return_value=object()),
+        patch(
+            "platform_api.app.load_deployment_capability_report",
+            return_value=object(),
+        ),
+        patch("platform_api.app.check_schema_readiness", new=AsyncMock(return_value=True)),
+        patch("platform_api.app.billing_recovery_worker_loop", new=billing_worker),
+    ):
+        async with lifespan(app):
+            await asyncio.wait_for(worker_started.wait(), timeout=1)
+            worker_task = app.state.billing_recovery_worker_task
+            assert worker_task is not None
+            assert not worker_task.done()
+        assert worker_task.cancelled()
+        assert worker_cancelled.is_set()
+        assert app.state.billing_recovery_worker_task is None
+        mock_engine.dispose.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -39,6 +39,8 @@ from platform_api.billing.routes import (
     internal_router as internal_billing_router,
     router as billing_router,
 )
+
+from platform_api.billing.service import billing_recovery_worker_loop
 from platform_api.catalog import load_catalog
 from platform_api.config import PlatformSettings, get_settings
 from platform_api.testing.routes import router as chat_test_router
@@ -191,6 +193,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.generation_job_tasks = {}
     app.state.qa_worker_task = None
     app.state.qa_job_tasks = {}
+    app.state.billing_recovery_worker_task = None
 
     engine = create_engine(settings)
     session_factory = get_session_factory(engine)
@@ -199,6 +202,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     created_model_client = False
     worker_task: asyncio.Task[None] | None = None
     qa_worker_task: asyncio.Task[None] | None = None
+    billing_recovery_worker_task: asyncio.Task[None] | None = None
 
     try:
         app.state.catalog = load_catalog(settings.catalog_path)
@@ -243,6 +247,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 name="platform-flow-qa-worker",
             )
             app.state.qa_worker_task = qa_worker_task
+        if (
+            app.state.schema_ready
+            and not getattr(app.state, "disable_billing_recovery_worker", False)
+        ):
+            billing_recovery_worker_task = asyncio.create_task(
+                billing_recovery_worker_loop(app),
+                name="platform-billing-recovery-worker",
+            )
+            app.state.billing_recovery_worker_task = billing_recovery_worker_task
 
         yield
     finally:
@@ -252,10 +265,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if qa_worker_task is not None:
             qa_worker_task.cancel()
             await asyncio.gather(qa_worker_task, return_exceptions=True)
+        if billing_recovery_worker_task is not None:
+            billing_recovery_worker_task.cancel()
+            await asyncio.gather(
+                billing_recovery_worker_task, return_exceptions=True
+            )
         app.state.generation_worker_task = None
         app.state.generation_job_tasks = {}
         app.state.qa_worker_task = None
         app.state.qa_job_tasks = {}
+        app.state.billing_recovery_worker_task = None
 
         if created_model_client:
             await app.state.model_client.aclose()
@@ -284,6 +303,7 @@ def create_app(settings: PlatformSettings | None = None) -> FastAPI:
     app.state.generation_job_tasks = {}
     app.state.qa_worker_task = None
     app.state.qa_job_tasks = {}
+    app.state.billing_recovery_worker_task = None
     app.state.deployment_identity = None
     app.state.catalog = None
 
