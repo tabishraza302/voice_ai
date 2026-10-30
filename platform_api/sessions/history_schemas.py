@@ -78,7 +78,7 @@ class TranscriptSegmentView(StrictModel):
     start_ms: int
     end_ms: int
     kind: str
-
+    corrected: bool
 
 class TranscriptGapView(StrictModel):
     after_sequence: int
@@ -89,6 +89,8 @@ class TranscriptGapView(StrictModel):
 class TranscriptPageView(StrictModel):
     session_id: uuid.UUID
     transcript_revision: int
+    policy_revision: int
+    visible_to_owner: bool
     segments: list[TranscriptSegmentView]
     has_gaps: bool
     gaps: list[TranscriptGapView]
