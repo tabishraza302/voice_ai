@@ -137,7 +137,9 @@ test.describe("touch creation", () => {
     });
 
     await page.getByRole("button", { name: "Save proposal as draft" }).tap();
-    await expect(page.getByRole("alert")).toBeVisible();
+    await expect(
+      page.getByRole("alert").filter({ has: page.getByRole("link", { name: "Open the created draft" }) })
+    ).toBeVisible();
     await expect(page.getByRole("link", { name: "Open the created draft" })).toBeVisible();
     expect(createdAgentId).not.toBeNull();
 
@@ -152,7 +154,9 @@ test.describe("touch creation", () => {
     await page.reload();
     await expect(page.getByRole("heading", { name: "COMPLETED", exact: true })).toBeVisible();
     await page.getByRole("button", { name: "Save proposal as draft" }).tap();
-    await expect(page.getByRole("alert")).toContainText("The created draft changed from r1 to r2");
+    await expect(
+      page.getByRole("alert").filter({ hasText: "The created draft changed from r1 to r2" })
+    ).toContainText("The created draft changed from r1 to r2");
     expect(agentCreateCount).toBe(1);
 
     await editedDraftPage.reload();
@@ -217,7 +221,9 @@ test("Chat Test uses a saved executable snapshot and reset keeps its hash but st
   const uncommittedMessage = "Continue from the latest confirmed details.";
   await page.getByLabel("Message the agent").fill(uncommittedMessage);
   await page.getByRole("button", { name: "Send message" }).click();
-  await expect(page.getByRole("alert")).toContainText("The pinned snapshot was rejected");
+  await expect(
+    page.getByRole("alert").filter({ hasText: "The pinned snapshot was rejected" })
+  ).toContainText("The pinned snapshot was rejected");
   await expect(page.getByRole("button", { name: "Start on selected snapshot" })).toBeVisible();
   await page.getByRole("button", { name: "Start on selected snapshot" }).click();
   const currentTestId = await page.getByText("Test ID:").locator("span").innerText();
@@ -336,7 +342,9 @@ test("duplicate retry reuses its idempotency key after response loss and reload"
   };
   await page.route(duplicateRoute, loseDuplicateResponse);
   await page.getByRole("button", { name: `Duplicate ${agentName}` }).click();
-  await expect(page.getByRole("alert")).toBeVisible();
+  await expect(
+    page.getByRole("alert").filter({ has: page.getByRole("button", { name: "Dismiss" }) })
+  ).toBeVisible();
   expect(firstIdempotencyKey).not.toBe("");
   await page.unroute(duplicateRoute, loseDuplicateResponse);
   await page.reload();
