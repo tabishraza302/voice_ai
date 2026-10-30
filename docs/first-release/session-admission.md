@@ -1,6 +1,6 @@
 # Task 6 platform session admission
 
-This document describes the implemented platform control-plane boundary for owner-only voice-test sessions. It does **not** claim that the local SaaS runtime or media pipeline is present: that runtime is an external prerequisite and must implement the bridge described below before voice-test admission can be enabled.
+This document describes the platform control-plane boundary and the local voice runner's Task 6 admission bridge. The bridge now binds an immutable runtime snapshot to Pipecat SmallWebRTC offers and blocks speech until admission and real media readiness. The runtime still fails closed unless durable PostgreSQL flow/stop storage, committed playback receipts, and the installed adapter qualification are provided; those production proofs are not fabricated here.
 
 ## Scope and storage
 
@@ -58,21 +58,26 @@ Registration command fields are `session_id`, `runner_id`, `registration_id`, `c
 
 Release command fields are `session_id`, `runner_id`, `registration_id`, and the exact `session_version`. Only an HTTP 200 response with matching session, runner, registration, and version plus `released: true` frees platform execution capacity. An absent, malformed, stale, or ambiguous acknowledgement keeps the slot reserved for retry.
 
-The platform accepts only exact loopback runner and signaling endpoints. It does not resolve a hosted runtime by DNS, download code or models, or expose a configurable public runner URL. The local runtime must authenticate the configured platform service token and runner identity, verify the join JWT and origin before allocating a media/provider session, load only the immutable published config, enforce permit/hard-end boundaries, report peer/lifecycle changes, and provide the stop attestation. Those runtime-side endpoints and media behaviors are not implemented in this platform worktree.
+The local runner mounts authenticated registration and release routes at `/internal/runtime/sessions/{session_id}/register` and `/release`. Browser admission is bound to the real Pipecat SmallWebRTC `POST /api/offer` contract: `request_data` must contain exactly `session_id` and `join_token`, and the exact configured `PLATFORM_WEB_ORIGIN` must be present. The returned `pc_id` is bound to that session and origin before the answer is returned; later `PATCH /api/offer` ICE candidates require the same origin and a live `pc_id` binding. The runner reports `ACTIVE` only after the pipeline hooks start, the answer is bound, and `SmallWebRTCConnection.is_connected()` is true. The SaaS path skips local agent-profile lookup and process-wide mode overrides, and it never installs the local text/language app-message handler. Local runner offers without session credentials retain their prior path.
 
 ## Configuration and external prerequisites
 
-All session configuration is unset in `.env.example`; `PLATFORM_ENABLE_VOICE_TEST` remains false. To enable a local deployment, an operator must provide all of the following from the actual installed environment:
+All platform session configuration remains unset in `.env.example`; `PLATFORM_ENABLE_VOICE_TEST` remains false. The voice runner reads `PLATFORM_API_BASE_URL`, `PLATFORM_SESSION_RUNNER_ID`, `PLATFORM_RUNTIME_SERVICE_TOKEN`, `PLATFORM_WEB_ORIGIN`, `PLATFORM_BILLING_SLICE_MS`, `PLATFORM_BILLING_PERMIT_TTL_MS`, and optionally `PLATFORM_SESSION_RUNTIME_TIMEOUT_SECONDS`. The runner API URL must be a loopback origin, the web origin is exact, and runtime service tokens must be private. Invalid SaaS settings fail only when the session bridge is used and do not change local startup.
+
+Before a local deployment can admit a browser session, an operator must provide:
 
 1. PostgreSQL with a fresh platform schema initialized for this code version. Test only against a disposable fresh database; do not reset an existing user database or use an incompatible schema.
 2. `PLATFORM_SESSION_RUNNER_ID` and `PLATFORM_SESSION_RUNNER_URL`, with the latter pointing to the real local loopback runtime bridge.
 3. `PLATFORM_RUNTIME_SERVICE_TOKEN`, a private token shared only by the platform and assigned local runner.
 4. Positive `PLATFORM_SESSION_OWNER_CAPACITY` and `PLATFORM_SESSION_RUNNER_CAPACITY` limits.
-5. `PLATFORM_SESSION_SIGNALING_URL` at a real local loopback signaling endpoint and `PLATFORM_WEB_ORIGIN` set to the exact owner browser origin.
+5. `PLATFORM_SESSION_SIGNALING_URL` at the real local HTTPS signaling endpoint and `PLATFORM_WEB_ORIGIN` set to the exact owner browser origin.
 6. `PLATFORM_SESSION_JOIN_ISSUER`, `PLATFORM_SESSION_JOIN_PRIVATE_KEY_B64`, and `PLATFORM_SESSION_JOIN_PUBLIC_KEY_B64` containing a matching platform-owned Ed25519 pair; keep the private key on the platform side.
 7. Positive `PLATFORM_SESSION_JOIN_TTL_SECONDS`, `PLATFORM_SESSION_MAX_DURATION_MS`, `PLATFORM_SESSION_SETUP_TIMEOUT_SECONDS`, `PLATFORM_SESSION_RECONNECT_GRACE_SECONDS`, and `PLATFORM_SESSION_RUNTIME_TIMEOUT_SECONDS`; these are required and have no code defaults. For fresh schema initialization only, explicitly set `PLATFORM_INITIAL_SESSION_RATE_MINOR_PER_MINUTE`, `PLATFORM_INITIAL_BILLING_SLICE_MS`, and `PLATFORM_INITIAL_BILLING_PERMIT_TTL_MS` together. They seed the first persisted tariff version; missing values fail fresh initialization. Runtime admission reads the active PostgreSQL tariff policy, never a second environment rate source.
 8. A real trusted qualification report and stable deployment identity from `PLATFORM_ADAPTER_CAPABILITY_REPORT_PATH`, `PLATFORM_ADAPTER_CAPABILITY_REPORT_HASH`, `PLATFORM_DEPLOYMENT_ADAPTER_ID`, `PLATFORM_DEPLOYMENT_ADAPTER_VERSION`, `PLATFORM_DEPLOYMENT_MODEL_REVISION`, `PLATFORM_DEPLOYMENT_PROFILE_HASH`, and `PLATFORM_DEPLOYMENT_SOURCE_REVISION`, matching the actual qualified EN/HI adapter and published voice settings.
-9. A funded owner wallet for each admitted session.
-10. The real runtime registration/release bridge, token/origin/JTI verification, immutable-config loading, permit enforcement, peer lifecycle, and version-bound stop attestation installed and verified in the intended air-gapped/loopback environment.
+9. A PostgreSQL-backed `DurablePostgresFlowStore` implementing committed event writes, flow-state restore, and idempotent save/load of the exact stop record before budget close. No SQLite, JSONL, or in-memory fallback qualifies.
+10. A session-bound `VerifiedPlaybackUsageMeter` sourced only from `committed_playback_receipts`, and the pinned `bot.flow.playback_receipts` implementation that verifies authenticated browser render receipts against exact server-side PCM ranges.
+11. Evidence from the installed adapter—not a configured label or raw transport probe—that the reported adapter qualification hash matches the pinned snapshot and supports speech gating, cancellation, metadata, and EN/HI playback.
+12. A pinned Pipecat TTS/SmallWebRTC stop-and-drain integration that stops output writes before final cursor cancellation ranges are recorded. Until then interrupted fragments cannot be credited as completed playback.
+13. A funded owner wallet for each admitted session and the real platform session service endpoints described above.
 
-Do not enable `PLATFORM_ENABLE_VOICE_TEST` until these prerequisites are present. No credentials, provider downloads, DNS-discovered services, hosted-media fallbacks, or fake successful acknowledgements are supplied by this code.
+Browser `AudioData.timestamp` must be mapped to the server's actual `RawAudioTrack` PTS; a missing or ambiguous mapping yields no receipt. Text-only responses, silent fixtures, byte counts, process health, and diagnostic transport probes are not proof of rendered audio. Do not enable `PLATFORM_ENABLE_VOICE_TEST` until every prerequisite is installed and verified in the intended air-gapped/loopback environment. No credentials, provider downloads, DNS-discovered services, hosted-media fallbacks, or fake successful acknowledgements are supplied by this code.

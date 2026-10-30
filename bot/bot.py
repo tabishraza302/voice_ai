@@ -218,36 +218,47 @@ async def start_mlx_audio_server(settings: Settings) -> subprocess.Popen | None:
     raise RuntimeError(f"the mlx-audio server did not come up on {root}")
 
 
-async def run_bot(transport, settings: Settings, runner_args=None) -> None:
+async def run_bot(
+    transport,
+    settings: Settings,
+    runner_args=None,
+    *,
+    flow_hooks=None,
+    register_local_app_messages: bool = True,
+) -> None:
     """Build and run the pipeline on the given transport."""
     server = await start_mlx_audio_server(settings)
     try:
-        await _run_pipeline(transport, settings, runner_args)
+        await _run_pipeline(
+            transport,
+            settings,
+            runner_args,
+            flow_hooks=flow_hooks,
+            register_local_app_messages=register_local_app_messages,
+        )
     finally:
         if server is not None:
             server.terminate()
 
 
-async def _run_pipeline(transport, settings: Settings, runner_args=None) -> None:
-    """Build the one voice pipeline and run it on the given transport.
-
-    The composition lives in ``bot.runtime.pipeline_builder`` so the local
-    entrypoint and the authorized runtime build the same pipeline. This
-    function owns only what is specific to the local runner: the
-    process-wide Prometheus observer (so ``/metrics`` and the pipeline
-    share a registry) and the browser client's app-message channel.
-    """
+async def _run_pipeline(
+    transport,
+    settings,
+    runner_args=None,
+    *,
+    flow_hooks=None,
+    register_local_app_messages: bool = True,
+) -> None:
+    """Build and run the shared local or platform-managed voice pipeline."""
     assembly = build_voice_pipeline(
         transport,
         settings,
         instruments=get_prometheus_observer(settings),
         runner_args=runner_args,
+        flow_hooks=flow_hooks,
     )
-
-    # The client's language switch and text box ride on the transport's
-    # app-message channel. Wire it before the runner starts the worker.
-    _register_app_message_handler(transport, assembly.pipeline, settings)
-
+    if register_local_app_messages:
+        _register_app_message_handler(transport, assembly.pipeline, settings)
     await assembly.run()
 
 
@@ -397,34 +408,97 @@ def mount_offer_guard(
     if getattr(app.state, "offer_guard_mounted", False):
         return
     app.state.offer_guard_mounted = True
-    from starlette.middleware.base import BaseHTTPMiddleware
-    from starlette.requests import Request
-    from starlette.responses import JSONResponse
+    from starlette.responses import JSONResponse, Response
     from sqlalchemy.exc import InterfaceError, OperationalError, SQLAlchemyError
     from bot.agents.service import AgentNotFoundError
     from bot.db.session import StorageUnavailableError
+    from bot.runtime.session_task import SessionAdmissionError
 
-    allowed_origins = {
-        f"http://localhost:{settings.web_port}",
-        f"http://127.0.0.1:{settings.web_port}",
-    }
 
     class WebRTCOfferPreflightMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: Request, call_next):
-            if request.method == "POST" and (
-                request.url.path == "/api/offer"
-                or request.url.path.endswith("/api/offer")
-                or request.url.path == "/start"
+            path = request.url.path
+            method = request.method.upper()
+            origin = request.headers.get("origin")
+            if path == "/api/offer" and method == "POST":
+                try:
+                    body_bytes = await request.body()
+                    data = json.loads(body_bytes) if body_bytes else {}
+                except json.JSONDecodeError:
+                    return JSONResponse(status_code=400, content={"detail": "Offer body must be valid JSON"})
+                request_data = _session_request_data(data)
+                if _has_session_credentials(request_data):
+                    manager = getattr(app.state, "voice_session_manager", None)
+                    if manager is None:
+                        return JSONResponse(status_code=503, content={"detail": "Platform session runtime is unavailable"})
+                    try:
+                        pending = await manager.prepare_offer(request_data, origin=origin)
+                    except SessionAdmissionError as exc:
+                        return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
+                    try:
+                        response = await call_next(request)
+                        if not 200 <= response.status_code < 300:
+                            await manager.abort_offer(pending.snapshot.session_id, reason="offer_failed")
+                            return response
+                        response_body = getattr(response, "body", None)
+                        if response_body is None:
+                            response_body = b"".join(
+                                chunk async for chunk in response.body_iterator
+                            )
+                        answer = json.loads(response_body)
+                        pc_id = answer.get("pc_id") if isinstance(answer, dict) else None
+                        if not isinstance(pc_id, str):
+                            raise SessionAdmissionError("SmallWebRTC answer has no pc_id", status_code=502)
+                        await manager.bind_peer_pc(pending.snapshot.session_id, pc_id)
+                        response_headers = {
+                            key: value
+                            for key, value in response.headers.items()
+                            if key.lower() not in {"content-length", "transfer-encoding"}
+                        }
+                        return Response(
+                            content=response_body,
+                            status_code=response.status_code,
+                            headers=response_headers,
+                            media_type=response.media_type,
+                            background=response.background,
+                        )
+                    except Exception as exc:
+                        try:
+                            await manager.abort_offer(pending.snapshot.session_id, reason="offer_failed")
+                        except Exception:
+                            logger.exception("Failed to release an unbound platform offer")
+                        if isinstance(exc, SessionAdmissionError):
+                            return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
+                        logger.exception("Platform offer negotiation failed")
+                        return JSONResponse(status_code=502, content={"detail": "WebRTC offer could not be bound to its platform session"})
+                if settings.platform_web_origin and origin == settings.platform_web_origin:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"detail": "Platform browser offers require session_id and join_token"},
+                    )
+
+            if path == "/api/offer" and method == "PATCH" and origin == settings.platform_web_origin:
+                manager = getattr(app.state, "voice_session_manager", None)
+                if manager is None:
+                    return JSONResponse(status_code=503, content={"detail": "Platform session runtime is unavailable"})
+                try:
+                    data = json.loads(await request.body())
+                except json.JSONDecodeError:
+                    return JSONResponse(status_code=400, content={"detail": "Candidate body must be valid JSON"})
+                pc_id = data.get("pc_id") if isinstance(data, dict) else None
+                if not isinstance(pc_id, str) or not manager.authorize_patch(pc_id, origin):
+                    return JSONResponse(status_code=403, content={"detail": "Candidate update has no active session binding"})
+
+            if method == "POST" and (
+                path == "/api/offer"
+                or path.endswith("/api/offer")
+                or path == "/start"
             ):
-                origin = request.headers.get("origin")
-                headers = {}
-                if origin in allowed_origins:
-                    headers["Access-Control-Allow-Origin"] = origin
                 try:
                     body_bytes = await request.body()
                     if body_bytes:
                         data = json.loads(body_bytes)
-                        source = "start" if request.url.path == "/start" else "offer"
+                        source = "start" if path == "/start" else "offer"
                         session_body = extract_session_body(data, source=source)
                         if session_body and "agent_id" in session_body:
                             await preflight_session_settings(
@@ -434,18 +508,10 @@ def mount_offer_guard(
                     pass
                 except InvalidSessionBodyError as exc:
                     logger.warning(f"WebRTC offer preflight rejected misplaced session body: {exc}")
-                    return JSONResponse(
-                        status_code=400,
-                        content={"detail": str(exc)},
-                        headers=headers,
-                    )
+                    return JSONResponse(status_code=400, content={"detail": str(exc)})
                 except InvalidAgentIdError as exc:
                     logger.warning(f"WebRTC offer preflight rejected invalid agent id: {exc}")
-                    return JSONResponse(
-                        status_code=400,
-                        content={"detail": f"Invalid agent ID: {exc}"},
-                        headers=headers,
-                    )
+                    return JSONResponse(status_code=400, content={"detail": f"Invalid agent ID: {exc}"})
                 except SttLanguageNotSupportedError as exc:
                     logger.warning(f"WebRTC offer preflight rejected incompatible STT settings: {exc}")
                     return JSONResponse(
@@ -456,15 +522,10 @@ def mount_offer_guard(
                                 "pinned languages. Set language to auto or switch speech recognition to mlx-audio."
                             )
                         },
-                        headers=headers,
                     )
                 except LlmModelNotAvailableError as exc:
                     logger.warning(f"WebRTC offer preflight rejected unavailable LLM model: {exc}")
-                    return JSONResponse(
-                        status_code=503,
-                        content={"detail": f"Selected language model is unavailable: {exc}"},
-                        headers=headers,
-                    )
+                    return JSONResponse(status_code=503, content={"detail": f"Selected language model is unavailable: {exc}"})
                 except (StorageUnavailableError, OperationalError, InterfaceError) as exc:
                     logger.warning(f"WebRTC offer preflight could not reach agent storage: {exc}")
                     return JSONResponse(
@@ -476,28 +537,29 @@ def mount_offer_guard(
                                 "Reconnect PostgreSQL and try again."
                             )
                         },
-                        headers=headers,
                     )
                 except AgentNotFoundError as exc:
                     logger.warning(f"WebRTC offer preflight rejected missing agent: {exc}")
                     return JSONResponse(
                         status_code=404,
                         content={"detail": "The requested agent profile was not found or has been deleted."},
-                        headers=headers,
                     )
                 except SQLAlchemyError as exc:
                     logger.error(f"WebRTC offer preflight failed on database error: {exc}")
                     return JSONResponse(
                         status_code=500,
                         content={"detail": "Database error: Unable to load agent configuration."},
-                        headers=headers,
                     )
                 except Exception:
                     logger.exception("WebRTC offer preflight failed unexpectedly")
                     return JSONResponse(
                         status_code=500,
-                        content={"detail": "Voice session initialization failed: The server encountered an unexpected error configuring the session."},
-                        headers=headers,
+                        content={
+                            "detail": (
+                                "Voice session initialization failed: The server encountered an unexpected error "
+                                "configuring the session."
+                            )
+                        },
                     )
 
             return await call_next(request)
@@ -510,13 +572,29 @@ async def bot(runner_args) -> None:
     """The entrypoint the Pipecat dev runner discovers."""
     webrtc_connection = getattr(runner_args, "webrtc_connection", None)
     try:
+        settings = Settings()
+        body = getattr(runner_args, "body", None)
+        request_data = _session_request_data(body)
+        if _has_session_credentials(request_data):
+            from bot.saas_runtime import get_session_manager
+
+            manager = get_session_manager()
+            if manager is None:
+                raise RuntimeError("Platform session runtime is unavailable")
+            await _run_platform_session(
+                runner_args,
+                manager,
+                request_data,
+                webrtc_connection,
+            )
+            return
+
         # Only Studio sessions that explicitly send an agent id receive a
         # profile. The prebuilt runner stays on the measured .env configuration.
-        settings = Settings()
         from bot.agents.service import apply_active_agent_to_settings
 
         settings = await resolve_session_settings(
-            settings, getattr(runner_args, "body", None), apply_active_agent_to_settings
+            settings, body, apply_active_agent_to_settings
         )
         # An explicit process-wide control-page STT mode override takes
         # precedence over a selected profile's STT provider.
@@ -536,6 +614,69 @@ async def bot(runner_args) -> None:
             await close_peer_connection(webrtc_connection)
         raise
 
+
+def _session_request_data(body: object) -> object:
+    if isinstance(body, dict) and "request_data" in body:
+        return body["request_data"]
+    return body
+
+
+def _has_session_credentials(request_data: object) -> bool:
+    return isinstance(request_data, dict) and (
+        "session_id" in request_data or "join_token" in request_data
+    )
+
+
+async def _run_platform_session(
+    runner_args,
+    manager,
+    request_data: object,
+    webrtc_connection,
+) -> None:
+    """Run only a join admitted by the platform session manager."""
+    pending = await manager.claim_pipeline(request_data)
+    pending.connection = webrtc_connection
+    activation_task = None
+    pipeline_task = None
+    try:
+        settings = await manager.begin_pipeline(pending)
+        validate_stt_language(settings)
+        logger.info(
+            f"platform voice session starting: stt={settings.stt_provider}/{settings.stt_model} "
+            f"llm={settings.llm_provider}/{settings.llm_model} "
+            f"tts={settings.tts_provider}/{settings.tts_model}"
+        )
+        transport = await create_transport(runner_args, transport_params())
+        await manager.attach_transport(pending, transport, webrtc_connection)
+        activation_task = asyncio.create_task(manager.wait_until_active(pending))
+        pipeline_task = asyncio.create_task(
+            run_bot(
+                transport,
+                settings,
+                runner_args,
+                flow_hooks=pending.runtime,
+                register_local_app_messages=False,
+            )
+        )
+        done, _ = await asyncio.wait(
+            {activation_task, pipeline_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if activation_task in done:
+            await activation_task
+        if pipeline_task in done:
+            await pipeline_task
+        else:
+            await pipeline_task
+    finally:
+        for task in (activation_task, pipeline_task):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        await manager.finish_pipeline(pending, "runner_exit")
 
 def build_model_resolver(settings: Settings):
     """Map a processor name to the model id configured behind it.
@@ -603,9 +744,11 @@ def mount_api(
     from fastapi.middleware.cors import CORSMiddleware
     from bot.api.router import create_api_router
     from bot.local_guard import mount_local_state_guard
+    from bot.saas_runtime import mount_saas_runtime
 
     # Mount preflight validation before local state guard so that the local
     # security guard is added last and runs outermost (Starlette LIFO order).
+    mount_saas_runtime(app, settings)
     mount_offer_guard(app, settings, profile_resolver=profile_resolver)
     app.add_middleware(
         CORSMiddleware,

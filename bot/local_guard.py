@@ -8,12 +8,9 @@ browser sends a same-origin request with ``Host: evil.example:7860``.
 
 This guard is deliberately narrow:
 
-* only state-changing methods are checked, so ordinary GET/HEAD/OPTIONS
-  traffic (including CORS preflight) is untouched;
-* an absent ``Origin`` is allowed, because curl and other non-browser
-  clients do not send one;
-* a present ``Origin`` must be the agent or Studio origin on a loopback
-  host;
+* only state-changing methods are checked, except for the exact configured platform `/api/offer` CORS preflight;
+* an absent ``Origin`` is allowed for non-browser local clients;
+* a present local ``Origin`` must be the agent or Studio origin on a loopback host; the configured platform origin is allowed only on `POST`/`PATCH /api/offer`;
 * ``Host`` must name a literal loopback IP (127.0.0.0/8, ::1) or ``localhost``
   with the agent's actual bound port, so a rebound DNS name is rejected even
   when the browser thinks the request is same-origin.
@@ -28,7 +25,7 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 
 from bot.config import Settings
 
@@ -211,7 +208,43 @@ def mount_local_state_guard(
 
     class LocalStateGuardMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: Request, call_next):
-            if request.method.upper() in STATE_CHANGING_METHODS:
+            method = request.method.upper()
+            path = request.url.path
+            origin = request.headers.get("origin")
+            platform_offer = bool(
+                settings.platform_web_origin
+                and origin == settings.platform_web_origin
+                and path == "/api/offer"
+                and method in {"POST", "PATCH"}
+            )
+            platform_preflight = bool(
+                settings.platform_web_origin
+                and origin == settings.platform_web_origin
+                and path == "/api/offer"
+                and method == "OPTIONS"
+            )
+            if platform_preflight:
+                bound_port = resolve_bound_port(request, settings)
+                host = request.headers.get("host", "")
+                requested_method = request.headers.get("access-control-request-method", "").upper()
+                if (
+                    not is_allowed_host(host, bound_port)
+                    or requested_method not in {"POST", "PATCH"}
+                    or request.headers.get("access-control-request-headers", "").lower()
+                    not in {"", "content-type"}
+                ):
+                    return JSONResponse(status_code=403, content={"detail": "Platform offer preflight is not allowed"})
+                return Response(
+                    status_code=204,
+                    headers={
+                        "Access-Control-Allow-Origin": origin,
+                        "Access-Control-Allow-Methods": "POST, PATCH, OPTIONS",
+                        "Access-Control-Allow-Headers": "Content-Type",
+                        "Access-Control-Max-Age": "600",
+                        "Vary": "Origin",
+                    },
+                )
+            if method in STATE_CHANGING_METHODS:
                 bound_port = resolve_bound_port(request, settings)
                 host = request.headers.get("host", "")
                 if not is_allowed_host(host, bound_port):
@@ -224,10 +257,9 @@ def mount_local_state_guard(
                             )
                         },
                     )
-                origin = request.headers.get("origin")
                 if origin is not None:
                     allowed_ports = {bound_port, settings.web_port}
-                    if not is_allowed_origin(origin, allowed_ports):
+                    if not platform_offer and not is_allowed_origin(origin, allowed_ports):
                         return JSONResponse(
                             status_code=403,
                             content={
@@ -237,6 +269,12 @@ def mount_local_state_guard(
                                 )
                             },
                         )
-            return await call_next(request)
+            response = await call_next(request)
+            if platform_offer:
+                response.headers["Access-Control-Allow-Origin"] = origin
+                response.headers["Access-Control-Allow-Methods"] = "POST, PATCH"
+                response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+                response.headers["Vary"] = "Origin"
+            return response
 
     app.add_middleware(LocalStateGuardMiddleware)
