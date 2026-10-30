@@ -16,13 +16,16 @@ from sqlalchemy import select
 
 from bot.flow.qualification import AgentQualificationSettings
 from bot.flow.schemas import AdapterCapabilities
+from platform_api.agents.models import IdempotencyRecord
 from platform_api.auth.errors import ConflictError, DependencyUnavailableError, ForbiddenError
 from platform_api.auth.sessions import create_authenticated_session
 from platform_api.auth.types import Principal
 from platform_api.billing.models import CallBudget
 from platform_api.billing.schemas import BudgetPermit, RuntimeStopAttestation
 from platform_api.billing.service import RuntimePrincipal, close_budget
+from platform_api.billing.tariffs import append_tariff_version
 from platform_api.config import PlatformSettings
+from platform_api.models.auth import AuditLog
 from platform_api.models.session import Session
 from platform_api.sessions import admission, service
 from platform_api.sessions.models import (
@@ -39,7 +42,11 @@ from platform_api.sessions.schemas import (
     RuntimeReservation,
     SessionTransitionRequest,
 )
-from tests.support.billing import create_funded_wallet, create_test_user
+from tests.support.billing import (
+    create_funded_wallet,
+    create_test_session,
+    create_test_user,
+)
 from tests.support.postgres import FreshPostgres
 
 
@@ -89,11 +96,7 @@ def _session_settings(
             "session_max_duration_ms": 60_000,
             "session_setup_timeout_seconds": 60,
             "session_reconnect_grace_seconds": 10,
-            "session_rate_minor_per_minute": 6000,
-            "session_tariff_version": "task6-contract-test-1",
             "session_runtime_timeout_seconds": 2.0,
-            "billing_slice_ms": 1000,
-            "billing_permit_ttl_ms": 60_000,
         }
     )
 
@@ -560,6 +563,348 @@ async def test_admission_funds_before_jti_and_releases_capacity_before_budget_cl
             await db.execute(select(Session).where(Session.id == registered.session_id))
         ).scalar_one()
         assert stored_session.state == "COMPLETED"
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_admission_retry_uses_the_session_tariff_after_active_rate_changes(
+    test_platform_settings: PlatformSettings,
+    initialized_pg: FreshPostgres,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retry reuses the rate/slice/TTL pinned before a current tariff change."""
+    settings = _session_settings(test_platform_settings)
+    capabilities, qualification_settings = _qualification()
+    monkeypatch.setattr(service, "_load_owned_version", _fake_owned_voice_version)
+    start = datetime.now(timezone.utc)
+    monkeypatch.setattr(service, "_utc_now", lambda: start)
+    registration_calls: list[RuntimeRegistrationRequest] = []
+    agent_id = uuid.uuid4()
+    agent_version_id = uuid.uuid4()
+    pause_checks: list[tuple[uuid.UUID, uuid.UUID]] = []
+
+    async def allow_admission(db, owner_user_id, checked_agent_id):
+        pause_checks.append((owner_user_id, checked_agent_id))
+
+    monkeypatch.setattr(service, "check_admission_pause", allow_admission)
+
+    async def register_bridge(config, command):
+        registration_calls.append(command)
+        return RuntimeReservation(
+            session_id=command.session_id,
+            runner_id=command.runner_id,
+            registration_id=command.registration_id,
+            expires_at=command.connect_deadline,
+        )
+
+    monkeypatch.setattr(service, "register_with_runtime", register_bridge)
+    original_finalize = service._finalize_registered_session
+
+    async def crash_after_first_permit(*args, **kwargs):
+        raise RuntimeError("simulated interruption after the first permit commit")
+
+    monkeypatch.setattr(
+        service, "_finalize_registered_session", crash_after_first_permit
+    )
+
+    async with initialized_pg.sessions() as db:
+        owner, auth_session, principal = await _owner_auth(db, settings)
+        owner_id = owner.id
+        auth_session_id = auth_session.id
+        await create_funded_wallet(db, user_id=owner_id, credited_minor=10_000)
+        with pytest.raises(RuntimeError, match="simulated interruption"):
+            await service.reserve_session(
+                db,
+                principal=principal,
+                auth_session_id=auth_session_id,
+                origin=settings.web_origin,
+                agent_id=agent_id,
+                agent_version_id=agent_version_id,
+                capabilities=capabilities,
+                qualification_settings=qualification_settings,
+                operation_id="tariff-pinned-retry",
+                settings=settings,
+            )
+
+    async with initialized_pg.sessions() as db:
+        session = (
+            await db.execute(
+                select(Session).where(Session.owner_user_id == owner_id)
+            )
+        ).scalar_one()
+        session_id = session.id
+        pinned_snapshot = session.tariff_snapshot
+        assert pinned_snapshot["tariff_version"] == "v1"
+        assert pinned_snapshot["rate_minor_per_minute"] == 6_000
+        assert pinned_snapshot["billing_slice_ms"] == 1_000
+        assert pinned_snapshot["permit_ttl_ms"] == 5_000
+
+    async with initialized_pg.sessions() as db:
+        changed_tariff = await append_tariff_version(
+            db,
+            expected_revision=1,
+            rate_minor_per_minute=12_000,
+            now=start + timedelta(seconds=1),
+        )
+        assert changed_tariff.revision == 2
+        assert changed_tariff.rate_minor_per_minute == 12_000
+        await db.commit()
+
+    async def paused_replay(db, owner_user_id, checked_agent_id):
+        raise ConflictError("Admission is paused")
+
+    monkeypatch.setattr(service, "check_admission_pause", paused_replay)
+
+    monkeypatch.setattr(service, "_finalize_registered_session", original_finalize)
+    async with initialized_pg.sessions() as db:
+        replay = await service.reserve_session(
+            db,
+            principal=principal,
+            auth_session_id=auth_session_id,
+            origin=settings.web_origin,
+            agent_id=agent_id,
+            agent_version_id=agent_version_id,
+            capabilities=capabilities,
+            qualification_settings=qualification_settings,
+            operation_id="tariff-pinned-retry",
+            settings=settings,
+        )
+        assert pause_checks == [(owner_id, agent_id)]
+        assert replay.session_id == session_id
+        budget = (
+            await db.execute(
+                select(CallBudget).where(CallBudget.session_id == session_id)
+            )
+        ).scalar_one()
+        stored_session = (
+            await db.execute(select(Session).where(Session.id == session_id))
+        ).scalar_one()
+        assert budget.pinned_rate == 6_000
+        assert budget.reserved_minor == 100
+        assert budget.version == 2
+        assert stored_session.tariff_snapshot == pinned_snapshot
+        assert len(registration_calls) == 2
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_admission_pause_blocks_new_owner_and_guest_sessions(
+    test_platform_settings: PlatformSettings,
+    initialized_pg: FreshPostgres,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _session_settings(test_platform_settings)
+    public_settings = settings.model_copy(
+        update={
+            "enable_public_calls": True,
+            "public_signaling_url": "ws://127.0.0.1:43002/signal",
+        }
+    )
+    capabilities, qualification_settings = _qualification()
+    pause_checks: list[tuple[uuid.UUID, uuid.UUID]] = []
+
+    async def reject_paused_admission(db, owner_user_id, agent_id):
+        pause_checks.append((owner_user_id, agent_id))
+        raise ConflictError("Admission is paused")
+
+    monkeypatch.setattr(service, "check_admission_pause", reject_paused_admission)
+    async with initialized_pg.sessions() as db:
+        owner, auth_session, principal = await _owner_auth(db, settings)
+
+        async def public_deployment_owner(
+            db,
+            *,
+            deployment_id,
+            owner_user_id,
+            agent_id,
+            agent_version_id,
+            origin,
+        ):
+            assert owner_user_id == owner.id
+            return owner
+
+        monkeypatch.setattr(
+            service, "_verify_public_deployment", public_deployment_owner
+        )
+        owner_agent_id = uuid.uuid4()
+        with pytest.raises(ConflictError, match="Admission is paused"):
+            await service.reserve_session(
+                db,
+                principal=principal,
+                auth_session_id=auth_session.id,
+                origin=settings.web_origin,
+                agent_id=owner_agent_id,
+                agent_version_id=uuid.uuid4(),
+                capabilities=capabilities,
+                qualification_settings=qualification_settings,
+                operation_id="paused-owner-admission",
+                settings=settings,
+            )
+        await db.rollback()
+
+        guest_agent_id = uuid.uuid4()
+        with pytest.raises(ConflictError, match="Admission is paused"):
+            await service.reserve_guest_session(
+                db,
+                owner_user_id=owner.id,
+                deployment_id=uuid.uuid4(),
+                origin=public_settings.web_origin,
+                agent_id=guest_agent_id,
+                agent_version_id=uuid.uuid4(),
+                capabilities=capabilities,
+                qualification_settings=qualification_settings,
+                operation_id="paused-guest-admission",
+                capability_digest="a" * 64,
+                settings=public_settings,
+            )
+        await db.rollback()
+        sessions = (
+            await db.execute(select(Session).where(Session.owner_user_id == owner.id))
+        ).scalars().all()
+        assert sessions == []
+        assert pause_checks == [
+            (owner.id, owner_agent_id),
+            (owner.id, guest_agent_id),
+        ]
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_admin_termination_is_audited_idempotent_and_waits_for_runner_ack(
+    test_platform_settings: PlatformSettings,
+    initialized_pg: FreshPostgres,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _session_settings(test_platform_settings)
+    now = datetime.now(timezone.utc)
+    release_calls: list[RuntimeReleaseRequest] = []
+
+    async def release_bridge(config, command):
+        release_calls.append(command)
+        return RuntimeReleaseAcknowledgement(
+            session_id=command.session_id,
+            runner_id=command.runner_id,
+            registration_id=command.registration_id,
+            session_version=command.session_version,
+            released=True,
+        )
+
+    monkeypatch.setattr(service, "release_from_runtime", release_bridge)
+    async with initialized_pg.sessions() as db:
+        admin, admin_auth, _ = await _owner_auth(db, settings)
+        second_auth, _ = await create_authenticated_session(
+            db,
+            settings,
+            user=admin,
+            client_ip="127.0.0.1",
+            user_agent="Second admin session",
+            now=now,
+        )
+        owner = await create_test_user(db)
+        session, _ = await create_test_session(
+            db,
+            owner_user_id=owner.id,
+            runner_id=settings.session_runner_id,
+            state="ACTIVE",
+            created_at=now,
+        )
+        registration_id = uuid.uuid4()
+        db.add(
+            RuntimeRegistration(
+                session_id=session.id,
+                runner_id=settings.session_runner_id,
+                registration_id=registration_id,
+                status="REGISTERED",
+                expires_at=now + timedelta(minutes=1),
+                created_at=now,
+            )
+        )
+        db.add(
+            SessionSlot(
+                session_id=session.id,
+                owner_user_id=owner.id,
+                runner_id=settings.session_runner_id,
+                reserved_at=now,
+            )
+        )
+        await db.commit()
+
+        reason = "Operator requested emergency shutdown"
+        operation_id = "admin-stop-session-once"
+        request_id = uuid.uuid4()
+        request_hash = service.compute_payload_hash(
+            {
+                "admin_user_id": str(admin.id),
+                "reason": reason,
+                "session_id": str(session.id),
+            }
+        )
+        result = await service.terminate_admin_session(
+            db,
+            session_id=session.id,
+            admin_user_id=admin.id,
+            auth_session_id=admin_auth.id,
+            operation_id=operation_id,
+            request_hash=request_hash,
+            reason=reason,
+            request_id=request_id,
+            source_ip="127.0.0.1",
+            settings=settings,
+            now=now,
+        )
+        replay = await service.terminate_admin_session(
+            db,
+            session_id=session.id,
+            admin_user_id=admin.id,
+            auth_session_id=second_auth.id,
+            operation_id=operation_id,
+            request_hash=request_hash,
+            reason=reason,
+            request_id=uuid.uuid4(),
+            source_ip="127.0.0.1",
+            settings=settings,
+            now=now,
+        )
+        assert result.state == replay.state == "ENDING"
+        assert result.session_version == replay.session_version == 2
+        assert len(release_calls) == 1
+        assert release_calls[0].session_version == 2
+
+        audit_rows = (
+            await db.execute(
+                select(AuditLog).where(
+                    AuditLog.action == "admin.session.terminate",
+                    AuditLog.target_id == session.id,
+                )
+            )
+        ).scalars().all()
+        assert len(audit_rows) == 1
+        assert audit_rows[0].actor_id == admin.id
+        assert audit_rows[0].session_id == admin_auth.id
+        assert audit_rows[0].reason == reason
+        assert audit_rows[0].change_summary == {
+            "from_state": "ACTIVE",
+            "to_state": "ENDING",
+        }
+        idempotency_rows = (
+            await db.execute(
+                select(IdempotencyRecord).where(
+                    IdempotencyRecord.user_id == admin.id,
+                    IdempotencyRecord.idempotency_key == operation_id,
+                    IdempotencyRecord.action == "admin.session.terminate",
+                )
+            )
+        ).scalars().all()
+        assert len(idempotency_rows) == 1
+        stored_session = (
+            await db.execute(select(Session).where(Session.id == session.id))
+        ).scalar_one()
+        assert stored_session.state == "ENDING"
+        budget = (
+            await db.execute(
+                select(CallBudget).where(CallBudget.session_id == session.id)
+            )
+        ).scalar_one()
+        assert budget.status == "OPEN"
 
 
 @pytest.mark.postgres

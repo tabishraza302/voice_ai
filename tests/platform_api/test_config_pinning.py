@@ -11,24 +11,37 @@ Follows Task 3 requirements:
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
 import json
-from pathlib import Path
-from typing import Any
 import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
 from sqlalchemy import select
 
-from platform_api.agents.models import AgentDraft, AgentVersion
+from platform_api.agents.defaults import compute_policy_hash
+from platform_api.agents.models import AgentDraft, AgentVersion, PlatformPromptVersion
 from platform_api.agents.publishing import _scrub_secrets, publish_agent_version
 from platform_api.agents.schemas import DraftUpdate
 from platform_api.agents.service import update_draft
+from platform_api.auth.errors import ConflictError
 from platform_api.auth.passwords import get_password_hasher
 from platform_api.auth.sessions import create_authenticated_session
+from platform_api.billing.service import (
+    RuntimePrincipal,
+    checkpoint_and_reserve,
+    create_call_budget,
+)
 from platform_api.config import PlatformSettings
-from platform_api.models.auth import User
+from platform_api.models.auth import AuthSession, User
+from platform_api.models.session import Session
+from platform_api.sessions import service as sessions_service
+from platform_api.sessions.models import RuntimeRegistration, SessionParticipant
+from platform_api.sessions.service import _validate_immutable_version, get_runtime_config
+from tests.support.billing import create_funded_wallet
 from tests.support.postgres import FreshPostgres
 
 
@@ -108,6 +121,7 @@ async def test_version_bytes_and_hashes_pinned_across_draft_mutations_and_new_ve
     app_client: httpx.AsyncClient,
     test_platform_settings: PlatformSettings,
     initialized_pg: FreshPostgres,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """Publishing Version 2 or editing draft does not alter Version 1 bytes, hashes, or manifest."""
     user, headers = await create_test_user_session(
@@ -145,6 +159,131 @@ async def test_version_bytes_and_hashes_pinned_across_draft_mutations_and_new_ve
         headers={"Cookie": headers["Cookie"]},
     )
     v1_config_before = v1_detail_before.json()["immutable_config"]
+    pinned_policy = v1_config_before["policy"]
+    assert isinstance(pinned_policy["prompt_text"], str)
+    assert compute_policy_hash(pinned_policy["prompt_text"]) == pinned_policy["policy_hash"]
+    async with initialized_pg.sessions() as db:
+        published_version = (
+            await db.execute(
+                select(AgentVersion).where(
+                    AgentVersion.agent_id == uuid.UUID(agent_id),
+                    AgentVersion.version == 1,
+                )
+            )
+        ).scalar_one()
+        policy_version = await db.get(
+            PlatformPromptVersion, published_version.policy_version_id
+        )
+        assert policy_version is not None
+        assert pinned_policy["prompt_text"] == policy_version.prompt_text
+        verified_snapshot = _validate_immutable_version(
+            published_version, policy_version
+        )
+        assert verified_snapshot["policy"]["prompt_text"] == policy_version.prompt_text
+        runner_id = "runner-policy-pinning"
+        monkeypatch.setattr(
+            sessions_service,
+            "session_runtime_config",
+            lambda _settings: SimpleNamespace(runner_id=runner_id),
+        )
+        now = datetime.now(timezone.utc)
+        auth_session = (
+            await db.execute(
+                select(AuthSession).where(AuthSession.user_id == user.id)
+            )
+        ).scalar_one()
+        await create_funded_wallet(db, user_id=user.id, credited_minor=1_000)
+        session_id = uuid.uuid4()
+        participant_id = uuid.uuid4()
+        registration_id = uuid.uuid4()
+        connect_deadline = now + timedelta(minutes=1)
+        hard_end_deadline = now + timedelta(hours=1)
+        db.add(
+            Session(
+                id=session_id,
+                owner_user_id=user.id,
+                participant_id=str(participant_id),
+                agent_version_id=published_version.id,
+                tariff_snapshot={
+                    "kind": "voice_test",
+                    "currency": "INR",
+                    "rate_minor_per_minute": 6_000,
+                    "tariff_version": "v1",
+                    "billing_slice_ms": 1_000,
+                    "permit_ttl_ms": 60_000,
+                    "maximum_session_duration_ms": 3_600_000,
+                    "public": False,
+                    "paid": False,
+                },
+                kind="voice_test",
+                state="REGISTERED",
+                version=2,
+                runner_id=runner_id,
+                connect_deadline=connect_deadline,
+                hard_end_deadline=hard_end_deadline,
+                created_at=now,
+            )
+        )
+        db.add(
+            RuntimeRegistration(
+                session_id=session_id,
+                runner_id=runner_id,
+                registration_id=registration_id,
+                status="REGISTERED",
+                expires_at=connect_deadline,
+                created_at=now,
+            )
+        )
+        db.add(
+            SessionParticipant(
+                participant_id=participant_id,
+                session_id=session_id,
+                owner_user_id=user.id,
+                auth_session_id=auth_session.id,
+                kind="owner",
+                origin=test_platform_settings.web_origin,
+                created_at=now,
+            )
+        )
+        await db.flush()
+        budget = await create_call_budget(
+            db,
+            session_id=session_id,
+            operation_id="runtime-policy-pin-budget",
+            pinned_rate_minor_per_minute=6_000,
+            now=now,
+        )
+        await checkpoint_and_reserve(
+            db,
+            runtime_principal=RuntimePrincipal(
+                runner_id=runner_id, service_id="voice-runtime"
+            ),
+            session_id=session_id,
+            operation_id="runtime-policy-pin-permit",
+            expected_budget_version=budget.budget_version,
+            cumulative_billable_ms=0,
+            requested_future_ms=1_000,
+            billing_slice_ms=1_000,
+            permit_ttl_ms=60_000,
+            now=now,
+        )
+        runtime_config = await get_runtime_config(
+            db,
+            session_id=session_id,
+            runtime_principal=RuntimePrincipal(
+                runner_id=runner_id, service_id="voice-runtime"
+            ),
+            settings=test_platform_settings,
+        )
+        assert runtime_config.immutable_config["policy"] == pinned_policy
+
+        tampered_snapshot = json.loads(
+            json.dumps(published_version.immutable_config_json)
+        )
+        tampered_snapshot["policy"]["prompt_text"] += " "
+        published_version.immutable_config_json = tampered_snapshot
+        with pytest.raises(ConflictError):
+            _validate_immutable_version(published_version, policy_version)
 
     # 2. Mutate draft to revision 3
     flow_v2 = load_text_only_flow("valid-credit-card-en-hi.json")

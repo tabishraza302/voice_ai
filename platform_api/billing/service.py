@@ -10,13 +10,16 @@ Follows accounting-contract.md:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import logging
 from typing import Any
 import uuid
+
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -46,7 +49,11 @@ from platform_api.billing.schemas import (
 from platform_api.models.session import Session
 from platform_api.sessions.models import RuntimeRegistration, SessionPeer
 
+BILLING_RECOVERY_INTERVAL_SECONDS = 5
+BILLING_RECOVERY_BATCH_SIZE = 100
 MAX_OPERATION_ID_LENGTH = 128
+
+logger = logging.getLogger(__name__)
 
 # New spending authority is only valid for states that can still execute paid
 # work. Unknown/future states fail closed rather than being treated as live.
@@ -91,6 +98,13 @@ class ConflictError(PlatformError):
     status_code: int = 409
     code: str = "CONFLICT"
     message: str = "Operation conflict"
+
+
+class PermitNotExpiredError(ConflictError):
+    """Raised when an expiry recovery races with a renewed active permit."""
+
+    code = "PERMIT_NOT_EXPIRED"
+    message = "Permit has not expired yet"
 
 
 class ReservationHoldError(ConflictError):
@@ -389,6 +403,76 @@ async def credit_wallet(
     await db.commit()
     return view
 
+def _session_tariff_terms(session: Session) -> tuple[int, int, int]:
+    """Read validated, immutable pricing and permit terms from the session snapshot."""
+    snapshot = session.tariff_snapshot
+    if not isinstance(snapshot, dict):
+        raise ConflictError("Session has no valid stored tariff")
+    tariff_id = snapshot.get("tariff_id")
+    try:
+        uuid.UUID(tariff_id)
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ConflictError("Session has no valid stored tariff") from exc
+    if not isinstance(snapshot.get("tariff_version"), str) or not snapshot["tariff_version"]:
+        raise ConflictError("Session has no valid stored tariff")
+    rate = snapshot.get("rate_minor_per_minute")
+    billing_slice_ms = snapshot.get("billing_slice_ms")
+    permit_ttl_ms = snapshot.get("permit_ttl_ms")
+    maximum_duration_ms = snapshot.get("maximum_session_duration_ms")
+    if (
+        type(rate) is not int
+        or rate < 0
+        or rate > MAX_BIGINT
+        or type(billing_slice_ms) is not int
+        or billing_slice_ms <= 0
+        or type(permit_ttl_ms) is not int
+        or permit_ttl_ms <= 0
+        or type(maximum_duration_ms) is not int
+        or maximum_duration_ms <= 0
+    ):
+        raise ConflictError("Session has no valid stored tariff")
+    return rate, billing_slice_ms, permit_ttl_ms
+
+
+async def resolve_session_billing_terms(
+    db: AsyncSession,
+    *,
+    session_id: uuid.UUID,
+    runtime_principal: RuntimePrincipal,
+) -> tuple[int, int]:
+    """Get permit terms from the stored tariff after verifying the assigned runner."""
+    stmt = (
+        select(Session)
+        .where(Session.id == session_id)
+        .execution_options(populate_existing=True)
+    )
+    session = (await db.execute(stmt)).scalar_one_or_none()
+    if session is None:
+        raise NotFoundError("Session not found")
+    if not session.runner_id or runtime_principal.runner_id != session.runner_id:
+        raise ForbiddenError("Runner ID does not match assigned session runner")
+    _, billing_slice_ms, permit_ttl_ms = _session_tariff_terms(session)
+    return billing_slice_ms, permit_ttl_ms
+
+
+def _validate_session_tariff_terms(
+    session: Session,
+    *,
+    pinned_rate: int,
+    billing_slice_ms: int,
+    permit_ttl_ms: int,
+) -> None:
+    if session.tariff_snapshot is None:
+        return
+    stored_rate, stored_slice_ms, stored_ttl_ms = _session_tariff_terms(session)
+    if (
+        stored_rate != pinned_rate
+        or stored_slice_ms != billing_slice_ms
+        or stored_ttl_ms != permit_ttl_ms
+    ):
+        raise ConflictError("Billing terms differ from immutable session tariff")
+
+
 async def checkpoint_and_reserve(
     db: AsyncSession,
     *,
@@ -405,8 +489,8 @@ async def checkpoint_and_reserve(
     """Process synchronous billable time checkpoint and cumulative reservation renewal.
 
     Follows accounting-contract.md:
-    Measurement caveat: billing_slice_ms and permit_ttl_ms are deployment budgets
-    calibrated to target database latency and network SLOs; there is no universal default.
+    Measurement caveat: billing_slice_ms and permit_ttl_ms are pinned from the
+    active persisted tariff at admission and are never live deployment settings.
     1. Authenticate/authorize assigned runner FIRST (before replay lookup or row locking).
     2. Acquire transaction-level advisory lock on session operation key.
     3. Check operation key/hash after authorization to prevent cross-runner cached response disclosure.
@@ -504,6 +588,12 @@ async def checkpoint_and_reserve(
     if session_locked.owner_user_id != wallet_owner_user_id:
         raise ConflictError("Session owner changed while billing rows were being locked")
     _ensure_budget_owner(budget, session_locked)
+    _validate_session_tariff_terms(
+        session_locked,
+        pinned_rate=budget.pinned_rate,
+        billing_slice_ms=billing_slice_ms,
+        permit_ttl_ms=permit_ttl_ms,
+    )
     # Re-check idempotency only after locked authorization and ownership checks.
     existing_op_locked = (await db.execute(stmt_op)).scalar_one_or_none()
     if existing_op_locked is not None:
@@ -1062,7 +1152,7 @@ async def expire_stopped_budget(
 
     # 4. Require permit expiry before write-off
     if budget.permit_expiry is not None and ts < budget.permit_expiry:
-        raise ConflictError(
+        raise PermitNotExpiredError(
             f"Permit has not expired yet; cannot write off budget before permit expiry ({budget.permit_expiry})"
         )
 
@@ -1113,6 +1203,63 @@ async def expire_stopped_budget(
     db.add(op)
     await db.commit()
     return view
+
+
+async def recover_expired_budgets(
+    db: AsyncSession,
+    *,
+    now: datetime | None = None,
+    batch_size: int = BILLING_RECOVERY_BATCH_SIZE,
+) -> int:
+    """Recover a bounded batch of budgets whose latest permit has expired."""
+    if type(batch_size) is not int or batch_size < 1:
+        raise ValueError("Billing recovery batch size must be positive")
+    ts = now or datetime.now(timezone.utc)
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    candidate_session_ids = (
+        await db.execute(
+            select(CallBudget.session_id)
+            .where(
+                CallBudget.status == "OPEN",
+                CallBudget.permit_expiry.is_not(None),
+                CallBudget.permit_expiry <= ts,
+            )
+            .order_by(CallBudget.permit_expiry, CallBudget.session_id)
+            .limit(batch_size)
+        )
+    ).scalars().all()
+    await db.commit()
+
+    recovered = 0
+    for session_id in candidate_session_ids:
+        try:
+            await expire_stopped_budget(
+                db,
+                session_id=session_id,
+                operation_id=f"runner_lost_expired:{session_id}",
+                now=ts,
+            )
+        except PermitNotExpiredError:
+            await db.rollback()
+            continue
+        await db.commit()
+        recovered += 1
+    return recovered
+
+
+async def billing_recovery_worker_loop(app: Any) -> None:
+    """Periodically recover expired runner permits using the app's session factory."""
+    session_factory = app.state.session_factory
+    while True:
+        try:
+            async with session_factory() as db:
+                await recover_expired_budgets(db)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Billing recovery sweep failed (%s)", type(exc).__name__)
+        await asyncio.sleep(BILLING_RECOVERY_INTERVAL_SECONDS)
 
 
 async def create_call_budget(
