@@ -110,6 +110,10 @@ class _JobInterrupted(Exception):
 class _InvalidScenarioInput(Exception):
     pass
 
+
+class _TokenBudgetExhausted(Exception):
+    pass
+
 async def run_qa_job_once(
     session_factory: async_sessionmaker[AsyncSession],
     settings: PlatformSettings,
@@ -126,7 +130,7 @@ async def run_qa_job_once(
 
 async def qa_worker_loop(app: Any) -> None:
     """Drain the durable queue without competing with active voice sessions."""
-    from platform_api.qa.service import next_queued_qa_job
+    from platform_api.qa.service import next_claimable_qa_job
 
     session_factory = app.state.session_factory
     settings: PlatformSettings = app.state.settings
@@ -150,7 +154,7 @@ async def qa_worker_loop(app: Any) -> None:
                             type(exc).__name__,
                         )
             while len(tasks) < settings.qa_max_running_jobs:
-                job_id = await next_queued_qa_job(session_factory)
+                job_id = await next_claimable_qa_job(session_factory)
                 if job_id is None or job_id in tasks:
                     break
                 task = asyncio.create_task(
@@ -214,19 +218,37 @@ async def _execute_claimed_job(
                         _inconclusive_result(item, "TOKEN_BUDGET_EXHAUSTED")
                         for item in scenarios[scenario_index:]
                     )
+                    current_index = len(scenarios)
                     break
-                result, artifact, scenario_usage = await _run_scenario(
-                    session_factory,
-                    settings,
-                    catalog,
-                    model_client,
-                    claimed,
-                    compiled,
-                    scenario,
-                    scenario_index,
-                    remaining,
-                    usage,
-                )
+                scenario_usage_before = _usage_totals(usage)
+                try:
+                    result, artifact, _ = await _run_scenario(
+                        session_factory,
+                        settings,
+                        catalog,
+                        model_client,
+                        claimed,
+                        compiled,
+                        scenario,
+                        scenario_index,
+                        remaining,
+                        usage,
+                    )
+                except _TokenBudgetExhausted:
+                    exhausted_budget = True
+                    token_usage = {
+                        key: int(usage.get(key) or 0) - scenario_usage_before[key]
+                        for key in scenario_usage_before
+                    }
+                    inconclusive = _inconclusive_result(scenario, "TOKEN_BUDGET_EXHAUSTED")
+                    inconclusive["token_usage"] = token_usage
+                    results.append(inconclusive)
+                    results.extend(
+                        _inconclusive_result(item, "TOKEN_BUDGET_EXHAUSTED")
+                        for item in scenarios[scenario_index + 1 :]
+                    )
+                    current_index = len(scenarios)
+                    break
                 results.append(result)
                 if artifact is not None:
                     artifacts.append(artifact)
@@ -243,12 +265,21 @@ async def _execute_claimed_job(
                     next_scenario_index=current_index,
                 ):
                     raise _JobInterrupted(await _interrupt_reason(session_factory, claimed))
+                if result["failure_code"] == "TOKEN_BUDGET_EXHAUSTED":
+                    exhausted_budget = True
+                    results.extend(
+                        _inconclusive_result(item, "TOKEN_BUDGET_EXHAUSTED")
+                        for item in scenarios[current_index:]
+                    )
+                    current_index = len(scenarios)
+                    break
                 if usage["total_tokens"] >= claimed.max_tokens and current_index < len(scenarios):
                     exhausted_budget = True
                     results.extend(
                         _inconclusive_result(item, "TOKEN_BUDGET_EXHAUSTED")
                         for item in scenarios[current_index:]
                     )
+                    current_index = len(scenarios)
                     break
     except _JobInterrupted as exc:
         if exc.reason == "voice":
@@ -462,6 +493,11 @@ async def _run_scenario(
             text=turn_text,
             history=history[-MAX_HISTORY_MESSAGES:],
         )
+        prompt_tokens, runtime_max_tokens = _budget_model_call(
+            messages,
+            available_tokens=remaining,
+            requested_completion_tokens=runtime_max_tokens,
+        )
         completion = await _complete_with_interrupt_monitor(
             session_factory,
             settings,
@@ -479,7 +515,7 @@ async def _run_scenario(
                 "max_tokens_parameter", settings.runtime_llm_max_tokens_parameter
             ),
         )
-        _record_completion_usage(usage, current_usage, messages, completion)
+        _record_completion_usage(usage, current_usage, completion, prompt_tokens)
         if not await checkpoint_qa_job(session_factory, job, usage=current_usage):
             raise _JobInterrupted(await _interrupt_reason(session_factory, job))
         try:
@@ -670,15 +706,23 @@ async def _generate_turns(
     ]
     feedback = ""
     for _ in range(2):
-        remaining = min(remaining_tokens, job.max_tokens - int(current_usage["total_tokens"] or 0))
+        remaining = min(
+            remaining_tokens,
+            job.max_tokens - int(current_usage["total_tokens"] or 0),
+        )
         if remaining <= 0:
-            break
+            raise _TokenBudgetExhausted
         if feedback:
             request = dict(scenario_request)
             request["validation_feedback"] = feedback
             messages[1]["content"] = json.dumps(
                 request, ensure_ascii=False, separators=(",", ":")
             )
+        prompt_tokens, completion_tokens = _budget_model_call(
+            messages,
+            available_tokens=remaining,
+            requested_completion_tokens=512,
+        )
         completion = await _complete_with_interrupt_monitor(
             session_factory,
             settings,
@@ -687,12 +731,12 @@ async def _generate_turns(
             endpoint="generation",
             model=job.utterance_model_id,
             messages=messages,
-            max_tokens=min(512, remaining),
+            max_tokens=completion_tokens,
             temperature=0,
             reasoning_effort=settings.generation_llm_reasoning_effort,
             max_tokens_parameter=settings.generation_llm_max_tokens_parameter,
         )
-        _record_completion_usage(scenario_usage, current_usage, messages, completion)
+        _record_completion_usage(scenario_usage, current_usage, completion, prompt_tokens)
         if not await checkpoint_qa_job(session_factory, job, usage=current_usage):
             raise _JobInterrupted(await _interrupt_reason(session_factory, job))
         try:
@@ -969,6 +1013,15 @@ async def _judge_scenario(
             ),
         },
     ]
+    available_tokens = min(
+        remaining_tokens,
+        job.max_tokens - int(current_usage["total_tokens"] or 0),
+    )
+    prompt_tokens, completion_tokens = _budget_model_call(
+        messages,
+        available_tokens=available_tokens,
+        requested_completion_tokens=256,
+    )
     completion = await _complete_with_interrupt_monitor(
         session_factory,
         settings,
@@ -977,12 +1030,12 @@ async def _judge_scenario(
         endpoint="generation",
         model=job.judge_model_id or "",
         messages=messages,
-        max_tokens=min(256, remaining_tokens),
+        max_tokens=completion_tokens,
         temperature=0,
         reasoning_effort=None,
         max_tokens_parameter=settings.generation_llm_max_tokens_parameter,
     )
-    _record_completion_usage(scenario_usage, current_usage, messages, completion)
+    _record_completion_usage(scenario_usage, current_usage, completion, prompt_tokens)
     if not await checkpoint_qa_job(session_factory, job, usage=current_usage):
         raise _JobInterrupted(await _interrupt_reason(session_factory, job))
     try:
@@ -1053,7 +1106,13 @@ async def _wait_for_interrupt(
     while True:
         async with session_factory() as db:
             current = await db.get(FlowQAJob, claimed.id)
-            if current is None or current.lease_token != claimed.lease_token:
+            now = datetime.now(timezone.utc)
+            if (
+                current is None
+                or current.lease_token != claimed.lease_token
+                or current.lease_expires_at is None
+                or current.lease_expires_at <= now
+            ):
                 return "lease_lost"
             if current.status == "CANCELLED" or current.cancel_requested_at is not None:
                 return "cancelled"
@@ -1392,14 +1451,20 @@ def _add_usage(target: dict[str, int | None], values: dict[str, int | None]) -> 
 
 
 def _add_completion_usage(
-    target: dict[str, int], messages: list[dict[str, str]], completion: ModelCompletion
+    target: dict[str, int],
+    completion: ModelCompletion,
+    prompt_tokens_estimate: int,
 ) -> None:
     usage: ModelUsage | None = completion.usage
-    prompt = usage.prompt_tokens if usage and usage.prompt_tokens is not None else _estimate_tokens(
-        "\n".join(message["content"] for message in messages)
+    prompt = (
+        usage.prompt_tokens
+        if usage and usage.prompt_tokens is not None
+        else prompt_tokens_estimate
     )
-    output = usage.completion_tokens if usage and usage.completion_tokens is not None else _estimate_tokens(
-        completion.content
+    output = (
+        usage.completion_tokens
+        if usage and usage.completion_tokens is not None
+        else _estimate_tokens(completion.content)
     )
     total = usage.total_tokens if usage and usage.total_tokens is not None else prompt + output
     target["prompt_tokens"] += prompt
@@ -1410,15 +1475,33 @@ def _add_completion_usage(
 def _record_completion_usage(
     scenario_usage: dict[str, int],
     job_usage: dict[str, int | None],
-    messages: list[dict[str, str]],
     completion: ModelCompletion,
+    prompt_tokens_estimate: int,
 ) -> None:
     before = dict(scenario_usage)
-    _add_completion_usage(scenario_usage, messages, completion)
+    _add_completion_usage(scenario_usage, completion, prompt_tokens_estimate)
     _add_usage(
         job_usage,
         {key: scenario_usage[key] - before[key] for key in scenario_usage},
     )
+
+
+def _budget_model_call(
+    messages: list[dict[str, str]],
+    *,
+    available_tokens: int,
+    requested_completion_tokens: int,
+) -> tuple[int, int]:
+    prompt_tokens = _estimate_tokens(
+        "\n".join(message["content"] for message in messages)
+    )
+    completion_tokens = min(
+        requested_completion_tokens,
+        available_tokens - prompt_tokens,
+    )
+    if completion_tokens < 1:
+        raise _TokenBudgetExhausted
+    return prompt_tokens, completion_tokens
 
 
 def _estimate_tokens(text: str) -> int:
