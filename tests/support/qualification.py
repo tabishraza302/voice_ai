@@ -347,6 +347,7 @@ def validate_speech_evidence(
     recognized = evidence.get("recognized_text")
     if not isinstance(recognized, str) or not recognized.strip():
         raise ValueError("STT recognized text is missing")
+    accepted = evidence.get("accepted_transcripts")
     if not isinstance(accepted, list) or not accepted:
         raise ValueError("corpus-specific accepted transcript reference is missing")
     normalize = lambda text: " ".join(text.casefold().split())
@@ -1282,7 +1283,7 @@ def validate_release_artifacts(
             fixtures=audio_fixtures,
             profile=profile,
             release_commit=commit,
-            deployment_models=config["models"] if profile == "deployment" else None,
+            deployment_models=config["models"],
             limits=config["limits"],
             expected_concurrency=config["concurrency"],
         )

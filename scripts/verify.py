@@ -2055,6 +2055,15 @@ class VerificationHarness:
                 self.results["release_evidence"]["reason"] = "prerequisite voice deployment gate failed"
             return self.write_result(target_gates=required_gates)
 
+        # Recheck deployment flags to ensure they were not toggled during voice lanes
+        try:
+            self.deployment_preflight_complete = False
+            self.check_deployment_endpoints(config_data)
+        except Exception as error:
+            reason = redact_secrets(f"post-voice deployment endpoint check failed: {error}")
+            self.results["release_evidence"] = {"status": "failed", "reason": reason}
+            return self.write_result(target_gates=required_gates)
+
         # 6. release evidence tests inspect completed prerequisite reports.
         self.write_manifest()
         try:
