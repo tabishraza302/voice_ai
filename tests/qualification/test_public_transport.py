@@ -80,15 +80,53 @@ def test_fake_or_incomplete_transport_evidence_fails_closed(mutation, message: s
         _validate(evidence)
 
 
-def test_transport_report_is_required_when_deployment_lane_is_enabled() -> None:
+def test_editable_runner_fields_and_passed_scenario_labels_are_not_live_proof() -> None:
+    from bot.flow.qualification_runner import REQUIRED_CONTRACT_SCENARIOS
+
+    run_id = "caller-chosen-run"
+    profile_hash = "a" * 64
+    commit = "f" * 40
+    report = {
+        "execution_provenance": {
+            "runner": "bot.flow.qualification_runner",
+            "run_id": run_id,
+            "profile_hash": profile_hash,
+            "source_revision": commit,
+        },
+        "contract_scenarios": [
+            {
+                "scenario_number": item.number,
+                "name": item.name,
+                "status": "PASSED",
+                "passed": True,
+            }
+            for item in REQUIRED_CONTRACT_SCENARIOS
+        ],
+        "overall_status": "supported",
+        "task_2_complete": True,
+    }
+
+    with pytest.raises(ValueError, match="authenticated live execution/ledger chain"):
+        qualification.validate_adapter_qualification_report(
+            report,
+            run_id=run_id,
+            profile_hash=profile_hash,
+            source_revision=commit,
+            require_supported=True,
+            execution_key="b" * 64,
+        )
+
+def test_transport_report_requires_current_run_qualified_adapter_scenarios() -> None:
     if os.environ.get("RUN_TRANSPORT_QUALIFICATION") != "1":
-        return
+        pytest.skip("deployment transport qualification is not enabled")
 
     config_path_value = os.environ.get("VERIFY_QUALIFICATION_CONFIG")
     artifact_dir_value = os.environ.get("VERIFY_ARTIFACT_DIR")
-    assert config_path_value and artifact_dir_value, (
-        "deployment transport qualification requires its config and report directory"
-    )
+    run_id = os.environ.get("VERIFY_RUN_ID")
+    profile_hash = os.environ.get("VERIFY_PROFILE_SHA256")
+    signing_key = os.environ.get("VERIFY_EVIDENCE_KEY")
+    if not config_path_value or not artifact_dir_value or not run_id or not profile_hash or not signing_key:
+        pytest.fail("missing prerequisite: current-run deployment adapter execution context")
     config_path = Path(config_path_value)
     artifact_dir = Path(artifact_dir_value)
     assert config_path.is_absolute() and config_path.is_file(), (
@@ -99,12 +137,24 @@ def test_transport_report_is_required_when_deployment_lane_is_enabled() -> None:
     qualification.validate_deployment_config(config)
     manifest = qualification.load_release_manifest(artifact_dir / "manifest.json")
     report_path = qualification.require_report(
-        artifact_dir / "transport-evidence.json",
-        "live public transport evidence report",
+        artifact_dir / "adapter-qualification-deployment.json",
+        "current-run deployment adapter qualification",
     )
-    evidence = json.loads(report_path.read_text(encoding="utf-8"))
-    qualification.validate_public_transport_evidence(
-        evidence,
-        config=config,
-        release_commit=manifest["commit"],
+    envelope = json.loads(report_path.read_text(encoding="utf-8"))
+    report = qualification.validate_live_evidence(
+        envelope,
+        kind="adapter_qualification",
+        run_id=run_id,
+        profile="deployment",
+        profile_hash=profile_hash,
+        commit=manifest["commit"],
+        key=signing_key,
+    )
+    qualification.validate_adapter_qualification_report(
+        report,
+        run_id=run_id,
+        profile_hash=profile_hash,
+        source_revision=manifest["commit"],
+        execution_key=signing_key,
+        require_supported=True,
     )

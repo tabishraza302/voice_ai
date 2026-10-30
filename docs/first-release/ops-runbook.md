@@ -90,52 +90,128 @@ Commands return nonzero and report only the exception class, not URLs or excepti
 
 ## Staging release qualification
 
-Run release qualification against the exact candidate commit in an isolated
-staging environment. Keep public-call and real-paid flags disabled throughout
-the drill. Do not use production database credentials, customer accounts, or
-private recordings.
+Run the release gate from the exact candidate commit in an isolated staging
+environment. Keep public calls, real-paid calls, and gateway access disabled
+throughout the run. Do not use production database credentials, customer
+accounts, or private recordings.
 
-Before the run, have the release owner review an absolute-path JSON profile with
-schema version `1` and profile `deployment`. It must pin exact HTTPS origins;
-LLM, STT, English TTS, and Hindi TTS IDs, revisions, and SHA-256 hashes; runner
-and API endpoints; the required TURN relay endpoint and a secret-manager
-credential reference (never a credential value); Chromium version; PostgreSQL
-server version and image digest; measured concurrency; timeout, latency, and
-quality limits; and baseline artifact IDs. Missing models, TURN, database,
-browser, audio fixtures, or reports block qualification.
+The current verifier fails closed unless it can run the real adapter
+qualification scenarios and obtain current-run PCM-to-STT-to-completed-flow
+evidence from recorded human speech. The repository's smoke and batch
+benchmark tools are diagnostics, not proof of a completed assistant turn. A
+hand-authored report, a prior run's report, a silent mic track, or text sent
+instead of speech cannot satisfy this prerequisite.
 
-Provision the pre-reviewed English and Hindi speech fixtures under
-`VERIFY_AUDIO_ROOT`, with a checked `audio_manifest.json`. Use the staging
-model/adapter tuple and matching deployment-specific baselines. The verifier
-must exercise PCM input through STT and a completed pinned-flow turn; send-text,
-synthetic, or silent media is not speech evidence. Keep raw recordings and
-provider/TURN credentials out of reports.
+### Prepare reviewed inputs
 
-The deployment lane must also report a real Chromium TLS/WebRTC session using
-the configured TURN relay, with non-silent media in both directions, a completed
-turn, barge-in cancellation, and audio recovery after reconnect. Keep
-`audio-evidence.json` and `transport-evidence.json` with the owned run artifacts;
-hand-authored or synthetic reports do not count.
+1. Commit the candidate and make sure the checkout is clean:
 
-From the candidate checkout, run:
+   ```sh
+   git status --porcelain
+   git rev-parse HEAD
+   ```
+
+   Both `local_offline` and `deployment` profiles must set
+   `qualification.source_revision` to that full commit hash.
+
+2. Review two absolute-path JSON profiles. Both use schema version `1`, pin
+   LLM/STT/English TTS/Hindi TTS IDs, revisions, and SHA-256 hashes, and carry
+   the same qualification tuple: loopback model and transport endpoints,
+   adapter version, exact LLM/STT/TTS agent settings, locales `["en", "hi"]`,
+   and `source_revision`. Each sets a positive concurrency and measured
+   `turn_timeout_ms`, `latency_p95_ms`, and `quality_threshold`.
+
+   The deployment profile additionally pins exact HTTPS origins, HTTPS runner,
+   API, and flags endpoints; a required TURN relay and secret-manager
+   credential reference (never the credential itself); Chromium version;
+   PostgreSQL server version and image digest; and baseline artifact IDs.
+   Neither profile may contain credentials or endpoint query strings.
+
+3. Provision the reviewed English and Hindi human-speech fixtures outside the
+   repository under `VERIFY_AUDIO_ROOT`. Its `audio_manifest.json` must identify
+   each PCM fixture, transcript, source, license, and SHA-256. The same fixture
+   files must be available offline throughout the run. Do not download
+   fixtures during qualification or substitute generated audio.
+
+4. Arrange a current-run audio qualification producer that records the actual
+   PCM input, STT result, completed pinned-flow turn, and assistant audio for
+   both locales. Arrange actual adapter scenario evidence bound to the
+   configured profile and source revision. If either producer is unavailable
+   or returns `NOT_RUN`, `UNSUPPORTED`, or `FAILED`, the gate must fail; do not
+   hand-create or edit its JSON to make the report pass.
+
+5. Configure the staging flags endpoint to return HTTP 200 JSON with a `flags`
+   object containing all of the following values, each explicitly `false`:
+
+   ```json
+   {
+     "flags": {
+       "PLATFORM_ENABLE_PUBLIC_CALLS": false,
+       "PLATFORM_ENABLE_REAL_PAID_CALLS": false,
+       "PLATFORM_ENABLE_GATEWAY": false
+     }
+   }
+   ```
+
+   The configured runner and API endpoints must also return HTTP 200 JSON with
+   `status` equal to `ok` or `ready`. Redirects, missing endpoints, missing
+   flags, and unknown/non-boolean flag values block the run.
+
+### Run and inspect
+
+From the clean candidate checkout, export the reviewed fixture root and run
+both profiles plus the required Chromium journeys:
 
 ```sh
+export VERIFY_AUDIO_ROOT='/secure-qualification/audio'
 scripts/voice-ai.sh verify release \
   --profile deployment \
-  --config '/secure-qualification/release-profile.json'
+  --config '/secure-qualification/deployment-profile.json' \
+  --local-config '/secure-qualification/local-offline-profile.json'
 ```
 
-Keep the owned `data/verification/<run-id>/` artifacts with the change record.
-Review both `manifest.json` and `result.json`: every required gate must be
-`passed`, each gate must have a status and reason, reports must be present and
-nonempty, and the manifest commit must be the same release commit being
-staged. Confirm the database report includes a fresh-database backup/restore,
-wallet-ledger reconciliation, and preserved audit evidence. A failed or
-`not_run` gate blocks the release; do not relabel a required capability as
-optional to clear it.
+The release gate runs the development split-port auth journey and the TLS
+production-like ingress journey in Chromium, then actual model/adapter
+qualification for each profile. The verifier writes results only inside its
+new `data/verification/<run-id>/` directory. Each verifier HMAC envelope binds
+the evidence payload to that run ID, profile hash, and exact commit with a
+temporary key that is never written to disk. The verifier HMAC is envelope
+integrity only; it does not authenticate a payload's origin. Do not prepopulate,
+copy, rename, or edit evidence files.
+
+Review `manifest.json` and `result.json`. Every required gate must be
+`passed`, and every gate must have a status and reason. Confirm the manifest
+commit is the candidate commit, `playwright_dev.json` and
+`playwright_tls.json` are raw reports from the two browser journeys, and
+`deployment-preflight.json` records live endpoint and disabled-flag checks.
+Profile-specific `adapter-qualification-<profile>.json` reports must contain
+all seven actual scenario results and an authenticated live execution ledger:
+a runner-minted execution UUID, per-scenario runtime traces, server event and
+transaction/ledger IDs, a receipt hash chain, and a valid runner HMAC bound to
+the current run, profile, commit, and capability report. Runner names,
+run IDs, profile hashes, report hashes, and scenario labels alone are not
+execution proof. Profile-specific `audio-evidence-<profile>.json` files must
+come from the current-run PCM-to-STT-to-completed-flow producer and contain
+measurements recomputed from actual completed turns; the verifier HMAC alone
+cannot make editable metrics live evidence.
+Audio measurements are derived from the current-run observed turns, not values
+asserted by a report: measured concurrency must equal the profile setting,
+each completed turn must be within `turn_timeout_ms`, measured p95 latency
+must be within `latency_p95_ms`, and English and Hindi transcript quality
+scores must meet `quality_threshold`. Do not retain raw recordings or
+provider/TURN credentials in the run directory.
+
+The verifier blocks on a missing fixture, live audio producer, endpoint,
+disabled flag, measurement, or qualified adapter scenario and reports the
+exact reason. The current repository has no PCM-to-STT-to-completed-flow
+producer and no adapter-owned execution UUID, runtime trace receipts,
+server-owned event/transaction ledger chain, or runner HMAC. The platform also
+does not expose the required flags endpoint. Those producer, runner/backend
+receipt-chain, and staging endpoint prerequisites must be implemented and
+supplied before this gate can pass. A failed or `not_run` gate is not a
+release approval.
 
 Only after the reviewed manifest records all required gates passed for the
-same release commit may the release owner separately approve public-call
-enablement. Public and real-paid flags remain off until that decision; payment
-gateway enablement remains independently disabled until its own verification
-is complete.
+same commit may the release owner separately approve public-call enablement.
+Public and real-paid flags remain off until that decision; gateway enablement
+remains independently disabled until its own verification is complete.

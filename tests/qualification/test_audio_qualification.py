@@ -56,6 +56,36 @@ def _validate(evidence: dict) -> None:
     )
 
 
+def _audio_report(recognized: dict[str, str] | None = None) -> tuple[dict, dict]:
+    fixtures = {
+        locale: {"sha256": FIXTURE_SHA256, "reference_text": f"reference {locale}"}
+        for locale in ("en", "hi")
+    }
+    cases = {}
+    quality_scores = {}
+    for locale, fixture in fixtures.items():
+        transcript = (recognized or {}).get(locale, fixture["reference_text"])
+        evidence = _speech_evidence()
+        evidence.update(
+            fixture_sha256=fixture["sha256"],
+            recognized_text=transcript,
+            accepted_transcripts=[fixture["reference_text"]],
+        )
+        cases[locale] = {"fixture_sha256": fixture["sha256"], "evidence": evidence}
+        quality_scores[locale] = 1.0 if transcript == fixture["reference_text"] else 0.5
+    return fixtures, {
+        "schema_version": 1,
+        "profile": "local_offline",
+        "commit": "f" * 40,
+        "cases": cases,
+        "measurements": {
+            "measured_concurrency": 4,
+            "latency_p95_ms": 1_250,
+            "quality_scores": quality_scores,
+        },
+    }
+
+
 def test_unverified_speech_samples_cannot_qualify() -> None:
     evidence = _speech_evidence()
     evidence["evidence_source"] = "unit_test"
@@ -104,9 +134,8 @@ def test_speech_evidence_requires_stt_samples_and_accepted_transcript() -> None:
     with pytest.raises(ValueError, match="STT"):
         _validate(evidence)
 
-    evidence = _speech_evidence()
-    evidence["recognized_text"] = "unrelated text"
-    with pytest.raises(ValueError, match="reference|accepted transcript"):
+    evidence["accepted_transcripts"] = []
+    with pytest.raises(ValueError, match="accepted transcript"):
         _validate(evidence)
 
 
@@ -127,6 +156,77 @@ def test_pcm_evidence_must_match_the_reviewed_fixture_hash() -> None:
     evidence["fixture_sha256"] = "d" * 64
     with pytest.raises(ValueError, match="fixture hash"):
         _validate(evidence)
+
+
+def test_live_measurements_are_recomputed_and_compared_with_profile_limits() -> None:
+    fixtures, report = _audio_report()
+    validate = qualification.validate_audio_evidence_report
+    limits = {
+        "turn_timeout_ms": 2_000,
+        "latency_p95_ms": 1_500,
+        "quality_threshold": 0.9,
+    }
+    validate(
+        report,
+        fixtures=fixtures,
+        profile="local_offline",
+        release_commit="f" * 40,
+        limits=limits,
+        expected_concurrency=4,
+    )
+
+    timeout_limits = dict(limits, turn_timeout_ms=1_000)
+    with pytest.raises(ValueError, match="turn_timeout_ms"):
+        validate(
+            report,
+            fixtures=fixtures,
+            profile="local_offline",
+            release_commit="f" * 40,
+            limits=timeout_limits,
+            expected_concurrency=4,
+        )
+
+    latency_limits = dict(limits, latency_p95_ms=1_000)
+    with pytest.raises(ValueError, match="latency_p95_ms"):
+        validate(
+            report,
+            fixtures=fixtures,
+            profile="local_offline",
+            release_commit="f" * 40,
+            limits=latency_limits,
+            expected_concurrency=4,
+        )
+
+    with pytest.raises(ValueError, match="configured concurrency"):
+        validate(
+            report,
+            fixtures=fixtures,
+            profile="local_offline",
+            release_commit="f" * 40,
+            limits=limits,
+            expected_concurrency=3,
+        )
+
+    with pytest.raises(ValueError, match="does not match observed"):
+        validate(
+            dict(report, measurements=dict(report["measurements"], latency_p95_ms=1)),
+            fixtures=fixtures,
+            profile="local_offline",
+            release_commit="f" * 40,
+            limits=limits,
+            expected_concurrency=4,
+        )
+
+    poor_fixtures, poor_report = _audio_report({"en": "reference"})
+    with pytest.raises(ValueError, match="quality_threshold"):
+        validate(
+            poor_report,
+            fixtures=poor_fixtures,
+            profile="local_offline",
+            release_commit="f" * 40,
+            limits=limits,
+            expected_concurrency=4,
+        )
 
 
 def _fixture_bundle(root, *, samples=(900, -1200, 1600, -800), provenance="synthetic_tone"):
@@ -208,6 +308,11 @@ def test_forged_audio_report_cannot_qualify_with_matching_fixture_hashes() -> No
         "profile": "local_offline",
         "commit": "f" * 40,
         "cases": cases,
+        "measurements": {
+            "measured_concurrency": 1,
+            "latency_p95_ms": 1_250,
+            "quality_scores": {"en": 1.0, "hi": 1.0},
+        },
     }
     with pytest.raises(ValueError, match="fake or unverified"):
         qualification.validate_audio_evidence_report(
@@ -216,50 +321,73 @@ def test_forged_audio_report_cannot_qualify_with_matching_fixture_hashes() -> No
             profile="local_offline",
             release_commit="f" * 40,
         )
-def test_live_audio_qualification_requires_commit_bound_evidence_report() -> None:
+def test_live_audio_qualification_requires_current_run_signed_evidence() -> None:
     if os.environ.get("RUN_AUDIO_QUALIFICATION") != "1":
-        return
+        pytest.skip("live audio qualification is not enabled")
 
     audio_root_value = os.environ.get("VERIFY_AUDIO_ROOT")
     artifact_dir_value = os.environ.get("VERIFY_ARTIFACT_DIR")
     profile = os.environ.get("VERIFY_PROFILE")
-    assert audio_root_value and artifact_dir_value and profile, (
-        "live qualification requires audio fixtures, artifact directory, and profile"
-    )
+    run_id = os.environ.get("VERIFY_RUN_ID")
+    profile_hash = os.environ.get("VERIFY_PROFILE_SHA256")
+    signing_key = os.environ.get("VERIFY_EVIDENCE_KEY")
+    if not audio_root_value:
+        pytest.fail("missing prerequisite: VERIFY_AUDIO_ROOT with reviewed English and Hindi human-speech fixtures")
+    if not artifact_dir_value or not profile or not run_id or not profile_hash or not signing_key:
+        pytest.fail("missing prerequisite: current-run audio qualification signing context")
     audio_root = Path(audio_root_value)
     artifact_dir = Path(artifact_dir_value)
     assert audio_root.is_absolute() and artifact_dir.is_absolute(), (
         "live qualification paths must be absolute"
     )
-    load_fixtures = getattr(qualification, "load_audio_fixture_manifest", None)
-    validate_report = getattr(qualification, "validate_audio_evidence_report", None)
-    load_manifest = getattr(qualification, "load_release_manifest", None)
-    assert callable(load_fixtures) and callable(validate_report) and callable(load_manifest)
-
-    fixtures = load_fixtures(audio_root / "audio_manifest.json", audio_root=audio_root)
-    release_manifest = load_manifest(artifact_dir / "manifest.json")
-    report_path = qualification.require_report(
-        artifact_dir / "audio-evidence.json",
-        "live speech qualification evidence report",
+    fixtures = qualification.load_audio_fixture_manifest(
+        audio_root / "audio_manifest.json",
+        audio_root=audio_root,
     )
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    deployment_models = None
-    if profile == "deployment":
-        config_path_value = os.environ.get("VERIFY_QUALIFICATION_CONFIG")
-        assert config_path_value, "deployment speech qualification requires its reviewed model config"
-        config_path = Path(config_path_value)
-        assert config_path.is_absolute() and config_path.is_file(), (
-            "deployment speech qualification model config is missing"
+    release_manifest = qualification.load_release_manifest(artifact_dir / "manifest.json")
+    report_file = artifact_dir / f"audio-evidence-{profile}.json"
+    if not report_file.is_file():
+        pytest.fail(
+            "missing prerequisite: no current-run PCM-to-STT-to-completed-flow audio qualification "
+            f"producer created {report_file.name}"
         )
-        config = json.loads(config_path.read_text(encoding="utf-8"))
+    report_path = qualification.require_report(
+        report_file,
+        f"current-run {profile} audio qualification evidence",
+    )
+    envelope = json.loads(report_path.read_text(encoding="utf-8"))
+    report = qualification.validate_live_evidence(
+        envelope,
+        kind="audio_qualification",
+        run_id=run_id,
+        profile=profile,
+        profile_hash=profile_hash,
+        commit=release_manifest["commit"],
+        key=signing_key,
+    )
+    config_path_value = os.environ.get("VERIFY_QUALIFICATION_CONFIG")
+    assert config_path_value, f"{profile} speech qualification requires its reviewed model config"
+    config_path = Path(config_path_value)
+    assert config_path.is_absolute() and config_path.is_file(), (
+        f"{profile} speech qualification model config is missing"
+    )
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    if profile == "deployment":
         qualification.validate_deployment_config(config)
         deployment_models = config["models"]
+    elif profile == "local_offline":
+        qualification.validate_local_qualification_config(config)
+        deployment_models = None
+    else:
+        pytest.fail(f"unknown live speech profile: {profile}")
 
-    validate_report(
+    qualification.validate_audio_evidence_report(
         report,
         fixtures=fixtures["fixtures"],
         profile=profile,
         release_commit=release_manifest["commit"],
         deployment_models=deployment_models,
+        limits=config["limits"],
+        expected_concurrency=config["concurrency"],
     )
 

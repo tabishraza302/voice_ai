@@ -10,9 +10,13 @@ from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import json
+import hmac
+import uuid
 from pathlib import Path
 import re
+import ipaddress
 from typing import Any
+from bot.flow.canonical import canonical_json_v1
 from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
 
@@ -48,6 +52,7 @@ _TEST_GATES = frozenset(
 _MANIFEST_FIELDS = frozenset(
     {
         "manifest_version",
+        "run_id",
         "run_dir",
         "created_at",
         "commit",
@@ -80,6 +85,102 @@ def require_report(path: Path | str, description: str) -> Path:
     return report
 
 
+def profile_sha256(profile: Mapping[str, Any]) -> str:
+    """Hash the exact canonical profile value used by a qualification run."""
+    return hashlib.sha256(canonical_json_v1(profile)).hexdigest()
+
+
+def authenticate_live_evidence(
+    payload: Mapping[str, Any],
+    *,
+    kind: str,
+    run_id: str,
+    profile: str,
+    profile_hash: str,
+    commit: str,
+    key: str,
+) -> dict[str, Any]:
+    """Add a verifier HMAC; this protects envelope integrity, not payload origin."""
+    if not isinstance(payload, Mapping):
+        raise ValueError("live evidence payload must be an object")
+    try:
+        key_bytes = bytes.fromhex(key)
+    except (TypeError, ValueError) as err:
+        raise ValueError("live evidence HMAC key must be hexadecimal") from err
+    if len(key_bytes) < 32:
+        raise ValueError("live evidence HMAC key is missing or too short")
+    envelope = {
+        "schema_version": 1,
+        "kind": kind,
+        "run_id": run_id,
+        "profile": profile,
+        "profile_sha256": profile_hash,
+        "commit": commit,
+        "payload": dict(payload),
+    }
+    envelope["hmac_sha256"] = hmac.new(
+        key_bytes,
+        canonical_json_v1(envelope),
+        hashlib.sha256,
+    ).hexdigest()
+    return envelope
+
+
+def validate_live_evidence(
+    envelope: Any,
+    *,
+    kind: str,
+    run_id: str,
+    profile: str,
+    profile_hash: str,
+    commit: str,
+    key: str,
+) -> Mapping[str, Any]:
+    """Verify the per-run HMAC and context; this does not authenticate payload origin."""
+    fields = {
+        "schema_version",
+        "kind",
+        "run_id",
+        "profile",
+        "profile_sha256",
+        "commit",
+        "payload",
+        "hmac_sha256",
+    }
+    if not isinstance(envelope, Mapping) or set(envelope) != fields:
+        raise ValueError("live evidence envelope has missing or unknown fields")
+    if type(envelope.get("schema_version")) is not int or envelope["schema_version"] != 1:
+        raise ValueError("live evidence schema_version must be integer 1")
+    if envelope.get("kind") != kind:
+        raise ValueError("live evidence kind does not match the requested report")
+    if envelope.get("run_id") != run_id:
+        raise ValueError("live evidence belongs to a different verification run")
+    if envelope.get("profile") != profile or envelope.get("profile_sha256") != profile_hash:
+        raise ValueError("live evidence profile does not match the requested profile")
+    if (
+        not isinstance(commit, str)
+        or not _COMMIT_RE.fullmatch(commit)
+        or envelope.get("commit") != commit
+    ):
+        raise ValueError("live evidence does not match the current release commit")
+    try:
+        key_bytes = bytes.fromhex(key)
+    except (TypeError, ValueError) as err:
+        raise ValueError("live evidence HMAC key must be hexadecimal") from err
+    if len(key_bytes) < 32:
+        raise ValueError("live evidence HMAC key is missing or too short")
+    mac = envelope.get("hmac_sha256")
+    if not isinstance(mac, str) or not _SHA256_RE.fullmatch(mac):
+        raise ValueError("live evidence HMAC is missing or malformed")
+    unsigned = {field: envelope[field] for field in fields if field != "hmac_sha256"}
+    expected = hmac.new(key_bytes, canonical_json_v1(unsigned), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(mac, expected):
+        raise ValueError("live evidence HMAC is invalid")
+    payload = envelope.get("payload")
+    if not isinstance(payload, Mapping):
+        raise ValueError("live evidence payload must be an object")
+    return payload
+
 def validate_release_manifest(
     manifest: Any,
     required_gates: Sequence[str] = RELEASE_REQUIRED_GATES,
@@ -90,11 +191,18 @@ def validate_release_manifest(
     required_fields = _MANIFEST_FIELDS - {"validation_error"}
     if not required_fields.issubset(manifest) or set(manifest) - _MANIFEST_FIELDS:
         raise ValueError("release manifest has missing or unknown fields")
-    if type(manifest.get("manifest_version")) is not int or manifest["manifest_version"] != 1:
-        raise ValueError("release manifest_version must be integer 1")
+    if type(manifest.get("manifest_version")) is not int or manifest["manifest_version"] != 2:
+        raise ValueError("release manifest_version must be integer 2")
     run_dir = manifest.get("run_dir")
     if not isinstance(run_dir, str) or not Path(run_dir).is_absolute():
         raise ValueError("release manifest run_dir must be an absolute path")
+    run_id = manifest.get("run_id")
+    if (
+        not isinstance(run_id, str)
+        or not run_id.strip()
+        or Path(run_dir).name != run_id
+    ):
+        raise ValueError("release manifest run_id must match its owned run directory")
     if not isinstance(manifest.get("python_version"), str) or not manifest["python_version"].strip():
         raise ValueError("release manifest python_version is missing")
     for field in ("uv_lock_sha256", "bun_lock_sha256", "pyproject_toml_sha256"):
@@ -237,17 +345,15 @@ def validate_speech_evidence(
     if type(received) is not int or received != len(input_samples):
         raise ValueError("STT must report receipt of every actual input sample")
     recognized = evidence.get("recognized_text")
-    accepted = evidence.get("accepted_transcripts")
-    if not isinstance(expected_reference_text, str) or not expected_reference_text.strip():
-        raise ValueError("reviewed corpus transcript reference is missing")
     if not isinstance(recognized, str) or not recognized.strip():
         raise ValueError("STT recognized text is missing")
     if not isinstance(accepted, list) or not accepted:
         raise ValueError("corpus-specific accepted transcript reference is missing")
     normalize = lambda text: " ".join(text.casefold().split())
-    if normalize(recognized) != normalize(expected_reference_text):
-        raise ValueError("recognized text does not match the reviewed fixture reference")
-    if not any(isinstance(item, str) and normalize(item) == normalize(expected_reference_text) for item in accepted):
+    if not any(
+        isinstance(item, str) and normalize(item) == normalize(expected_reference_text)
+        for item in accepted
+    ):
         raise ValueError("accepted transcript policy does not match the reviewed fixture reference")
     if evidence.get("flow_progressed") is not True:
         raise ValueError("valid pinned-flow progress evidence is missing")
@@ -277,6 +383,26 @@ def validate_speech_evidence(
         raise ValueError("speech qualification backend versions are incomplete")
 
 
+def _word_quality_score(reference: str, recognized: str) -> float:
+    reference_words = " ".join(reference.casefold().split()).split()
+    recognized_words = " ".join(recognized.casefold().split()).split()
+    previous = list(range(len(recognized_words) + 1))
+    for row, reference_word in enumerate(reference_words, start=1):
+        current = [row]
+        for column, recognized_word in enumerate(recognized_words, start=1):
+            current.append(
+                min(
+                    current[column - 1] + 1,
+                    previous[column] + 1,
+                    previous[column - 1] + (reference_word != recognized_word),
+                )
+            )
+        previous = current
+    if not reference_words:
+        return 1.0 if not recognized_words else 0.0
+    return max(0.0, 1.0 - previous[-1] / len(reference_words))
+
+
 def validate_audio_evidence_report(
     report: Any,
     *,
@@ -284,9 +410,12 @@ def validate_audio_evidence_report(
     profile: str,
     release_commit: str,
     deployment_models: Mapping[str, Any] | None = None,
+    limits: Mapping[str, Any] | None = None,
+    expected_concurrency: int | None = None,
 ) -> None:
-    """Bind each live EN/HI speech result to reviewed fixtures and release models."""
-    if not isinstance(report, Mapping) or set(report) != {"schema_version", "profile", "commit", "cases"}:
+    """Bind live speech results and measured limits to reviewed inputs."""
+    fields = {"schema_version", "profile", "commit", "cases", "measurements"}
+    if not isinstance(report, Mapping) or set(report) != fields:
         raise ValueError("audio evidence report has missing or unknown fields")
     if type(report.get("schema_version")) is not int or report["schema_version"] != 1:
         raise ValueError("audio evidence report schema_version must be integer 1")
@@ -297,6 +426,9 @@ def validate_audio_evidence_report(
     cases = report.get("cases")
     if not isinstance(cases, Mapping) or set(cases) != {"en", "hi"}:
         raise ValueError("audio evidence report must include exactly English and Hindi speech cases")
+
+    durations: list[int] = []
+    computed_quality: dict[str, float] = {}
     for locale in ("en", "hi"):
         fixture = fixtures.get(locale)
         case = cases.get(locale)
@@ -312,6 +444,11 @@ def validate_audio_evidence_report(
             expected_fixture_sha256=fixture["sha256"],
             expected_reference_text=fixture["reference_text"],
         )
+        durations.append(evidence["duration_ms"])
+        computed_quality[locale] = _word_quality_score(
+            fixture["reference_text"],
+            evidence["recognized_text"],
+        )
         if deployment_models is not None:
             expected = {
                 "llm": deployment_models["llm"],
@@ -323,6 +460,43 @@ def validate_audio_evidence_report(
                 if any(actual[field] != model[field] for field in ("id", "revision", "sha256")):
                     raise ValueError(f"{locale} speech evidence used an unpinned {name} model")
 
+    measurements = report.get("measurements")
+    if not isinstance(measurements, Mapping) or set(measurements) != {
+        "measured_concurrency",
+        "latency_p95_ms",
+        "quality_scores",
+    }:
+        raise ValueError("audio evidence measurements are missing or malformed")
+    measured_concurrency = measurements.get("measured_concurrency")
+    if type(measured_concurrency) is not int or measured_concurrency <= 0:
+        raise ValueError("audio measured concurrency is missing or invalid")
+    if expected_concurrency is not None and measured_concurrency != expected_concurrency:
+        raise ValueError("audio measured concurrency does not match the configured concurrency")
+    sorted_durations = sorted(durations)
+    p95_rank = (95 * len(sorted_durations) + 99) // 100
+    measured_p95 = sorted_durations[p95_rank - 1]
+    if measurements.get("latency_p95_ms") != measured_p95:
+        raise ValueError("audio latency_p95_ms does not match observed completed-turn durations")
+    quality_scores = measurements.get("quality_scores")
+    if not isinstance(quality_scores, Mapping) or set(quality_scores) != {"en", "hi"}:
+        raise ValueError("audio quality scores must include English and Hindi")
+    for locale, measured_score in computed_quality.items():
+        score = quality_scores.get(locale)
+        if (
+            isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or abs(score - measured_score) > 1e-9
+        ):
+            raise ValueError(f"{locale} measured quality score does not match the observed transcript")
+    if limits is not None:
+        if expected_concurrency is None:
+            raise ValueError("configured audio limits require the expected measured concurrency")
+        if any(duration > limits["turn_timeout_ms"] for duration in durations):
+            raise ValueError("audio completed turn exceeded the configured turn_timeout_ms")
+        if measured_p95 > limits["latency_p95_ms"]:
+            raise ValueError("audio p95 latency exceeded the configured latency_p95_ms")
+        if min(computed_quality.values()) < limits["quality_threshold"]:
+            raise ValueError("audio transcript quality fell below the configured quality_threshold")
 
 def validate_backup_restore_evidence(
     evidence: Any,
@@ -495,6 +669,132 @@ def validate_public_transport_evidence(
             raise ValueError(f"public transport {description} evidence is missing")
 
 
+def _validate_profile_endpoint(
+    endpoint: Any,
+    name: str,
+    *,
+    https_only: bool = False,
+    loopback_only: bool = False,
+) -> None:
+    parsed = urlparse(endpoint) if isinstance(endpoint, str) else None
+    allowed_schemes = {"https"} if https_only else {"http", "https"}
+    if (
+        parsed is None
+        or parsed.scheme not in allowed_schemes
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        scheme_text = "HTTPS" if https_only else "HTTP or HTTPS"
+        raise ValueError(f"{name} endpoint must be a credential-free {scheme_text} URL without query or fragment")
+    if loopback_only:
+        hostname = parsed.hostname.casefold()
+        if hostname != "localhost":
+            try:
+                is_loopback = ipaddress.ip_address(hostname).is_loopback
+            except ValueError:
+                is_loopback = False
+            if not is_loopback:
+                raise ValueError(f"{name} endpoint must use a literal loopback address for the air-gapped runner")
+
+
+def _validate_models(models: Any, profile: str) -> None:
+    model_names = {"llm", "stt", "tts_en", "tts_hi"}
+    if not isinstance(models, Mapping) or set(models) != model_names:
+        raise ValueError(f"{profile} model identities must include llm, stt, tts_en, and tts_hi")
+    for name, model in models.items():
+        if not isinstance(model, Mapping) or set(model) != {"id", "revision", "sha256"}:
+            raise ValueError(f"{profile} {name} model identity has missing or unknown fields")
+        for field in ("id", "revision", "sha256"):
+            if not isinstance(model.get(field), str) or not model[field].strip():
+                raise ValueError(f"{profile} {name} model {field} is missing")
+        if not _SHA256_RE.fullmatch(model["sha256"].lower()):
+            raise ValueError(f"{profile} {name} model hash is invalid")
+
+
+def _validate_limits(limits: Any, profile: str) -> None:
+    if not isinstance(limits, Mapping) or set(limits) != {
+        "turn_timeout_ms",
+        "latency_p95_ms",
+        "quality_threshold",
+    }:
+        raise ValueError(f"{profile} timeout, latency, and quality limits are missing or malformed")
+    for field in ("turn_timeout_ms", "latency_p95_ms"):
+        if type(limits.get(field)) is not int or limits[field] <= 0:
+            raise ValueError(f"{profile} {field} must be a positive integer")
+    quality = limits.get("quality_threshold")
+    if isinstance(quality, bool) or not isinstance(quality, (int, float)) or not 0 < quality <= 1:
+        raise ValueError(f"{profile} quality_threshold must be greater than zero and at most one")
+
+
+def _validate_qualification(config: Mapping[str, Any], profile: str) -> None:
+    qualification = config.get("qualification")
+    required = {
+        "model_endpoint",
+        "transport_endpoint",
+        "adapter_version",
+        "agent_settings",
+        "locales",
+        "source_revision",
+    }
+    if not isinstance(qualification, Mapping) or set(qualification) != required:
+        raise ValueError(f"{profile} qualification endpoints and adapter settings are missing or malformed")
+    _validate_profile_endpoint(
+        qualification.get("model_endpoint"),
+        f"{profile} model",
+        loopback_only=True,
+    )
+    _validate_profile_endpoint(
+        qualification.get("transport_endpoint"),
+        f"{profile} transport",
+        loopback_only=True,
+    )
+    if not isinstance(qualification.get("adapter_version"), str) or not qualification["adapter_version"].strip():
+        raise ValueError(f"{profile} adapter_version is missing")
+    settings = qualification.get("agent_settings")
+    setting_fields = {"llm_model", "stt_provider", "tts_voice_en", "tts_voice_hi"}
+    if (
+        not isinstance(settings, Mapping)
+        or set(settings) != setting_fields
+        or any(not isinstance(value, str) or not value.strip() for value in settings.values())
+    ):
+        raise ValueError(f"{profile} agent settings are missing or malformed")
+    if settings["llm_model"] != config["models"]["llm"]["id"]:
+        raise ValueError(f"{profile} agent LLM setting does not match the pinned LLM model ID")
+    locales = qualification.get("locales")
+    if not isinstance(locales, list) or locales != ["en", "hi"]:
+        raise ValueError(f"{profile} qualification locales must be exactly English and Hindi")
+    if not isinstance(qualification.get("source_revision"), str) or not _COMMIT_RE.fullmatch(
+        qualification["source_revision"]
+    ):
+        raise ValueError(f"{profile} source_revision must be a full Git commit hash")
+
+
+def validate_local_qualification_config(config: Any) -> None:
+    """Validate the explicit loopback-only qualification profile."""
+    required_fields = {
+        "schema_version",
+        "profile",
+        "models",
+        "qualification",
+        "concurrency",
+        "limits",
+    }
+    if not isinstance(config, Mapping) or set(config) != required_fields:
+        raise ValueError("local qualification config has missing or unknown fields")
+    if type(config.get("schema_version")) is not int or config["schema_version"] != 1:
+        raise ValueError("local qualification config schema_version must be 1")
+    if config.get("profile") != "local_offline":
+        raise ValueError("local qualification config profile must be local_offline")
+    _validate_models(config.get("models"), "local_offline")
+    _validate_qualification(config, "local_offline")
+    if type(config.get("concurrency")) is not int or config["concurrency"] <= 0:
+        raise ValueError("local_offline measured concurrency must be a positive integer")
+    _validate_limits(config.get("limits"), "local_offline")
+
+
 def validate_deployment_config(config: Any) -> None:
     """Validate the exact reviewed deployment profile and all pinned dependencies."""
     if not isinstance(config, Mapping):
@@ -505,6 +805,7 @@ def validate_deployment_config(config: Any) -> None:
         "allowed_origins",
         "models",
         "runner_api_endpoints",
+        "qualification",
         "turn",
         "browser",
         "database",
@@ -532,26 +833,14 @@ def validate_deployment_config(config: Any) -> None:
         if parsed is None or parsed.scheme != "https" or not parsed.netloc or parsed.path not in ("", "/") or parsed.query or parsed.fragment:
             raise ValueError("deployment allowed origins must be exact HTTPS origins")
 
-    models = config.get("models")
-    model_names = {"llm", "stt", "tts_en", "tts_hi"}
-    if not isinstance(models, Mapping) or set(models) != model_names:
-        raise ValueError("deployment model identities must include llm, stt, tts_en, and tts_hi")
-    for name, model in models.items():
-        if not isinstance(model, Mapping) or set(model) != {"id", "revision", "sha256"}:
-            raise ValueError(f"deployment {name} model identity has missing or unknown fields")
-        for field in ("id", "revision", "sha256"):
-            if not isinstance(model.get(field), str) or not model[field].strip():
-                raise ValueError(f"deployment {name} model {field} is missing")
-        if not _SHA256_RE.fullmatch(model["sha256"].lower()):
-            raise ValueError(f"deployment {name} model hash is invalid")
+    _validate_models(config.get("models"), "deployment")
+    _validate_qualification(config, "deployment")
 
     endpoints = config.get("runner_api_endpoints")
-    if not isinstance(endpoints, Mapping) or set(endpoints) != {"runner", "api"}:
-        raise ValueError("deployment runner/API endpoints are missing or unknown")
+    if not isinstance(endpoints, Mapping) or set(endpoints) != {"runner", "api", "flags"}:
+        raise ValueError("deployment runner, API, and flags endpoints are missing or unknown")
     for name, endpoint in endpoints.items():
-        parsed = urlparse(endpoint) if isinstance(endpoint, str) else None
-        if parsed is None or parsed.scheme != "https" or not parsed.netloc:
-            raise ValueError(f"deployment {name} endpoint must be an HTTPS URL")
+        _validate_profile_endpoint(endpoint, f"deployment {name}", https_only=True)
 
     turn = config.get("turn")
     if not isinstance(turn, Mapping) or set(turn) != {"required", "endpoint", "credential_reference"}:
@@ -585,20 +874,237 @@ def validate_deployment_config(config: Any) -> None:
     concurrency = config.get("concurrency")
     if type(concurrency) is not int or concurrency <= 0:
         raise ValueError("deployment measured concurrency must be a positive integer")
-    limits = config.get("limits")
-    if not isinstance(limits, Mapping) or set(limits) != {"turn_timeout_ms", "latency_p95_ms", "quality_threshold"}:
-        raise ValueError("deployment timeout, latency, and quality limits are missing or malformed")
-    for field in ("turn_timeout_ms", "latency_p95_ms"):
-        if type(limits.get(field)) is not int or limits[field] <= 0:
-            raise ValueError(f"deployment {field} must be a positive integer")
-    quality = limits.get("quality_threshold")
-    if isinstance(quality, bool) or not isinstance(quality, (int, float)) or not 0 < quality <= 1:
-        raise ValueError("deployment quality_threshold must be greater than zero and at most one")
+    _validate_limits(config.get("limits"), "deployment")
     baselines = config.get("baseline_artifact_ids")
     if not isinstance(baselines, list) or not baselines or any(
         not isinstance(item, str) or not item.strip() for item in baselines
     ) or len(set(baselines)) != len(baselines):
         raise ValueError("deployment measured baseline artifact IDs are missing or duplicated")
+
+
+def _validate_adapter_execution_ledger(
+    ledger: Any,
+    *,
+    run_id: str,
+    profile_hash: str,
+    source_revision: str,
+    capability_report: Mapping[str, Any],
+    scenarios: Sequence[Mapping[str, Any]],
+    execution_key: str | None,
+) -> None:
+    required_fields = {
+        "schema_version",
+        "execution_id",
+        "run_id",
+        "profile_hash",
+        "source_revision",
+        "capability_manifest_hash",
+        "capability_report_hash",
+        "receipts",
+        "final_receipt_hash",
+        "hmac_sha256",
+    }
+    if not isinstance(ledger, Mapping) or set(ledger) != required_fields:
+        raise ValueError(
+            "adapter qualification is missing the authenticated live execution/ledger chain"
+        )
+    if type(ledger.get("schema_version")) is not int or ledger["schema_version"] != 1:
+        raise ValueError("adapter execution ledger schema_version must be integer 1")
+    try:
+        execution_id = uuid.UUID(ledger.get("execution_id", ""))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("adapter execution ledger ID must be a runner-minted UUIDv4") from error
+    if execution_id.version != 4 or str(execution_id) != ledger["execution_id"]:
+        raise ValueError("adapter execution ledger ID must be a runner-minted UUIDv4")
+    if (
+        ledger.get("run_id") != run_id
+        or ledger.get("profile_hash") != profile_hash
+        or ledger.get("source_revision") != source_revision
+    ):
+        raise ValueError("adapter execution ledger does not match this run, profile, and commit")
+
+    manifest_excluded = {"cases", "measurements", "budgets", "raw_evidence_references", "report_hash"}
+    manifest = {name: value for name, value in capability_report.items() if name not in manifest_excluded}
+    expected_manifest_hash = hashlib.sha256(
+        b"voice-ai/adapter-capability-manifest/v1\0" + canonical_json_v1(manifest)
+    ).hexdigest()
+    if ledger.get("capability_manifest_hash") != expected_manifest_hash:
+        raise ValueError("adapter ledger capability manifest hash does not match the qualified profile")
+    if ledger.get("capability_report_hash") != capability_report.get("report_hash"):
+        raise ValueError("adapter execution ledger does not bind the final capability report hash")
+
+    receipts = ledger.get("receipts")
+    if not isinstance(receipts, list) or len(receipts) != len(scenarios):
+        raise ValueError("adapter execution ledger must include one receipt for every required scenario")
+    receipt_fields = {
+        "scenario_number",
+        "trace_id",
+        "server_event_id",
+        "transaction_id",
+        "ledger_id",
+        "evidence_id",
+        "previous_receipt_hash",
+        "receipt_hash",
+    }
+    previous_hash = "0" * 64
+    unique_ids: dict[str, set[str]] = {
+        name: set()
+        for name in ("trace_id", "server_event_id", "transaction_id", "ledger_id", "evidence_id")
+    }
+    evidence_references = capability_report.get("raw_evidence_references")
+    if not isinstance(evidence_references, list) or any(
+        not isinstance(reference, str) for reference in evidence_references
+    ):
+        raise ValueError("adapter capability report has no raw execution receipt references")
+    for expected_number, (scenario, receipt) in enumerate(zip(scenarios, receipts, strict=True), start=1):
+        if not isinstance(receipt, Mapping) or set(receipt) != receipt_fields:
+            raise ValueError("adapter execution receipt is missing required ledger ownership fields")
+        if type(receipt.get("scenario_number")) is not int or receipt["scenario_number"] != expected_number:
+            raise ValueError("adapter execution ledger receipts are missing or out of scenario order")
+        if not isinstance(receipt.get("previous_receipt_hash"), str) or receipt["previous_receipt_hash"] != previous_hash:
+            raise ValueError("adapter execution receipt chain has a broken predecessor link")
+        receipt_hash = receipt.get("receipt_hash")
+        if not isinstance(receipt_hash, str) or not _SHA256_RE.fullmatch(receipt_hash):
+            raise ValueError("adapter execution receipt hash is missing or malformed")
+        unsigned_receipt = {name: value for name, value in receipt.items() if name != "receipt_hash"}
+        expected_receipt_hash = hashlib.sha256(
+            b"voice-ai/adapter-execution-receipt/v1\0" + canonical_json_v1(unsigned_receipt)
+        ).hexdigest()
+        if not hmac.compare_digest(receipt_hash, expected_receipt_hash):
+            raise ValueError("adapter execution receipt hash does not match its canonical data")
+        for name in unique_ids:
+            value = receipt.get(name)
+            if not isinstance(value, str) or not value.strip() or value in unique_ids[name]:
+                raise ValueError(f"adapter execution receipt has missing or duplicated {name}")
+            unique_ids[name].add(value)
+        if receipt["trace_id"] != scenario.get("trace_id"):
+            raise ValueError("adapter execution receipt trace does not match its scenario result")
+        if receipt["evidence_id"] not in evidence_references:
+            raise ValueError("adapter capability report does not reference every execution receipt")
+        previous_hash = receipt_hash
+    if ledger.get("final_receipt_hash") != previous_hash:
+        raise ValueError("adapter execution ledger final hash does not match its receipt chain")
+
+    if not isinstance(execution_key, str):
+        raise ValueError("adapter execution ledger verification key is unavailable")
+    try:
+        key_bytes = bytes.fromhex(execution_key)
+    except ValueError as error:
+        raise ValueError("adapter execution ledger verification key is malformed") from error
+    if len(key_bytes) < 32:
+        raise ValueError("adapter execution ledger verification key is unavailable")
+    signature = ledger.get("hmac_sha256")
+    if not isinstance(signature, str) or not _SHA256_RE.fullmatch(signature):
+        raise ValueError("adapter execution ledger HMAC is missing or malformed")
+    unsigned_ledger = {name: value for name, value in ledger.items() if name != "hmac_sha256"}
+    expected_hmac = hmac.new(
+        key_bytes,
+        b"voice-ai/adapter-execution-ledger/v1\0" + canonical_json_v1(unsigned_ledger),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(signature, expected_hmac):
+        raise ValueError("adapter execution ledger HMAC is invalid")
+
+
+def validate_adapter_qualification_report(
+    report: Any,
+    *,
+    run_id: str,
+    profile_hash: str,
+    source_revision: str,
+    require_supported: bool,
+    execution_key: str | None = None,
+) -> None:
+    """Validate runner provenance and the seven actual adapter scenario results."""
+    if not isinstance(report, Mapping):
+        raise ValueError("adapter qualification report must be an object")
+    provenance = report.get("execution_provenance")
+    if not isinstance(provenance, Mapping) or set(provenance) != {
+        "runner",
+        "run_id",
+        "profile_hash",
+        "source_revision",
+    }:
+        raise ValueError("adapter qualification execution provenance is missing or malformed")
+    if provenance.get("runner") != "bot.flow.qualification_runner":
+        raise ValueError("adapter qualification report was not produced by the qualified runner")
+    if (
+        provenance.get("run_id") != run_id
+        or provenance.get("profile_hash") != profile_hash
+        or provenance.get("source_revision") != source_revision
+    ):
+        raise ValueError("adapter qualification provenance does not match this run, profile, and commit")
+
+    from bot.flow.qualification_runner import REQUIRED_CONTRACT_SCENARIOS
+
+    expected = {item.number: item.name for item in REQUIRED_CONTRACT_SCENARIOS}
+    scenarios = report.get("contract_scenarios")
+    if not isinstance(scenarios, list) or len(scenarios) != len(expected):
+        raise ValueError("adapter qualification report must include all seven contract scenarios")
+    seen: set[int] = set()
+    all_passed = True
+    for scenario in scenarios:
+        if not isinstance(scenario, Mapping):
+            raise ValueError("adapter qualification scenario result must be an object")
+        number = scenario.get("scenario_number")
+        status = scenario.get("status")
+        passed = scenario.get("passed")
+        if (
+            type(number) is not int
+            or number not in expected
+            or number in seen
+            or scenario.get("name") != expected[number]
+        ):
+            raise ValueError("adapter qualification report has a missing or duplicated scenario")
+        if status not in {"PASSED", "FAILED", "NOT_RUN", "UNSUPPORTED"}:
+            raise ValueError(f"adapter scenario {expected[number]} has an invalid status")
+        if type(passed) is not bool or passed is not (status == "PASSED"):
+            raise ValueError(f"adapter scenario {expected[number]} pass value does not match its status")
+        seen.add(number)
+        all_passed = all_passed and passed
+    if seen != set(expected):
+        raise ValueError("adapter qualification report does not cover all seven scenarios")
+
+    supported = report.get("overall_status") == "supported" and report.get("task_2_complete") is True
+    if supported:
+        if not isinstance(report.get("execution_ledger"), Mapping):
+            raise ValueError(
+                "adapter qualification is missing the authenticated live execution/ledger chain"
+            )
+        capability_report = report.get("capability_report")
+        if not isinstance(capability_report, Mapping):
+            raise ValueError("supported adapter report is missing its protocol-v2 capability report")
+        from bot.flow.qualification import validate_capability_report
+
+        diagnostics = validate_capability_report(dict(capability_report))
+        if diagnostics:
+            detail = "; ".join(diagnostic.message for diagnostic in diagnostics)
+            raise ValueError(f"adapter capability report is invalid: {detail}")
+        if (
+            capability_report.get("profile_hash") != profile_hash
+            or capability_report.get("source_revision") != source_revision
+        ):
+            raise ValueError("adapter capability tuple does not match this profile and commit")
+        _validate_adapter_execution_ledger(
+            report.get("execution_ledger"),
+            run_id=run_id,
+            profile_hash=profile_hash,
+            source_revision=source_revision,
+            capability_report=capability_report,
+            scenarios=scenarios,
+            execution_key=execution_key,
+        )
+    if require_supported and (not supported or not all_passed):
+        reasons = []
+        for field in ("unsupported_reasons", "missing_evidence"):
+            values = report.get(field, [])
+            if not isinstance(values, list):
+                raise ValueError(f"adapter qualification {field} must be a list")
+            reasons.extend(item for item in values if isinstance(item, str) and item.strip())
+        if supported and not all_passed:
+            reasons.append("one or more required adapter scenarios did not pass")
+        detail = "; ".join(reasons) if reasons else "one or more required adapter scenarios did not pass"
+        raise ValueError(f"adapter qualification is unsupported: {detail}")
 
 
 def require_junit_testcase(path: Path | str, test_name: str) -> None:
@@ -623,14 +1129,23 @@ def validate_staging_runbook(text: str) -> None:
         "## staging release qualification",
         "scripts/voice-ai.sh verify release",
         "--profile deployment --config",
+        "--local-config",
         "verify_audio_root",
         "turn",
         "manifest.json",
         "result.json",
-        "same release commit",
-        "audio-evidence.json",
-        "transport-evidence.json",
-        "real chromium tls/webrtc session",
+        "same commit",
+        "audio-evidence-<profile>.json",
+        "adapter-qualification-<profile>.json",
+        "playwright_dev.json",
+        "playwright_tls.json",
+        "deployment-preflight.json",
+        "platform_enable_public_calls",
+        "platform_enable_real_paid_calls",
+        "platform_enable_gateway",
+        "current-run pcm-to-stt-to-completed-flow",
+        "authenticated live execution ledger",
+        "verifier hmac is envelope integrity only",
         "public and real-paid flags remain off",
     )
     normalized = " ".join(text.casefold().replace("\\\n", " ").split())
@@ -639,8 +1154,16 @@ def validate_staging_runbook(text: str) -> None:
         raise ValueError(f"staging release runbook is incomplete: missing {', '.join(missing)}")
 
 
-def validate_release_artifacts(run_dir: Path | str, *, require_final_report: bool) -> None:
-    """Require complete reports and passed prerequisite gates from an owned release run."""
+def validate_release_artifacts(
+    run_dir: Path | str,
+    *,
+    require_final_report: bool,
+    evidence_key: str | None = None,
+    profile_hashes: Mapping[str, str] | None = None,
+    profile_configs: Mapping[str, Mapping[str, Any]] | None = None,
+    audio_fixtures: Mapping[str, Any] | None = None,
+) -> None:
+    """Require same-run verifier-HMAC envelopes, raw browser journeys, and passed gates."""
     root = Path(run_dir)
     if not root.is_dir():
         raise FileNotFoundError(f"required release report directory missing: {root}")
@@ -650,7 +1173,9 @@ def validate_release_artifacts(run_dir: Path | str, *, require_final_report: boo
     except json.JSONDecodeError as err:
         raise ValueError(f"malformed release manifest: {err}") from err
     validate_release_manifest(manifest)
-    if manifest.get("commit") is None:
+    commit = manifest.get("commit")
+    run_id = manifest.get("run_id")
+    if commit is None:
         raise ValueError("release manifest commit is missing")
     gates = manifest["gates"]
     for name in RELEASE_REQUIRED_GATES[:-1]:
@@ -658,6 +1183,42 @@ def validate_release_artifacts(run_dir: Path | str, *, require_final_report: boo
             raise ValueError(f"required release gate {name} did not pass: {gates[name]['reason']}")
     if gates["release_evidence"]["status"] not in {"not_run", "passed"}:
         raise ValueError("release evidence gate already failed")
+
+    if not isinstance(evidence_key, str) or not evidence_key:
+        raise ValueError("current-run evidence HMAC key is missing")
+    if not isinstance(profile_hashes, Mapping) or set(profile_hashes) != {"local_offline", "deployment"}:
+        raise ValueError("current-run profile hashes are missing")
+    if not isinstance(profile_configs, Mapping) or set(profile_configs) != {"local_offline", "deployment"}:
+        raise ValueError("reviewed local and deployment profiles are missing")
+    if not isinstance(audio_fixtures, Mapping) or set(audio_fixtures) != {"en", "hi"}:
+        raise ValueError("reviewed English and Hindi audio fixtures are missing")
+
+    for profile in ("local_offline", "deployment"):
+        config = profile_configs[profile]
+        if profile == "deployment":
+            validate_deployment_config(config)
+        else:
+            validate_local_qualification_config(config)
+        if config["qualification"]["source_revision"] != commit:
+            raise ValueError(f"{profile} qualification source_revision does not match the release commit")
+        if profile_sha256(config) != profile_hashes[profile]:
+            raise ValueError(f"{profile} profile hash does not match the reviewed profile")
+
+    def authenticated_payload(filename: str, kind: str, profile: str) -> Mapping[str, Any]:
+        report_path = require_report(root / filename, f"current-run {profile} {kind} evidence")
+        try:
+            envelope = json.loads(report_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as err:
+            raise ValueError(f"malformed current-run evidence {report_path}: {err}") from err
+        return validate_live_evidence(
+            envelope,
+            kind=kind,
+            run_id=run_id,
+            profile=profile,
+            profile_hash=profile_hashes[profile],
+            commit=commit,
+            key=evidence_key,
+        )
 
     commands_path = require_report(root / "commands.json", "command report")
     try:
@@ -674,27 +1235,97 @@ def validate_release_artifacts(run_dir: Path | str, *, require_final_report: boo
         "postgres_tests",
         "browser_dev_tests",
         "browser_tls_tests",
-        "voice_qualification",
+        "adapter_qualification_local_offline",
+        "adapter_qualification_deployment",
+        "voice_qualification_local_offline",
+        "voice_qualification_deployment",
     }
     for name in command_names:
         matching = [entry for entry in commands if isinstance(entry, Mapping) and entry.get("name") == name]
-        if not matching:
-            raise ValueError(f"required release command report missing: {name}")
-        if any(type(entry.get("returncode")) is not int or entry["returncode"] != 0 for entry in matching):
+        if len(matching) != 1:
+            raise ValueError(f"required release command report missing or duplicated: {name}")
+        if type(matching[0].get("returncode")) is not int or matching[0]["returncode"] != 0:
             raise ValueError(f"required release command failed: {name}")
 
-    for filename in ("python-unit.xml", "postgres.xml", "audio.xml"):
+    for filename in ("python-unit.xml", "postgres.xml", "voice-local_offline.xml", "voice-deployment.xml"):
         counts = parse_junit_xml(require_report(root / filename, f"{filename} test report"))
         require_gate(counts)
     require_junit_testcase(
         root / "postgres.xml",
         "test_backup_restores_platform_data_into_fresh_owned_database",
     )
-    browser_counts = parse_playwright_json(require_report(root / "playwright.json", "browser report"))
-    require_gate(browser_counts)
+    for filename in ("playwright_dev.json", "playwright_tls.json"):
+        require_gate(parse_playwright_json(require_report(root / filename, f"{filename} browser journey")))
+
+    for profile in ("local_offline", "deployment"):
+        report = authenticated_payload(
+            f"adapter-qualification-{profile}.json",
+            "adapter_qualification",
+            profile,
+        )
+        validate_adapter_qualification_report(
+            report,
+            run_id=run_id,
+            profile_hash=profile_hashes[profile],
+            source_revision=commit,
+            execution_key=evidence_key,
+            require_supported=True,
+        )
+        audio_report = authenticated_payload(
+            f"audio-evidence-{profile}.json",
+            "audio_qualification",
+            profile,
+        )
+        config = profile_configs[profile]
+        validate_audio_evidence_report(
+            audio_report,
+            fixtures=audio_fixtures,
+            profile=profile,
+            release_commit=commit,
+            deployment_models=config["models"] if profile == "deployment" else None,
+            limits=config["limits"],
+            expected_concurrency=config["concurrency"],
+        )
+
+    preflight = authenticated_payload("deployment-preflight.json", "deployment_preflight", "deployment")
+    if (
+        not isinstance(preflight, Mapping)
+        or set(preflight) != {"profile", "endpoints", "checked_at"}
+        or preflight.get("profile") != "deployment"
+        or not isinstance(preflight.get("checked_at"), str)
+        or not preflight["checked_at"].strip()
+    ):
+        raise ValueError("HMAC-authenticated deployment preflight evidence is missing or malformed")
+    endpoint_results = preflight.get("endpoints")
+    configured_endpoints = profile_configs["deployment"]["runner_api_endpoints"]
+    if not isinstance(endpoint_results, Mapping) or set(endpoint_results) != {"runner", "api", "flags"}:
+        raise ValueError("HMAC-authenticated deployment endpoint checks are incomplete")
+    for name in ("runner", "api"):
+        result = endpoint_results[name]
+        if (
+            not isinstance(result, Mapping)
+            or set(result) != {"url", "http_status", "status"}
+            or result.get("url") != configured_endpoints[name]
+            or result.get("http_status") != 200
+            or result.get("status") not in {"ok", "ready"}
+        ):
+            raise ValueError(f"HMAC-authenticated deployment {name} endpoint check did not pass")
+    flags_result = endpoint_results["flags"]
+    expected_flags = {
+        "PLATFORM_ENABLE_PUBLIC_CALLS": False,
+        "PLATFORM_ENABLE_REAL_PAID_CALLS": False,
+        "PLATFORM_ENABLE_GATEWAY": False,
+    }
+    if (
+        not isinstance(flags_result, Mapping)
+        or set(flags_result) != {"url", "http_status", "flags"}
+        or flags_result.get("url") != configured_endpoints["flags"]
+        or flags_result.get("http_status") != 200
+        or flags_result.get("flags") != expected_flags
+    ):
+        raise ValueError("HMAC-authenticated deployment flags check is missing or not explicitly disabled")
     if require_final_report:
         require_gate(parse_junit_xml(require_report(root / "release-evidence.xml", "release evidence report")))
-
 
 @dataclass(frozen=True)
 class GateCounts:

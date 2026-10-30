@@ -430,19 +430,40 @@ def test_external_admin_keeps_opaque_owner_token_out_of_database_names(
 
 
 
-def test_release_sequencing_stops_at_failing_lane_and_records_pending_not_run(tmp_path: Path) -> None:
-    """Release orchestration deterministically checks each lane and preserves pending not_run on failure."""
+def test_release_sequencing_stops_at_failing_lane_and_records_pending_not_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid release profile reaches the mocked lanes and preserves the first failure."""
     import json
+    from types import SimpleNamespace
+
+    from scripts import verify
     from scripts.verify import VerificationHarness
+    from tests.qualification.test_release_evidence import _deployment_config, _local_config
 
     harness = VerificationHarness(REPO_ROOT)
-    cfg = tmp_path / "valid_qualification.json"
-    cfg.write_text("{}")
+    real_run = verify.subprocess.run
 
-    # Mock lane outcomes: unit passes, postgres passes, browser fails
+    def clean_checkout_for_lane_test(command, **kwargs):
+        if command == ["git", "status", "--porcelain", "--untracked-files=all"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(verify.subprocess, "run", clean_checkout_for_lane_test)
+    deployment = _deployment_config()
+    local = _local_config()
+    commit = harness.current_commit()
+    deployment["qualification"]["source_revision"] = commit
+    local["qualification"]["source_revision"] = commit
+    deployment_path = tmp_path / "deployment.json"
+    local_path = tmp_path / "local.json"
+    deployment_path.write_text(json.dumps(deployment), encoding="utf-8")
+    local_path.write_text(json.dumps(local), encoding="utf-8")
+
     def fake_unit(standalone: bool = True) -> int:
-        for g in ["python_unit", "bun_test", "bun_typecheck", "bun_build"]:
-            harness.results[g] = {"status": "passed"}
+        for gate in ("python_unit", "bun_test", "bun_typecheck", "bun_build"):
+            harness.results[gate] = {"status": "passed"}
         return 0
 
     def fake_postgres(standalone: bool = True) -> int:
@@ -457,10 +478,14 @@ def test_release_sequencing_stops_at_failing_lane_and_records_pending_not_run(tm
     harness.postgres = fake_postgres  # type: ignore[assignment]
     harness.browser = fake_browser  # type: ignore[assignment]
 
-    rc = harness.release(profile="deployment", config=str(cfg))
+    rc = harness.release(
+        profile="deployment",
+        config=str(deployment_path),
+        local_config=str(local_path),
+    )
     assert rc != 0
 
-    result_data = json.loads(harness.result_file.read_text())
+    result_data = json.loads(harness.result_file.read_text(encoding="utf-8"))
     assert result_data["overall_success"] is False
     assert result_data["gates"]["python_unit"]["status"] == "passed"
     assert result_data["gates"]["postgres_gate"]["status"] == "passed"
@@ -469,3 +494,136 @@ def test_release_sequencing_stops_at_failing_lane_and_records_pending_not_run(tm
     assert "prerequisite browser gate failed" in result_data["gates"]["voice_local_offline"]["reason"]
     assert result_data["gates"]["release_evidence"]["status"] == "not_run"
 
+
+def _preflight_harness(tmp_path: Path):
+    from scripts.verify import VerificationHarness
+
+    harness = VerificationHarness(tmp_path)
+    harness.run_dir = tmp_path / "preflight-run"
+    harness.run_dir.mkdir()
+    harness.run_id = harness.run_dir.name
+    harness.profile_hashes["deployment"] = "a" * 64
+    harness.current_commit = lambda: "f" * 40  # type: ignore[method-assign]
+    config = {
+        "runner_api_endpoints": {
+            "runner": "https://runner.example.invalid/health",
+            "api": "https://api.example.invalid/health",
+            "flags": "https://flags.example.invalid/health/flags",
+        }
+    }
+    return harness, config
+
+
+class _JsonResponse:
+    def __init__(self, url: str, payload: dict, status: int = 200) -> None:
+        import json
+
+        self._url = url
+        self._body = json.dumps(payload).encode()
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def geturl(self) -> str:
+        return self._url
+
+    def read(self, _size: int = -1) -> bytes:
+        return self._body
+
+
+def test_deployment_preflight_records_actual_live_flags_and_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json
+
+    from scripts import verify
+    from tests.support import qualification
+
+    harness, config = _preflight_harness(tmp_path)
+    flags = {
+        "PLATFORM_ENABLE_PUBLIC_CALLS": False,
+        "PLATFORM_ENABLE_REAL_PAID_CALLS": False,
+        "PLATFORM_ENABLE_GATEWAY": False,
+    }
+
+    def fake_urlopen(request, timeout):
+        assert timeout == 5
+        if request.full_url == config["runner_api_endpoints"]["flags"]:
+            payload = {"flags": flags}
+        else:
+            payload = {"status": "ready"}
+        return _JsonResponse(request.full_url, payload)
+
+    monkeypatch.setattr(verify.urllib.request, "urlopen", fake_urlopen)
+    harness.check_deployment_endpoints(config)
+    envelope = json.loads((harness.run_dir / "deployment-preflight.json").read_text())
+    payload = qualification.validate_live_evidence(
+        envelope,
+        kind="deployment_preflight",
+        run_id=harness.run_id,
+        profile="deployment",
+        profile_hash=harness.profile_hashes["deployment"],
+        commit="f" * 40,
+        key=harness.evidence_key,
+    )
+    assert payload["endpoints"]["flags"]["flags"] == flags
+    assert payload["endpoints"]["runner"]["status"] == "ready"
+
+
+@pytest.mark.parametrize(
+    "flags, health, message",
+    [
+        (
+            {
+                "PLATFORM_ENABLE_PUBLIC_CALLS": True,
+                "PLATFORM_ENABLE_REAL_PAID_CALLS": False,
+                "PLATFORM_ENABLE_GATEWAY": False,
+            },
+            "ready",
+            "PLATFORM_ENABLE_PUBLIC_CALLS",
+        ),
+        (
+            {
+                "PLATFORM_ENABLE_PUBLIC_CALLS": False,
+                "PLATFORM_ENABLE_REAL_PAID_CALLS": False,
+            },
+            "ready",
+            "PLATFORM_ENABLE_GATEWAY",
+        ),
+        (
+            {
+                "PLATFORM_ENABLE_PUBLIC_CALLS": False,
+                "PLATFORM_ENABLE_REAL_PAID_CALLS": False,
+                "PLATFORM_ENABLE_GATEWAY": False,
+            },
+            "degraded",
+            "status ok or ready",
+        ),
+    ],
+)
+def test_deployment_preflight_fails_for_live_flags_or_health(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    flags: dict,
+    health: str,
+    message: str,
+) -> None:
+    from scripts import verify
+
+    harness, config = _preflight_harness(tmp_path)
+
+    def fake_urlopen(request, timeout):
+        if request.full_url == config["runner_api_endpoints"]["flags"]:
+            payload = {"flags": flags}
+        else:
+            payload = {"status": health}
+        return _JsonResponse(request.full_url, payload)
+
+    monkeypatch.setattr(verify.urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(ValueError, match=message):
+        harness.check_deployment_endpoints(config)
