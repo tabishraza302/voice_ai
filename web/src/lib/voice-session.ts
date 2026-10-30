@@ -18,6 +18,20 @@ export interface VoiceSessionDependencies {
   onActivated?: (agent: Agent) => void;
 }
 
+type GuestJoinRequestData = {
+  session_id: string;
+  join_token: string;
+};
+
+type VoiceSessionConnectOptions = {
+  offerUrl: string;
+  isActive?: boolean;
+  activate?: () => Promise<Agent>;
+} & (
+  | { agentId: string; requestData?: never }
+  | { agentId?: never; requestData: GuestJoinRequestData }
+);
+
 export class VoiceSession {
   private generation = 0;
   private abortController: AbortController | null = null;
@@ -29,8 +43,11 @@ export class VoiceSession {
 
   constructor(private readonly dependencies: VoiceSessionDependencies) {}
 
-  async connect(options: { offerUrl: string; agentId: string; isActive?: boolean; activate?: () => Promise<Agent> }): Promise<VoiceSessionConnection> {
+  async connect(options: VoiceSessionConnectOptions): Promise<VoiceSessionConnection> {
     if (this.abortController || this.peerConnection) throw new Error("A voice session connection is already starting.");
+    const requestData = options.requestData ??
+      (options.agentId ? { agent_id: options.agentId } : null);
+    if (!requestData) throw new Error("A voice session must include an agent or guest join request.");
     const generation = ++this.generation;
     const controller = new AbortController();
     this.abortController = controller;
@@ -142,7 +159,7 @@ export class VoiceSession {
         body: JSON.stringify({
           sdp: peerConnection.localDescription?.sdp || offer.sdp,
           type: peerConnection.localDescription?.type || offer.type,
-          request_data: { agent_id: options.agentId },
+          request_data: requestData,
         }),
       });
       this.assertCurrent(isCurrent);

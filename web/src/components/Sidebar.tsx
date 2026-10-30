@@ -22,6 +22,8 @@ export function Sidebar() {
   const pathname = usePathname();
   const { state, isLocalMode } = useAuth();
 
+  if (pathname.startsWith("/public/")) return null;
+
   const user = state.user;
   const isAdmin = user?.role === "admin";
   const isAuthenticated = state.status === "authenticated";
