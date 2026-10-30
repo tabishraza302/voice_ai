@@ -640,15 +640,17 @@ async def claim_qa_job(
                 job.completed_at = now
                 job.updated_at = now
                 return None
+            if job.started_at is None:
+                job.started_at = now
+            elapsed_seconds = max(0, int((now - job.started_at).total_seconds()))
+            remaining_seconds = max(
+                1,
+                min(job.max_runtime_seconds, settings.qa_job_timeout_seconds) - elapsed_seconds,
+            )
             job.status = "RUNNING"
-            job.started_at = now
             job.lease_token = uuid.uuid4()
             job.lease_expires_at = now + timedelta(
-                seconds=min(
-                    job.max_runtime_seconds,
-                    settings.qa_job_timeout_seconds,
-                )
-                + QA_WORKER_LEASE_GRACE_SECONDS
+                seconds=remaining_seconds + QA_WORKER_LEASE_GRACE_SECONDS
             )
             job.updated_at = now
             await db.flush()
