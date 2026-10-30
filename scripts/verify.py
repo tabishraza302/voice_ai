@@ -6,6 +6,7 @@ Implements the contract and execution lanes specified in verification-plan.md.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import argparse
 import base64
 from dataclasses import dataclass, field
@@ -37,13 +38,23 @@ from tests.support.qualification import (
     parse_bun_output,
     parse_junit_xml,
     parse_playwright_json,
+    profile_sha256,
     redact_secrets,
     require_gate,
+    authenticate_live_evidence,
+    validate_adapter_qualification_report,
     validate_deployment_config,
+    validate_live_evidence,
+    validate_local_qualification_config,
     validate_release_manifest,
 )
 from tests.support.tls import generate_ephemeral_loopback_cert
 
+_DISABLED_RELEASE_FLAGS = {
+    "PLATFORM_ENABLE_PUBLIC_CALLS": False,
+    "PLATFORM_ENABLE_REAL_PAID_CALLS": False,
+    "PLATFORM_ENABLE_GATEWAY": False,
+}
 
 def is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
     """Check if a port on the given host is currently listening or bound."""
@@ -383,7 +394,6 @@ class VerificationHarness:
         self.lifecycle = LifecycleManager()
         self.lifecycle.install_signal_handlers()
 
-        # Initialize run directory strictly under data/verification
         run_id = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
         custom_artifact_dir = os.environ.get("VERIFY_ARTIFACT_DIR")
         if custom_artifact_dir:
@@ -403,6 +413,9 @@ class VerificationHarness:
         else:
             self.run_dir = self.repo_root / "data" / "verification" / run_id
 
+        self.run_id = self.run_dir.name
+        self.evidence_key = secrets.token_hex(32)
+
         self.run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             self.run_dir.chmod(0o700)
@@ -416,7 +429,11 @@ class VerificationHarness:
         self.results: dict[str, dict[str, Any]] = {}
         self.required_gates: list[str] = []
         self.explicit_secrets: set[str] = set()
+        self.profile_hashes: dict[str, str] = {}
+        self.profile_paths: dict[str, Path] = {}
+        self.deployment_preflight_complete = False
 
+        self.register_secret(self.evidence_key)
     def register_secret(self, secret: str | None) -> None:
         """Register an explicit sensitive value to be scrubbed from all retained evidence."""
         if secret and len(secret) >= 4:
@@ -505,7 +522,8 @@ class VerificationHarness:
             gate_records[gate_name] = record
         required_gates = list(self.required_gates or gate_records)
         manifest = {
-            "manifest_version": 1,
+            "manifest_version": 2,
+            "run_id": self.run_id,
             "run_dir": str(self.run_dir),
             "created_at": datetime.now(timezone.utc).isoformat(),
             "commit": commit,
@@ -577,6 +595,190 @@ class VerificationHarness:
         self.result_file.write_text(json.dumps(payload, indent=2))
         return 0 if overall_passed else 1
 
+
+    def current_commit(self) -> str:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=self.repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        commit = result.stdout.strip()
+        if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", commit):
+            raise ValueError("release commit could not be resolved from the current checkout")
+        return commit
+
+    def prepare_profile(self, profile: str, config_path: Path) -> Path:
+        if profile in self.profile_paths:
+            return self.profile_paths[profile]
+        if not config_path.is_absolute() or not config_path.is_file():
+            raise FileNotFoundError(f"required absolute {profile} qualification profile missing: {config_path}")
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        if profile == "deployment":
+            validate_deployment_config(config)
+        elif profile == "local_offline":
+            validate_local_qualification_config(config)
+        else:
+            raise ValueError(f"unknown qualification profile: {profile}")
+        commit = self.current_commit()
+        if config["qualification"]["source_revision"] != commit:
+            raise ValueError(f"{profile} qualification profile source_revision does not match HEAD {commit}")
+        snapshot = self.run_dir / f"{profile}-profile.json"
+        with snapshot.open("x", encoding="utf-8") as stream:
+            json.dump(config, stream, sort_keys=True, separators=(",", ":"))
+        snapshot.chmod(0o600)
+        self.profile_paths[profile] = snapshot
+        self.profile_hashes[profile] = profile_sha256(config)
+        return snapshot
+
+    def evidence_environment(self, profile: str, commit: str) -> dict[str, str]:
+        profile_hash = self.profile_hashes.get(profile)
+        if profile_hash is None:
+            raise ValueError(f"{profile} profile has not been prepared for this run")
+        return {
+            "VERIFY_RUN_ID": self.run_id,
+            "VERIFY_PROFILE_SHA256": profile_hash,
+            "VERIFY_RELEASE_COMMIT": commit,
+            "VERIFY_EVIDENCE_KEY": self.evidence_key,
+        }
+
+    def write_live_evidence(
+        self,
+        filename: str,
+        payload: Mapping[str, Any],
+        *,
+        kind: str,
+        profile: str,
+        commit: str,
+    ) -> Path:
+        envelope = authenticate_live_evidence(
+            payload,
+            kind=kind,
+            run_id=self.run_id,
+            profile=profile,
+            profile_hash=self.profile_hashes[profile],
+            commit=commit,
+            key=self.evidence_key,
+        )
+        target = self.run_dir / filename
+        with target.open("x", encoding="utf-8") as stream:
+            json.dump(envelope, stream, sort_keys=True, separators=(",", ":"))
+        target.chmod(0o600)
+        return target
+
+    def _read_endpoint_json(self, name: str, endpoint: str) -> dict[str, Any]:
+        request = urllib.request.Request(
+            endpoint,
+            headers={"Accept": "application/json", "User-Agent": "voice-ai-verify"},
+            method="GET",
+        )
+        try:
+            response = urllib.request.urlopen(request, timeout=5)
+        except Exception as error:
+            raise ValueError(
+                f"deployment {name} endpoint unavailable at {endpoint}: {type(error).__name__}: {error}"
+            ) from error
+        with response:
+            if response.geturl() != endpoint:
+                raise ValueError(f"deployment {name} endpoint redirected away from its configured URL")
+            if response.status != 200:
+                raise ValueError(f"deployment {name} endpoint returned HTTP {response.status}, expected 200")
+            body = response.read(65537)
+        if len(body) > 65536:
+            raise ValueError(f"deployment {name} endpoint response exceeded 65536 bytes")
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"deployment {name} endpoint did not return valid JSON") from error
+        if not isinstance(payload, dict):
+            raise ValueError(f"deployment {name} endpoint returned a non-object response")
+        return payload
+
+    def check_deployment_endpoints(self, config: Mapping[str, Any]) -> None:
+        if self.deployment_preflight_complete:
+            return
+        endpoints = config["runner_api_endpoints"]
+        results: dict[str, Any] = {}
+        for name in ("runner", "api"):
+            payload = self._read_endpoint_json(name, endpoints[name])
+            if payload.get("status") not in {"ok", "ready"}:
+                raise ValueError(
+                    f"deployment {name} endpoint {endpoints[name]} did not report status ok or ready"
+                )
+            results[name] = {
+                "url": endpoints[name],
+                "http_status": 200,
+                "status": payload["status"],
+            }
+        flags_payload = self._read_endpoint_json("flags", endpoints["flags"])
+        flags = flags_payload.get("flags")
+        if not isinstance(flags, dict):
+            raise ValueError("deployment flags endpoint response is missing its flags object")
+        for flag, expected in _DISABLED_RELEASE_FLAGS.items():
+            if type(flags.get(flag)) is not bool or flags[flag] is not expected:
+                raise ValueError(f"deployment flag {flag} must be explicitly false at release time")
+        results["flags"] = {
+            "url": endpoints["flags"],
+            "http_status": 200,
+            "flags": dict(_DISABLED_RELEASE_FLAGS),
+        }
+        self.write_live_evidence(
+            "deployment-preflight.json",
+            {
+                "profile": "deployment",
+                "endpoints": results,
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+            },
+            kind="deployment_preflight",
+            profile="deployment",
+            commit=self.current_commit(),
+        )
+        self.deployment_preflight_complete = True
+
+    def run_adapter_qualification(self, profile: str, commit: str) -> tuple[int, dict[str, Any]]:
+        profile_path = self.profile_paths[profile]
+        raw_path = self.run_dir / f"adapter-qualification-{profile}.raw.json"
+        if raw_path.exists():
+            raise ValueError(f"current-run adapter report path already exists: {raw_path}")
+        command = [
+            "scripts/voice-ai.sh",
+            "flow-qualify",
+            "--profile",
+            str(profile_path),
+            "--output",
+            str(raw_path),
+        ]
+        rc, stdout, stderr = self.run_cmd(
+            f"adapter_qualification_{profile}",
+            command,
+            env=self.evidence_environment(profile, commit),
+        )
+        if not raw_path.is_file():
+            raise ValueError(
+                "flow-qualify did not produce an actual current-run adapter report: "
+                + redact_secrets(stderr or stdout)
+            )
+        try:
+            report = json.loads(raw_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"flow-qualify produced an unreadable report: {error}") from error
+        validate_adapter_qualification_report(
+            report,
+            run_id=self.run_id,
+            profile_hash=self.profile_hashes[profile],
+            source_revision=commit,
+            execution_key=self.evidence_key,
+            require_supported=False,
+        )
+        self.write_live_evidence(
+            f"adapter-qualification-{profile}.json",
+            report,
+            kind="adapter_qualification",
+            profile=profile,
+            commit=commit,
+        )
+        return rc, report
 
     def _build_sanitized_env(self, env: dict[str, str] | None = None) -> dict[str, str]:
         allowed_sys_keys = {
@@ -1628,17 +1830,6 @@ class VerificationHarness:
             if combined_counts.collected == 0 or combined_counts.passed == 0:
                 raise ValueError("zero browser tests collected")
 
-            playwright_json = self.run_dir / "playwright.json"
-            merged_stats = {
-                "stats": {
-                    "expected": combined_counts.passed,
-                    "unexpected": combined_counts.failed,
-                    "flaky": 0,
-                    "skipped": combined_counts.skipped,
-                }
-            }
-            playwright_json.write_text(json.dumps(merged_stats, indent=2), encoding="utf-8")
-            _redact_persisted_file(playwright_json, explicit_secrets=self.explicit_secrets)
 
             self.results["browser_gate"] = {
                 "status": "passed",
@@ -1685,53 +1876,63 @@ class VerificationHarness:
         self.write_manifest()
         gate_name = "voice_local_offline" if profile == "local_offline" else "voice_deployment"
         try:
-            config_path: Path | None = None
-            try:
-                audio_root_value = os.environ.get("VERIFY_AUDIO_ROOT")
-                if not audio_root_value:
-                    raise ValueError("VERIFY_AUDIO_ROOT missing for voice qualification")
-                audio_root = Path(audio_root_value)
-                if not audio_root.is_absolute() or not audio_root.is_dir():
-                    raise FileNotFoundError(f"required absolute VERIFY_AUDIO_ROOT directory missing: {audio_root}")
-                load_audio_fixture_manifest(audio_root / "audio_manifest.json")
-                if profile == "deployment":
-                    if not config:
-                        raise FileNotFoundError("deployment qualification config is required")
-                    config_path = Path(config)
-                    if not config_path.is_absolute() or not config_path.is_file():
-                        raise FileNotFoundError(f"required absolute qualification config missing: {config_path}")
-                    validate_deployment_config(json.loads(config_path.read_text(encoding="utf-8")))
-            except Exception as e:
-                self.results[gate_name] = {
-                    "status": "failed",
-                    "reason": redact_secrets(str(e)),
-                }
-            else:
-                junit_xml = self.run_dir / "audio.xml"
-                cmd = build_gate_command(gate_name, self.repo_root) + [f"--junitxml={junit_xml}"]
-                env = {
-                    "RUN_AUDIO_QUALIFICATION": "1",
-                    "RUN_TRANSPORT_QUALIFICATION": "1" if profile == "deployment" else "0",
-                    "VERIFY_AUDIO_ROOT": str(audio_root),
-                    "VERIFY_ARTIFACT_DIR": str(self.run_dir.resolve()),
-                    "VERIFY_QUALIFICATION_CONFIG": str(config_path) if config_path else "",
-                    "VERIFY_PROFILE": profile,
-                }
-                rc, out, err = self.run_cmd("voice_qualification", cmd, env=env)
-                try:
-                    if rc != 0:
-                        raise ValueError(f"voice qualification exited with code {rc}: {redact_secrets(err or out)}")
-                    counts = parse_junit_xml(junit_xml)
-                    require_gate(counts)
-                except Exception as e:
-                    self.results[gate_name] = {"status": "failed", "reason": redact_secrets(str(e))}
-                else:
-                    self.results[gate_name] = {"status": "passed", "counts": counts.__dict__}
+            if not config:
+                raise FileNotFoundError(f"{profile} qualification profile is required")
+            config_path = Path(config)
+            self.prepare_profile(profile, config_path)
+            commit = self.current_commit()
+            if profile == "deployment":
+                deployment_config = json.loads(self.profile_paths[profile].read_text(encoding="utf-8"))
+                self.check_deployment_endpoints(deployment_config)
+
+            runner_rc, adapter_report = self.run_adapter_qualification(profile, commit)
+            junit_xml = self.run_dir / f"voice-{profile}.xml"
+            command = build_gate_command(gate_name, self.repo_root) + [f"--junitxml={junit_xml}"]
+            audio_root = os.environ.get("VERIFY_AUDIO_ROOT", "")
+            env = {
+                "RUN_AUDIO_QUALIFICATION": "1",
+                "RUN_TRANSPORT_QUALIFICATION": "1" if profile == "deployment" else "0",
+                "VERIFY_AUDIO_ROOT": audio_root,
+                "VERIFY_ARTIFACT_DIR": str(self.run_dir.resolve()),
+                "VERIFY_QUALIFICATION_CONFIG": str(self.profile_paths[profile].resolve()),
+                "VERIFY_PROFILE": profile,
+                **self.evidence_environment(profile, commit),
+            }
+            rc, stdout, stderr = self.run_cmd(f"voice_qualification_{profile}", command, env=env)
+            if rc != 0:
+                raise ValueError(
+                    f"{profile} voice qualification exited with code {rc}: "
+                    + redact_secrets(stderr or stdout)
+                )
+            counts = parse_junit_xml(junit_xml)
+            require_gate(counts)
+            validate_adapter_qualification_report(
+                adapter_report,
+                run_id=self.run_id,
+                profile_hash=self.profile_hashes[profile],
+                source_revision=commit,
+                execution_key=self.evidence_key,
+                require_supported=True,
+            )
+            if runner_rc != 0:
+                raise ValueError(f"{profile} qualified flow runner exited with code {runner_rc}")
+            audio_report = self.run_dir / f"audio-evidence-{profile}.json"
+            if not audio_report.is_file():
+                raise FileNotFoundError(
+                    "missing prerequisite: no current-run PCM-to-STT-to-completed-flow audio "
+                    f"qualification report for profile {profile}"
+                )
+            self.results[gate_name] = {"status": "passed", "counts": counts.__dict__}
+        except Exception as error:
+            self.results[gate_name] = {
+                "status": "failed",
+                "reason": redact_secrets(str(error)),
+            }
         finally:
             try:
                 self.lifecycle.cleanup()
-            except Exception as e:
-                self.results["cleanup"] = {"status": "failed", "reason": redact_secrets(str(e))}
+            except Exception as error:
+                self.results["cleanup"] = {"status": "failed", "reason": redact_secrets(str(error))}
 
         voice_passed = (
             self.results.get(gate_name, {}).get("status") == "passed"
@@ -1741,35 +1942,45 @@ class VerificationHarness:
             return self.write_result(target_gates=[gate_name])
         return 0 if voice_passed else 1
 
-    def release(self, profile: str, config: str | None = None) -> int:
+
+    def release(
+        self,
+        profile: str,
+        config: str | None = None,
+        local_config: str | None = None,
+    ) -> int:
         print("==> Running verify release gate...")
 
         required_gates = list(RELEASE_REQUIRED_GATES)
         self.required_gates = required_gates
-        for g in required_gates:
-            self.results[g] = {"status": "not_run", "reason": "pending execution"}
+        for gate in required_gates:
+            self.results[gate] = {"status": "not_run", "reason": "pending execution"}
         self.write_manifest()
 
-        # Profile validation: release gate requires a reviewed deployment configuration.
         if profile != "deployment":
-            for g in required_gates:
-                self.results[g] = {"status": "not_run", "reason": "release gate requires --profile deployment"}
-            self.results["release_evidence"] = {
-                "status": "failed",
-                "reason": "release gate requires --profile deployment",
-            }
+            reason = "release gate requires --profile deployment"
+            for gate in required_gates:
+                self.results[gate] = {"status": "not_run", "reason": reason}
+            self.results["release_evidence"] = {"status": "failed", "reason": reason}
             return self.write_result(target_gates=required_gates)
 
         config_path = Path(config) if config else None
+        local_config_path = Path(local_config) if local_config else None
         try:
             if config_path is None or not config_path.is_absolute() or not config_path.is_file():
-                raise FileNotFoundError("reviewed qualification config must be an existing absolute JSON path")
+                raise FileNotFoundError("reviewed deployment qualification config must be an existing absolute JSON path")
+            if local_config_path is None or not local_config_path.is_absolute() or not local_config_path.is_file():
+                raise FileNotFoundError("reviewed local_offline qualification config must be an existing absolute JSON path")
             config_data = json.loads(config_path.read_text(encoding="utf-8"))
+            local_config_data = json.loads(local_config_path.read_text(encoding="utf-8"))
             validate_deployment_config(config_data)
-        except Exception as e:
-            reason = redact_secrets(f"reviewed qualification config invalid: {e}")
-            for g in required_gates:
-                self.results[g] = {"status": "not_run", "reason": reason}
+            validate_local_qualification_config(local_config_data)
+            self.prepare_profile("deployment", config_path)
+            self.prepare_profile("local_offline", local_config_path)
+        except Exception as error:
+            reason = redact_secrets(f"reviewed qualification profiles invalid: {error}")
+            for gate in required_gates:
+                self.results[gate] = {"status": "not_run", "reason": reason}
             self.results["release_evidence"] = {"status": "failed", "reason": reason}
             return self.write_result(target_gates=required_gates)
 
@@ -1812,8 +2023,21 @@ class VerificationHarness:
                     self.results[g]["reason"] = "prerequisite browser gate failed"
             return self.write_result(target_gates=required_gates)
 
+        try:
+            self.check_deployment_endpoints(config_data)
+        except Exception as error:
+            reason = redact_secrets(f"deployment preflight failed: {error}")
+            for gate in ("voice_local_offline", "voice_deployment"):
+                self.results[gate] = {"status": "not_run", "reason": reason}
+            self.results["release_evidence"] = {"status": "failed", "reason": reason}
+            return self.write_result(target_gates=required_gates)
+
         # 4. voice local_offline profile
-        vo_local_rc = self.voice(profile="local_offline", standalone=False)
+        vo_local_rc = self.voice(
+            profile="local_offline",
+            config=str(local_config_path),
+            standalone=False,
+        )
         if vo_local_rc != 0:
             for g in ["voice_deployment", "release_evidence"]:
                 if self.results[g]["status"] == "not_run":
@@ -1821,7 +2045,11 @@ class VerificationHarness:
             return self.write_result(target_gates=required_gates)
 
         # 5. voice deployment profile
-        vo_dep_rc = self.voice(profile="deployment", config=config, standalone=False)
+        vo_dep_rc = self.voice(
+            profile="deployment",
+            config=str(config_path),
+            standalone=False,
+        )
         if vo_dep_rc != 0:
             if self.results["release_evidence"]["status"] == "not_run":
                 self.results["release_evidence"]["reason"] = "prerequisite voice deployment gate failed"
@@ -1832,9 +2060,17 @@ class VerificationHarness:
         try:
             junit_xml = self.run_dir / "release-evidence.xml"
             cmd = build_gate_command("release", self.repo_root) + [f"--junitxml={junit_xml}"]
+            release_commit = self.current_commit()
             evidence_env = {
                 "VERIFY_ARTIFACT_DIR": str(self.run_dir.resolve()),
-                "VERIFY_QUALIFICATION_CONFIG": str(Path(config).resolve()),
+                "VERIFY_AUDIO_ROOT": os.environ.get("VERIFY_AUDIO_ROOT", ""),
+                "VERIFY_QUALIFICATION_CONFIG": str(self.profile_paths["deployment"].resolve()),
+                "VERIFY_LOCAL_QUALIFICATION_CONFIG": str(self.profile_paths["local_offline"].resolve()),
+                "VERIFY_RUN_ID": self.run_id,
+                "VERIFY_RELEASE_COMMIT": release_commit,
+                "VERIFY_EVIDENCE_KEY": self.evidence_key,
+                "VERIFY_LOCAL_PROFILE_SHA256": self.profile_hashes["local_offline"],
+                "VERIFY_DEPLOYMENT_PROFILE_SHA256": self.profile_hashes["deployment"],
             }
             rc, out, err = self.run_cmd("release_evidence", cmd, env=evidence_env)
             try:
@@ -1907,6 +2143,11 @@ def main() -> None:
         "--config",
         help="Path to reviewed qualification config JSON",
     )
+    release_parser.add_argument(
+        "--local-config",
+        required=True,
+        help="Path to reviewed local_offline qualification profile JSON",
+    )
 
     args = parser.parse_args()
     harness = VerificationHarness(REPO_ROOT)
@@ -1922,7 +2163,13 @@ def main() -> None:
     elif args.subcommand == "voice":
         sys.exit(harness.voice(profile=args.profile, config=args.config))
     elif args.subcommand == "release":
-        sys.exit(harness.release(profile=args.profile, config=args.config))
+        sys.exit(
+            harness.release(
+                profile=args.profile,
+                config=args.config,
+                local_config=args.local_config,
+            )
+        )
     else:
         parser.print_help()
         sys.exit(1)

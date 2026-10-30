@@ -18,19 +18,41 @@ RUNBOOK = REPO_ROOT / "docs" / "first-release" / "ops-runbook.md"
 MODEL_HASH = "d" * 64
 
 
+def _qualification_settings() -> dict:
+    return {
+        "model_endpoint": "http://127.0.0.1:11434",
+        "transport_endpoint": "http://127.0.0.1:8080",
+        "adapter_version": "qualification-adapter-1",
+        "agent_settings": {
+            "llm_model": "llm-id",
+            "stt_provider": "mlx-audio",
+            "tts_voice_en": "af_heart",
+            "tts_voice_hi": "hf_alpha",
+        },
+        "locales": ["en", "hi"],
+        "source_revision": "f" * 40,
+    }
+
+
+def _models() -> dict:
+    return {
+        name: {"id": f"{name}-id", "revision": f"{name}-revision", "sha256": MODEL_HASH}
+        for name in ("llm", "stt", "tts_en", "tts_hi")
+    }
+
+
 def _deployment_config() -> dict:
     return {
         "schema_version": 1,
         "profile": "deployment",
         "allowed_origins": ["https://staging.example.invalid"],
-        "models": {
-            name: {"id": f"{name}-id", "revision": f"{name}-revision", "sha256": MODEL_HASH}
-            for name in ("llm", "stt", "tts_en", "tts_hi")
-        },
+        "models": _models(),
         "runner_api_endpoints": {
             "runner": "https://runner.staging.example.invalid",
             "api": "https://api.staging.example.invalid",
+            "flags": "https://flags.staging.example.invalid/health/flags",
         },
+        "qualification": _qualification_settings(),
         "turn": {
             "required": True,
             "endpoint": "turns:relay.staging.example.invalid:5349",
@@ -45,6 +67,21 @@ def _deployment_config() -> dict:
             "quality_threshold": 0.9,
         },
         "baseline_artifact_ids": ["latency-baseline-2026-10-30"],
+    }
+
+
+def _local_config() -> dict:
+    return {
+        "schema_version": 1,
+        "profile": "local_offline",
+        "models": _models(),
+        "qualification": _qualification_settings(),
+        "concurrency": 1,
+        "limits": {
+            "turn_timeout_ms": 30_000,
+            "latency_p95_ms": 2_000,
+            "quality_threshold": 0.9,
+        },
     }
 
 
@@ -107,6 +144,72 @@ def test_deployment_config_rejects_missing_required_qualification_inputs(mutatio
     with pytest.raises(ValueError, match=message):
         validate(config)
 
+def test_local_and_deployment_profiles_bind_the_exact_model_tuple() -> None:
+    validate_local = getattr(qualification, "validate_local_qualification_config", None)
+    validate_deployment = getattr(qualification, "validate_deployment_config", None)
+    assert callable(validate_local) and callable(validate_deployment)
+    validate_local(_local_config())
+    validate_deployment(_deployment_config())
+
+    bad_model = _local_config()
+    bad_model["qualification"]["agent_settings"]["llm_model"] = "unpinned-model"
+    with pytest.raises(ValueError, match="does not match the pinned LLM"):
+        validate_local(bad_model)
+
+
+@pytest.mark.parametrize(
+    "mutation, message",
+    [
+        (lambda data: data["runner_api_endpoints"].pop("flags"), "flags endpoint"),
+        (
+            lambda data: data["runner_api_endpoints"].update(
+                flags="https://flags.staging.example.invalid/health/flags?editable=true"
+            ),
+            "credential-free",
+        ),
+        (
+            lambda data: data["qualification"].update(model_endpoint="https://model.example.invalid"),
+            "loopback address",
+        ),
+        (
+            lambda data: data["qualification"]["agent_settings"].update(llm_model="other-model"),
+            "does not match the pinned LLM",
+        ),
+    ],
+)
+def test_profiles_reject_unqualified_endpoints_and_model_drift(mutation, message: str) -> None:
+    config = _deployment_config()
+    mutation(config)
+    with pytest.raises(ValueError, match=message):
+        qualification.validate_deployment_config(config)
+
+
+def test_hmac_binds_verifier_envelope_but_not_payload_origin() -> None:
+    authenticate = getattr(qualification, "authenticate_live_evidence", None)
+    validate = getattr(qualification, "validate_live_evidence", None)
+    assert callable(authenticate) and callable(validate)
+    payload = {"scenarios": ["actual-run-result"]}
+    kwargs = {
+        "kind": "adapter_qualification",
+        "run_id": "run-20261106T000000Z-12345678",
+        "profile": "deployment",
+        "profile_hash": "a" * 64,
+        "commit": "f" * 40,
+        "key": "12" * 32,
+    }
+    envelope = authenticate(payload, **kwargs)
+    assert validate(envelope, **kwargs) == payload
+
+    with pytest.raises(ValueError, match="missing or unknown fields"):
+        validate(payload, **kwargs)
+    altered = dict(envelope)
+    altered["payload"] = {"scenarios": ["hand-edited"]}
+    with pytest.raises(ValueError, match="HMAC is invalid"):
+        validate(altered, **kwargs)
+    with pytest.raises(ValueError, match="different verification run"):
+        validate(envelope, **{**kwargs, "run_id": "different-run"})
+
+
 
 def test_missing_live_run_directory_or_config_is_not_silent_in_required_mode(tmp_path: Path) -> None:
     require = getattr(qualification, "require_prerequisite", None)
@@ -116,11 +219,43 @@ def test_missing_live_run_directory_or_config_is_not_silent_in_required_mode(tmp
 
     if os.environ.get("VERIFY_REQUIRED") == "1":
         artifact_dir = os.environ.get("VERIFY_ARTIFACT_DIR")
-        config_path = os.environ.get("VERIFY_QUALIFICATION_CONFIG")
+        deployment_path = os.environ.get("VERIFY_QUALIFICATION_CONFIG")
+        local_path = os.environ.get("VERIFY_LOCAL_QUALIFICATION_CONFIG")
+        audio_root = os.environ.get("VERIFY_AUDIO_ROOT")
         require("release report directory", available=bool(artifact_dir))
-        check(Path(artifact_dir), require_final_report=False)
-        require("reviewed model/TURN config", available=bool(config_path and Path(config_path).is_file()))
-        validate_config(json.loads(Path(config_path).read_text(encoding="utf-8")))
+        require(
+            "reviewed deployment profile",
+            available=bool(deployment_path and Path(deployment_path).is_file()),
+        )
+        require(
+            "reviewed local profile",
+            available=bool(local_path and Path(local_path).is_file()),
+        )
+        require("reviewed audio fixtures", available=bool(audio_root and Path(audio_root).is_dir()))
+        profiles = {
+            "deployment": json.loads(Path(deployment_path).read_text(encoding="utf-8")),
+            "local_offline": json.loads(Path(local_path).read_text(encoding="utf-8")),
+        }
+        validate_config(profiles["deployment"])
+        qualification.validate_local_qualification_config(profiles["local_offline"])
+        fixtures = qualification.load_audio_fixture_manifest(
+            Path(audio_root) / "audio_manifest.json",
+            audio_root=Path(audio_root),
+        )
+        check(
+            Path(artifact_dir),
+            require_final_report=False,
+            evidence_key=os.environ.get("VERIFY_EVIDENCE_KEY"),
+            profile_hashes={
+                "local_offline": os.environ.get("VERIFY_LOCAL_PROFILE_SHA256"),
+                "deployment": os.environ.get("VERIFY_DEPLOYMENT_PROFILE_SHA256"),
+            },
+            profile_configs={
+                "local_offline": profiles["local_offline"],
+                "deployment": profiles["deployment"],
+            },
+            audio_fixtures=fixtures["fixtures"],
+        )
     else:
         with pytest.raises(ValueError, match="release report directory"):
             require("release report directory", available=False)
