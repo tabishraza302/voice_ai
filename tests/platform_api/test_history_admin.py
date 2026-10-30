@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 import uuid
 
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from platform_api.agents.defaults import DEFAULT_AGENT_TEMPLATES
 from platform_api.agents.models import Agent, AgentVersion, IdempotencyRecord
@@ -17,6 +18,17 @@ from platform_api.config import PlatformSettings
 from platform_api.events.repository import HistoryRepository
 from platform_api.events.schemas import build_event
 from platform_api.models.auth import AuditLog, AuthMfa, User
+from platform_api.billing.models import CallBudget
+from platform_api.billing.tariffs import resolve_active_tariff
+from platform_api.events.models import TranscriptSegment
+from platform_api.models.admission_pause import AdmissionPause
+from platform_api.models.tariff import SessionTariffRecord
+from platform_api.models.transcript_policy import TranscriptCorrection, TranscriptPolicy
+from platform_api.sessions.admission_policy import (
+    AdmissionPausedError,
+    check_admission_pause,
+    lock_admission_pause_scope,
+)
 from platform_api.models.session import Session
 from tests.support.billing import create_funded_wallet, create_test_session, create_test_user
 from tests.support.postgres import FreshPostgres
@@ -837,3 +849,622 @@ async def test_admin_agent_disable_is_audited_and_does_not_end_existing_sessions
         "enabled_before": True,
         "enabled_after": False,
     }
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_admin_tariff_change_is_step_up_csrf_idempotent_and_preserves_pinned_call_data(
+    app_client: httpx.AsyncClient,
+    test_platform_settings: PlatformSettings,
+    initialized_pg: FreshPostgres,
+) -> None:
+    owner, owner_headers = await _authenticated_headers(
+        initialized_pg,
+        test_platform_settings,
+        app_client,
+        email="tariff-pinned-owner@example.com",
+    )
+    _, admin_headers = await _authenticated_headers(
+        initialized_pg,
+        test_platform_settings,
+        app_client,
+        email="tariff-pinned-admin@example.com",
+        role="admin",
+        step_up=True,
+    )
+    _, unstepped_headers = await _authenticated_headers(
+        initialized_pg,
+        test_platform_settings,
+        app_client,
+        email="tariff-unstepped-admin@example.com",
+        role="admin",
+        step_up=False,
+    )
+
+    async with initialized_pg.sessions() as db:
+        session, budget = await create_test_session(
+            db,
+            owner_user_id=owner.id,
+            pinned_rate=6000,
+        )
+        active = await resolve_active_tariff(db)
+        now = session.created_at
+        agent = Agent(
+            id=uuid.uuid4(),
+            owner_user_id=owner.id,
+            name="Tariff Inspection Agent",
+            description="Agent for pinned configuration regression coverage",
+            enabled=True,
+            draft_revision=1,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(agent)
+        await db.flush()
+        version = AgentVersion(
+            id=uuid.uuid4(),
+            agent_id=agent.id,
+            version=1,
+            immutable_config_json={
+                "persona_prompt": "Pinned support instructions",
+                "flow": {"entry_step_id": "welcome"},
+            },
+            authoring_hash="a" * 64,
+            flow_hash="b" * 64,
+            artifact_hash="c" * 64,
+            created_at=now,
+        )
+        db.add(version)
+        await db.flush()
+        session.agent_version_id = version.id
+        session.tariff_snapshot = {
+            "tariff_id": str(active.tariff_id),
+            "tariff_version": active.tariff_version,
+            "rate_minor_per_minute": active.rate_minor_per_minute,
+            "billing_slice_ms": active.billing_slice_ms,
+            "permit_ttl_ms": active.permit_ttl_ms,
+        }
+        budget.pinned_rate = active.rate_minor_per_minute
+        pinned_tariff = dict(session.tariff_snapshot)
+        await db.commit()
+
+    current = await app_client.get("/api/v1/admin/tariffs", headers=admin_headers)
+    assert current.status_code == 200
+    assert current.json()["current"]["revision"] == 1
+    assert current.json()["current"]["rate_minor_per_minute"] == 6000
+
+    path = "/api/v1/admin/tariffs/versions"
+    body = {
+        "expected_revision": 1,
+        "rate_minor_per_minute": 9000,
+        "reason": "Approved price update PRC-318",
+    }
+    no_step_up = await app_client.post(
+        path,
+        headers={**unstepped_headers, "Idempotency-Key": "tariff-no-step-up"},
+        json=body,
+    )
+    no_csrf = await app_client.post(
+        path,
+        headers={
+            key: value
+            for key, value in {
+                **admin_headers,
+                "Idempotency-Key": "tariff-no-csrf",
+            }.items()
+            if key != "X-CSRF-Token"
+        },
+        json=body,
+    )
+    owner_attempt = await app_client.post(
+        path,
+        headers={**owner_headers, "Idempotency-Key": "tariff-owner-denied"},
+        json=body,
+    )
+    assert no_step_up.status_code == no_csrf.status_code == owner_attempt.status_code == 403
+
+    request_headers = {**admin_headers, "Idempotency-Key": "tariff-version-prc-318"}
+    first = await app_client.post(path, headers=request_headers, json=body)
+    replay = await app_client.post(path, headers=request_headers, json=body)
+    conflict = await app_client.post(
+        path,
+        headers=request_headers,
+        json={**body, "rate_minor_per_minute": 9500},
+    )
+    stale_revision = await app_client.post(
+        path,
+        headers={**admin_headers, "Idempotency-Key": "tariff-stale-revision"},
+        json=body,
+    )
+    assert first.status_code == replay.status_code == 201
+    assert first.json() == replay.json()
+    assert conflict.status_code == stale_revision.status_code == 409
+
+    updated = await app_client.get("/api/v1/admin/tariffs", headers=admin_headers)
+    inventory = await app_client.get(
+        "/api/v1/admin/agents",
+        params={"q": "Tariff Inspection"},
+        headers=admin_headers,
+    )
+    detail = await app_client.get(
+        f"/api/v1/admin/sessions/{session.id}",
+        headers=admin_headers,
+    )
+    agent_detail = await app_client.get(
+        f"/api/v1/admin/agents/{agent.id}",
+        headers=admin_headers,
+    )
+    assert (
+        updated.status_code
+        == inventory.status_code
+        == detail.status_code
+        == agent_detail.status_code
+        == 200
+    )
+    assert updated.json()["current"]["revision"] == 2
+    assert updated.json()["current"]["rate_minor_per_minute"] == 9000
+    assert len(inventory.json()["items"]) == 1
+    assert inventory.json()["items"][0]["id"] == str(agent.id)
+    assert agent_detail.json()["immutable_config"]["persona_prompt"] == (
+        "Pinned support instructions"
+    )
+    assert detail.json()["tariff_snapshot"] == pinned_tariff
+    assert detail.json()["pinned_config_snapshot"]["agent_version_id"] == str(version.id)
+    assert detail.json()["pinned_config_snapshot"]["immutable_config"]["persona_prompt"] == (
+        "Pinned support instructions"
+    )
+
+    async with initialized_pg.sessions() as db:
+        persisted_session = await db.get(Session, session.id)
+        persisted_budget = await db.get(CallBudget, session.id)
+        tariff_records = list(
+            (
+                await db.execute(select(SessionTariffRecord).order_by(SessionTariffRecord.revision))
+            ).scalars().all()
+        )
+        audits = list(
+            (
+                await db.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "admin.tariff.version.create"
+                    )
+                )
+            ).scalars().all()
+        )
+    assert persisted_session is not None
+    assert persisted_session.tariff_snapshot == pinned_tariff
+    assert persisted_budget is not None and persisted_budget.pinned_rate == 6000
+    assert [record.revision for record in tariff_records] == [1, 2]
+    assert len(audits) == 1
+    assert audits[0].reason == body["reason"]
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_admin_pause_policy_is_authenticated_audited_and_enforced_by_admission_check(
+    app_client: httpx.AsyncClient,
+    test_platform_settings: PlatformSettings,
+    initialized_pg: FreshPostgres,
+) -> None:
+    owner, owner_headers = await _authenticated_headers(
+        initialized_pg,
+        test_platform_settings,
+        app_client,
+        email="pause-policy-owner@example.com",
+    )
+    _, admin_headers = await _authenticated_headers(
+        initialized_pg,
+        test_platform_settings,
+        app_client,
+        email="pause-policy-admin@example.com",
+        role="admin",
+        step_up=True,
+    )
+    _, unstepped_headers = await _authenticated_headers(
+        initialized_pg,
+        test_platform_settings,
+        app_client,
+        email="pause-policy-unstepped@example.com",
+        role="admin",
+        step_up=False,
+    )
+
+    path = "/api/v1/admin/admission-pauses"
+    body = {
+        "scope": "global",
+        "paused": True,
+        "expected_revision": 0,
+        "reason": "Emergency maintenance window",
+    }
+    no_step_up = await app_client.post(
+        path,
+        headers={**unstepped_headers, "Idempotency-Key": "pause-no-step-up"},
+        json=body,
+    )
+    no_csrf = await app_client.post(
+        path,
+        headers={
+            key: value
+            for key, value in {
+                **admin_headers,
+                "Idempotency-Key": "pause-no-csrf",
+            }.items()
+            if key != "X-CSRF-Token"
+        },
+        json=body,
+    )
+    owner_attempt = await app_client.post(
+        path,
+        headers={**owner_headers, "Idempotency-Key": "pause-owner-denied"},
+        json=body,
+    )
+    assert no_step_up.status_code == no_csrf.status_code == owner_attempt.status_code == 403
+
+    request_headers = {**admin_headers, "Idempotency-Key": "pause-global-maintenance"}
+    first = await app_client.post(path, headers=request_headers, json=body)
+    replay = await app_client.post(path, headers=request_headers, json=body)
+    conflict = await app_client.post(
+        path,
+        headers=request_headers,
+        json={**body, "paused": False},
+    )
+    assert first.status_code == replay.status_code == 200
+    assert first.json() == replay.json()
+    assert conflict.status_code == 409
+
+    listing = await app_client.get(path, headers=admin_headers)
+    assert listing.status_code == 200
+    assert listing.json()["items"][0]["paused"] is True
+    async with initialized_pg.sessions() as db:
+        with pytest.raises(AdmissionPausedError):
+            async with db.begin():
+                await check_admission_pause(db, owner.id, uuid.uuid4())
+
+    stale = await app_client.post(
+        path,
+        headers={**admin_headers, "Idempotency-Key": "pause-stale-revision"},
+        json=body,
+    )
+    cleared = await app_client.post(
+        path,
+        headers={**admin_headers, "Idempotency-Key": "pause-clear-maintenance"},
+        json={
+            **body,
+            "paused": False,
+            "expected_revision": 1,
+            "reason": "Maintenance window has ended",
+        },
+    )
+    assert stale.status_code == 409
+    assert cleared.status_code == 200
+    async with initialized_pg.sessions() as db:
+        async with db.begin():
+            await check_admission_pause(db, owner.id, uuid.uuid4())
+        rows = list(
+            (
+                await db.execute(
+                    select(AdmissionPause).where(AdmissionPause.scope == "global")
+                )
+            ).scalars().all()
+        )
+        audits = list(
+            (
+                await db.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "admin.admission.pause.set"
+                    )
+                )
+            ).scalars().all()
+        )
+    assert len(rows) == 1 and rows[0].paused is False and rows[0].revision == 2
+    assert len(audits) == 2
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_admission_pause_mutation_waits_for_inflight_check_even_without_existing_row(
+    initialized_pg: FreshPostgres,
+) -> None:
+    async with initialized_pg.sessions() as db:
+        owner = await create_test_user(db, email="pause-race-owner@example.com")
+        admin = await create_test_user(
+            db,
+            email="pause-race-admin@example.com",
+            role="admin",
+        )
+
+    admission_checked = asyncio.Event()
+    release_admission = asyncio.Event()
+    mutation_started = asyncio.Event()
+    mutation_finished = asyncio.Event()
+    owner_agent_id = uuid.uuid4()
+    mutation_pid: int | None = None
+
+    async def admission_check() -> None:
+        async with initialized_pg.sessions() as db:
+            async with db.begin():
+                await check_admission_pause(db, owner.id, owner_agent_id)
+                admission_checked.set()
+                await release_admission.wait()
+
+    async def pause_mutation() -> None:
+        nonlocal mutation_pid
+        async with initialized_pg.sessions() as db:
+            async with db.begin():
+                pid = await db.scalar(text("SELECT pg_backend_pid()"))
+                assert isinstance(pid, int)
+                mutation_pid = pid
+                mutation_started.set()
+                await lock_admission_pause_scope(
+                    db,
+                    scope="global",
+                    scope_id=None,
+                )
+                now = datetime.now(timezone.utc)
+                db.add(
+                    AdmissionPause(
+                        id=uuid.uuid4(),
+                        scope="global",
+                        owner_user_id=None,
+                        agent_id=None,
+                        paused=True,
+                        revision=1,
+                        reason="Emergency maintenance window",
+                        updated_by_user_id=admin.id,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                await db.flush()
+                mutation_finished.set()
+
+    async def wait_for_advisory_lock_wait() -> bool:
+        assert mutation_pid is not None
+        deadline = asyncio.get_running_loop().time() + 5
+        while asyncio.get_running_loop().time() < deadline:
+            async with initialized_pg.sessions() as monitor:
+                blocked = await monitor.scalar(
+                    text(
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                        "WHERE pid = :pid AND wait_event_type = 'Lock')"
+                    ),
+                    {"pid": mutation_pid},
+                )
+            if blocked:
+                return True
+            await asyncio.sleep(0.01)
+        return False
+
+    admission_task = asyncio.create_task(admission_check())
+    mutation_task: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(admission_checked.wait(), timeout=5)
+        mutation_task = asyncio.create_task(pause_mutation())
+        await asyncio.wait_for(mutation_started.wait(), timeout=5)
+        assert await wait_for_advisory_lock_wait()
+        assert not mutation_finished.is_set()
+    finally:
+        release_admission.set()
+    if mutation_task is not None:
+        await asyncio.wait_for(mutation_task, timeout=5)
+    await asyncio.wait_for(admission_task, timeout=5)
+
+    async with initialized_pg.sessions() as db:
+        with pytest.raises(AdmissionPausedError):
+            async with db.begin():
+                await check_admission_pause(db, owner.id, owner_agent_id)
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_transcript_correction_and_visibility_are_audited_revisioned_and_owner_scoped(
+    app_client: httpx.AsyncClient,
+    test_platform_settings: PlatformSettings,
+    initialized_pg: FreshPostgres,
+) -> None:
+    owner, owner_headers = await _authenticated_headers(
+        initialized_pg,
+        test_platform_settings,
+        app_client,
+        email="transcript-policy-owner@example.com",
+    )
+    _, admin_headers = await _authenticated_headers(
+        initialized_pg,
+        test_platform_settings,
+        app_client,
+        email="transcript-policy-admin@example.com",
+        role="admin",
+        step_up=True,
+    )
+    _, unstepped_headers = await _authenticated_headers(
+        initialized_pg,
+        test_platform_settings,
+        app_client,
+        email="transcript-policy-unstepped@example.com",
+        role="admin",
+        step_up=False,
+    )
+    async with initialized_pg.sessions() as db:
+        session, _ = await create_test_session(db, owner_user_id=owner.id)
+    await _append_transcript_segment(
+        initialized_pg,
+        session_id=session.id,
+        sequence=1,
+        text_content="The original first line",
+    )
+    await _append_transcript_segment(
+        initialized_pg,
+        session_id=session.id,
+        sequence=2,
+        text_content="The unchanged second line",
+    )
+
+    transcript_path = f"/api/v1/sessions/{session.id}/transcript"
+    original_page = await app_client.get(
+        transcript_path,
+        params={"limit": 1},
+        headers=owner_headers,
+    )
+    assert original_page.status_code == 200
+    assert original_page.json()["next_cursor"] is not None
+    event_id = original_page.json()["segments"][0]["event_id"]
+    old_cursor = original_page.json()["next_cursor"]
+
+    correction_path = f"/api/v1/admin/sessions/{session.id}/transcript-corrections"
+    correction_body = {
+        "event_id": event_id,
+        "expected_revision": 0,
+        "replacement_text": "The corrected first line",
+        "reason": "Customer verified transcript correction",
+    }
+    no_step_up = await app_client.post(
+        correction_path,
+        headers={**unstepped_headers, "Idempotency-Key": "correction-no-step-up"},
+        json=correction_body,
+    )
+    no_csrf = await app_client.post(
+        correction_path,
+        headers={
+            key: value
+            for key, value in {
+                **admin_headers,
+                "Idempotency-Key": "correction-no-csrf",
+            }.items()
+            if key != "X-CSRF-Token"
+        },
+        json=correction_body,
+    )
+    owner_attempt = await app_client.post(
+        correction_path,
+        headers={**owner_headers, "Idempotency-Key": "correction-owner-denied"},
+        json=correction_body,
+    )
+    assert no_step_up.status_code == no_csrf.status_code == owner_attempt.status_code == 403
+
+    correction_headers = {
+        **admin_headers,
+        "Idempotency-Key": "correction-customer-verified",
+    }
+    correction = await app_client.post(
+        correction_path,
+        headers=correction_headers,
+        json=correction_body,
+    )
+    correction_replay = await app_client.post(
+        correction_path,
+        headers=correction_headers,
+        json=correction_body,
+    )
+    correction_conflict = await app_client.post(
+        correction_path,
+        headers=correction_headers,
+        json={**correction_body, "replacement_text": "Conflicting correction"},
+    )
+    assert correction.status_code == correction_replay.status_code == 201
+    assert correction.json() == correction_replay.json()
+    assert correction_conflict.status_code == 409
+
+    stale_cursor = await app_client.get(
+        transcript_path,
+        params={"cursor": old_cursor, "limit": 1},
+        headers=owner_headers,
+    )
+    visible_page = await app_client.get(transcript_path, headers=owner_headers)
+    assert stale_cursor.status_code == 409
+    assert visible_page.status_code == 200
+    assert visible_page.json()["segments"][0]["text"] == "The corrected first line"
+
+    visibility_path = f"/api/v1/admin/sessions/{session.id}/transcript-visibility"
+    hidden_body = {
+        "visible_to_owner": False,
+        "expected_revision": 1,
+        "reason": "Hide content pending owner review",
+    }
+    hidden_headers = {**admin_headers, "Idempotency-Key": "transcript-hide-owner"}
+    hidden = await app_client.post(
+        visibility_path,
+        headers=hidden_headers,
+        json=hidden_body,
+    )
+    hidden_replay = await app_client.post(
+        visibility_path,
+        headers=hidden_headers,
+        json=hidden_body,
+    )
+    hidden_conflict = await app_client.post(
+        visibility_path,
+        headers=hidden_headers,
+        json={**hidden_body, "visible_to_owner": True},
+    )
+    assert hidden.status_code == hidden_replay.status_code == 200
+    assert hidden.json() == hidden_replay.json()
+    assert hidden_conflict.status_code == 409
+    assert hidden.json()["visible_to_owner"] is False
+    hidden_page = await app_client.get(transcript_path, headers=owner_headers)
+    assert hidden_page.status_code == 200
+    assert hidden_page.json()["visible_to_owner"] is False
+    assert hidden_page.json()["segments"] == []
+
+    admin_access_path = f"/api/v1/admin/sessions/{session.id}/transcript-access"
+    admin_access = await app_client.post(
+        admin_access_path,
+        headers={**admin_headers, "Idempotency-Key": "transcript-hidden-admin-review"},
+        json={"reason": "Review corrected transcript with support", "limit": 10},
+    )
+    assert admin_access.status_code == 200
+    assert admin_access.json()["visible_to_owner"] is False
+    assert admin_access.json()["segments"][0]["text"] == "The corrected first line"
+
+    restored = await app_client.post(
+        visibility_path,
+        headers={**admin_headers, "Idempotency-Key": "transcript-restore-owner"},
+        json={
+            "visible_to_owner": True,
+            "expected_revision": 2,
+            "reason": "Owner review is complete",
+        },
+    )
+    owner_after_restore = await app_client.get(transcript_path, headers=owner_headers)
+    assert restored.status_code == 200
+    assert restored.json()["policy_revision"] == 3
+    assert owner_after_restore.status_code == 200
+    assert owner_after_restore.json()["segments"][0]["text"] == "The corrected first line"
+
+    async with initialized_pg.sessions() as db:
+        raw_segment = await db.get(TranscriptSegment, uuid.UUID(event_id))
+        correction_rows = list(
+            (
+                await db.execute(
+                    select(TranscriptCorrection).where(
+                        TranscriptCorrection.session_id == session.id,
+                        TranscriptCorrection.event_id == uuid.UUID(event_id),
+                    )
+                )
+            ).scalars().all()
+        )
+        policy = await db.get(TranscriptPolicy, session.id)
+        audits = list(
+            (
+                await db.execute(
+                    select(AuditLog).where(
+                        AuditLog.target_id == session.id,
+                        AuditLog.action == "admin.transcript.visibility.set",
+                    )
+                )
+            ).scalars().all()
+        )
+        correction_audits = list(
+            (
+                await db.execute(
+                    select(AuditLog).where(
+                        AuditLog.action == "admin.transcript.correction.create",
+                        AuditLog.target_id == uuid.UUID(event_id),
+                    )
+                )
+            ).scalars().all()
+        )
+    assert raw_segment is not None and raw_segment.final_text == "The original first line"
+    assert len(correction_rows) == 1
+    assert correction_rows[0].replacement_text == "The corrected first line"
+    assert policy is not None and policy.visible_to_owner is True and policy.revision == 3
+    assert len(audits) == 2
+    assert len(correction_audits) == 1
+    assert "replacement_text" not in correction_audits[0].change_summary

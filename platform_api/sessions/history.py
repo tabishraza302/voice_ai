@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import base64
+import binascii
+import json
 from typing import Literal
 import uuid
 
@@ -20,13 +23,22 @@ from platform_api.events.repository import (
     InvalidCursor,
     TranscriptChanged,
     TranscriptPage,
+    decode_transcript_cursor,
+    encode_transcript_cursor,
 )
 from platform_api.models.session import Session
+from platform_api.models.transcript_policy import TranscriptCorrection
 from platform_api.pagination import (
+    MAX_CURSOR_LENGTH,
     PaginationError,
     decode_keyset_cursor,
     encode_keyset_cursor,
     normalize_date_range,
+)
+from platform_api.sessions.transcript_policy import (
+    TranscriptPolicyState,
+    lock_transcript_policy,
+    read_transcript_policy,
 )
 from platform_api.sessions.history_schemas import (
     ConfigSnapshotView,
@@ -410,6 +422,43 @@ async def get_owner_config_snapshot(
         published_at=version.created_at,
     )
 
+async def get_admin_config_snapshot(
+    db: AsyncSession,
+    *,
+    session_id: uuid.UUID,
+) -> ConfigSnapshotView | None:
+    """Return a sanitized exact version pinned to a session for operator inspection."""
+    session = await _get_session(db, session_id=session_id, owner_user_id=None)
+    if session.agent_version_id is None:
+        return None
+    pinned = (
+        await db.execute(
+            select(AgentVersion, Agent)
+            .join(Agent, Agent.id == AgentVersion.agent_id)
+            .where(AgentVersion.id == session.agent_version_id)
+        )
+    ).one_or_none()
+    if pinned is None:
+        raise ConflictError("Pinned agent version is missing")
+    version, agent = pinned
+    if find_secret_paths(version.immutable_config_json):
+        raise ConflictError("Pinned configuration contains protected fields")
+    if find_secret_paths(session.tariff_snapshot):
+        raise ConflictError("Pinned tariff snapshot contains protected fields")
+    return ConfigSnapshotView(
+        session_id=session.id,
+        agent_id=agent.id,
+        agent_name=agent.name,
+        agent_version_id=version.id,
+        agent_version=version.version,
+        flow_hash=version.flow_hash,
+        artifact_hash=version.artifact_hash,
+        authoring_hash=version.authoring_hash,
+        immutable_config=version.immutable_config_json,
+        tariff_snapshot=session.tariff_snapshot,
+        published_at=version.created_at,
+    )
+
 
 async def _transcript_page(
     db: AsyncSession,
@@ -435,19 +484,112 @@ async def _transcript_page(
         raise ValidationError("Transcript page request is invalid") from exc
 
 
-def _transcript_view(page: TranscriptPage) -> TranscriptPageView:
+def encode_transcript_api_cursor(
+    *,
+    transcript_revision: int,
+    policy_revision: int,
+    after_sequence: int,
+) -> str:
+    """Bind a public transcript cursor to both source and admin-policy revisions."""
+    raw_cursor = encode_transcript_cursor(
+        revision=transcript_revision,
+        after_sequence=after_sequence,
+    )
+    payload = {
+        "event_cursor": raw_cursor,
+        "policy_revision": policy_revision,
+        "transcript_revision": transcript_revision,
+        "v": 1,
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_transcript_api_cursor(
+    cursor: str | None,
+    *,
+    policy_revision: int,
+) -> str | None:
+    if cursor is None:
+        return None
+    if not isinstance(cursor, str) or not cursor or len(cursor) > MAX_CURSOR_LENGTH:
+        raise ValidationError("Transcript cursor is invalid")
+    padded = cursor + "=" * (-len(cursor) % 4)
+    try:
+        raw = base64.b64decode(padded.encode("ascii"), altchars=b"-_", validate=True)
+        payload = json.loads(raw.decode("utf-8"))
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValidationError("Transcript cursor is invalid") from exc
+    if not isinstance(payload, dict) or set(payload) != {
+        "event_cursor",
+        "policy_revision",
+        "transcript_revision",
+        "v",
+    }:
+        raise ValidationError("Transcript cursor is invalid")
+    if (
+        type(payload["v"]) is not int
+        or payload["v"] != 1
+        or type(payload["policy_revision"]) is not int
+        or type(payload["transcript_revision"]) is not int
+        or not isinstance(payload["event_cursor"], str)
+    ):
+        raise ValidationError("Transcript cursor is invalid")
+    if payload["policy_revision"] != policy_revision:
+        raise ConflictError("Transcript policy changed; reload the first page")
+    try:
+        event_cursor = decode_transcript_cursor(payload["event_cursor"])
+    except InvalidCursor as exc:
+        raise ValidationError("Transcript cursor is invalid") from exc
+    if event_cursor.revision != payload["transcript_revision"]:
+        raise ValidationError("Transcript cursor is invalid")
+    return payload["event_cursor"]
+
+
+async def _transcript_view(
+    db: AsyncSession,
+    page: TranscriptPage,
+    policy: TranscriptPolicyState,
+) -> TranscriptPageView:
+    corrections: dict[uuid.UUID, str] = {}
+    event_ids = tuple(segment.event_id for segment in page.segments)
+    if event_ids:
+        rows = (
+            await db.execute(
+                select(TranscriptCorrection)
+                .where(
+                    TranscriptCorrection.session_id == page.session_id,
+                    TranscriptCorrection.event_id.in_(event_ids),
+                    TranscriptCorrection.policy_revision <= policy.revision,
+                )
+                .order_by(TranscriptCorrection.policy_revision.desc())
+            )
+        ).scalars().all()
+        for correction in rows:
+            corrections.setdefault(correction.event_id, correction.replacement_text)
+    next_cursor = None
+    if page.next_cursor is not None:
+        raw_position = decode_transcript_cursor(page.next_cursor)
+        next_cursor = encode_transcript_api_cursor(
+            transcript_revision=page.transcript_revision,
+            policy_revision=policy.revision,
+            after_sequence=raw_position.after_sequence,
+        )
     return TranscriptPageView(
         session_id=page.session_id,
         transcript_revision=page.transcript_revision,
+        policy_revision=policy.revision,
+        visible_to_owner=policy.visible_to_owner,
         segments=[
             TranscriptSegmentView(
                 sequence=segment.sequence,
                 event_id=segment.event_id,
                 speaker=segment.speaker,
-                final_text=segment.final_text,
+                final_text=corrections.get(segment.event_id, segment.final_text),
                 start_ms=segment.start_ms,
                 end_ms=segment.end_ms,
                 kind=segment.kind,
+                corrected=segment.event_id in corrections,
             )
             for segment in page.segments
         ],
@@ -461,7 +603,7 @@ def _transcript_view(page: TranscriptPage) -> TranscriptPageView:
             for gap in page.gaps
         ],
         processing=page.processing,
-        next_cursor=page.next_cursor,
+        next_cursor=next_cursor,
     )
 
 
@@ -478,14 +620,31 @@ async def get_owner_transcript_page(
         session_id=session_id,
         owner_user_id=owner_user_id,
     )
-    return _transcript_view(
-        await _transcript_page(
-            db,
-            session_id=session_id,
-            cursor=cursor,
-            limit=limit,
-        )
+    await lock_transcript_policy(db, session_id, shared=True)
+    policy = await read_transcript_policy(db, session_id)
+    raw_cursor = _decode_transcript_api_cursor(
+        cursor,
+        policy_revision=policy.revision,
     )
+    page = await _transcript_page(
+        db,
+        session_id=session_id,
+        cursor=raw_cursor,
+        limit=limit,
+    )
+    if not policy.visible_to_owner:
+        return TranscriptPageView(
+            session_id=page.session_id,
+            transcript_revision=page.transcript_revision,
+            policy_revision=policy.revision,
+            visible_to_owner=False,
+            segments=[],
+            has_gaps=False,
+            gaps=[],
+            processing=page.processing,
+            next_cursor=None,
+        )
+    return await _transcript_view(db, page, policy)
 
 
 async def get_admin_transcript_page(
@@ -496,15 +655,19 @@ async def get_admin_transcript_page(
     limit: int = 50,
 ) -> TranscriptPageView:
     await _get_session(db, session_id=session_id, owner_user_id=None)
-    return _transcript_view(
-        await _transcript_page(
-            db,
-            session_id=session_id,
-            cursor=cursor,
-            limit=limit,
-        )
+    await lock_transcript_policy(db, session_id, shared=True)
+    policy = await read_transcript_policy(db, session_id)
+    raw_cursor = _decode_transcript_api_cursor(
+        cursor,
+        policy_revision=policy.revision,
     )
-
+    page = await _transcript_page(
+        db,
+        session_id=session_id,
+        cursor=raw_cursor,
+        limit=limit,
+    )
+    return await _transcript_view(db, page, policy)
 
 def billing_view_for_admin(budget: CallBudget | None) -> SessionBillingView | None:
     return _billing_view(budget)

@@ -15,6 +15,7 @@ from platform_api.agents.defaults import DEFAULT_POLICY_SLUG, compute_policy_has
 from platform_api.agents.models import (
     Agent,
     AgentTemplateVersion,
+    AgentVersion,
     PlatformPromptVersion,
 )
 from platform_api.agents.publishing import ensure_default_policy_version
@@ -39,10 +40,16 @@ from platform_api.sessions.history import (
     AdminSessionRecord,
     SessionRecordsPage,
     billing_view_for_admin,
+    get_admin_config_snapshot,
     get_admin_session_record,
     list_admin_session_records,
 )
+from platform_api.sessions.transcript_policy import (
+    lock_transcript_policy,
+    read_transcript_policy,
+)
 from platform_api.admin.schemas import (
+    AdminAgentDetail,
     AdminAgentItem,
     AdminAgentPage,
     AdminAuditItem,
@@ -258,6 +265,9 @@ async def get_admin_session(
     item = _admin_session_item(record)
     if find_secret_paths(record.session.tariff_snapshot):
         raise ConflictError("Session tariff snapshot contains protected fields")
+    config_snapshot = await get_admin_config_snapshot(db, session_id=session_id)
+    await lock_transcript_policy(db, session_id, shared=True)
+    transcript_policy = await read_transcript_policy(db, session_id)
     return AdminSessionDetail(
         session_id=item.session_id,
         owner_user_id=item.owner_user_id,
@@ -273,6 +283,9 @@ async def get_admin_session(
         failure_code=item.failure_code,
         billing=item.billing,
         tariff_snapshot=record.session.tariff_snapshot,
+        pinned_config_snapshot=config_snapshot,
+        transcript_visible_to_owner=transcript_policy.visible_to_owner,
+        transcript_policy_revision=transcript_policy.revision,
     )
 
 
@@ -299,7 +312,10 @@ async def list_admin_wallet_entries(
     )
 
 
-def _admin_agent_item(row: Agent) -> AdminAgentItem:
+def _admin_agent_item(
+    row: Agent,
+    version: AgentVersion | None,
+) -> AdminAgentItem:
     return AdminAgentItem(
         id=row.id,
         owner_user_id=row.owner_user_id,
@@ -308,6 +324,7 @@ def _admin_agent_item(row: Agent) -> AdminAgentItem:
         enabled=row.enabled,
         draft_revision=row.draft_revision,
         current_published_version_id=row.current_published_version_id,
+        current_published_version=version.version if version is not None else None,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -351,7 +368,16 @@ async def disable_admin_agent(
         result="success",
         change_summary={"enabled_before": was_enabled, "enabled_after": False},
     )
-    return _admin_agent_item(row)
+    version = (
+        await db.get(AgentVersion, row.current_published_version_id)
+        if row.current_published_version_id is not None
+        else None
+    )
+    if row.current_published_version_id is not None and (
+        version is None or version.agent_id != row.id
+    ):
+        raise ConflictError("Agent points to a missing published version")
+    return _admin_agent_item(row, version)
 
 
 async def list_admin_agents(
@@ -359,6 +385,7 @@ async def list_admin_agents(
     *,
     owner_user_id: uuid.UUID | None = None,
     enabled: bool | None = None,
+    q: str | None = None,
     from_at: datetime | None = None,
     to_at: datetime | None = None,
     limit: int = 50,
@@ -366,10 +393,16 @@ async def list_admin_agents(
 ) -> AdminAgentPage:
     _validate_limit(limit)
     start, end = _normalize_dates(from_at, to_at)
+    search = q.strip() if q is not None else None
+    if search == "":
+        search = None
+    if search is not None and len(search) > 128:
+        raise ValidationError("Agent search must not exceed 128 characters")
     filters = {
         "enabled": enabled,
         "from_at": start.isoformat() if start else None,
         "owner_user_id": str(owner_user_id) if owner_user_id else None,
+        "q": search,
         "to_at": end.isoformat() if end else None,
     }
     position = _cursor_position(cursor, scope="admin.agents", filters=filters)
@@ -380,6 +413,12 @@ async def list_admin_agents(
         stmt = stmt.where(Agent.enabled.is_(enabled))
     if start is not None and end is not None:
         stmt = stmt.where(Agent.created_at >= start, Agent.created_at < end)
+    if search is not None:
+        search_value = search.lower()
+        stmt = stmt.where(
+            func.lower(Agent.name).contains(search_value, autoescape=True)
+            | func.lower(Agent.description).contains(search_value, autoescape=True)
+        )
     if position is not None:
         stmt = stmt.where(
             (Agent.created_at < position.created_at)
@@ -398,9 +437,63 @@ async def list_admin_agents(
         scope="admin.agents",
         filters=filters,
     )
-    return AdminAgentPage(
-        items=[_admin_agent_item(row) for row in rows[:limit]],
-        next_cursor=next_cursor,
+    page_rows = rows[:limit]
+    version_ids = tuple(
+        row.current_published_version_id
+        for row in page_rows
+        if row.current_published_version_id is not None
+    )
+    versions: dict[uuid.UUID, AgentVersion] = {}
+    if version_ids:
+        versions = {
+            version.id: version
+            for version in (
+                await db.execute(
+                    select(AgentVersion).where(AgentVersion.id.in_(version_ids))
+                )
+            ).scalars().all()
+        }
+    items: list[AdminAgentItem] = []
+    for row in page_rows:
+        version = versions.get(row.current_published_version_id)
+        if row.current_published_version_id is not None and (
+            version is None or version.agent_id != row.id
+        ):
+            raise ConflictError("Agent points to a missing published version")
+        items.append(_admin_agent_item(row, version))
+    return AdminAgentPage(items=items, next_cursor=next_cursor)
+
+async def get_admin_agent_detail(
+    db: AsyncSession,
+    *,
+    agent_id: uuid.UUID,
+) -> AdminAgentDetail:
+    row = await db.get(Agent, agent_id)
+    if row is None:
+        raise NotFoundError("Agent not found")
+    owner = await db.get(User, row.owner_user_id)
+    if owner is None:
+        raise ConflictError("Agent owner is missing")
+    version = (
+        await db.get(AgentVersion, row.current_published_version_id)
+        if row.current_published_version_id is not None
+        else None
+    )
+    if row.current_published_version_id is not None and (
+        version is None or version.agent_id != row.id
+    ):
+        raise ConflictError("Agent points to a missing published version")
+    if version is not None and find_secret_paths(version.immutable_config_json):
+        raise ConflictError("Published configuration contains protected fields")
+    item = _admin_agent_item(row, version)
+    return AdminAgentDetail(
+        **item.model_dump(),
+        owner_email=owner.email,
+        owner_display_name=owner.display_name,
+        immutable_config=version.immutable_config_json if version is not None else None,
+        flow_hash=version.flow_hash if version is not None else None,
+        artifact_hash=version.artifact_hash if version is not None else None,
+        authoring_hash=version.authoring_hash if version is not None else None,
     )
 
 

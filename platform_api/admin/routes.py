@@ -13,9 +13,21 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_api.admin.schemas import (
+    AdminAgentDetail,
     AdminAgentPage,
     AdminAgentDisableRequest,
     AdminAgentItem,
+    AdminAdmissionPauseItem,
+    AdminAdmissionPausePage,
+    AdminAdmissionPauseRequest,
+    AdminTariffPage,
+    AdminTariffVersionItem,
+    AdminTariffVersionRequest,
+    AdminSessionTerminationRequest,
+    AdminTranscriptCorrectionItem,
+    AdminTranscriptCorrectionRequest,
+    AdminTranscriptPolicyView,
+    AdminTranscriptVisibilityRequest,
     AdminAuditPage,
     AdminOverview,
     AdminPromptItem,
@@ -33,6 +45,7 @@ from platform_api.admin.service import (
     create_template_version,
     get_admin_overview,
     get_admin_session,
+    get_admin_agent_detail,
     get_admin_wallet,
     disable_admin_agent,
     get_prompt_version,
@@ -43,6 +56,14 @@ from platform_api.admin.service import (
     list_admin_sessions,
     list_admin_templates,
     list_admin_wallet_entries,
+)
+from platform_api.admin.policies import (
+    create_admin_tariff_version,
+    create_admin_transcript_correction,
+    list_admin_admission_pauses,
+    list_admin_tariffs,
+    set_admin_admission_pause,
+    set_admin_transcript_visibility,
 )
 from platform_api.agents.service import (
     check_idempotency_record,
@@ -60,11 +81,15 @@ from platform_api.auth.dependencies import (
 )
 from platform_api.auth.errors import ConflictError, ValidationError
 from platform_api.auth.types import AuthSessionContext, Principal
-from platform_api.db.session import get_db
-from platform_api.events.repository import encode_transcript_cursor
-from platform_api.sessions.history import get_admin_transcript_page
-from platform_api.sessions.history_schemas import TranscriptPageView
 from platform_api.billing.schemas import WalletEntriesPage, WalletView
+from platform_api.db.session import get_db
+from platform_api.sessions.history import (
+    encode_transcript_api_cursor,
+    get_admin_transcript_page,
+)
+from platform_api.sessions.history_schemas import TranscriptPageView
+from platform_api.sessions.schemas import SessionStateView
+from platform_api.sessions.service import terminate_admin_session
 
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -118,6 +143,17 @@ def _cached_response(cached: object, view: object) -> JSONResponse:
         content=model_dump(mode="json"),
         headers={"Cache-Control": "no-store"},
     )
+
+def _cached_model_response(cached: object, model_type: object, label: str) -> JSONResponse:
+    response_json = getattr(cached, "response_json", None)
+    validator = getattr(model_type, "model_validate", None)
+    if not isinstance(response_json, dict) or not callable(validator):
+        raise ConflictError(f"Stored {label} result is invalid")
+    try:
+        view = validator(response_json)
+    except (TypeError, ValueError) as exc:
+        raise ConflictError(f"Stored {label} result is invalid") from exc
+    return _cached_response(cached, view)
 
 
 def _cached_admin_agent_response(cached: object) -> JSONResponse:
@@ -226,6 +262,7 @@ async def access_admin_conversation_transcript(
             "limit",
             "session_id",
             "transcript_revision",
+            "policy_revision",
         }:
             raise ConflictError("Stored transcript access result is invalid")
         if (
@@ -233,6 +270,7 @@ async def access_admin_conversation_transcript(
             or marker["limit"] != payload.limit
             or not isinstance(marker["cursor"], str)
             or type(marker["transcript_revision"]) is not int
+            or type(marker["policy_revision"]) is not int
         ):
             raise ConflictError("Stored transcript access result is invalid")
         page = await get_admin_transcript_page(
@@ -241,7 +279,10 @@ async def access_admin_conversation_transcript(
             cursor=marker["cursor"],
             limit=payload.limit,
         )
-        if page.transcript_revision != marker["transcript_revision"]:
+        if (
+            page.transcript_revision != marker["transcript_revision"]
+            or page.policy_revision != marker["policy_revision"]
+        ):
             raise ConflictError("Transcript changed; repeat support access with a new key")
         await db.commit()
         return page
@@ -252,8 +293,9 @@ async def access_admin_conversation_transcript(
         cursor=payload.cursor,
         limit=payload.limit,
     )
-    stable_cursor = payload.cursor or encode_transcript_cursor(
-        revision=page.transcript_revision,
+    stable_cursor = payload.cursor or encode_transcript_api_cursor(
+        transcript_revision=page.transcript_revision,
+        policy_revision=page.policy_revision,
         after_sequence=0,
     )
     source_ip, request_id = _request_context(request)
@@ -271,6 +313,7 @@ async def access_admin_conversation_transcript(
         result="success",
         change_summary={
             "transcript_revision": page.transcript_revision,
+            "policy_revision": page.policy_revision,
             "page_limit": payload.limit,
         },
     )
@@ -286,6 +329,7 @@ async def access_admin_conversation_transcript(
             "limit": payload.limit,
             "session_id": str(session_id),
             "transcript_revision": page.transcript_revision,
+            "policy_revision": page.policy_revision,
         },
     )
     await db.commit()
@@ -325,6 +369,7 @@ async def get_admin_user_wallet_entries(
 async def get_admin_agent_inventory(
     response: Response,
     owner_user_id: uuid.UUID | None = Query(default=None),
+    q: str | None = Query(default=None, max_length=128),
     enabled: bool | None = Query(default=None),
     from_at: datetime | None = Query(default=None),
     to_at: datetime | None = Query(default=None),
@@ -337,12 +382,24 @@ async def get_admin_agent_inventory(
     return await list_admin_agents(
         db,
         owner_user_id=owner_user_id,
+        q=q,
         enabled=enabled,
         from_at=from_at,
         to_at=to_at,
         cursor=cursor,
         limit=limit,
     )
+
+
+@router.get("/agents/{agent_id}", response_model=AdminAgentDetail)
+async def get_admin_agent_record(
+    agent_id: uuid.UUID,
+    response: Response,
+    principal: Principal = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> AdminAgentDetail:
+    response.headers["Cache-Control"] = "no-store"
+    return await get_admin_agent_detail(db, agent_id=agent_id)
 
 
 @router.post(
@@ -591,3 +648,321 @@ async def get_admin_audit_logs(
         cursor=cursor,
         limit=limit,
     )
+
+
+@router.get("/admission-pauses", response_model=AdminAdmissionPausePage)
+async def get_admin_admission_pause_policies(
+    response: Response,
+    scope: Literal["global", "user", "agent"] | None = Query(default=None),
+    owner_user_id: uuid.UUID | None = Query(default=None),
+    agent_id: uuid.UUID | None = Query(default=None),
+    cursor: str | None = Query(default=None, max_length=1024),
+    limit: int = Query(default=50, ge=1, le=100),
+    principal: Principal = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> AdminAdmissionPausePage:
+    response.headers["Cache-Control"] = "no-store"
+    return await list_admin_admission_pauses(
+        db,
+        scope=scope,
+        owner_user_id=owner_user_id,
+        agent_id=agent_id,
+        cursor=cursor,
+        limit=limit,
+    )
+
+
+@router.post(
+    "/admission-pauses",
+    response_model=AdminAdmissionPauseItem,
+)
+async def set_admin_admission_pause_route(
+    payload: AdminAdmissionPauseRequest,
+    request: Request,
+    response: Response,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    _transaction_isolation: None = Depends(_set_idempotency_transaction_isolation),
+    principal: Principal = Depends(require_step_up),
+    _csrf: AuthSessionContext = Depends(require_csrf),
+    db: AsyncSession = Depends(get_db),
+) -> AdminAdmissionPauseItem | JSONResponse:
+    key = _normalize_idempotency_key(idempotency_key)
+    action = "admin.admission.pause.set"
+    await lock_idempotency_key(
+        db,
+        user_id=principal.user_id,
+        idempotency_key=key,
+        action=action,
+    )
+    request_hash = compute_payload_hash({"request": payload.model_dump(mode="json")})
+    cached = await check_idempotency_record(
+        db,
+        user_id=principal.user_id,
+        idempotency_key=key,
+        action=action,
+        request_hash=request_hash,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    if cached is not None:
+        result = _cached_model_response(cached, AdminAdmissionPauseItem, "admission pause")
+        await db.commit()
+        return result
+    source_ip, request_id = _request_context(request)
+    view = await set_admin_admission_pause(
+        db,
+        actor_id=principal.user_id,
+        auth_session_id=principal.session_id,
+        payload=payload,
+        request_id=request_id,
+        source_ip=source_ip,
+    )
+    await store_idempotency_record(
+        db,
+        user_id=principal.user_id,
+        idempotency_key=key,
+        action=action,
+        request_hash=request_hash,
+        status_code=status.HTTP_200_OK,
+        response_json=view.model_dump(mode="json"),
+    )
+    await db.commit()
+    return view
+
+
+@router.get("/tariffs", response_model=AdminTariffPage)
+async def get_admin_tariff_versions(
+    response: Response,
+    cursor: str | None = Query(default=None, max_length=1024),
+    limit: int = Query(default=50, ge=1, le=100),
+    principal: Principal = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> AdminTariffPage:
+    response.headers["Cache-Control"] = "no-store"
+    page = await list_admin_tariffs(db, cursor=cursor, limit=limit)
+    await db.commit()
+    return page
+
+
+@router.post(
+    "/tariffs/versions",
+    status_code=status.HTTP_201_CREATED,
+    response_model=AdminTariffVersionItem,
+)
+async def post_admin_tariff_version(
+    payload: AdminTariffVersionRequest,
+    request: Request,
+    response: Response,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    _transaction_isolation: None = Depends(_set_idempotency_transaction_isolation),
+    principal: Principal = Depends(require_step_up),
+    _csrf: AuthSessionContext = Depends(require_csrf),
+    db: AsyncSession = Depends(get_db),
+) -> AdminTariffVersionItem | JSONResponse:
+    key = _normalize_idempotency_key(idempotency_key)
+    action = "admin.tariff.version.create"
+    await lock_idempotency_key(
+        db,
+        user_id=principal.user_id,
+        idempotency_key=key,
+        action=action,
+    )
+    request_hash = compute_payload_hash({"request": payload.model_dump(mode="json")})
+    cached = await check_idempotency_record(
+        db,
+        user_id=principal.user_id,
+        idempotency_key=key,
+        action=action,
+        request_hash=request_hash,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    if cached is not None:
+        result = _cached_model_response(cached, AdminTariffVersionItem, "tariff")
+        await db.commit()
+        return result
+    source_ip, request_id = _request_context(request)
+    view = await create_admin_tariff_version(
+        db,
+        actor_id=principal.user_id,
+        auth_session_id=principal.session_id,
+        payload=payload,
+        request_id=request_id,
+        source_ip=source_ip,
+    )
+    await store_idempotency_record(
+        db,
+        user_id=principal.user_id,
+        idempotency_key=key,
+        action=action,
+        request_hash=request_hash,
+        status_code=status.HTTP_201_CREATED,
+        response_json=view.model_dump(mode="json"),
+    )
+    await db.commit()
+    return view
+
+
+@router.post(
+    "/sessions/{session_id}/terminate",
+    response_model=SessionStateView,
+)
+async def terminate_admin_conversation(
+    session_id: uuid.UUID,
+    payload: AdminSessionTerminationRequest,
+    request: Request,
+    response: Response,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    _transaction_isolation: None = Depends(_set_idempotency_transaction_isolation),
+    principal: Principal = Depends(require_step_up),
+    _csrf: AuthSessionContext = Depends(require_csrf),
+    db: AsyncSession = Depends(get_db),
+) -> SessionStateView:
+    key = _normalize_idempotency_key(idempotency_key)
+    source_ip, request_id = _request_context(request)
+    settings = get_request_settings(request)
+    request_hash = compute_payload_hash(
+        {
+            "admin_user_id": str(principal.user_id),
+            "reason": payload.reason.strip(),
+            "session_id": str(session_id),
+        }
+    )
+    response.headers["Cache-Control"] = "no-store"
+    view = await terminate_admin_session(
+        db,
+        session_id=session_id,
+        admin_user_id=principal.user_id,
+        auth_session_id=principal.session_id,
+        operation_id=key,
+        request_hash=request_hash,
+        reason=payload.reason,
+        request_id=request_id,
+        source_ip=source_ip,
+        settings=settings,
+    )
+    response.status_code = (
+        status.HTTP_202_ACCEPTED if view.state == "ENDING" else status.HTTP_200_OK
+    )
+    return view
+
+
+@router.post(
+    "/sessions/{session_id}/transcript-corrections",
+    status_code=status.HTTP_201_CREATED,
+    response_model=AdminTranscriptCorrectionItem,
+)
+async def create_admin_transcript_correction_route(
+    session_id: uuid.UUID,
+    payload: AdminTranscriptCorrectionRequest,
+    request: Request,
+    response: Response,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    _transaction_isolation: None = Depends(_set_idempotency_transaction_isolation),
+    principal: Principal = Depends(require_step_up),
+    _csrf: AuthSessionContext = Depends(require_csrf),
+    db: AsyncSession = Depends(get_db),
+) -> AdminTranscriptCorrectionItem | JSONResponse:
+    key = _normalize_idempotency_key(idempotency_key)
+    action = "admin.transcript.correction.create"
+    await lock_idempotency_key(
+        db,
+        user_id=principal.user_id,
+        idempotency_key=key,
+        action=action,
+    )
+    request_hash = compute_payload_hash(
+        {"session_id": str(session_id), "request": payload.model_dump(mode="json")}
+    )
+    cached = await check_idempotency_record(
+        db,
+        user_id=principal.user_id,
+        idempotency_key=key,
+        action=action,
+        request_hash=request_hash,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    if cached is not None:
+        result = _cached_model_response(cached, AdminTranscriptCorrectionItem, "transcript correction")
+        await db.commit()
+        return result
+    source_ip, request_id = _request_context(request)
+    view = await create_admin_transcript_correction(
+        db,
+        session_id=session_id,
+        actor_id=principal.user_id,
+        auth_session_id=principal.session_id,
+        payload=payload,
+        request_id=request_id,
+        source_ip=source_ip,
+    )
+    await store_idempotency_record(
+        db,
+        user_id=principal.user_id,
+        idempotency_key=key,
+        action=action,
+        request_hash=request_hash,
+        status_code=status.HTTP_201_CREATED,
+        response_json=view.model_dump(mode="json"),
+    )
+    await db.commit()
+    return view
+
+
+@router.post(
+    "/sessions/{session_id}/transcript-visibility",
+    response_model=AdminTranscriptPolicyView,
+)
+async def set_admin_transcript_visibility_route(
+    session_id: uuid.UUID,
+    payload: AdminTranscriptVisibilityRequest,
+    request: Request,
+    response: Response,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
+    _transaction_isolation: None = Depends(_set_idempotency_transaction_isolation),
+    principal: Principal = Depends(require_step_up),
+    _csrf: AuthSessionContext = Depends(require_csrf),
+    db: AsyncSession = Depends(get_db),
+) -> AdminTranscriptPolicyView | JSONResponse:
+    key = _normalize_idempotency_key(idempotency_key)
+    action = "admin.transcript.visibility.set"
+    await lock_idempotency_key(
+        db,
+        user_id=principal.user_id,
+        idempotency_key=key,
+        action=action,
+    )
+    request_hash = compute_payload_hash(
+        {"session_id": str(session_id), "request": payload.model_dump(mode="json")}
+    )
+    cached = await check_idempotency_record(
+        db,
+        user_id=principal.user_id,
+        idempotency_key=key,
+        action=action,
+        request_hash=request_hash,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    if cached is not None:
+        result = _cached_model_response(cached, AdminTranscriptPolicyView, "transcript policy")
+        await db.commit()
+        return result
+    source_ip, request_id = _request_context(request)
+    view = await set_admin_transcript_visibility(
+        db,
+        session_id=session_id,
+        actor_id=principal.user_id,
+        auth_session_id=principal.session_id,
+        payload=payload,
+        request_id=request_id,
+        source_ip=source_ip,
+    )
+    await store_idempotency_record(
+        db,
+        user_id=principal.user_id,
+        idempotency_key=key,
+        action=action,
+        request_hash=request_hash,
+        status_code=status.HTTP_200_OK,
+        response_json=view.model_dump(mode="json"),
+    )
+    await db.commit()
+    return view
