@@ -32,6 +32,14 @@ type PageState =
   | "unavailable";
 
 type SavedGuestSession = { sessionId: string; csrfToken: string };
+type SavedGuestAdmissionAttempt = {
+  publicId: string;
+  idempotencyKey: string;
+  payload: {
+    disclosure_version: string;
+    disclosure_acknowledged: true;
+  };
+};
 
 const TERMINAL_STATES: Record<string, true> = {
   CLOSED: true,
@@ -50,6 +58,10 @@ const RECONNECTABLE_STATES: Record<string, true> = {
 
 function storageKey(publicId: string): string {
   return `public-guest-session:${publicId}`;
+}
+
+function admissionStorageKey(publicId: string): string {
+  return `public-guest-admission:${publicId}`;
 }
 
 function readSavedSession(publicId: string): SavedGuestSession | null {
@@ -93,6 +105,70 @@ function clearSavedSession(publicId: string): void {
   }
 }
 
+function readSavedAdmissionAttempt(
+  publicId: string,
+  disclosureVersion: string,
+): SavedGuestAdmissionAttempt | null {
+  try {
+    const raw = window.sessionStorage.getItem(admissionStorageKey(publicId));
+    if (!raw) return null;
+    const value: unknown = JSON.parse(raw);
+    if (
+      !value ||
+      typeof value !== "object" ||
+      !("publicId" in value) ||
+      typeof value.publicId !== "string" ||
+      !("idempotencyKey" in value) ||
+      typeof value.idempotencyKey !== "string" ||
+      value.idempotencyKey.length === 0 ||
+      !("payload" in value) ||
+      !value.payload ||
+      typeof value.payload !== "object" ||
+      !("disclosure_version" in value.payload) ||
+      typeof value.payload.disclosure_version !== "string" ||
+      !("disclosure_acknowledged" in value.payload) ||
+      value.payload.disclosure_acknowledged !== true
+    ) {
+      clearSavedAdmissionAttempt(publicId);
+      return null;
+    }
+    if (
+      value.publicId !== publicId ||
+      value.payload.disclosure_version !== disclosureVersion
+    ) {
+      clearSavedAdmissionAttempt(publicId);
+      return null;
+    }
+    return {
+      publicId: value.publicId,
+      idempotencyKey: value.idempotencyKey,
+      payload: {
+        disclosure_version: value.payload.disclosure_version,
+        disclosure_acknowledged: true,
+      },
+    };
+  } catch {
+    clearSavedAdmissionAttempt(publicId);
+    return null;
+  }
+}
+
+function saveAdmissionAttempt(publicId: string, attempt: SavedGuestAdmissionAttempt): void {
+  try {
+    window.sessionStorage.setItem(admissionStorageKey(publicId), JSON.stringify(attempt));
+  } catch {
+    // The in-memory attempt still protects retries while this page stays open.
+  }
+}
+
+function clearSavedAdmissionAttempt(publicId: string): void {
+  try {
+    window.sessionStorage.removeItem(admissionStorageKey(publicId));
+  } catch {
+    // The page can still use the result it received.
+  }
+}
+
 function messageFor(error: unknown): string {
   return error instanceof Error ? error.message : "The guest session request failed.";
 }
@@ -114,6 +190,7 @@ export function PublicGuestPage({ publicId }: { publicId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [loadAttempt, setLoadAttempt] = useState(0);
   const pageStateRef = useRef<PageState>("loading");
+  const admissionAttemptRef = useRef<SavedGuestAdmissionAttempt | null>(null);
   const voiceSessionRef = useRef<VoiceSession | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
   const connectedRef = useRef(false);
@@ -136,6 +213,7 @@ export function PublicGuestPage({ publicId }: { publicId: string }) {
 
   useEffect(() => {
     let cancelled = false;
+    admissionAttemptRef.current = null;
     showState("loading");
     setBootstrap(null);
     setError(null);
@@ -143,6 +221,7 @@ export function PublicGuestPage({ publicId }: { publicId: string }) {
 
     const load = async () => {
       const saved = readSavedSession(publicId);
+      if (saved) clearSavedAdmissionAttempt(publicId);
       let deployment: PublicDeploymentBootstrap | null = null;
       let bootstrapError: string | null = null;
 
@@ -150,6 +229,9 @@ export function PublicGuestPage({ publicId }: { publicId: string }) {
         deployment = await client.bootstrap(publicId);
         if (cancelled) return;
         setBootstrap(deployment);
+        admissionAttemptRef.current = saved
+          ? null
+          : readSavedAdmissionAttempt(publicId, deployment.disclosure_version);
       } catch (loadError) {
         if (cancelled) return;
         bootstrapError = messageFor(loadError);
@@ -321,19 +403,47 @@ export function PublicGuestPage({ publicId }: { publicId: string }) {
     showState("admitting");
     let admitted = false;
     try {
+      const payload = {
+        disclosure_version: bootstrap.disclosure_version,
+        disclosure_acknowledged: true as const,
+      };
+      const currentAttempt = admissionAttemptRef.current;
+      const attempt = currentAttempt &&
+        currentAttempt.publicId === publicId &&
+        currentAttempt.payload.disclosure_version === payload.disclosure_version &&
+        currentAttempt.payload.disclosure_acknowledged === payload.disclosure_acknowledged
+        ? currentAttempt
+        : {
+          publicId,
+          idempotencyKey: crypto.randomUUID(),
+          payload,
+        };
+      admissionAttemptRef.current = attempt;
+      saveAdmissionAttempt(publicId, attempt);
       const session = await client.admit(
         publicId,
         bootstrap,
-        crypto.randomUUID(),
+        attempt.idempotencyKey,
       );
       admitted = true;
       setSessionId(session.session_id);
       setGuestCsrf(session.csrf_token);
       setSessionState(session.state);
       saveSession(publicId, session.session_id, session.csrf_token);
+      clearSavedAdmissionAttempt(publicId);
+      admissionAttemptRef.current = null;
       await connectTransport(session);
     } catch (startError) {
       setError(messageFor(startError));
+      if (
+        !admitted &&
+        startError instanceof PublicGuestApiError &&
+        startError.status >= 400 &&
+        startError.status < 500
+      ) {
+        clearSavedAdmissionAttempt(publicId);
+        admissionAttemptRef.current = null;
+      }
       if (!["ending", "ended"].includes(pageStateRef.current)) {
         showState(admitted ? "disconnected" : "ready");
       }
