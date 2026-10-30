@@ -113,7 +113,9 @@ test("completed cancellation shows status and lets users retry failed details", 
   await page.getByRole("button", { name: "Cancel generation" }).click();
   await expect(page.getByRole("heading", { name: "COMPLETED", exact: true })).toBeVisible();
   const retryButton = page.getByRole("button", { name: "Retry status check" });
-  await expect(page.getByRole("alert")).toContainText("Temporary job detail failure");
+  await expect(
+    page.getByRole("alert").filter({ hasText: "Temporary job detail failure" })
+  ).toContainText("Temporary job detail failure");
   await expect(retryButton).toBeVisible();
   expect(completionReads).toBe(1);
   await expect(page.getByText("Generation completed without a proposal. No agent draft was created.")).toHaveCount(0);
