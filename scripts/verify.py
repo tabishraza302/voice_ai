@@ -31,13 +31,16 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tests.support.qualification import (
+    RELEASE_REQUIRED_GATES,
     GateCounts,
+    load_audio_fixture_manifest,
     parse_bun_output,
     parse_junit_xml,
     parse_playwright_json,
-    prerequisite_action,
     redact_secrets,
     require_gate,
+    validate_deployment_config,
+    validate_release_manifest,
 )
 from tests.support.tls import generate_ephemeral_loopback_cert
 
@@ -346,7 +349,7 @@ def build_gate_command(gate: str, repo_root: Path) -> list[str]:
             "run",
             "--frozen",
             "pytest",
-            "tests/qualification/test_voice_audio_input.py",
+            "tests/qualification/test_audio_qualification.py",
             "tests/qualification/test_flow_adapter.py",
             "--strict-markers",
         ]
@@ -356,7 +359,7 @@ def build_gate_command(gate: str, repo_root: Path) -> list[str]:
             "run",
             "--frozen",
             "pytest",
-            "tests/qualification/test_voice_audio_input.py",
+            "tests/qualification/test_audio_qualification.py",
             "tests/qualification/test_flow_adapter.py",
             "tests/qualification/test_public_transport.py",
             "--strict-markers",
@@ -367,11 +370,11 @@ def build_gate_command(gate: str, repo_root: Path) -> list[str]:
             "run",
             "--frozen",
             "pytest",
-            "tests/qualification/test_backup_restore.py",
+            "tests/qualification/test_release_manifest.py",
+            "tests/qualification/test_backup_restore_acceptance.py",
             "tests/qualification/test_release_evidence.py",
             "--strict-markers",
         ]
-    raise ValueError(f"unknown gate: {gate}")
 
 
 class VerificationHarness:
@@ -411,6 +414,7 @@ class VerificationHarness:
 
         self.commands_recorded: list[dict[str, Any]] = []
         self.results: dict[str, dict[str, Any]] = {}
+        self.required_gates: list[str] = []
         self.explicit_secrets: set[str] = set()
 
     def register_secret(self, secret: str | None) -> None:
@@ -490,7 +494,18 @@ class VerificationHarness:
         except Exception:
             pass
 
+        gate_records: dict[str, dict[str, Any]] = {}
+        for gate_name, data in self.results.items():
+            record = dict(data)
+            if not record.get("reason"):
+                record["reason"] = (
+                    "gate passed" if record.get("status") == "passed"
+                    else f"gate {gate_name} has no explicit outcome reason"
+                )
+            gate_records[gate_name] = record
+        required_gates = list(self.required_gates or gate_records)
         manifest = {
+            "manifest_version": 1,
             "run_dir": str(self.run_dir),
             "created_at": datetime.now(timezone.utc).isoformat(),
             "commit": commit,
@@ -498,37 +513,70 @@ class VerificationHarness:
             "uv_lock_sha256": uv_hash,
             "bun_lock_sha256": bun_hash,
             "pyproject_toml_sha256": pyproject_hash,
+            "required_gates": required_gates,
+            "gates": gate_records,
+            "overall_success": bool(required_gates)
+            and all(gate_records.get(name, {}).get("status") == "passed" for name in required_gates)
+            and gate_records.get("cleanup", {}).get("status", "passed") == "passed",
         }
         self.manifest_file.write_text(json.dumps(manifest, indent=2))
 
     def write_result(self, target_gates: list[str] | None = None) -> int:
-        if target_gates is not None:
-            overall_passed = bool(target_gates) and all(
-                self.results.get(g, {}).get("status") == "passed" for g in target_gates
-            )
-        else:
-            overall_passed = bool(self.results) and all(
-                data.get("status") == "passed" for data in self.results.values()
-            )
-
-        for gate_name, data in self.results.items():
-            if data.get("status") != "passed":
-                if not data.get("reason"):
-                    data["reason"] = f"gate {gate_name} failed without explicit reason"
+        required_gates = list(
+            target_gates if target_gates is not None
+            else self.required_gates or list(self.results)
+        )
+        self.required_gates = required_gates
+        for gate_name in required_gates:
+            if gate_name not in self.results:
+                self.results[gate_name] = {
+                    "status": "failed",
+                    "reason": "required gate missing from verifier results",
+                }
 
         if self.lifecycle.cleanup_failed:
-            overall_passed = False
             self.results["cleanup"] = {
                 "status": "failed",
                 "reason": "verifier cleanup encountered errors",
             }
 
+        for gate_name, data in self.results.items():
+            reason = data.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                data["reason"] = (
+                    "gate passed" if data.get("status") == "passed"
+                    else f"gate {gate_name} failed without explicit reason"
+                )
+
+        overall_passed = bool(required_gates) and all(
+            self.results.get(gate, {}).get("status") == "passed" for gate in required_gates
+        ) and not self.lifecycle.cleanup_failed
+        self.write_manifest()
+        manifest_validation_error = None
+        try:
+            manifest = json.loads(self.manifest_file.read_text(encoding="utf-8"))
+            manifest_passed = validate_release_manifest(manifest, required_gates=required_gates)
+            overall_passed = overall_passed and manifest_passed
+        except Exception as err:
+            manifest_validation_error = redact_secrets(str(err))
+            overall_passed = False
+            try:
+                manifest = json.loads(self.manifest_file.read_text(encoding="utf-8"))
+                manifest["overall_success"] = False
+                manifest["validation_error"] = manifest_validation_error
+                self.manifest_file.write_text(json.dumps(manifest, indent=2))
+            except Exception:
+                pass
+
         payload = {
             "overall_success": overall_passed,
             "gates": self.results,
         }
+        if manifest_validation_error:
+            payload["manifest_validation_error"] = manifest_validation_error
         self.result_file.write_text(json.dumps(payload, indent=2))
         return 0 if overall_passed else 1
+
 
     def _build_sanitized_env(self, env: dict[str, str] | None = None) -> dict[str, str]:
         allowed_sys_keys = {
@@ -1637,34 +1685,48 @@ class VerificationHarness:
         self.write_manifest()
         gate_name = "voice_local_offline" if profile == "local_offline" else "voice_deployment"
         try:
-            audio_root = os.environ.get("VERIFY_AUDIO_ROOT")
-            action = prerequisite_action(available=bool(audio_root), required=True)
-            if action != "run":
+            config_path: Path | None = None
+            try:
+                audio_root_value = os.environ.get("VERIFY_AUDIO_ROOT")
+                if not audio_root_value:
+                    raise ValueError("VERIFY_AUDIO_ROOT missing for voice qualification")
+                audio_root = Path(audio_root_value)
+                if not audio_root.is_absolute() or not audio_root.is_dir():
+                    raise FileNotFoundError(f"required absolute VERIFY_AUDIO_ROOT directory missing: {audio_root}")
+                load_audio_fixture_manifest(audio_root / "audio_manifest.json")
+                if profile == "deployment":
+                    if not config:
+                        raise FileNotFoundError("deployment qualification config is required")
+                    config_path = Path(config)
+                    if not config_path.is_absolute() or not config_path.is_file():
+                        raise FileNotFoundError(f"required absolute qualification config missing: {config_path}")
+                    validate_deployment_config(json.loads(config_path.read_text(encoding="utf-8")))
+            except Exception as e:
                 self.results[gate_name] = {
                     "status": "failed",
-                    "reason": "VERIFY_AUDIO_ROOT missing for voice qualification",
+                    "reason": redact_secrets(str(e)),
                 }
-                if standalone:
-                    return self.write_result(target_gates=[gate_name])
-                return 1
-
-            junit_xml = self.run_dir / "audio.xml"
-            cmd = build_gate_command(gate_name, self.repo_root) + [f"--junitxml={junit_xml}"]
-            env = {
-                "RUN_AUDIO_QUALIFICATION": "1",
-                "VERIFY_QUALIFICATION_CONFIG": config or "",
-            }
-
-            rc, out, err = self.run_cmd("voice_qualification", cmd, env=env)
-            try:
-                if rc != 0:
-                    raise ValueError(f"voice qualification exited with code {rc}: {redact_secrets(err or out)}")
-                counts = parse_junit_xml(junit_xml)
-                require_gate(counts)
-            except Exception as e:
-                self.results[gate_name] = {"status": "failed", "reason": redact_secrets(str(e))}
             else:
-                self.results[gate_name] = {"status": "passed", "counts": counts.__dict__}
+                junit_xml = self.run_dir / "audio.xml"
+                cmd = build_gate_command(gate_name, self.repo_root) + [f"--junitxml={junit_xml}"]
+                env = {
+                    "RUN_AUDIO_QUALIFICATION": "1",
+                    "RUN_TRANSPORT_QUALIFICATION": "1" if profile == "deployment" else "0",
+                    "VERIFY_AUDIO_ROOT": str(audio_root),
+                    "VERIFY_ARTIFACT_DIR": str(self.run_dir.resolve()),
+                    "VERIFY_QUALIFICATION_CONFIG": str(config_path) if config_path else "",
+                    "VERIFY_PROFILE": profile,
+                }
+                rc, out, err = self.run_cmd("voice_qualification", cmd, env=env)
+                try:
+                    if rc != 0:
+                        raise ValueError(f"voice qualification exited with code {rc}: {redact_secrets(err or out)}")
+                    counts = parse_junit_xml(junit_xml)
+                    require_gate(counts)
+                except Exception as e:
+                    self.results[gate_name] = {"status": "failed", "reason": redact_secrets(str(e))}
+                else:
+                    self.results[gate_name] = {"status": "passed", "counts": counts.__dict__}
         finally:
             try:
                 self.lifecycle.cleanup()
@@ -1681,23 +1743,14 @@ class VerificationHarness:
 
     def release(self, profile: str, config: str | None = None) -> int:
         print("==> Running verify release gate...")
-        self.write_manifest()
 
-        required_gates = [
-            "python_unit",
-            "bun_test",
-            "bun_typecheck",
-            "bun_build",
-            "postgres_gate",
-            "browser_gate",
-            "voice_local_offline",
-            "voice_deployment",
-            "release_evidence",
-        ]
+        required_gates = list(RELEASE_REQUIRED_GATES)
+        self.required_gates = required_gates
         for g in required_gates:
             self.results[g] = {"status": "not_run", "reason": "pending execution"}
+        self.write_manifest()
 
-        # Profile validation: release gate requires deployment profile and reviewed config
+        # Profile validation: release gate requires a reviewed deployment configuration.
         if profile != "deployment":
             for g in required_gates:
                 self.results[g] = {"status": "not_run", "reason": "release gate requires --profile deployment"}
@@ -1707,14 +1760,33 @@ class VerificationHarness:
             }
             return self.write_result(target_gates=required_gates)
 
-        if not config or not Path(config).is_file():
+        config_path = Path(config) if config else None
+        try:
+            if config_path is None or not config_path.is_absolute() or not config_path.is_file():
+                raise FileNotFoundError("reviewed qualification config must be an existing absolute JSON path")
+            config_data = json.loads(config_path.read_text(encoding="utf-8"))
+            validate_deployment_config(config_data)
+        except Exception as e:
+            reason = redact_secrets(f"reviewed qualification config invalid: {e}")
             for g in required_gates:
-                self.results[g] = {"status": "not_run", "reason": f"reviewed qualification config JSON missing or invalid: {config}"}
-            self.results["release_evidence"] = {
-                "status": "failed",
-                "reason": f"reviewed qualification config JSON missing or invalid: {config}",
-            }
+                self.results[g] = {"status": "not_run", "reason": reason}
+            self.results["release_evidence"] = {"status": "failed", "reason": reason}
             return self.write_result(target_gates=required_gates)
+
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=self.repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if status.returncode != 0 or status.stdout.strip():
+            reason = "release qualification requires a clean committed worktree"
+            for g in required_gates:
+                self.results[g] = {"status": "not_run", "reason": reason}
+            self.results["release_evidence"] = {"status": "failed", "reason": reason}
+            return self.write_result(target_gates=required_gates)
+
 
         # 1. unit gate (python_unit, bun_test, bun_typecheck, bun_build)
         unit_rc = self.unit(standalone=False)
@@ -1755,11 +1827,16 @@ class VerificationHarness:
                 self.results["release_evidence"]["reason"] = "prerequisite voice deployment gate failed"
             return self.write_result(target_gates=required_gates)
 
-        # 6. release evidence tests
+        # 6. release evidence tests inspect completed prerequisite reports.
+        self.write_manifest()
         try:
             junit_xml = self.run_dir / "release-evidence.xml"
             cmd = build_gate_command("release", self.repo_root) + [f"--junitxml={junit_xml}"]
-            rc, out, err = self.run_cmd("release_evidence", cmd)
+            evidence_env = {
+                "VERIFY_ARTIFACT_DIR": str(self.run_dir.resolve()),
+                "VERIFY_QUALIFICATION_CONFIG": str(Path(config).resolve()),
+            }
+            rc, out, err = self.run_cmd("release_evidence", cmd, env=evidence_env)
             try:
                 if rc != 0:
                     raise ValueError(f"release evidence tests exited with code {rc}: {redact_secrets(err or out)}")
