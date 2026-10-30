@@ -245,14 +245,14 @@ test("a definitive guest admission rejection allows a new operation key", async 
     name: "I have read and acknowledge the disclosure above.",
   }).check();
   await page.getByRole("button", { name: "Start voice session" }).click();
-  await expect(page.getByRole("alert")).toContainText("The guest admission was rejected.");
+  await expect(page.getByRole("alert").filter({ hasText: "The guest admission was rejected." })).toBeVisible();
 
   await page.reload();
   await page.getByRole("checkbox", {
     name: "I have read and acknowledge the disclosure above.",
   }).check();
   await page.getByRole("button", { name: "Start voice session" }).click();
-  await expect(page.getByRole("alert")).toContainText("The guest admission was rejected.");
+  await expect(page.getByRole("alert").filter({ hasText: "The guest admission was rejected." })).toBeVisible();
 
   expect(admissionRequests).toHaveLength(2);
   expect(admissionRequests[0]?.key).not.toBe("");
