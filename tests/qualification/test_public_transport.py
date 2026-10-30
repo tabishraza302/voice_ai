@@ -116,6 +116,94 @@ def test_editable_runner_fields_and_passed_scenario_labels_are_not_live_proof() 
             execution_key="b" * 64,
         )
 
+
+
+def test_execution_ledger_validator_checks_receipt_chain_and_runner_hmac() -> None:
+    """Synthetic input for the validator only; never used as live qualification evidence."""
+    import hashlib
+    import hmac
+    import uuid
+
+    from bot.flow.canonical import canonical_json_v1
+
+    run_id = "run-20261106T000000Z-12345678"
+    profile_hash = "a" * 64
+    commit = "f" * 40
+    execution_key = "42" * 32
+    scenarios = [{"trace_id": f"trace-{number}"} for number in range(1, 8)]
+    evidence_references = [f"evidence-{number}" for number in range(1, 8)]
+    capability_report = {
+        "adapter_id": "fixture-adapter",
+        "profile_hash": profile_hash,
+        "source_revision": commit,
+        "raw_evidence_references": evidence_references,
+        "report_hash": "b" * 64,
+    }
+    manifest = {
+        name: value
+        for name, value in capability_report.items()
+        if name not in {"cases", "measurements", "budgets", "raw_evidence_references", "report_hash"}
+    }
+    manifest_hash = hashlib.sha256(
+        b"voice-ai/adapter-capability-manifest/v1\0" + canonical_json_v1(manifest)
+    ).hexdigest()
+
+    receipts = []
+    previous_hash = "0" * 64
+    for number, scenario in enumerate(scenarios, start=1):
+        receipt = {
+            "scenario_number": number,
+            "trace_id": scenario["trace_id"],
+            "server_event_id": f"event-{number}",
+            "transaction_id": f"transaction-{number}",
+            "ledger_id": f"ledger-{number}",
+            "evidence_id": evidence_references[number - 1],
+            "previous_receipt_hash": previous_hash,
+        }
+        receipt["receipt_hash"] = hashlib.sha256(
+            b"voice-ai/adapter-execution-receipt/v1\0" + canonical_json_v1(receipt)
+        ).hexdigest()
+        receipts.append(receipt)
+        previous_hash = receipt["receipt_hash"]
+
+    ledger = {
+        "schema_version": 1,
+        "execution_id": str(uuid.uuid4()),
+        "run_id": run_id,
+        "profile_hash": profile_hash,
+        "source_revision": commit,
+        "capability_manifest_hash": manifest_hash,
+        "capability_report_hash": capability_report["report_hash"],
+        "receipts": receipts,
+        "final_receipt_hash": previous_hash,
+    }
+    ledger["hmac_sha256"] = hmac.new(
+        bytes.fromhex(execution_key),
+        b"voice-ai/adapter-execution-ledger/v1\0" + canonical_json_v1(ledger),
+        hashlib.sha256,
+    ).hexdigest()
+
+    qualification._validate_adapter_execution_ledger(
+        ledger,
+        run_id=run_id,
+        profile_hash=profile_hash,
+        source_revision=commit,
+        capability_report=capability_report,
+        scenarios=scenarios,
+        execution_key=execution_key,
+    )
+
+    tampered = dict(ledger, hmac_sha256="0" * 64)
+    with pytest.raises(ValueError, match="execution ledger HMAC is invalid"):
+        qualification._validate_adapter_execution_ledger(
+            tampered,
+            run_id=run_id,
+            profile_hash=profile_hash,
+            source_revision=commit,
+            capability_report=capability_report,
+            scenarios=scenarios,
+            execution_key=execution_key,
+        )
 def test_transport_report_requires_current_run_qualified_adapter_scenarios() -> None:
     if os.environ.get("RUN_TRANSPORT_QUALIFICATION") != "1":
         pytest.skip("deployment transport qualification is not enabled")
