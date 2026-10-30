@@ -269,6 +269,11 @@ async def publish_agent_version(
 
     # 9. Resolve the active platform policy revision.
     prompt_version = await ensure_default_policy_version(db)
+    if compute_policy_hash(prompt_version.prompt_text) != prompt_version.policy_hash:
+        raise ValidationError(
+            "Active platform policy text does not match its pinned hash",
+            fields=[{"field": "policy", "code": "HASH_MISMATCH"}],
+        )
 
     # 10. Extract the flow and provider/voice settings from the draft envelope.
     try:
@@ -320,6 +325,7 @@ async def publish_agent_version(
             "version": prompt_version.version,
             "slug": prompt_version.slug,
             "policy_hash": prompt_version.policy_hash,
+            "prompt_text": prompt_version.prompt_text,
         },
         "persona_prompt": agent.persona_prompt,
         "model_pins": {
@@ -354,6 +360,15 @@ async def publish_agent_version(
         raise ValidationError(
             "Immutable configuration scrubbing changed the compiled manifest",
             fields=[{"field": "", "code": "SECRET_NOT_ALLOWED"}],
+        )
+    if (
+        immutable_config["policy"]["prompt_text"] != prompt_version.prompt_text
+        or compute_policy_hash(immutable_config["policy"]["prompt_text"])
+        != prompt_version.policy_hash
+    ):
+        raise ValidationError(
+            "Immutable policy text does not match its pinned hash",
+            fields=[{"field": "policy", "code": "HASH_MISMATCH"}],
         )
 
     # 14. Determine the next append-only version number for this agent. The

@@ -9,19 +9,27 @@ Follows accounting-contract.md and verification-plan.md Phase 5:
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 import uuid
 import pytest
 from sqlalchemy import select
 
-from platform_api.billing.models import CallBudget, WalletAccount, WalletEntry
+from platform_api.billing.models import (
+    BillingOperation,
+    CallBudget,
+    WalletAccount,
+    WalletEntry,
+)
 from platform_api.models.session import Session
+from platform_api.billing import service as billing_service
 from platform_api.billing.service import (
     ConflictError,
     RuntimePrincipal,
     checkpoint_and_reserve,
     close_budget,
     expire_stopped_budget,
+    recover_expired_budgets,
 )
 from tests.support.billing import (
     assert_wallet_invariants,
@@ -177,6 +185,263 @@ async def test_unknown_usage_is_not_guessed_or_automatically_refunded(fresh_pg: 
         # Unproven time was waived; balance returns to full 100 paise
         await assert_wallet_invariants(db, user_id=user.id)
 
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_recovery_sweep_waits_for_expiry_then_releases_crashed_runner_hold(
+    fresh_pg: FreshPostgres,
+):
+    """The scheduled sweep cannot reclaim a live permit and waives unknown usage afterward."""
+    await fresh_pg.initialize()
+    t0 = datetime(2026, 10, 28, 12, 0, 0, tzinfo=timezone.utc)
+
+    async with fresh_pg.new_session() as db:
+        user = await create_test_user(db)
+        await create_funded_wallet(db, user_id=user.id, credited_minor=100)
+        session, _ = await create_test_session(
+            db, owner_user_id=user.id, runner_id="runner-expiry-sweep"
+        )
+        permit = await checkpoint_and_reserve(
+            db,
+            runtime_principal=RuntimePrincipal(runner_id="runner-expiry-sweep"),
+            session_id=session.id,
+            operation_id="grant-expiry-sweep",
+            expected_budget_version=1,
+            cumulative_billable_ms=0,
+            requested_future_ms=10_000,
+            billing_slice_ms=10_000,
+            permit_ttl_ms=5_000,
+            now=t0,
+        )
+
+    async with fresh_pg.new_session() as db:
+        recovered = await recover_expired_budgets(
+            db, now=permit.expires_at - timedelta(microseconds=1)
+        )
+        assert recovered == 0
+        budget = (
+            await db.execute(
+                select(CallBudget).where(CallBudget.session_id == session.id)
+            )
+        ).scalar_one()
+        wallet = (
+            await db.execute(
+                select(WalletAccount).where(WalletAccount.user_id == user.id)
+            )
+        ).scalar_one()
+        assert budget.status == "OPEN"
+        assert budget.reserved_minor == 34
+        assert wallet.reserved_minor == 34
+
+    async with fresh_pg.new_session() as db:
+        recovered = await recover_expired_budgets(
+            db, now=permit.expires_at + timedelta(seconds=1)
+        )
+        assert recovered == 1
+        budget = (
+            await db.execute(
+                select(CallBudget).where(CallBudget.session_id == session.id)
+            )
+        ).scalar_one()
+        wallet = (
+            await db.execute(
+                select(WalletAccount).where(WalletAccount.user_id == user.id)
+            )
+        ).scalar_one()
+        charge_entries = (
+            await db.execute(
+                select(WalletEntry).where(
+                    WalletEntry.session_id == session.id,
+                    WalletEntry.kind == "charge",
+                )
+            )
+        ).scalars().all()
+        assert budget.status == "CLOSED"
+        assert budget.waived_unknown_usage is True
+        assert budget.cumulative_proven_ms == 0
+        assert budget.cumulative_charged_minor == 0
+        assert budget.reserved_minor == 0
+        assert wallet.posted_minor == 100
+        assert wallet.reserved_minor == 0
+        assert charge_entries == []
+        await assert_wallet_invariants(db, user_id=user.id)
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_recovery_rechecks_permit_renewed_after_candidate_scan(
+    fresh_pg: FreshPostgres,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A permit renewed after selection remains funded when expiry recovery locks it."""
+    await fresh_pg.initialize()
+    t0 = datetime(2026, 10, 28, 12, 0, 0, tzinfo=timezone.utc)
+
+    async with fresh_pg.new_session() as db:
+        user = await create_test_user(db)
+        await create_funded_wallet(db, user_id=user.id, credited_minor=100)
+        session, _ = await create_test_session(
+            db, owner_user_id=user.id, runner_id="runner-renewed-expiry"
+        )
+        original_permit = await checkpoint_and_reserve(
+            db,
+            runtime_principal=RuntimePrincipal(runner_id="runner-renewed-expiry"),
+            session_id=session.id,
+            operation_id="grant-renewed-expiry",
+            expected_budget_version=1,
+            cumulative_billable_ms=0,
+            requested_future_ms=10_000,
+            billing_slice_ms=10_000,
+            permit_ttl_ms=5_000,
+            now=t0,
+        )
+
+    original_expire = billing_service.expire_stopped_budget
+    renewal_time = original_permit.expires_at + timedelta(milliseconds=500)
+    recovery_time = original_permit.expires_at + timedelta(seconds=1)
+
+    async def renew_before_expiring(db, *, session_id, operation_id, now):
+        await checkpoint_and_reserve(
+            db,
+            runtime_principal=RuntimePrincipal(runner_id="runner-renewed-expiry"),
+            session_id=session_id,
+            operation_id="renew-racing-recovery",
+            expected_budget_version=2,
+            cumulative_billable_ms=0,
+            requested_future_ms=10_000,
+            billing_slice_ms=10_000,
+            permit_ttl_ms=5_000,
+            now=renewal_time,
+        )
+        return await original_expire(
+            db, session_id=session_id, operation_id=operation_id, now=now
+        )
+
+    monkeypatch.setattr(
+        billing_service, "expire_stopped_budget", renew_before_expiring
+    )
+    async with fresh_pg.new_session() as db:
+        assert await recover_expired_budgets(db, now=recovery_time) == 0
+
+    async with fresh_pg.new_session() as db:
+        budget = (
+            await db.execute(
+                select(CallBudget).where(CallBudget.session_id == session.id)
+            )
+        ).scalar_one()
+        wallet = (
+            await db.execute(
+                select(WalletAccount).where(WalletAccount.user_id == user.id)
+            )
+        ).scalar_one()
+        assert budget.status == "OPEN"
+        assert budget.permit_expiry > recovery_time
+        assert budget.reserved_minor == 34
+        assert wallet.reserved_minor == 34
+        await assert_wallet_invariants(db, user_id=user.id)
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_concurrent_recovery_sweeps_commit_one_proven_settlement(
+    fresh_pg: FreshPostgres,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Two sweeps racing a lost runner use one stable operation and release funds once."""
+    await fresh_pg.initialize()
+    t0 = datetime(2026, 10, 28, 12, 0, 0, tzinfo=timezone.utc)
+
+    async with fresh_pg.new_session() as db:
+        user = await create_test_user(db)
+        await create_funded_wallet(db, user_id=user.id, credited_minor=200)
+        session, _ = await create_test_session(
+            db,
+            owner_user_id=user.id,
+            runner_id="runner-concurrent-expiry",
+            created_at=t0,
+        )
+        await checkpoint_and_reserve(
+            db,
+            runtime_principal=RuntimePrincipal(runner_id="runner-concurrent-expiry"),
+            session_id=session.id,
+            operation_id="grant-concurrent-expiry",
+            expected_budget_version=1,
+            cumulative_billable_ms=0,
+            requested_future_ms=10_000,
+            billing_slice_ms=10_000,
+            permit_ttl_ms=5_000,
+            now=t0,
+        )
+        await checkpoint_and_reserve(
+            db,
+            runtime_principal=RuntimePrincipal(runner_id="runner-concurrent-expiry"),
+            session_id=session.id,
+            operation_id="proof-concurrent-expiry",
+            expected_budget_version=2,
+            cumulative_billable_ms=3_000,
+            requested_future_ms=7_000,
+            billing_slice_ms=10_000,
+            permit_ttl_ms=5_000,
+            now=t0 + timedelta(seconds=1),
+        )
+
+    original_expire = billing_service.expire_stopped_budget
+    both_selected = asyncio.Barrier(2)
+
+    async def synchronize_expiration(db, **kwargs):
+        await both_selected.wait()
+        return await original_expire(db, **kwargs)
+
+    monkeypatch.setattr(
+        billing_service, "expire_stopped_budget", synchronize_expiration
+    )
+    recovered_at = t0 + timedelta(seconds=7)
+
+    async def sweep():
+        async with fresh_pg.new_session() as db:
+            return await recover_expired_budgets(db, now=recovered_at)
+
+    await asyncio.gather(sweep(), sweep())
+
+    async with fresh_pg.new_session() as db:
+        budget = (
+            await db.execute(
+                select(CallBudget).where(CallBudget.session_id == session.id)
+            )
+        ).scalar_one()
+        wallet = (
+            await db.execute(
+                select(WalletAccount).where(WalletAccount.user_id == user.id)
+            )
+        ).scalar_one()
+        recovery_operations = (
+            await db.execute(
+                select(BillingOperation).where(
+                    BillingOperation.session_id == session.id,
+                    BillingOperation.operation_id
+                    == f"runner_lost_expired:{session.id}",
+                )
+            )
+        ).scalars().all()
+        charge_entries = (
+            await db.execute(
+                select(WalletEntry).where(
+                    WalletEntry.session_id == session.id,
+                    WalletEntry.kind == "charge",
+                )
+            )
+        ).scalars().all()
+        assert budget.status == "CLOSED"
+        assert budget.cumulative_proven_ms == 3_000
+        assert budget.cumulative_charged_minor == 10
+        assert budget.waived_unknown_usage is True
+        assert budget.reserved_minor == 0
+        assert wallet.posted_minor == 190
+        assert wallet.reserved_minor == 0
+        assert len(recovery_operations) == 1
+        assert len(charge_entries) == 1
+        assert charge_entries[0].amount_minor == -10
+        await assert_wallet_invariants(db, user_id=user.id)
 
 @pytest.mark.postgres
 @pytest.mark.asyncio

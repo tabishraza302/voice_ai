@@ -27,6 +27,7 @@ from platform_api.agents.config import (
     compute_settings_hash,
     compute_voice_hash,
 )
+from platform_api.agents.defaults import compute_policy_hash
 from platform_api.agents.models import (
     Agent,
     AgentVersion,
@@ -40,6 +41,7 @@ from platform_api.agents.service import (
     lock_idempotency_key,
     store_idempotency_record,
 )
+from platform_api.audit import record_audit
 from platform_api.auth.errors import (
     ConflictError,
     DependencyUnavailableError,
@@ -62,6 +64,7 @@ from platform_api.billing.service import (
     close_budget,
     create_call_budget,
 )
+from platform_api.billing.tariffs import resolve_active_tariff
 from platform_api.config import PlatformSettings
 from platform_api.models.auth import AuthSession, User
 from platform_api.models.session import Session
@@ -74,6 +77,7 @@ from platform_api.sessions.admission import (
     session_admission_config,
     session_runtime_config,
 )
+from platform_api.sessions.admission_policy import check_admission_pause
 from platform_api.sessions.models import (
     RunnerCapacity,
     RuntimeRegistration,
@@ -106,6 +110,7 @@ PUBLIC_SESSION_JOIN_ACTION = "public.session.join"
 PUBLIC_SESSION_END_ACTION = "public.session.end"
 SESSION_JOIN_ACTION = "session.join"
 SESSION_END_ACTION = "session.end"
+ADMIN_SESSION_TERMINATE_ACTION = "admin.session.terminate"
 LIVE_SESSION_STATES = frozenset(
     {"RESERVED", "REGISTERED", "CONNECTING", "INITIALIZING", "READY", "ACTIVE", "RECONNECTING", "ENDING"}
 )
@@ -272,6 +277,20 @@ def _validate_immutable_version(
     except (KeyError, TypeError, ValueError) as exc:
         raise ConflictError("Published agent version hashes cannot be verified") from exc
 
+    try:
+        pinned_policy_text = policy["prompt_text"]
+        if not isinstance(pinned_policy_text, str):
+            raise ValueError("Pinned policy text is invalid")
+        pinned_policy_hash = compute_policy_hash(pinned_policy_text)
+        stored_policy_hash = compute_policy_hash(policy_version.prompt_text)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ConflictError("Published policy text cannot be verified") from exc
+    if (
+        pinned_policy_text != policy_version.prompt_text
+        or pinned_policy_hash != policy_version.policy_hash
+        or stored_policy_hash != policy_version.policy_hash
+    ):
+        raise ConflictError("Published policy text does not match its pinned hash")
     expected_hashes = {
         "authoring_hash": authoring_hash,
         "flow_hash": flow_hash,
@@ -528,6 +547,7 @@ async def _create_or_replay_reservation(
         session_admission_config(settings)
     else:
         public_session_admission_config(settings)
+    await check_admission_pause(db, owner.id, agent_id)
     _, _, snapshot = await _load_owned_version(
         db,
         owner_user_id=owner.id,
@@ -539,6 +559,7 @@ async def _create_or_replay_reservation(
         capabilities=capabilities,
         qualification_settings=qualification_settings,
     )
+    tariff = await resolve_active_tariff(db)
     runner_capacity = await _lock_runner_capacity(
         db,
         runner_id=config.runner_id,
@@ -575,10 +596,11 @@ async def _create_or_replay_reservation(
     tariff_snapshot = {
         "kind": session_kind,
         "currency": "INR",
-        "rate_minor_per_minute": config.rate_minor_per_minute,
-        "tariff_version": config.tariff_version,
-        "billing_slice_ms": config.billing_slice_ms,
-        "permit_ttl_ms": config.billing_permit_ttl_ms,
+        "tariff_id": str(tariff.tariff_id),
+        "rate_minor_per_minute": tariff.rate_minor_per_minute,
+        "tariff_version": tariff.tariff_version,
+        "billing_slice_ms": tariff.billing_slice_ms,
+        "permit_ttl_ms": tariff.permit_ttl_ms,
         "maximum_session_duration_ms": config.max_duration_ms,
         "setup_timeout_seconds": config.setup_timeout_seconds,
         "reconnect_grace_seconds": config.reconnect_grace_seconds,
@@ -890,18 +912,50 @@ async def _new_first_permit(
     db: AsyncSession,
     *,
     session_id: uuid.UUID,
-    config: SessionAdmissionConfig,
     now: datetime,
 ) -> BudgetPermit:
+    session = (
+        await db.execute(select(Session).where(Session.id == session_id))
+    ).scalar_one_or_none()
+    if session is None or not session.runner_id:
+        raise ConflictError("First funded session assignment is unavailable")
+    snapshot = session.tariff_snapshot
+    if not isinstance(snapshot, dict):
+        raise ConflictError("First funded session tariff is unavailable")
+    try:
+        rate = snapshot["rate_minor_per_minute"]
+        billing_slice_ms = snapshot["billing_slice_ms"]
+        permit_ttl_ms = snapshot["permit_ttl_ms"]
+        max_duration_ms = snapshot["maximum_session_duration_ms"]
+        tariff_id = snapshot["tariff_id"]
+        tariff_version = snapshot["tariff_version"]
+        uuid.UUID(tariff_id)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ConflictError("First funded session tariff is invalid") from exc
+    if (
+        type(rate) is not int
+        or rate < 0
+        or type(billing_slice_ms) is not int
+        or billing_slice_ms <= 0
+        or type(permit_ttl_ms) is not int
+        or permit_ttl_ms <= 0
+        or type(max_duration_ms) is not int
+        or max_duration_ms <= 0
+        or not isinstance(tariff_version, str)
+        or not tariff_version
+    ):
+        raise ConflictError("First funded session tariff is invalid")
     budget = await create_call_budget(
         db,
         session_id=session_id,
         operation_id=_budget_create_operation_id(session_id),
-        pinned_rate_minor_per_minute=config.rate_minor_per_minute,
+        pinned_rate_minor_per_minute=rate,
         now=now,
     )
-    requested_ms = min(config.billing_slice_ms, config.max_duration_ms)
-    runtime = RuntimePrincipal(runner_id=config.runner_id, service_id="platform-admission")
+    requested_ms = min(billing_slice_ms, max_duration_ms)
+    runtime = RuntimePrincipal(
+        runner_id=session.runner_id, service_id="platform-admission"
+    )
     permit = await checkpoint_and_reserve(
         db,
         runtime_principal=runtime,
@@ -910,8 +964,8 @@ async def _new_first_permit(
         expected_budget_version=budget.budget_version,
         cumulative_billable_ms=0,
         requested_future_ms=requested_ms,
-        billing_slice_ms=config.billing_slice_ms,
-        permit_ttl_ms=config.billing_permit_ttl_ms,
+        billing_slice_ms=billing_slice_ms,
+        permit_ttl_ms=permit_ttl_ms,
         now=now,
     )
     if permit.expires_at <= now:
@@ -932,8 +986,8 @@ async def _new_first_permit(
             expected_budget_version=current.version,
             cumulative_billable_ms=current.cumulative_proven_ms,
             requested_future_ms=requested_ms,
-            billing_slice_ms=config.billing_slice_ms,
-            permit_ttl_ms=config.billing_permit_ttl_ms,
+            billing_slice_ms=billing_slice_ms,
+            permit_ttl_ms=permit_ttl_ms,
             now=_utc_now(),
         )
     return permit
@@ -1545,7 +1599,6 @@ async def _reserve_session(
         permit = await _new_first_permit(
             db,
             session_id=session_id,
-            config=config,
             now=now,
         )
     except Exception as exc:
@@ -3079,6 +3132,163 @@ async def end_guest_session(
     return view
 
 
+async def terminate_admin_session(
+    db: AsyncSession,
+    *,
+    session_id: uuid.UUID,
+    admin_user_id: uuid.UUID,
+    auth_session_id: uuid.UUID,
+    operation_id: str,
+    request_hash: str,
+    reason: str,
+    request_id: uuid.UUID,
+    source_ip: str | None,
+    settings: PlatformSettings,
+    now: datetime | None = None,
+) -> SessionStateView:
+    """Idempotently request an audited admin stop using the bound runner release path."""
+    config = session_runtime_config(settings)
+    operation_id = _check_operation_id(operation_id)
+    reason = reason.strip()
+    if not 10 <= len(reason) <= 500:
+        raise ValidationError(
+            "Termination reason must contain between 10 and 500 characters",
+            fields=[{"field": "reason", "code": "INVALID_REASON"}],
+        )
+    expected_request_hash = compute_payload_hash(
+        {
+            "admin_user_id": str(admin_user_id),
+            "reason": reason,
+            "session_id": str(session_id),
+        }
+    )
+    if not hmac.compare_digest(request_hash, expected_request_hash):
+        raise ValidationError(
+            "Termination request hash does not match its payload",
+            fields=[{"field": "request", "code": "HASH_MISMATCH"}],
+        )
+    timestamp = now or _utc_now()
+    await lock_idempotency_key(
+        db,
+        user_id=admin_user_id,
+        idempotency_key=operation_id,
+        action=ADMIN_SESSION_TERMINATE_ACTION,
+    )
+    cached = await check_idempotency_record(
+        db,
+        user_id=admin_user_id,
+        idempotency_key=operation_id,
+        action=ADMIN_SESSION_TERMINATE_ACTION,
+        request_hash=request_hash,
+    )
+    if cached is not None:
+        if cached.status_code not in {200, 202}:
+            raise ConflictError("Stored admin session termination is unavailable")
+        try:
+            view = decode_stored_response(SessionStateView, cached.response_json)
+        except PydanticValidationError as exc:
+            raise DependencyUnavailableError(
+                "Stored admin session termination is invalid"
+            ) from exc
+        if view.session_id != session_id:
+            raise DependencyUnavailableError(
+                "Stored admin session termination targets a different session"
+            )
+        await db.commit()
+        if view.state == "ENDING":
+            await _release_execution_slot(
+                db,
+                config=config,
+                session_id=session_id,
+                runner_id=config.runner_id,
+            )
+        return view
+
+    session = (
+        await db.execute(
+            select(Session)
+            .where(Session.id == session_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if session is None:
+        raise NotFoundError("Session not found")
+    previous_state = session.state
+    if session.state in LIVE_SESSION_STATES:
+        if session.state == "RESERVED":
+            raise ConflictError("Session admission is still being resolved")
+        if session.runner_id != config.runner_id:
+            raise DependencyUnavailableError(
+                "Configured runner does not match the existing session assignment"
+            )
+        registration = (
+            await db.execute(
+                select(RuntimeRegistration)
+                .where(RuntimeRegistration.session_id == session_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        slot = (
+            await db.execute(
+                select(SessionSlot)
+                .where(SessionSlot.session_id == session_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if (
+            registration is None
+            or registration.runner_id != session.runner_id
+            or registration.status not in {"REGISTERED", "RELEASED"}
+            or slot is None
+            or slot.runner_id != session.runner_id
+        ):
+            raise DependencyUnavailableError(
+                "Session runtime release records are incomplete"
+            )
+        if session.state != "ENDING":
+            session.state = "ENDING"
+            session.version += 1
+            session.failure_code = None
+    elif session.state not in TERMINAL_SESSION_STATES:
+        raise ConflictError("Session cannot be terminated from its current state")
+
+    view = _session_state_view(session)
+    await store_idempotency_record(
+        db,
+        user_id=admin_user_id,
+        idempotency_key=operation_id,
+        action=ADMIN_SESSION_TERMINATE_ACTION,
+        request_hash=request_hash,
+        status_code=202 if view.state == "ENDING" else 200,
+        response_json=view.model_dump(mode="json"),
+    )
+    await record_audit(
+        db,
+        actor_kind="admin",
+        actor_id=admin_user_id,
+        session_id=auth_session_id,
+        action=ADMIN_SESSION_TERMINATE_ACTION,
+        target_type="session",
+        target_id=session_id,
+        reason=reason,
+        request_id=request_id,
+        source_ip=source_ip,
+        result="success",
+        change_summary={"from_state": previous_state, "to_state": view.state},
+        created_at=timestamp,
+    )
+    await db.commit()
+    if view.state == "ENDING":
+        await _release_execution_slot(
+            db,
+            config=config,
+            session_id=session_id,
+            runner_id=config.runner_id,
+        )
+    return view
+
+
 async def release_peer(
     db: AsyncSession,
     *,
@@ -3328,6 +3538,7 @@ __all__ = [
     "end_guest_session",
     "end_owner_session",
     "get_owner_session",
+    "terminate_admin_session",
     "get_runtime_config",
     "issue_guest_join",
     "issue_join",

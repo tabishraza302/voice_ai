@@ -47,6 +47,7 @@ from platform_api.billing.service import (
     credit_wallet,
     get_wallet_entries,
     get_wallet_view,
+    resolve_session_billing_terms,
 )
 from platform_api.db.session import get_db
 from platform_api.sessions.admission import get_runtime_principal
@@ -196,20 +197,18 @@ async def adjust_user_wallet(
 async def session_budget_checkpoint(
     session_id: uuid.UUID,
     payload: CheckpointRequest,
-    request: Request,
     response: Response,
     principal: RuntimePrincipal = Depends(get_runtime_principal),
     db: AsyncSession = Depends(get_db),
 ) -> BudgetPermit:
-    """Synchronous checkpoint of proven billable time and renewal of cumulative permit."""
+    """Synchronous checkpoint of proven time using the session's pinned tariff."""
     response.headers["Cache-Control"] = "no-store"
-    settings = getattr(request.app.state, "settings", None)
-    slice_ms = getattr(settings, "billing_slice_ms", None) if settings else None
-    ttl_ms = getattr(settings, "billing_permit_ttl_ms", None) if settings else None
-    if slice_ms is None or ttl_ms is None:
-        raise DependencyUnavailableError(
-            "Billing deployment configuration missing: PLATFORM_BILLING_SLICE_MS and PLATFORM_BILLING_PERMIT_TTL_MS must be explicitly configured"
-        )
+    slice_ms, ttl_ms = await _billing_db_call(
+        resolve_session_billing_terms,
+        db,
+        session_id=session_id,
+        runtime_principal=principal,
+    )
     return await _billing_db_call(
         checkpoint_and_reserve,
         db,

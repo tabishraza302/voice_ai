@@ -28,7 +28,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from platform_api.app import create_app
 from platform_api.billing import routes as billing_routes
-from platform_api.billing.schemas import CloseBudgetRequest, RuntimeStopAttestation
+from platform_api.billing.schemas import (
+    CheckpointRequest,
+    CloseBudgetRequest,
+    RuntimeStopAttestation,
+)
 from platform_api.auth.errors import ForbiddenError
 from platform_api.auth.passwords import get_password_hasher
 from platform_api.auth.sessions import create_authenticated_session
@@ -48,6 +52,7 @@ from platform_api.billing.service import (
     close_budget,
     expire_stopped_budget,
     credit_wallet,
+    resolve_session_billing_terms,
 )
 from platform_api.config import PlatformSettings
 from platform_api.models.session import Session
@@ -950,8 +955,8 @@ async def test_cross_runner_replay_disclosure_prevented(fresh_pg: FreshPostgres)
             )
 @pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_deployment_configured_slice_and_ttl_enforced(fresh_pg: FreshPostgres):
-    """Explicit deployment-configured billing_slice_ms and permit_ttl_ms are strictly enforced."""
+async def test_checkpoint_slice_and_ttl_are_enforced(fresh_pg: FreshPostgres):
+    """Checkpoint slice and permit TTL inputs are strictly enforced."""
     await fresh_pg.initialize()
     t0 = datetime(2026, 10, 28, 14, 0, 0, tzinfo=timezone.utc)
 
@@ -1048,6 +1053,118 @@ async def test_budget_close_route_forwards_stop_attestation(
     assert observed["service_call"] is close_budget
     assert observed["stop_attestation"] == attestation
     assert observed["stop_evidence"] == attestation.model_dump(mode="json")
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_checkpoint_uses_assigned_session_tariff_snapshot(
+    fresh_pg: FreshPostgres,
+) -> None:
+    await fresh_pg.initialize()
+    async with fresh_pg.new_session() as db:
+        user = await create_test_user(db)
+        await create_funded_wallet(db, user_id=user.id, credited_minor=1_000)
+        session, budget = await create_test_session(
+            db,
+            owner_user_id=user.id,
+            runner_id="runner-pinned-tariff",
+            pinned_rate=6_000,
+        )
+        session.tariff_snapshot = {
+            "tariff_id": str(uuid.uuid4()),
+            "tariff_version": "v1",
+            "rate_minor_per_minute": 6_000,
+            "billing_slice_ms": 1_000,
+            "permit_ttl_ms": 5_000,
+            "maximum_session_duration_ms": 60_000,
+        }
+        await db.commit()
+
+        terms = await resolve_session_billing_terms(
+            db,
+            session_id=session.id,
+            runtime_principal=RuntimePrincipal(runner_id="runner-pinned-tariff"),
+        )
+        assert terms == (1_000, 5_000)
+        with pytest.raises(ForbiddenError):
+            await resolve_session_billing_terms(
+                db,
+                session_id=session.id,
+                runtime_principal=RuntimePrincipal(runner_id="runner-other"),
+            )
+        with pytest.raises(ConflictError, match="immutable session tariff"):
+            await checkpoint_and_reserve(
+                db,
+                runtime_principal=RuntimePrincipal(runner_id="runner-pinned-tariff"),
+                session_id=session.id,
+                operation_id="wrong-pinned-terms",
+                expected_budget_version=budget.version,
+                cumulative_billable_ms=0,
+                requested_future_ms=1_000,
+                billing_slice_ms=2_000,
+                permit_ttl_ms=5_000,
+            )
+
+
+@pytest.mark.asyncio
+async def test_budget_checkpoint_route_uses_pinned_session_terms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = uuid.uuid4()
+    principal = RuntimePrincipal(runner_id="runner-alpha")
+    payload = CheckpointRequest(
+        operation_id="http-checkpoint-pinned-tariff",
+        expected_budget_version=2,
+        cumulative_billable_ms=0,
+        requested_future_ms=10_000,
+    )
+    sentinel = object()
+    observed: dict[str, object] = {}
+
+    async def resolve_terms(db, **kwargs):
+        observed["resolve_db"] = db
+        observed["resolve_kwargs"] = kwargs
+        return 1_000, 5_000
+
+    async def capture_checkpoint(db, **kwargs):
+        observed["checkpoint_db"] = db
+        observed["checkpoint_kwargs"] = kwargs
+        return sentinel
+
+    async def dispatch(service_call, db, **kwargs):
+        return await service_call(db, **kwargs)
+
+    monkeypatch.setattr(billing_routes, "_billing_db_call", dispatch)
+    monkeypatch.setattr(billing_routes, "resolve_session_billing_terms", resolve_terms)
+    monkeypatch.setattr(billing_routes, "checkpoint_and_reserve", capture_checkpoint)
+
+    response = Response()
+    db = object()
+    result = await billing_routes.session_budget_checkpoint(
+        session_id=session_id,
+        payload=payload,
+        response=response,
+        principal=principal,
+        db=db,
+    )
+
+    assert result is sentinel
+    assert response.headers["Cache-Control"] == "no-store"
+    assert observed["resolve_db"] is db
+    assert observed["resolve_kwargs"] == {
+        "session_id": session_id,
+        "runtime_principal": principal,
+    }
+    assert observed["checkpoint_db"] is db
+    assert observed["checkpoint_kwargs"] == {
+        "runtime_principal": principal,
+        "session_id": session_id,
+        "operation_id": payload.operation_id,
+        "expected_budget_version": payload.expected_budget_version,
+        "cumulative_billable_ms": payload.cumulative_billable_ms,
+        "requested_future_ms": payload.requested_future_ms,
+        "billing_slice_ms": 1_000,
+        "permit_ttl_ms": 5_000,
+    }
 
 
 @pytest.mark.postgres

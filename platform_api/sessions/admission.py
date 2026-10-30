@@ -49,10 +49,6 @@ class SessionAdmissionConfig:
     max_duration_ms: int
     setup_timeout_seconds: int
     reconnect_grace_seconds: int
-    rate_minor_per_minute: int
-    tariff_version: str
-    billing_slice_ms: int
-    billing_permit_ttl_ms: int
     runtime_timeout_seconds: float
 
 
@@ -179,10 +175,6 @@ def session_runtime_config(settings: PlatformSettings) -> SessionAdmissionConfig
         "PLATFORM_SESSION_MAX_DURATION_MS": settings.session_max_duration_ms,
         "PLATFORM_SESSION_SETUP_TIMEOUT_SECONDS": settings.session_setup_timeout_seconds,
         "PLATFORM_SESSION_RECONNECT_GRACE_SECONDS": settings.session_reconnect_grace_seconds,
-        "PLATFORM_SESSION_RATE_MINOR_PER_MINUTE": settings.session_rate_minor_per_minute,
-        "PLATFORM_SESSION_TARIFF_VERSION": settings.session_tariff_version,
-        "PLATFORM_BILLING_SLICE_MS": settings.billing_slice_ms,
-        "PLATFORM_BILLING_PERMIT_TTL_MS": settings.billing_permit_ttl_ms,
         "PLATFORM_SESSION_RUNTIME_TIMEOUT_SECONDS": settings.session_runtime_timeout_seconds,
     }
     missing = [name for name, value in required.items() if value is None]
@@ -278,10 +270,6 @@ def session_runtime_config(settings: PlatformSettings) -> SessionAdmissionConfig
         max_duration_ms=settings.session_max_duration_ms,
         setup_timeout_seconds=settings.session_setup_timeout_seconds,
         reconnect_grace_seconds=settings.session_reconnect_grace_seconds,
-        rate_minor_per_minute=settings.session_rate_minor_per_minute,
-        tariff_version=settings.session_tariff_version,
-        billing_slice_ms=settings.billing_slice_ms,
-        billing_permit_ttl_ms=settings.billing_permit_ttl_ms,
         runtime_timeout_seconds=settings.session_runtime_timeout_seconds,
     )
 
