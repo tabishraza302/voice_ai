@@ -103,19 +103,28 @@ class FreshPostgres:
         schema: str = "platform",
         expected_version: str = "platform-v1",
         metadata_hash: str | None = None,
+        initial_tariff=None,
     ) -> None:
-        """Initialize platform schema using production schema initializer."""
+        """Initialize platform schema using explicit test-only tariff seed data."""
+        from platform_api.billing.tariffs import InitialSessionTariff
         from platform_api.db.schema import initialize_schema, compute_metadata_hash
         from platform_api.db.base import Base
 
         if metadata_hash is None:
             metadata_hash = compute_metadata_hash(Base.metadata)
+        if initial_tariff is None:
+            initial_tariff = InitialSessionTariff(
+                rate_minor_per_minute=6000,
+                billing_slice_ms=1000,
+                permit_ttl_ms=5000,
+            )
 
         await initialize_schema(
             self.engine,
             schema=schema,
             expected_version=expected_version,
             metadata_hash=metadata_hash,
+            initial_tariff=initial_tariff,
         )
     async def dispose(self) -> None:
         await self.engine.dispose()

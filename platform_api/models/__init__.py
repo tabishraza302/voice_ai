@@ -6,6 +6,9 @@ Completely isolated from bot.db.
 
 from platform_api.db.base import Base
 from platform_api.db.schema import SchemaInfo
+from platform_api.models.admission_pause import AdmissionPause
+from platform_api.models.tariff import ActiveSessionTariff, SessionTariffRecord
+from platform_api.models.transcript_policy import TranscriptCorrection, TranscriptPolicy
 from platform_api.models.wallet import WalletAccount
 from platform_api.models.auth import (
     AuditLog,
@@ -62,6 +65,11 @@ __all__ = [
     "AuthRateLimit",
     "AuthMail",
     "AuditLog",
+    "AdmissionPause",
+    "ActiveSessionTariff",
+    "SessionTariffRecord",
+    "TranscriptPolicy",
+    "TranscriptCorrection",
     "WalletAccount",
     "WalletEntry",
     "CallBudget",

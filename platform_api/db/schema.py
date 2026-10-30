@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from sqlalchemy import (
     CheckConstraint,
@@ -30,6 +30,9 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sqlalchemy.orm import Mapped, mapped_column
 
 from platform_api.db.base import Base, DEFAULT_PLATFORM_SCHEMA
+if TYPE_CHECKING:
+    from platform_api.billing.tariffs import InitialSessionTariff
+
 
 # Unique 64-bit advisory lock ID for serializing platform schema operations
 PLATFORM_SCHEMA_ADVISORY_LOCK_ID = 8100984920448107368
@@ -278,17 +281,17 @@ async def initialize_schema(
     schema: str = DEFAULT_PLATFORM_SCHEMA,
     expected_version: str = "platform-v1",
     metadata_hash: str | None = None,
+    initial_tariff: InitialSessionTariff | None = None,
 ) -> None:
-    """Initialize fresh platform PostgreSQL schema or verify identical existing schema.
+    """Initialize or verify the platform schema; fresh setup requires an explicit tariff seed.
 
     Serialized with PostgreSQL transaction-level advisory lock.
     - Non-PostgreSQL dialect: raises SchemaMismatch.
-    - Missing or empty platform schema: creates platform schema, tables, and inserts schema_info record.
+    - Missing or empty platform schema: creates tables and records the schema only
+      after persisting the explicitly supplied initial tariff.
     - Non-empty unknown platform schema (lacks schema_info or has unexpected objects): raises SchemaMismatch.
     - Matching schema_info but missing/extra tables or views: raises SchemaMismatch.
-    - Identical recorded schema and tables: safe no-op.
-    - Preserves safety against unknown objects within platform schema while tolerating
-      legitimate local and Phoenix schemas.
+    - Identical recorded schema and tables: safe no-op; initial tariff values are ignored.
     """
     if engine.dialect.name != "postgresql":
         raise SchemaMismatch(
@@ -314,10 +317,17 @@ async def initialize_schema(
 
         inventory = await _inspect_catalog_inventory(conn, schema=schema)
 
-        # 1. Fresh platform schema case: schema missing or completely empty of all user objects
         if inventory.total_user_objects == 0:
+            if initial_tariff is None:
+                raise SchemaMismatch(
+                    "SCHEMA_MISMATCH: Fresh platform schema initialization requires explicit "
+                    "initial session rate, billing slice, and permit TTL values."
+                )
             await conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
             await conn.run_sync(Base.metadata.create_all)
+            from platform_api.billing.tariffs import seed_initial_active_tariff
+
+            await seed_initial_active_tariff(conn, initial_tariff)
             await conn.execute(
                 SchemaInfo.__table__.insert().values(
                     version=expected_version,

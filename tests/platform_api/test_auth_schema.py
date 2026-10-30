@@ -19,7 +19,13 @@ from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from tests.support.postgres import FreshPostgres
-from platform_api.models import User, WalletAccount
+from platform_api.billing.tariffs import InitialSessionTariff
+from platform_api.models import (
+    ActiveSessionTariff,
+    SessionTariffRecord,
+    User,
+    WalletAccount,
+)
 from platform_api.config import PlatformSettings
 from platform_api.db.base import Base
 from platform_api.db.schema import (
@@ -38,6 +44,12 @@ TEST_KEYS = {
     "auth_rate_key": TEST_RATE_KEY,
     "auth_mfa_key": TEST_MFA_KEY,
 }
+
+TEST_INITIAL_TARIFF = InitialSessionTariff(
+    rate_minor_per_minute=6000,
+    billing_slice_ms=1000,
+    permit_ttl_ms=5000,
+)
 
 def test_platform_settings_no_implicit_dotenv(monkeypatch):
     """PlatformSettings must never implicitly load root .env when env vars are absent."""
@@ -241,12 +253,23 @@ async def test_schema_lifecycle_contract(fresh_pg: FreshPostgres):
     Uses the isolated disposable PostgreSQL database from fresh_pg fixture.
     """
     metadata_hash = compute_metadata_hash(Base.metadata)
+    assert {"session_tariff_versions", "active_session_tariff"} <= set(Base.metadata.tables)
 
-    # 1. Fresh schema initialization using production initializer
+    # Missing bootstrap values must not invent a price or create a partial schema.
+    with pytest.raises(SchemaMismatch, match="explicit initial session rate"):
+        await initialize_schema(
+            fresh_pg.engine,
+            expected_version="platform-v1",
+            metadata_hash=metadata_hash,
+        )
+    assert await check_schema_readiness(fresh_pg.engine) is False
+
+    # 1. Fresh schema initialization uses an explicit persisted tariff.
     await initialize_schema(
         fresh_pg.engine,
         expected_version="platform-v1",
         metadata_hash=metadata_hash,
+        initial_tariff=TEST_INITIAL_TARIFF,
     )
 
     # 2. Verify readiness check passes
@@ -255,6 +278,15 @@ async def test_schema_lifecycle_contract(fresh_pg: FreshPostgres):
         expected_version="platform-v1",
         metadata_hash=metadata_hash,
     )
+    async with fresh_pg.new_session() as db:
+        pointer = await db.get(ActiveSessionTariff, 1)
+        assert pointer is not None
+        tariff = await db.get(SessionTariffRecord, pointer.current_tariff_id)
+        assert tariff is not None
+        assert tariff.revision == 1
+        assert tariff.rate_minor_per_minute == TEST_INITIAL_TARIFF.rate_minor_per_minute
+        assert tariff.billing_slice_ms == TEST_INITIAL_TARIFF.billing_slice_ms
+        assert tariff.permit_ttl_ms == TEST_INITIAL_TARIFF.permit_ttl_ms
     assert ready is True
 
     # 3. Repeat initialization must be a safe no-op
@@ -298,11 +330,13 @@ async def test_schema_concurrent_initialization(fresh_pg: FreshPostgres):
                 fresh_pg.engine,
                 expected_version="platform-v1",
                 metadata_hash=metadata_hash,
+                initial_tariff=TEST_INITIAL_TARIFF,
             ),
             initialize_schema(
                 engine2,
                 expected_version="platform-v1",
                 metadata_hash=metadata_hash,
+                initial_tariff=TEST_INITIAL_TARIFF,
             ),
             return_exceptions=True,
         )
@@ -325,7 +359,11 @@ async def test_schema_mismatch_refusal(fresh_pg: FreshPostgres):
     metadata_hash = compute_metadata_hash(Base.metadata)
 
     # Initialize clean schema
-    await initialize_schema(fresh_pg.engine, metadata_hash=metadata_hash)
+    await initialize_schema(
+        fresh_pg.engine,
+        metadata_hash=metadata_hash,
+        initial_tariff=TEST_INITIAL_TARIFF,
+    )
     assert await check_schema_readiness(fresh_pg.engine) is True
 
     # 1. Missing required table: drop platform.wallet_accounts
@@ -408,7 +446,7 @@ async def test_schema_tolerates_local_and_phoenix_schemas(fresh_pg: FreshPostgre
         await conn.execute(text("CREATE VIEW public.local_sessions_view AS SELECT id FROM public.voice_sessions"))
 
     # Platform schema initialization must succeed despite non-empty public and phoenix schemas
-    await initialize_schema(fresh_pg.engine)
+    await initialize_schema(fresh_pg.engine, initial_tariff=TEST_INITIAL_TARIFF)
     assert await check_schema_readiness(fresh_pg.engine) is True
 
     # Verify public and phoenix tables/views remain completely intact and unaffected
@@ -455,7 +493,7 @@ async def test_platform_initialization_leaves_legacy_db_untouched(fresh_pg: Fres
         public_before = await conn.run_sync(_get_public_tables)
 
     # Initialize platform schema on the same database
-    await initialize_schema(fresh_pg.engine)
+    await initialize_schema(fresh_pg.engine, initial_tariff=TEST_INITIAL_TARIFF)
 
     async with fresh_pg.engine.connect() as conn:
         public_after = await conn.run_sync(_get_public_tables)
@@ -480,6 +518,9 @@ async def test_cli_init_and_independent_app_readiness(fresh_pg: FreshPostgres):
     settings = PlatformSettings(
         database_url=fresh_pg.url,
         **TEST_KEYS,
+        initial_session_rate_minor_per_minute=6000,
+        initial_billing_slice_ms=1000,
+        initial_billing_permit_ttl_ms=5000,
     )
 
     # 1. Execute real CLI init-db command
