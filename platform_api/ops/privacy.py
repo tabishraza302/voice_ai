@@ -42,6 +42,7 @@ from platform_api.models.auth import AuthMail, AuthMfa, AuthSession, AuthToken, 
 from platform_api.models.session import Session
 from platform_api.models.wallet import WalletAccount
 from platform_api.agents.models import Agent, AgentDraft, AgentVersion, IdempotencyRecord
+from platform_api.public.models import PublicDeployment
 from platform_api.sessions.models import (
     RuntimeRegistration,
     SessionJoinJti,
@@ -333,6 +334,9 @@ async def export_user_data(
             IdempotencyRecord, IdempotencyRecord.user_id == user_id
         ),
         "agents": agents,
+        "public_deployments": await select_records(
+            PublicDeployment, PublicDeployment.owner_user_id == user_id
+        ),
         "agent_drafts": await select_records(AgentDraft, AgentDraft.agent_id.in_(agent_ids)) if agent_ids else [],
         "agent_versions": await select_records(AgentVersion, AgentVersion.agent_id.in_(agent_ids)) if agent_ids else [],
         "generation_jobs": await select_records(GenerationJob, GenerationJob.owner_user_id == user_id),

@@ -32,7 +32,7 @@ python -m platform_api.cli export-user \
 
 Transcript/chat text is redacted by default. `--include-transcripts` requires privacy/security approval; the artifact remains highly sensitive, although known secret fields and recognizable secret strings are still redacted. Do not send it through email/chat or store it in ordinary support attachments. Check the returned user UUID, counts, size and elapsed time; verify `ops.user.exported` in `platform.audit_logs`; deliver only through the approved channel and expire the copy under the deployment's export-copy policy.
 
-The export includes the user's profile, account/session, agent/testing, wallet/billing, history and related audit data. Credential/MFA values are redacted. Wallet entries and audit evidence are preserved and included. Limits come from `PLATFORM_OPS_EXPORT_MAX_BYTES` and `PLATFORM_OPS_EXPORT_MAX_RECORDS`; optional CLI limits can only lower them.
+The export includes the user's profile, account/session, agent/testing, public deployment metadata, wallet/billing, history and related audit data. Public deployment IDs, origin, disclosure version, enabled state, and created/disabled timestamps are included; guest bearer capabilities and capability digests are excluded. Credential/MFA values are redacted. Wallet entries and audit evidence are preserved and included. Limits come from `PLATFORM_OPS_EXPORT_MAX_BYTES` and `PLATFORM_OPS_EXPORT_MAX_RECORDS`; optional CLI limits can only lower them.
 
 ## Transcript deletion and retention
 

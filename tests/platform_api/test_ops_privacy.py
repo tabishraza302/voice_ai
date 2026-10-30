@@ -9,11 +9,12 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.engine import make_url
 
-from platform_api.billing.models import WalletEntry
+from platform_api.agents.models import Agent
 from platform_api.auth.errors import ValidationError
+from platform_api.billing.models import WalletEntry
+from platform_api.events.models import EventQuarantine, TranscriptSegment, TranscriptState
 from platform_api.models.auth import AuditLog, AuthMfa, User
 from platform_api.models.session import Session
-from platform_api.events.models import EventQuarantine, TranscriptSegment, TranscriptState
 from platform_api.models.wallet import WalletAccount
 from platform_api.ops.privacy import (
     apply_retention,
@@ -21,6 +22,8 @@ from platform_api.ops.privacy import (
     redact_user_transcripts,
     validate_retention_database_url,
 )
+from platform_api.public.models import PublicDeployment, PublicGuestCapability
+from platform_api.sessions.models import SessionParticipant
 from tests.support.postgres import FreshPostgres
 
 
@@ -30,6 +33,11 @@ async def _seed_privacy_fixture(db, *, created_at: datetime | None = None):
     user_id = uuid.uuid4()
     session_id = uuid.uuid4()
     event_id = uuid.uuid4()
+    deployment_id = uuid.uuid4()
+    participant_id = uuid.uuid4()
+    capability_digest = "c" * 64
+    agent_id = uuid.uuid4()
+    public_id = "p" * 32
     user = User(
         id=user_id,
         email=f"privacy-{user_id}@example.test",
@@ -45,6 +53,29 @@ async def _seed_privacy_fixture(db, *, created_at: datetime | None = None):
         auth_version=1,
         created_at=now,
         updated_at=now,
+    )
+    agent = Agent(
+        id=agent_id,
+        owner_user_id=user_id,
+        name="Privacy guest agent",
+        description="Public guest export fixture",
+        persona_prompt="Be helpful.",
+        enabled=True,
+        draft_revision=1,
+        current_published_version_id=None,
+        created_at=created_at,
+        updated_at=created_at,
+    )
+    deployment = PublicDeployment(
+        id=deployment_id,
+        public_id=public_id,
+        owner_user_id=user_id,
+        agent_id=agent_id,
+        origin="https://guest.example.test",
+        disclosure_version="guest-disclosure-v1",
+        enabled=True,
+        created_at=created_at,
+        disabled_at=None,
     )
     wallet = WalletAccount(
         user_id=user_id,
@@ -64,6 +95,26 @@ async def _seed_privacy_fixture(db, *, created_at: datetime | None = None):
         version=1,
         created_at=created_at,
         ended_at=created_at,
+    )
+    participant = SessionParticipant(
+        participant_id=participant_id,
+        session_id=session_id,
+        owner_user_id=user_id,
+        auth_session_id=None,
+        kind="guest",
+        origin="https://guest.example.test",
+        created_at=created_at,
+        revoked_at=None,
+    )
+    capability = PublicGuestCapability(
+        session_id=session_id,
+        deployment_id=deployment_id,
+        owner_user_id=user_id,
+        participant_id=participant_id,
+        capability_digest=capability_digest,
+        expires_at=created_at + timedelta(hours=1),
+        created_at=created_at,
+        revoked_at=None,
     )
     ledger = WalletEntry(
         id=uuid.uuid4(),
@@ -123,7 +174,13 @@ async def _seed_privacy_fixture(db, *, created_at: datetime | None = None):
     )
     db.add(user)
     await db.flush()
-    db.add_all([wallet, session, mfa])
+    db.add(agent)
+    await db.flush()
+    db.add_all([wallet, session, mfa, deployment])
+    await db.flush()
+    db.add(participant)
+    await db.flush()
+    db.add(capability)
     await db.flush()
     db.add_all([ledger, transcript, transcript_state, audit, quarantined])
     await db.flush()
@@ -134,6 +191,8 @@ async def _seed_privacy_fixture(db, *, created_at: datetime | None = None):
         "ledger_id": ledger.id,
         "audit_id": audit.id,
         "quarantine_id": quarantine_id,
+        "public_id": public_id,
+        "capability_digest": capability_digest,
     }
 
 
@@ -168,6 +227,11 @@ async def test_user_export_redacts_credentials_and_transcripts_but_keeps_ledger(
     assert summary.user_id == fixture["user_id"]
     assert full_summary.include_transcripts is True
     assert payload["records"]["wallet_entries"][0]["amount_minor"] == 100
+    assert payload["records"]["public_deployments"][0]["public_id"] == fixture["public_id"]
+    assert summary.record_counts["public_deployments"] == 1
+    assert "public_guest_capabilities" not in payload["records"]
+    assert "capability_digest" not in serialized
+    assert fixture["capability_digest"] not in serialized
     assert payload["records"]["transcript_segments"][0]["final_text"] == "[REDACTED]"
     assert payload["records"]["event_quarantine"][0]["body"] == "[REDACTED]"
     assert payload["records"]["auth_mfa"][0]["secret_ciphertext"] == "[REDACTED]"
