@@ -343,4 +343,98 @@ describe("PlatformApiClient", () => {
     // Non-idempotent suspend mutation must NOT have been retried automatically
     expect(callCount).toBe(1);
   });
+  test("history and admin operations keep query, CSRF, and idempotency contracts", async () => {
+    client.setCsrfToken("csrf-platform-policy");
+    mockFetch(async () =>
+      new Response("{}", {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    );
+
+    await client.getWallet();
+    await client.getOwnerSessions({ state: "ACTIVE", kind: "voice_test", limit: 20 });
+    await client.getOwnerUsage({ limit: 20 });
+    await client.adminGetAgents({
+      owner_user_id: "owner-1",
+      q: "Safe Agent",
+      limit: 25,
+    });
+    await client.adminCreateTariffVersion(
+      {
+        expected_revision: 1,
+        rate_minor_per_minute: 9000,
+        reason: "Approved price update PRC-318",
+      },
+      "tariff-key-1"
+    );
+    await client.adminSetAdmissionPause(
+      {
+        scope: "global",
+        paused: true,
+        expected_revision: 0,
+        reason: "Emergency maintenance window",
+      },
+      "pause-key-1"
+    );
+    await client.adminCreateTranscriptCorrection(
+      "session-1",
+      {
+        event_id: "event-1",
+        expected_revision: 0,
+        replacement_text: "Corrected transcript text",
+        reason: "Customer verified transcript correction",
+      },
+      "correction-key-1"
+    );
+    await client.adminSetTranscriptVisibility(
+      "session-1",
+      {
+        visible_to_owner: false,
+        expected_revision: 1,
+        reason: "Hide content pending owner review",
+      },
+      "visibility-key-1"
+    );
+    await client.adminTerminateSession(
+      "session-1",
+      "Verified active-call safety issue",
+      "termination-key-1"
+    );
+
+    expect(new URL(calls[0].url).pathname).toBe("/api/v1/wallet");
+    const sessionsUrl = new URL(calls[1].url);
+    expect(sessionsUrl.pathname).toBe("/api/v1/sessions");
+    expect(sessionsUrl.searchParams.get("state")).toBe("ACTIVE");
+    expect(sessionsUrl.searchParams.get("kind")).toBe("voice_test");
+    expect(sessionsUrl.searchParams.get("limit")).toBe("20");
+    expect(new URL(calls[2].url).pathname).toBe("/api/v1/usage");
+    const agentsUrl = new URL(calls[3].url);
+    expect(agentsUrl.pathname).toBe("/api/v1/admin/agents");
+    expect(agentsUrl.searchParams.get("q")).toBe("Safe Agent");
+    expect(agentsUrl.searchParams.get("owner_user_id")).toBe("owner-1");
+
+    const mutationPaths = [
+      "/api/v1/admin/tariffs/versions",
+      "/api/v1/admin/admission-pauses",
+      "/api/v1/admin/sessions/session-1/transcript-corrections",
+      "/api/v1/admin/sessions/session-1/transcript-visibility",
+      "/api/v1/admin/sessions/session-1/terminate",
+    ];
+    const idempotencyKeys = [
+      "tariff-key-1",
+      "pause-key-1",
+      "correction-key-1",
+      "visibility-key-1",
+      "termination-key-1",
+    ];
+    for (const [index, path] of mutationPaths.entries()) {
+      const { url, init } = calls[index + 4];
+      expect(new URL(url).pathname).toBe(path);
+      expect(init.method).toBe("POST");
+      expect(init.credentials).toBe("include");
+      expect(init.headers.get("X-CSRF-Token")).toBe("csrf-platform-policy");
+      expect(init.headers.get("Idempotency-Key")).toBe(idempotencyKeys[index]);
+    }
+  });
 });

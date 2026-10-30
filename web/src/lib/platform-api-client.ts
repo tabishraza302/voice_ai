@@ -22,6 +22,32 @@ import type {
   UserView,
   VerifyEmailRequest,
 } from "@/types/auth";
+import type {
+  AdminAdmissionPausePage,
+  AdmissionPauseRequest,
+  AdminAgentItem,
+  AdminAgentDetail,
+  AdminAgentFilters,
+  AdminAgentPage,
+  AdminAuditPage,
+  AdminOverview,
+  AdminSessionFilters,
+  AdminSessionDetail,
+  AdminSessionPage,
+  AdminTariffPage,
+  AdminTariffVersionItem,
+  AdminTranscriptCorrectionItem,
+  AdminTranscriptPolicyView,
+  ConfigSnapshotView,
+  OwnerSessionsPage,
+  OwnerUsagePage,
+  SessionFilters,
+  SessionStateView,
+  TranscriptPageView,
+  TariffVersionRequest,
+  WalletEntriesPage,
+  WalletView,
+} from "@/types/platform";
 
 export class PlatformApiError extends Error {
   readonly status: number;
@@ -50,6 +76,19 @@ export class PlatformApiError extends Error {
 
 const DEFAULT_PLATFORM_API_URL =
   process.env.NEXT_PUBLIC_PLATFORM_API_URL || "/api/v1";
+
+function buildQuery(
+  params: Record<string, string | number | boolean | null | undefined>
+): string {
+  const searchParams = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && value !== "") {
+      searchParams.set(key, String(value));
+    }
+  }
+  const query = searchParams.toString();
+  return query ? `?${query}` : "";
+}
 
 export class PlatformApiClient {
   private baseUrl: string;
@@ -370,6 +409,298 @@ export class PlatformApiClient {
         method: "POST",
         body: JSON.stringify(data),
       }
+    );
+  }
+  async getWallet(): Promise<WalletView> {
+    return this.request<WalletView>("/wallet", { method: "GET" });
+  }
+
+  async getWalletEntries(params?: {
+    cursor?: string | null;
+    limit?: number;
+  }): Promise<WalletEntriesPage> {
+    return this.request<WalletEntriesPage>(
+      `/wallet/entries${buildQuery({ cursor: params?.cursor, limit: params?.limit })}`,
+      { method: "GET" }
+    );
+  }
+
+  async getOwnerSessions(params?: SessionFilters): Promise<OwnerSessionsPage> {
+    return this.request<OwnerSessionsPage>(
+      `/sessions${buildQuery({
+        cursor: params?.cursor,
+        limit: params?.limit,
+        state: params?.state,
+        kind: params?.kind,
+        agent_version_id: params?.agent_version_id,
+        from_at: params?.from_at,
+        to_at: params?.to_at,
+      })}`,
+      { method: "GET" }
+    );
+  }
+
+  async getOwnerUsage(params?: SessionFilters): Promise<OwnerUsagePage> {
+    return this.request<OwnerUsagePage>(
+      `/usage${buildQuery({
+        cursor: params?.cursor,
+        limit: params?.limit,
+        state: params?.state,
+        kind: params?.kind,
+        agent_version_id: params?.agent_version_id,
+        from_at: params?.from_at,
+        to_at: params?.to_at,
+      })}`,
+      { method: "GET" }
+    );
+  }
+
+  async getOwnerConfigSnapshot(sessionId: string): Promise<ConfigSnapshotView> {
+    return this.request<ConfigSnapshotView>(
+      `/sessions/${encodeURIComponent(sessionId)}/config-snapshot`,
+      { method: "GET" }
+    );
+  }
+
+  async getOwnerTranscript(
+    sessionId: string,
+    params?: { cursor?: string | null; limit?: number }
+  ): Promise<TranscriptPageView> {
+    return this.request<TranscriptPageView>(
+      `/sessions/${encodeURIComponent(sessionId)}/transcript${buildQuery({
+        cursor: params?.cursor,
+        limit: params?.limit,
+      })}`,
+      { method: "GET" }
+    );
+  }
+
+  async adminGetOverview(): Promise<AdminOverview> {
+    return this.request<AdminOverview>("/admin/overview", { method: "GET" });
+  }
+
+  async adminGetSessions(params?: AdminSessionFilters): Promise<AdminSessionPage> {
+    return this.request<AdminSessionPage>(
+      `/admin/sessions${buildQuery({
+        cursor: params?.cursor,
+        limit: params?.limit,
+        owner_user_id: params?.owner_user_id,
+        state: params?.state,
+        kind: params?.kind,
+        agent_version_id: params?.agent_version_id,
+        from_at: params?.from_at,
+        to_at: params?.to_at,
+      })}`,
+      { method: "GET" }
+    );
+  }
+
+  async adminGetSession(sessionId: string): Promise<AdminSessionDetail> {
+    return this.request<AdminSessionDetail>(
+      `/admin/sessions/${encodeURIComponent(sessionId)}`,
+      { method: "GET" }
+    );
+  }
+
+  async adminGetWallet(userId: string): Promise<WalletView> {
+    return this.request<WalletView>(
+      `/admin/users/${encodeURIComponent(userId)}/wallet`,
+      { method: "GET" }
+    );
+  }
+
+  async adminGetWalletEntries(
+    userId: string,
+    params?: { cursor?: string | null; limit?: number }
+  ): Promise<WalletEntriesPage> {
+    return this.request<WalletEntriesPage>(
+      `/admin/users/${encodeURIComponent(userId)}/wallet/entries${buildQuery({
+        cursor: params?.cursor,
+        limit: params?.limit,
+      })}`,
+      { method: "GET" }
+    );
+  }
+
+  async adminGetAgents(params?: AdminAgentFilters): Promise<AdminAgentPage> {
+    return this.request<AdminAgentPage>(
+      `/admin/agents${buildQuery({
+        cursor: params?.cursor,
+        limit: params?.limit,
+        owner_user_id: params?.owner_user_id,
+        q: params?.q,
+        enabled: params?.enabled,
+      })}`,
+      { method: "GET" }
+    );
+  }
+
+  async adminGetAgent(agentId: string): Promise<AdminAgentDetail> {
+    return this.request<AdminAgentDetail>(
+      `/admin/agents/${encodeURIComponent(agentId)}`,
+      { method: "GET" }
+    );
+  }
+
+  async adminDisableAgent(
+    agentId: string,
+    reason: string,
+    idempotencyKey: string
+  ): Promise<AdminAgentItem> {
+    return this.request<AdminAgentItem>(
+      `/admin/agents/${encodeURIComponent(agentId)}/disable`,
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey },
+        body: JSON.stringify({ reason }),
+      }
+    );
+  }
+
+  async adminGetTariffs(params?: {
+    cursor?: string | null;
+    limit?: number;
+  }): Promise<AdminTariffPage> {
+    return this.request<AdminTariffPage>(
+      `/admin/tariffs${buildQuery({
+        cursor: params?.cursor,
+        limit: params?.limit,
+      })}`,
+      { method: "GET" }
+    );
+  }
+
+  async adminCreateTariffVersion(
+    data: TariffVersionRequest,
+    idempotencyKey: string
+  ): Promise<AdminTariffVersionItem> {
+    return this.request<AdminTariffVersionItem>("/admin/tariffs/versions", {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify(data),
+    });
+  }
+
+  async adminGetAdmissionPauses(params?: {
+    scope?: "global" | "user" | "agent";
+    owner_user_id?: string;
+    agent_id?: string;
+    cursor?: string | null;
+    limit?: number;
+  }): Promise<AdminAdmissionPausePage> {
+    return this.request<AdminAdmissionPausePage>(
+      `/admin/admission-pauses${buildQuery({
+        scope: params?.scope,
+        owner_user_id: params?.owner_user_id,
+        agent_id: params?.agent_id,
+        cursor: params?.cursor,
+        limit: params?.limit,
+      })}`,
+      { method: "GET" }
+    );
+  }
+
+  async adminSetAdmissionPause(
+    data: AdmissionPauseRequest,
+    idempotencyKey: string
+  ): Promise<AdminAdmissionPausePage["items"][number]> {
+    return this.request<AdminAdmissionPausePage["items"][number]>(
+      "/admin/admission-pauses",
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey },
+        body: JSON.stringify(data),
+      }
+    );
+  }
+
+  async adminAccessTranscript(
+    sessionId: string,
+    data: { reason: string; cursor?: string | null; limit?: number },
+    idempotencyKey: string
+  ): Promise<TranscriptPageView> {
+    return this.request<TranscriptPageView>(
+      `/admin/sessions/${encodeURIComponent(sessionId)}/transcript-access`,
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey },
+        body: JSON.stringify(data),
+      }
+    );
+  }
+
+  async adminCreateTranscriptCorrection(
+    sessionId: string,
+    data: {
+      event_id: string;
+      expected_revision: number;
+      replacement_text: string;
+      reason: string;
+    },
+    idempotencyKey: string
+  ): Promise<AdminTranscriptCorrectionItem> {
+    return this.request<AdminTranscriptCorrectionItem>(
+      `/admin/sessions/${encodeURIComponent(sessionId)}/transcript-corrections`,
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey },
+        body: JSON.stringify(data),
+      }
+    );
+  }
+
+  async adminSetTranscriptVisibility(
+    sessionId: string,
+    data: { visible_to_owner: boolean; expected_revision: number; reason: string },
+    idempotencyKey: string
+  ): Promise<AdminTranscriptPolicyView> {
+    return this.request<AdminTranscriptPolicyView>(
+      `/admin/sessions/${encodeURIComponent(sessionId)}/transcript-visibility`,
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey },
+        body: JSON.stringify(data),
+      }
+    );
+  }
+
+  async adminTerminateSession(
+    sessionId: string,
+    reason: string,
+    idempotencyKey: string
+  ): Promise<SessionStateView> {
+    return this.request<SessionStateView>(
+      `/admin/sessions/${encodeURIComponent(sessionId)}/terminate`,
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey },
+        body: JSON.stringify({ reason }),
+      }
+    );
+  }
+
+  async adminGetAuditLogs(params?: {
+    actor_id?: string;
+    action?: string;
+    target_type?: string;
+    target_id?: string;
+    from_at?: string;
+    to_at?: string;
+    cursor?: string | null;
+    limit?: number;
+  }): Promise<AdminAuditPage> {
+    return this.request<AdminAuditPage>(
+      `/admin/audit-logs${buildQuery({
+        actor_id: params?.actor_id,
+        action: params?.action,
+        target_type: params?.target_type,
+        target_id: params?.target_id,
+        from_at: params?.from_at,
+        to_at: params?.to_at,
+        cursor: params?.cursor,
+        limit: params?.limit,
+      })}`,
+      { method: "GET" }
     );
   }
 }

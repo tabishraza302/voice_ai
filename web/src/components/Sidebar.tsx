@@ -37,11 +37,19 @@ export function Sidebar() {
     : [
         { href: "/", label: "Overview", icon: Layers },
         { href: "/agents", label: "Agents", icon: Bot },
+        { href: "/conversations", label: "Call history", icon: ScrollText },
+        { href: "/billing", label: "Billing", icon: Activity },
         { href: "/settings", label: "Settings", icon: Settings },
       ];
 
   const adminNavItems = [
+    { href: "/admin/overview", label: "Overview", icon: Layers },
     { href: "/admin/users", label: "User accounts", icon: Users },
+    { href: "/admin/wallet", label: "Wallets", icon: Activity },
+    { href: "/admin/agents", label: "Agent inventory", icon: Bot },
+    { href: "/admin/sessions", label: "Sessions", icon: Mic2 },
+    { href: "/admin/tariffs", label: "Rates & pauses", icon: Settings },
+    { href: "/admin/audit", label: "Audit log", icon: ScrollText },
     { href: "/admin/settings", label: "Admin security", icon: ShieldCheck },
   ];
 
