@@ -286,7 +286,7 @@ class AdminTariffVersionRequest(StrictModel):
 
 
 class AdminTranscriptCorrectionRequest(StrictModel):
-    event_id: uuid.UUID
+    event_id: uuid.UUID = Field(..., strict=False)
     expected_revision: int = Field(..., ge=0)
     replacement_text: str = Field(..., min_length=1, max_length=16_384)
     reason: str = Field(..., min_length=10, max_length=500)

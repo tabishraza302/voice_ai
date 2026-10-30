@@ -134,7 +134,9 @@ def test_speech_evidence_requires_stt_samples_and_accepted_transcript() -> None:
     with pytest.raises(ValueError, match="STT"):
         _validate(evidence)
 
+    evidence = _speech_evidence()
     evidence["accepted_transcripts"] = []
+
     with pytest.raises(ValueError, match="accepted transcript"):
         _validate(evidence)
 

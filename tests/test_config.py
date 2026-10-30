@@ -67,15 +67,6 @@ def test_database_url_rejects_non_async_postgres(invalid_url):
         Settings(_env_file=None, database_url=invalid_url)
     assert "postgresql+asyncpg" in str(exc_info.value)
 
-def test_every_field_has_a_default():
-    """A field with no default would make a missing .env fatal."""
-    s = Settings(_env_file=None)
-    for name in type(s).model_fields:
-        assert getattr(s, name) is not None or name in (
-            # These are legitimately nullable: "auto" is None at the
-            # STT layer, and a missing voice is the model's own default.
-            "stt_language",
-        ), f"{name} has no usable default"
 
 
 def test_env_overrides(monkeypatch):

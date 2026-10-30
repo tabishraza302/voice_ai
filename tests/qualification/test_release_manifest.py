@@ -27,7 +27,8 @@ REQUIRED_GATES = (
 
 def _passing_manifest() -> dict:
     return {
-        "manifest_version": 1,
+        "manifest_version": 2,
+        "run_id": "run",
         "run_dir": "/tmp/qualification/run",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "commit": "a" * 40,

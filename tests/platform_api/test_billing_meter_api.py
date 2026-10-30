@@ -77,10 +77,15 @@ async def test_meter_ack_requires_durable_database_commit(fresh_pg: FreshPostgre
         user = await create_test_user(db)
         await create_funded_wallet(db, user_id=user.id, credited_minor=100)
         session, _ = await create_test_session(db, owner_user_id=user.id, runner_id="runner-1")
-        session.tariff_snapshot = {
+        tariff_snapshot = {
+            "tariff_id": str(uuid.uuid4()),
             "tariff_version": "retail-2026-10",
             "rate_minor_per_minute": 200,
+            "billing_slice_ms": 5000,
+            "permit_ttl_ms": 5000,
+            "maximum_session_duration_ms": 60_000,
         }
+        session.tariff_snapshot = tariff_snapshot
         await db.commit()
 
         permit = await checkpoint_and_reserve(
@@ -112,6 +117,8 @@ async def test_meter_ack_requires_durable_database_commit(fresh_pg: FreshPostgre
             await db.execute(select(Session).where(Session.id == session.id))
         ).scalar_one()
         stored_session.tariff_snapshot = {
+            **tariff_snapshot,
+            "tariff_id": str(uuid.uuid4()),
             "tariff_version": "retail-2026-11",
             "rate_minor_per_minute": 250,
         }
@@ -126,10 +133,7 @@ async def test_meter_ack_requires_durable_database_commit(fresh_pg: FreshPostgre
                 )
             )
         ).scalar_one()
-        assert chk.tariff_snapshot == {
-            "tariff_version": "retail-2026-10",
-            "rate_minor_per_minute": 200,
-        }
+        assert chk.tariff_snapshot == tariff_snapshot
 
 
 @pytest.mark.postgres
@@ -1937,10 +1941,14 @@ async def test_meter_outage_blocks_unconfirmed_chargeable_work(
 
 
 @pytest.mark.asyncio
-async def test_billing_route_surface_matches_contract(
-    test_platform_settings: PlatformSettings,
-):
+async def test_billing_route_surface_matches_contract():
     """The platform app mounts exactly the five contract billing routes and methods."""
+    test_platform_settings = PlatformSettings(
+        database_url="postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai_test",
+        auth_csrf_key=base64.urlsafe_b64encode(b"C" * 32).decode("ascii"),
+        auth_rate_key=base64.urlsafe_b64encode(b"R" * 32).decode("ascii"),
+        auth_mfa_key=base64.urlsafe_b64encode(b"M" * 32).decode("ascii"),
+    )
     app = create_app(test_platform_settings)
     paths = app.openapi()["paths"]
 
@@ -1969,6 +1977,7 @@ async def test_billing_route_surface_matches_contract(
     }
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_wallet_routes_require_authentication(app_client: httpx.AsyncClient):
     """Owner wallet reads and admin adjustments reject unauthenticated callers."""
@@ -1986,7 +1995,6 @@ async def test_wallet_routes_require_authentication(app_client: httpx.AsyncClien
     )
     assert admin_res.status_code == 401
     assert admin_res.json()["error"]["code"] == "UNAUTHENTICATED"
-
 
 @pytest.mark.postgres
 @pytest.mark.asyncio

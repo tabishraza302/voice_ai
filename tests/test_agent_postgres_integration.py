@@ -9,6 +9,8 @@ from bot.agents.schemas import AgentCreate, BasePromptUpdate
 from bot.agents.service import AgentService
 from bot.db.seeds.presets import DEFAULT_BASE_PROMPT
 from tests.support.postgres import disposable_postgres_schema
+pytestmark = pytest.mark.postgres
+
 @pytest_asyncio.fixture
 async def postgres_schema():
     async with disposable_postgres_schema() as (_engine, factory, _schema):

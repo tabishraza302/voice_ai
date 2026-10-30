@@ -319,9 +319,18 @@ test.describe("Platform Authentication Real HTTP Journeys", () => {
       await page.goto("/base-prompt");
       await expect(page.getByText("Global Instructions Not Available")).toBeVisible();
 
-      // Authenticated customer visiting /agents sees local studio isolation notice
+      // The SaaS directory must load owner-scoped agents, not the local studio API.
+      const localAgentRequests: string[] = [];
+      page.on("request", (request) => {
+        if (new URL(request.url()).pathname === "/api/agents") localAgentRequests.push(request.url());
+      });
+      const platformAgents = page.waitForResponse((response) =>
+        new URL(response.url()).pathname === "/api/v1/agents" && response.request().method() === "GET"
+      );
       await page.goto("/agents");
-      await expect(page.getByText("Local Studio Isolated")).toBeVisible();
+      expect((await platformAgents).status()).toBe(200);
+      await expect(page.getByRole("heading", { name: "No agents yet" })).toBeVisible();
+      expect(localAgentRequests).toEqual([]);
 
       // Authenticated customer visiting /admin/users sees 403 Access Denied
       await page.goto("/admin/users");

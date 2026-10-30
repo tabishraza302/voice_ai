@@ -408,6 +408,8 @@ def mount_offer_guard(
     if getattr(app.state, "offer_guard_mounted", False):
         return
     app.state.offer_guard_mounted = True
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.requests import Request
     from starlette.responses import JSONResponse, Response
     from sqlalchemy.exc import InterfaceError, OperationalError, SQLAlchemyError
     from bot.agents.service import AgentNotFoundError

@@ -3,13 +3,14 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 import asyncio
+from contextlib import asynccontextmanager
 import hashlib
 import hmac
 import importlib
 import inspect
 import time
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, AsyncIterator, Awaitable, Callable, Protocol
 from uuid import UUID, uuid4
 
 from bot.config import Settings
@@ -99,6 +100,13 @@ class SessionRegistration:
     stop_record: RuntimeStopRecord | None = None
 
 
+
+@dataclass
+class _AdmissionLock:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
+
+
 @dataclass
 class PendingSession:
     snapshot: RuntimeSnapshot
@@ -161,7 +169,7 @@ class SessionTaskManager:
         self._sessions: dict[UUID, RetainedSession] = {}
         self._pending: dict[UUID, PendingSession] = {}
         self._pc_bindings: dict[str, tuple[UUID, UUID, str]] = {}
-        self._admission_locks: dict[UUID, asyncio.Lock] = {}
+        self._admission_locks: dict[UUID, _AdmissionLock] = {}
         self._registry_lock = asyncio.Lock()
         self._billing_slice_ms_raw = base_settings.platform_billing_slice_ms
         self._permit_ttl_ms_raw = base_settings.platform_billing_permit_ttl_ms
@@ -236,8 +244,7 @@ class SessionTaskManager:
         credentials = self._platform.credentials
         if origin is None or origin != credentials.web_origin:
             raise SessionAdmissionError("Browser Origin does not match the registered session origin", status_code=403)
-        lock = await self._lock_for(session_id)
-        async with lock:
+        async with self._lock_for(session_id):
             if session_id in self._pending:
                 raise SessionAdmissionError("A browser peer is already being admitted", status_code=409)
             self._require_session_prerequisites()
@@ -562,8 +569,12 @@ class SessionTaskManager:
             if pending.pipeline_done.is_set():
                 return
             pending.runtime.deny_speech()
+            terminal = False
+            terminal_finalized = False
             try:
                 await pending.runtime.pipeline_ended(reason[:64] or "pipeline_ended")
+                terminal_state = pending.runtime.state
+                terminal = bool(terminal_state.teardown_emitted)
                 if pending.cursor is not None:
                     close = getattr(pending.cursor, "close", None)
                     if not callable(close):
@@ -584,29 +595,54 @@ class SessionTaskManager:
                     except asyncio.CancelledError:
                         pass
                 if not pending.platform_release:
-                    try:
-                        await self._platform.release_peer(
-                            str(pending.snapshot.session_id),
-                            PeerReleaseRequest(
-                                peer_id=pending.peer_id,
-                                reason=reason[:64] or "peer_closed",
-                            ),
+                    if terminal:
+                        if not pending.media_stopped:
+                            raise SessionAdmissionError("Media stop could not be verified", status_code=503)
+                        # ENDING synchronously calls back into this runner's release endpoint.
+                        # Signal pipeline completion after media stop so that callback can settle.
+                        pending.pipeline_done.set()
+                        failure_code = "FLOW_FAILED" if terminal_state.outcome == "failed" else None
+                        ending = await self._transition(
+                            pending,
+                            "ENDING",
+                            failure_code=failure_code,
                         )
-                    except RuntimePlatformError:
-                        # The platform keeps the peer for its reconciliation path.
-                        pass
+                        if ending.state != "ENDING":
+                            raise SessionAdmissionError(
+                                "Platform did not enter ENDING for terminal flow teardown",
+                                status_code=409,
+                            )
+                        terminal_target = "FAILED" if failure_code is not None else "COMPLETED"
+                        final_state = await self._transition(
+                            pending,
+                            terminal_target,
+                            failure_code=failure_code,
+                        )
+                        if final_state.state != terminal_target:
+                            raise SessionAdmissionError(
+                                "Platform did not finalize the terminal flow session",
+                                status_code=409,
+                            )
+                        terminal_finalized = True
+                    else:
+                        try:
+                            await self._platform.release_peer(
+                                str(pending.snapshot.session_id),
+                                PeerReleaseRequest(
+                                    peer_id=pending.peer_id,
+                                    reason=reason[:64] or "peer_closed",
+                                ),
+                            )
+                        except RuntimePlatformError:
+                            # The platform keeps the peer for its reconciliation path.
+                            pass
             finally:
-                if pending.pc_id is not None:
-                    self._pc_bindings.pop(pending.pc_id, None)
-                self._pending.pop(pending.snapshot.session_id, None)
-                retained = self._sessions.get(pending.snapshot.session_id)
-                if retained is not None:
-                    retained.current_pending = None
+                if not terminal or terminal_finalized:
+                    self._forget_pending(pending.snapshot.session_id, pending)
                 pending.pipeline_done.set()
 
     async def release_registration(self, request: RuntimeReleaseRequest) -> RuntimeReleaseAcknowledgement:
-        lock = await self._lock_for(request.session_id)
-        async with lock:
+        async with self._lock_for(request.session_id):
             registration = self._registrations.get(request.session_id)
             if (
                 registration is not None
@@ -715,6 +751,7 @@ class SessionTaskManager:
                     released_version=request.session_version,
                     stop_record=record,
                 )
+            self._forget_pending(request.session_id, pending)
             self._sessions.pop(request.session_id, None)
             return _release_ack(request)
 
@@ -833,13 +870,20 @@ class SessionTaskManager:
             if pending.connection is not None:
                 pending.media_stopped = await _close_connection(pending.connection)
 
-    async def _transition(self, pending: PendingSession, target: str) -> SessionStateView:
+    async def _transition(
+        self,
+        pending: PendingSession,
+        target: str,
+        *,
+        failure_code: str | None = None,
+    ) -> SessionStateView:
         result = await self._platform.transition(
             str(pending.snapshot.session_id),
             SessionTransitionRequest(
                 registration_id=pending.snapshot.registration_id,
                 expected_version=pending.session_version,
                 target_state=target,
+                failure_code=failure_code,
             ),
         )
         if result.session_id != pending.snapshot.session_id or result.session_version <= pending.session_version:
@@ -915,9 +959,39 @@ class SessionTaskManager:
         ):
             raise SessionAdmissionError("Runtime snapshot does not match its runner registration", status_code=409)
 
-    async def _lock_for(self, session_id: UUID) -> asyncio.Lock:
+    @asynccontextmanager
+    async def _lock_for(self, session_id: UUID) -> AsyncIterator[None]:
         async with self._registry_lock:
-            return self._admission_locks.setdefault(session_id, asyncio.Lock())
+            entry = self._admission_locks.get(session_id)
+            if entry is None:
+                entry = _AdmissionLock()
+                self._admission_locks[session_id] = entry
+            # Count waiters before they block so every session shares one live lock.
+            entry.users += 1
+
+        acquired = False
+        try:
+            await entry.lock.acquire()
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                entry.lock.release()
+            async with self._registry_lock:
+                entry.users -= 1
+                if entry.users == 0 and self._admission_locks.get(session_id) is entry:
+                    del self._admission_locks[session_id]
+
+    def _forget_pending(self, session_id: UUID, pending: PendingSession | None) -> None:
+        if pending is None:
+            return
+        if pending.pc_id is not None:
+            self._pc_bindings.pop(pending.pc_id, None)
+        if self._pending.get(session_id) is pending:
+            self._pending.pop(session_id)
+        retained = self._sessions.get(session_id)
+        if retained is not None and retained.current_pending is pending:
+            retained.current_pending = None
 
     async def _release_consumed_peer(
         self,

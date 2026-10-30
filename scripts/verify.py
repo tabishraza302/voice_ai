@@ -341,7 +341,14 @@ def build_gate_command(gate: str, repo_root: Path) -> list[str]:
             "--strict-markers",
         ]
     elif gate == "postgres":
-        targets = ["tests/test_agent_postgres_integration.py"]
+        targets = [
+            "tests/test_agent_postgres_integration.py",
+            "tests/test_agent_service.py",
+            "tests/test_db_session.py",
+            "tests/test_agent_pipeline_integration.py",
+            "tests/test_routes.py",
+            "tests/test_session_profile_integration.py",
+        ]
         if (repo_root / "tests/platform_api").exists():
             targets.append("tests/platform_api")
         return [
@@ -695,45 +702,64 @@ class VerificationHarness:
             raise ValueError(f"deployment {name} endpoint returned a non-object response")
         return payload
 
-    def check_deployment_endpoints(self, config: Mapping[str, Any]) -> None:
-        if self.deployment_preflight_complete:
+    def check_deployment_endpoints(
+        self,
+        config: Mapping[str, Any],
+        *,
+        post_voice_recheck: bool = False,
+    ) -> None:
+        if self.deployment_preflight_complete and not post_voice_recheck:
             return
         endpoints = config["runner_api_endpoints"]
         results: dict[str, Any] = {}
         for name in ("runner", "api"):
             payload = self._read_endpoint_json(name, endpoints[name])
-            if payload.get("status") not in {"ok", "ready"}:
-                raise ValueError(
-                    f"deployment {name} endpoint {endpoints[name]} did not report status ok or ready"
-                )
             results[name] = {
                 "url": endpoints[name],
                 "http_status": 200,
-                "status": payload["status"],
+                "status": payload.get("status"),
             }
         flags_payload = self._read_endpoint_json("flags", endpoints["flags"])
         flags = flags_payload.get("flags")
-        if not isinstance(flags, dict):
-            raise ValueError("deployment flags endpoint response is missing its flags object")
-        for flag, expected in _DISABLED_RELEASE_FLAGS.items():
-            if type(flags.get(flag)) is not bool or flags[flag] is not expected:
-                raise ValueError(f"deployment flag {flag} must be explicitly false at release time")
+        observed_flags = (
+            {flag: flags.get(flag) for flag in _DISABLED_RELEASE_FLAGS}
+            if isinstance(flags, dict)
+            else None
+        )
         results["flags"] = {
             "url": endpoints["flags"],
             "http_status": 200,
-            "flags": dict(_DISABLED_RELEASE_FLAGS),
+            "flags": observed_flags,
         }
+        if post_voice_recheck:
+            evidence_filename = "deployment-post-voice-recheck.json"
+            evidence_kind = "deployment_post_voice_recheck"
+        else:
+            evidence_filename = "deployment-preflight.json"
+            evidence_kind = "deployment_preflight"
         self.write_live_evidence(
-            "deployment-preflight.json",
+            evidence_filename,
             {
                 "profile": "deployment",
                 "endpoints": results,
                 "checked_at": datetime.now(timezone.utc).isoformat(),
             },
-            kind="deployment_preflight",
+            kind=evidence_kind,
             profile="deployment",
             commit=self.current_commit(),
         )
+        if not isinstance(flags, dict):
+            raise ValueError("deployment flags endpoint response is missing its flags object")
+
+        for name in ("runner", "api"):
+            status = results[name]["status"]
+            if not isinstance(status, str) or status not in {"ok", "ready"}:
+                raise ValueError(
+                    f"deployment {name} endpoint {endpoints[name]} did not report status ok or ready"
+                )
+        for flag, expected in _DISABLED_RELEASE_FLAGS.items():
+            if type(flags.get(flag)) is not bool or flags[flag] is not expected:
+                raise ValueError(f"deployment flag {flag} must be explicitly false at release time")
         self.deployment_preflight_complete = True
 
     def run_adapter_qualification(self, profile: str, commit: str) -> tuple[int, dict[str, Any]]:
@@ -1295,6 +1321,9 @@ class VerificationHarness:
             "PLATFORM_AUTH_MFA_KEY": mfa_key,
             "PLATFORM_AUTH_MAIL_DIR": str(mail_dir),
             "PLATFORM_AUTH_MAIL_MODE": "file",
+            "PLATFORM_INITIAL_SESSION_RATE_MINOR_PER_MINUTE": "0",
+            "PLATFORM_INITIAL_BILLING_SLICE_MS": "1000",
+            "PLATFORM_INITIAL_BILLING_PERMIT_TTL_MS": "5000",
         }
         init_rc, init_out, init_err = self.run_cmd("browser_schema_init_dev", schema_init_cmd, env=schema_init_env)
         if init_rc != 0:
@@ -1544,6 +1573,9 @@ class VerificationHarness:
             "PLATFORM_AUTH_MFA_KEY": mfa_key,
             "PLATFORM_AUTH_MAIL_DIR": str(mail_dir),
             "PLATFORM_AUTH_MAIL_MODE": "file",
+            "PLATFORM_INITIAL_SESSION_RATE_MINOR_PER_MINUTE": "0",
+            "PLATFORM_INITIAL_BILLING_SLICE_MS": "1000",
+            "PLATFORM_INITIAL_BILLING_PERMIT_TTL_MS": "5000",
         }
         init_rc, init_out, init_err = self.run_cmd("browser_schema_init_tls", schema_init_cmd, env=schema_init_env)
         if init_rc != 0:
@@ -2055,10 +2087,9 @@ class VerificationHarness:
                 self.results["release_evidence"]["reason"] = "prerequisite voice deployment gate failed"
             return self.write_result(target_gates=required_gates)
 
-        # Recheck deployment flags to ensure they were not toggled during voice lanes
+        # Recheck live deployment endpoints and flags after both voice lanes.
         try:
-            self.deployment_preflight_complete = False
-            self.check_deployment_endpoints(config_data)
+            self.check_deployment_endpoints(config_data, post_voice_recheck=True)
         except Exception as error:
             reason = redact_secrets(f"post-voice deployment endpoint check failed: {error}")
             self.results["release_evidence"] = {"status": "failed", "reason": reason}

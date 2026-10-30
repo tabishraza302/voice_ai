@@ -7,6 +7,7 @@ from bot.agents.service import AgentService
 from bot.agents.schemas import AgentCreate, AgentUpdate, BasePromptUpdate
 from bot.db.seeds.presets import DEFAULT_BASE_PROMPT
 from tests.support.postgres import disposable_postgres_schema
+pytestmark = pytest.mark.postgres
 
 @pytest_asyncio.fixture
 async def async_session():

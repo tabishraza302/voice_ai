@@ -914,6 +914,7 @@ async def test_admin_tariff_change_is_step_up_csrf_idempotent_and_preserves_pinn
         )
         db.add(version)
         await db.flush()
+        agent.current_published_version_id = version.id
         session.agent_version_id = version.id
         session.tariff_snapshot = {
             "tariff_id": str(active.tariff_id),
@@ -1370,7 +1371,7 @@ async def test_transcript_correction_and_visibility_are_audited_revisioned_and_o
     visible_page = await app_client.get(transcript_path, headers=owner_headers)
     assert stale_cursor.status_code == 409
     assert visible_page.status_code == 200
-    assert visible_page.json()["segments"][0]["text"] == "The corrected first line"
+    assert visible_page.json()["segments"][0]["final_text"] == "The corrected first line"
 
     visibility_path = f"/api/v1/admin/sessions/{session.id}/transcript-visibility"
     hidden_body = {
@@ -1411,7 +1412,7 @@ async def test_transcript_correction_and_visibility_are_audited_revisioned_and_o
     )
     assert admin_access.status_code == 200
     assert admin_access.json()["visible_to_owner"] is False
-    assert admin_access.json()["segments"][0]["text"] == "The corrected first line"
+    assert admin_access.json()["segments"][0]["final_text"] == "The corrected first line"
 
     restored = await app_client.post(
         visibility_path,
@@ -1426,7 +1427,7 @@ async def test_transcript_correction_and_visibility_are_audited_revisioned_and_o
     assert restored.status_code == 200
     assert restored.json()["policy_revision"] == 3
     assert owner_after_restore.status_code == 200
-    assert owner_after_restore.json()["segments"][0]["text"] == "The corrected first line"
+    assert owner_after_restore.json()["segments"][0]["final_text"] == "The corrected first line"
 
     async with initialized_pg.sessions() as db:
         raw_segment = await db.get(TranscriptSegment, uuid.UUID(event_id))

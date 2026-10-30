@@ -86,8 +86,15 @@ def require_report(path: Path | str, description: str) -> Path:
 
 
 def profile_sha256(profile: Mapping[str, Any]) -> str:
-    """Hash the exact canonical profile value used by a qualification run."""
-    return hashlib.sha256(canonical_json_v1(profile)).hexdigest()
+    """Hash a JSON profile with stable key ordering, including valid decimal limits."""
+    serialized = json.dumps(
+        profile,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def authenticate_live_evidence(
@@ -1141,6 +1148,7 @@ def validate_staging_runbook(text: str) -> None:
         "playwright_dev.json",
         "playwright_tls.json",
         "deployment-preflight.json",
+        "deployment-post-voice-recheck.json",
         "platform_enable_public_calls",
         "platform_enable_real_paid_calls",
         "platform_enable_gateway",
@@ -1288,43 +1296,80 @@ def validate_release_artifacts(
             expected_concurrency=config["concurrency"],
         )
 
-    preflight = authenticated_payload("deployment-preflight.json", "deployment_preflight", "deployment")
-    if (
-        not isinstance(preflight, Mapping)
-        or set(preflight) != {"profile", "endpoints", "checked_at"}
-        or preflight.get("profile") != "deployment"
-        or not isinstance(preflight.get("checked_at"), str)
-        or not preflight["checked_at"].strip()
-    ):
-        raise ValueError("HMAC-authenticated deployment preflight evidence is missing or malformed")
-    endpoint_results = preflight.get("endpoints")
     configured_endpoints = profile_configs["deployment"]["runner_api_endpoints"]
-    if not isinstance(endpoint_results, Mapping) or set(endpoint_results) != {"runner", "api", "flags"}:
-        raise ValueError("HMAC-authenticated deployment endpoint checks are incomplete")
-    for name in ("runner", "api"):
-        result = endpoint_results[name]
-        if (
-            not isinstance(result, Mapping)
-            or set(result) != {"url", "http_status", "status"}
-            or result.get("url") != configured_endpoints[name]
-            or result.get("http_status") != 200
-            or result.get("status") not in {"ok", "ready"}
-        ):
-            raise ValueError(f"HMAC-authenticated deployment {name} endpoint check did not pass")
-    flags_result = endpoint_results["flags"]
     expected_flags = {
         "PLATFORM_ENABLE_PUBLIC_CALLS": False,
         "PLATFORM_ENABLE_REAL_PAID_CALLS": False,
         "PLATFORM_ENABLE_GATEWAY": False,
     }
-    if (
-        not isinstance(flags_result, Mapping)
-        or set(flags_result) != {"url", "http_status", "flags"}
-        or flags_result.get("url") != configured_endpoints["flags"]
-        or flags_result.get("http_status") != 200
-        or flags_result.get("flags") != expected_flags
-    ):
-        raise ValueError("HMAC-authenticated deployment flags check is missing or not explicitly disabled")
+
+    def validate_deployment_endpoint_evidence(
+        filename: str,
+        kind: str,
+        stage: str,
+    ) -> datetime:
+        report = authenticated_payload(filename, kind, "deployment")
+        if (
+            not isinstance(report, Mapping)
+            or set(report) != {"profile", "endpoints", "checked_at"}
+            or report.get("profile") != "deployment"
+            or not isinstance(report.get("checked_at"), str)
+            or not report["checked_at"].strip()
+        ):
+            raise ValueError(f"HMAC-authenticated deployment {stage} evidence is missing or malformed")
+        try:
+            checked_at = datetime.fromisoformat(report["checked_at"].replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError(f"HMAC-authenticated deployment {stage} timestamp is malformed") from error
+        if checked_at.tzinfo is None or checked_at.utcoffset() is None:
+            raise ValueError(f"HMAC-authenticated deployment {stage} timestamp must include a timezone")
+        endpoint_results = report.get("endpoints")
+        if not isinstance(endpoint_results, Mapping) or set(endpoint_results) != {"runner", "api", "flags"}:
+            raise ValueError(f"HMAC-authenticated deployment {stage} endpoint checks are incomplete")
+        for name in ("runner", "api"):
+            result = endpoint_results[name]
+            if (
+                not isinstance(result, Mapping)
+                or set(result) != {"url", "http_status", "status"}
+                or result.get("url") != configured_endpoints[name]
+                or result.get("http_status") != 200
+                or not isinstance(result.get("status"), str)
+                or result["status"] not in {"ok", "ready"}
+            ):
+                raise ValueError(f"HMAC-authenticated deployment {stage} {name} endpoint check did not pass")
+        flags_result = endpoint_results["flags"]
+        observed_flags = flags_result.get("flags") if isinstance(flags_result, Mapping) else None
+        if (
+            not isinstance(flags_result, Mapping)
+            or set(flags_result) != {"url", "http_status", "flags"}
+            or flags_result.get("url") != configured_endpoints["flags"]
+            or flags_result.get("http_status") != 200
+            or not isinstance(observed_flags, Mapping)
+            or set(observed_flags) != set(expected_flags)
+            or any(
+                type(observed_flags[flag]) is not bool or observed_flags[flag] is not False
+                for flag in expected_flags
+            )
+        ):
+            raise ValueError(
+                f"HMAC-authenticated deployment {stage} flags check is missing or not explicitly disabled"
+            )
+        return checked_at
+
+    preflight_checked_at = validate_deployment_endpoint_evidence(
+        "deployment-preflight.json",
+        "deployment_preflight",
+        "preflight",
+    )
+    post_voice_checked_at = validate_deployment_endpoint_evidence(
+        "deployment-post-voice-recheck.json",
+        "deployment_post_voice_recheck",
+        "post-voice recheck",
+    )
+    if post_voice_checked_at < preflight_checked_at:
+        raise ValueError(
+            "HMAC-authenticated deployment post-voice recheck predates the deployment preflight"
+        )
     if require_final_report:
         require_gate(parse_junit_xml(require_report(root / "release-evidence.xml", "release evidence report")))
 

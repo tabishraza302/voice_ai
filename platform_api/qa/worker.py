@@ -194,6 +194,23 @@ async def _execute_claimed_job(
         )
         return
 
+    runtime_budget_seconds = min(
+        claimed.max_runtime_seconds, settings.qa_job_timeout_seconds
+    )
+    elapsed_runtime_seconds = (
+        max(
+            0.0,
+            (datetime.now(timezone.utc) - claimed.started_at).total_seconds(),
+        )
+        if claimed.started_at is not None
+        else 0.0
+    )
+    # Keep the persisted start time as the deadline across worker recovery.
+    loop = asyncio.get_running_loop()
+    runtime_deadline = loop.time() + max(
+        0.0, runtime_budget_seconds - elapsed_runtime_seconds
+    )
+
     results = list(claimed.results_json or [])
     suggestions = list(claimed.suggestions_json or [])
     artifacts = list(claimed.artifacts_json or [])
@@ -206,9 +223,9 @@ async def _execute_claimed_job(
     exhausted_budget = False
 
     try:
-        async with asyncio.timeout(
-            min(claimed.max_runtime_seconds, settings.qa_job_timeout_seconds)
-        ):
+        if runtime_deadline <= loop.time():
+            raise TimeoutError
+        async with asyncio.timeout_at(runtime_deadline):
             for scenario_index in range(current_index, len(scenarios)):
                 scenario = scenarios[scenario_index]
                 remaining = claimed.max_tokens - usage["total_tokens"]

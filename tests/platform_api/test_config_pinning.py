@@ -205,6 +205,7 @@ async def test_version_bytes_and_hashes_pinned_across_draft_mutations_and_new_ve
                 participant_id=str(participant_id),
                 agent_version_id=published_version.id,
                 tariff_snapshot={
+                    "tariff_id": str(uuid.uuid4()),
                     "kind": "voice_test",
                     "currency": "INR",
                     "rate_minor_per_minute": 6_000,

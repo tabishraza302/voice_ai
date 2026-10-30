@@ -510,6 +510,8 @@ export function PublicGuestPage({ publicId }: { publicId: string }) {
   };
 
   const startAnotherSession = () => {
+    clearSavedAdmissionAttempt(publicId);
+    admissionAttemptRef.current = null;
     setError(null);
     setAcknowledged(false);
     setSessionState(null);

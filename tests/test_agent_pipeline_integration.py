@@ -21,6 +21,7 @@ async def integration_session():
         async with factory() as session:
             yield session
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_apply_active_agent_to_settings(integration_session):
     service = AgentService(integration_session)
@@ -40,6 +41,7 @@ async def test_apply_active_agent_to_settings(integration_session):
     assert active.persona_prompt in updated_settings.system_instruction
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_explicit_missing_agent_is_not_hidden(integration_session):
     with pytest.raises(LookupError, match="not found"):
@@ -97,6 +99,7 @@ async def test_unrequested_agent_sqlalchemy_error_fails_closed(monkeypatch):
     default_settings = Settings(_env_file=None)
     with pytest.raises(StorageUnavailableError):
         await apply_active_agent_to_settings(default_settings)
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_apply_active_agent_rejects_incompatible_realtime_non_auto_language(integration_session):
     service = AgentService(integration_session)
@@ -120,6 +123,7 @@ async def test_apply_active_agent_rejects_incompatible_realtime_non_auto_languag
         )
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_apply_active_agent_allows_realtime_preset_when_batch_mode_override_active(integration_session, monkeypatch):
     service = AgentService(integration_session)
@@ -145,6 +149,7 @@ async def test_apply_active_agent_allows_realtime_preset_when_batch_mode_overrid
     assert resolved.stt_language == "hi"
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_apply_active_agent_realtime_with_batch_override_swaps_whisper_to_nemotron(
     integration_session, monkeypatch
@@ -191,6 +196,7 @@ async def test_apply_active_agent_realtime_with_batch_override_swaps_whisper_to_
     assert stt_router.delta_for(Language.EN).model == NEMOTRON_MODEL
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_apply_active_agent_preserves_explicit_custom_stt_model_under_override(
     integration_session, monkeypatch
@@ -233,6 +239,7 @@ async def test_apply_active_agent_preserves_explicit_custom_stt_model_under_over
     assert stt_router.delta_for(Language.EN).model == custom_model
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_apply_active_agent_realtime_without_override_swaps_whisper_to_nemotron(
     integration_session,
@@ -261,6 +268,7 @@ async def test_apply_active_agent_realtime_without_override_swaps_whisper_to_nem
     assert resolved.stt_model == NEMOTRON_MODEL
 
 
+@pytest.mark.postgres
 @pytest.mark.asyncio
 async def test_apply_active_agent_preserves_explicit_batch_whisper_when_unchanged(
     integration_session,

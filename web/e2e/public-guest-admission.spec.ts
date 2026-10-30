@@ -259,3 +259,52 @@ test("a definitive guest admission rejection allows a new operation key", async 
   expect(admissionRequests[1]?.key).not.toBe(admissionRequests[0]?.key);
   expect(admissionRequests[1]?.body).toBe(admissionRequests[0]?.body);
 });
+
+test("a finished session starts a new admission even when session storage was full", async ({ page }) => {
+  const keys: string[] = [];
+  await installBootstrap(page);
+  await installFakeVoiceApis(page);
+  await page.addInitScript(() => {
+    const original = Storage.prototype.setItem;
+    Storage.prototype.setItem = function (key, value) {
+      if (key.startsWith("public-guest-session:")) throw new DOMException("full", "QuotaExceededError");
+      return original.call(this, key, value);
+    };
+  });
+  await page.route(`**/api/v1/public/deployments/${publicId}/sessions`, async (route) => {
+    const key = route.request().headers()["idempotency-key"] ?? "";
+    keys.push(key);
+    if (keys.length > 1 && key === keys[0]) {
+      await route.fulfill({ status: 409, json: { error: { code: "CONFLICT", message: "Session ended" } } });
+      return;
+    }
+    await route.fulfill({ status: 201, json: {
+      session_id: `00000000-0000-4000-8000-${String(keys.length).padStart(12, "0")}`,
+      state: "REGISTERED", signaling_url: "/mock-voice/join", join_token: "join-token",
+      join_expires_at: "2099-01-01T00:10:00Z", hard_end_deadline: "2099-01-01T00:20:00Z",
+      csrf_token: "guest-csrf",
+    } });
+  });
+  await page.route("**/api/v1/guest/sessions/*/status", async (route) => {
+    await route.fulfill({ json: { state: "REGISTERED" } });
+  });
+  await page.route("**/api/v1/guest/sessions/*/end", async (route) => {
+    await route.fulfill({ json: { state: "CLOSED" } });
+  });
+  await page.route("**/mock-voice/join", async (route) => {
+    await route.fulfill({ json: { pc_id: "guest-pc", sdp: "answer-sdp", type: "answer" } });
+  });
+
+  await openGuestPage(page);
+  const acknowledgement = page.getByRole("checkbox", { name: "I have read and acknowledge the disclosure above." });
+  await acknowledgement.check();
+  await page.getByRole("button", { name: "Start voice session" }).click();
+  await expect(page.getByRole("status")).toContainText("Connected. Speak naturally; live audio is active.");
+  await page.getByRole("button", { name: "End session" }).click();
+  await page.getByRole("button", { name: "Start another session" }).click();
+  await acknowledgement.check();
+  await page.getByRole("button", { name: "Start voice session" }).click();
+  await expect(page.getByRole("status")).toContainText("Connected. Speak naturally; live audio is active.");
+  expect(keys).toHaveLength(2);
+  expect(keys[1]).not.toBe(keys[0]);
+});
