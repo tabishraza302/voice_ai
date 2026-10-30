@@ -86,14 +86,15 @@ function readSavedSession(publicId: string): SavedGuestSession | null {
   }
 }
 
-function saveSession(publicId: string, sessionId: string, csrfToken: string): void {
+function saveSession(publicId: string, sessionId: string, csrfToken: string): boolean {
   try {
     window.sessionStorage.setItem(
       storageKey(publicId),
       JSON.stringify({ sessionId, csrfToken }),
     );
+    return true;
   } catch {
-    // The live session remains usable when browser storage is unavailable.
+    return false;
   }
 }
 
@@ -153,11 +154,12 @@ function readSavedAdmissionAttempt(
   }
 }
 
-function saveAdmissionAttempt(publicId: string, attempt: SavedGuestAdmissionAttempt): void {
+function saveAdmissionAttempt(publicId: string, attempt: SavedGuestAdmissionAttempt): boolean {
   try {
     window.sessionStorage.setItem(admissionStorageKey(publicId), JSON.stringify(attempt));
+    return true;
   } catch {
-    // The in-memory attempt still protects retries while this page stays open.
+    return false;
   }
 }
 
@@ -418,8 +420,10 @@ export function PublicGuestPage({ publicId }: { publicId: string }) {
           idempotencyKey: crypto.randomUUID(),
           payload,
         };
+      if (!saveAdmissionAttempt(publicId, attempt)) {
+        throw new Error("Browser session storage is unavailable; cannot safely start session.");
+      }
       admissionAttemptRef.current = attempt;
-      saveAdmissionAttempt(publicId, attempt);
       const session = await client.admit(
         publicId,
         bootstrap,
@@ -429,9 +433,10 @@ export function PublicGuestPage({ publicId }: { publicId: string }) {
       setSessionId(session.session_id);
       setGuestCsrf(session.csrf_token);
       setSessionState(session.state);
-      saveSession(publicId, session.session_id, session.csrf_token);
-      clearSavedAdmissionAttempt(publicId);
-      admissionAttemptRef.current = null;
+      if (saveSession(publicId, session.session_id, session.csrf_token)) {
+        clearSavedAdmissionAttempt(publicId);
+        admissionAttemptRef.current = null;
+      }
       await connectTransport(session);
     } catch (startError) {
       setError(messageFor(startError));
@@ -439,7 +444,8 @@ export function PublicGuestPage({ publicId }: { publicId: string }) {
         !admitted &&
         startError instanceof PublicGuestApiError &&
         startError.status >= 400 &&
-        startError.status < 500
+        startError.status < 500 &&
+        startError.status !== 429
       ) {
         clearSavedAdmissionAttempt(publicId);
         admissionAttemptRef.current = null;
@@ -604,7 +610,7 @@ export function PublicGuestPage({ publicId }: { publicId: string }) {
                 <span>{statusText}</span>
               </div>
 
-              {error && pageState !== "unavailable" && (
+              {error && (
                 <div role="alert" className="rounded-lg border border-rust-800 bg-rust-950/30 p-3 text-sm text-rust-200">
                   {error}
                 </div>
