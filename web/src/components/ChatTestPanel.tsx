@@ -127,6 +127,9 @@ function pendingUserMessage(transcript: ChatTestView, expectedSequence: number):
     message.role === "user" && message.turn_sequence === expectedSequence
   );
 }
+function isTurnSettled(transcript: ChatTestView, expectedSequence: number): boolean {
+  return transcript.turn_sequence >= expectedSequence && transcript.pending_turn_sequence === null;
+}
 
 function isStaleSnapshotError(error: unknown): error is PlatformApiError {
   return error instanceof PlatformApiError &&
@@ -252,12 +255,14 @@ export function ChatTestPanel({ agentId, draft, versions, onRefreshDraftSnapshot
       }
       const transcriptSession = fromTranscript(transcript, saved.snapshotLabel);
       const localPending = saved.pendingRecovery;
-      if (localPending && transcript.turn_sequence >= localPending.expectedSequence) {
+      const serverPendingMessage = localPending
+        ? pendingUserMessage(transcript, localPending.expectedSequence)
+        : undefined;
+      if (localPending && isTurnSettled(transcript, localPending.expectedSequence)) {
         applyTranscript(transcript, saved.snapshotLabel);
         return;
       }
       if (localPending) {
-        const serverPendingMessage = pendingUserMessage(transcript, localPending.expectedSequence);
         const serverHasDifferentPending = transcript.pending_turn_sequence !== null &&
           (transcript.pending_turn_sequence !== localPending.expectedSequence ||
             serverPendingMessage?.content !== localPending.text);
@@ -375,7 +380,9 @@ export function ChatTestPanel({ agentId, draft, versions, onRefreshDraftSnapshot
       } catch (error: unknown) {
         transcriptError = error;
       }
-      if (transcript && transcript.turn_sequence >= pending.expectedSequence) {
+      const pendingMessage = transcript ? pendingUserMessage(transcript, pending.expectedSequence) : undefined;
+      const serverPendingSequence = transcript?.pending_turn_sequence ?? null;
+      if (transcript && isTurnSettled(transcript, pending.expectedSequence)) {
         applyTranscript(transcript, activeSession.snapshotLabel);
         return;
       }
@@ -396,15 +403,13 @@ export function ChatTestPanel({ agentId, draft, versions, onRefreshDraftSnapshot
             ? `The pinned snapshot was rejected: ${errorMessage(turnError)}. This conversation remains pinned to its original snapshot. Start a new test on the selected snapshot to continue.`
             : `The pinned snapshot was rejected: ${errorMessage(turnError)}. The latest draft snapshot could not be loaded.${transcriptError ? ` Transcript error: ${errorMessage(transcriptError)}` : ""}`
         );
-      } else if (isChatRevisionConflict(turnError)) {
+      } else if (isChatRevisionConflict(turnError) && serverPendingSequence === null) {
         clearPendingTurn(
           reconciledSession,
           pending,
           `The platform rejected this turn before saving it: ${errorMessage(turnError)}. Reset this test before sending again.`
         );
       } else {
-        const pendingMessage = transcript ? pendingUserMessage(transcript, pending.expectedSequence) : undefined;
-        const serverPendingSequence = transcript?.pending_turn_sequence ?? null;
         const mismatch = serverPendingSequence !== null &&
           (serverPendingSequence !== pending.expectedSequence || pendingMessage?.content !== pending.text);
         keepPendingTurn(
@@ -439,18 +444,19 @@ export function ChatTestPanel({ agentId, draft, versions, onRefreshDraftSnapshot
         if (observedTranscript.snapshot_hash !== activeSession.snapshotHash) {
           throw new Error("The saved test ID now refers to a different pinned snapshot. No message was sent.");
         }
-        if (observedTranscript.turn_sequence >= pending.expectedSequence) {
-          applyTranscript(observedTranscript, activeSession.snapshotLabel);
-          return;
-        }
         const serverPendingMessage = pendingUserMessage(observedTranscript, pending.expectedSequence);
-        if (observedTranscript.pending_turn_sequence !== null &&
-          (observedTranscript.pending_turn_sequence !== pending.expectedSequence || serverPendingMessage?.content !== pending.text)) {
+        const matchingPendingTurn = observedTranscript.pending_turn_sequence === pending.expectedSequence &&
+          serverPendingMessage?.content === pending.text;
+        if (observedTranscript.pending_turn_sequence !== null && !matchingPendingTurn) {
           keepPendingTurn(
             fromTranscript(observedTranscript, activeSession.snapshotLabel),
             pending,
             "The server transcript reports a different pending turn. Your exact message was preserved and no replacement was sent."
           );
+          return;
+        }
+        if (isTurnSettled(observedTranscript, pending.expectedSequence)) {
+          applyTranscript(observedTranscript, activeSession.snapshotLabel);
           return;
         }
         const latestSession = fromTranscript(observedTranscript, activeSession.snapshotLabel);
@@ -498,10 +504,10 @@ export function ChatTestPanel({ agentId, draft, versions, onRefreshDraftSnapshot
         } catch {
           // Keep the original request and retry identity when the transcript cannot be read.
         }
-        if (transcript && transcript.turn_sequence >= pending.expectedSequence) {
+        const pendingMessage = transcript ? pendingUserMessage(transcript, pending.expectedSequence) : undefined;
+        if (transcript && isTurnSettled(transcript, pending.expectedSequence)) {
           applyTranscript(transcript, activeSession.snapshotLabel);
         } else if (transcript && transcript.pending_turn_sequence !== null) {
-          const pendingMessage = pendingUserMessage(transcript, pending.expectedSequence);
           const mismatch = transcript.pending_turn_sequence !== pending.expectedSequence || pendingMessage?.content !== pending.text;
           keepPendingTurn(
             fromTranscript(transcript, activeSession.snapshotLabel),
