@@ -87,3 +87,55 @@ Restore is only into a separate empty target database. The command initializes t
 ## Failures
 
 Commands return nonzero and report only the exception class, not URLs or exception text. Do not retry with broader privileges or raise configured limits to bypass a failure. Preserve the change reference and ask the database owner to check role grants and schema state; involve privacy/security when scope or content is in doubt. Check the protected output directory before retrying. A failed export/backup removes its newly created artifact when possible.
+
+## Staging release qualification
+
+Run release qualification against the exact candidate commit in an isolated
+staging environment. Keep public-call and real-paid flags disabled throughout
+the drill. Do not use production database credentials, customer accounts, or
+private recordings.
+
+Before the run, have the release owner review an absolute-path JSON profile with
+schema version `1` and profile `deployment`. It must pin exact HTTPS origins;
+LLM, STT, English TTS, and Hindi TTS IDs, revisions, and SHA-256 hashes; runner
+and API endpoints; the required TURN relay endpoint and a secret-manager
+credential reference (never a credential value); Chromium version; PostgreSQL
+server version and image digest; measured concurrency; timeout, latency, and
+quality limits; and baseline artifact IDs. Missing models, TURN, database,
+browser, audio fixtures, or reports block qualification.
+
+Provision the pre-reviewed English and Hindi speech fixtures under
+`VERIFY_AUDIO_ROOT`, with a checked `audio_manifest.json`. Use the staging
+model/adapter tuple and matching deployment-specific baselines. The verifier
+must exercise PCM input through STT and a completed pinned-flow turn; send-text,
+synthetic, or silent media is not speech evidence. Keep raw recordings and
+provider/TURN credentials out of reports.
+
+The deployment lane must also report a real Chromium TLS/WebRTC session using
+the configured TURN relay, with non-silent media in both directions, a completed
+turn, barge-in cancellation, and audio recovery after reconnect. Keep
+`audio-evidence.json` and `transport-evidence.json` with the owned run artifacts;
+hand-authored or synthetic reports do not count.
+
+From the candidate checkout, run:
+
+```sh
+scripts/voice-ai.sh verify release \
+  --profile deployment \
+  --config '/secure-qualification/release-profile.json'
+```
+
+Keep the owned `data/verification/<run-id>/` artifacts with the change record.
+Review both `manifest.json` and `result.json`: every required gate must be
+`passed`, each gate must have a status and reason, reports must be present and
+nonempty, and the manifest commit must be the same release commit being
+staged. Confirm the database report includes a fresh-database backup/restore,
+wallet-ledger reconciliation, and preserved audit evidence. A failed or
+`not_run` gate blocks the release; do not relabel a required capability as
+optional to clear it.
+
+Only after the reviewed manifest records all required gates passed for the
+same release commit may the release owner separately approve public-call
+enablement. Public and real-paid flags remain off until that decision; payment
+gateway enablement remains independently disabled until its own verification
+is complete.
