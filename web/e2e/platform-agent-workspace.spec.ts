@@ -363,7 +363,7 @@ test("Chat Test reloads a pending message and retries the exact persisted turn",
   let pinnedRequest: Record<string, unknown> | null = null;
   const sends: Record<string, unknown>[] = [];
   let testId = "";
-  await page.route(`**/api/v1/agents/${agentId}/test/chat`, async (route) => {
+  await page.route(`**/api/v1/agents/${agentId}/test/chat**`, async (route) => {
     if (route.request().method() === "POST") {
       const body = JSON.parse(route.request().postData() ?? "{}") as Record<string, unknown>;
       sends.push(body);
@@ -391,7 +391,7 @@ test("Chat Test reloads a pending message and retries the exact persisted turn",
       body: JSON.stringify({
         test_id: testId,
         snapshot_hash: request?.snapshot_hash,
-        turn_sequence: 0,
+        turn_sequence: 1,
         pending_turn_sequence: 1,
         messages: [{
           id: "pending-user-message",
