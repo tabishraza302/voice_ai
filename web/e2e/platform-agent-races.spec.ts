@@ -38,9 +38,10 @@ const completedJob = {
   usage: { prompt_tokens: null, completion_tokens: null, total_tokens: null },
 };
 
-test("cancellation racing with generation completion reloads the proposal", async ({ page }) => {
+test("completed cancellation shows status and lets users retry failed details", async ({ page }) => {
   let cancellationRequested = false;
   let completionReads = 0;
+  let retryRequested = false;
   await page.route("**/api/v1/**", async (route) => {
     const request = route.request();
     const pathname = new URL(request.url()).pathname;
@@ -85,7 +86,7 @@ test("cancellation racing with generation completion reloads the proposal", asyn
         return;
       }
       completionReads += 1;
-      if (completionReads === 1) {
+      if (!retryRequested) {
         await route.fulfill({
           status: 503,
           contentType: "application/json",
@@ -111,15 +112,18 @@ test("cancellation racing with generation completion reloads the proposal", asyn
   await expect(page.getByRole("heading", { name: "RUNNING", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Cancel generation" }).click();
   await expect(page.getByRole("heading", { name: "COMPLETED", exact: true })).toBeVisible();
-  await expect(page.getByText("Generation completed without a proposal. No agent draft was created.")).toHaveCount(0);
   const retryButton = page.getByRole("button", { name: "Retry status check" });
-  const proposalHeading = page.getByRole("heading", { name: "Loan guide", exact: true });
-  await expect.poll(async () => (await proposalHeading.isVisible()) || (await retryButton.isVisible())).toBe(true);
-  if (await retryButton.isVisible()) await retryButton.click();
-  await expect(proposalHeading).toBeVisible();
+  await expect(page.getByRole("alert")).toContainText("Temporary job detail failure");
+  await expect(retryButton).toBeVisible();
+  expect(completionReads).toBe(1);
+  await expect(page.getByText("Generation completed without a proposal. No agent draft was created.")).toHaveCount(0);
+
+  retryRequested = true;
+  await retryButton.click();
+  await expect(page.getByRole("heading", { name: "Loan guide", exact: true })).toBeVisible();
   await expect(page.getByText(/Usage: unknown prompt \+ unknown completion tokens, unknown total\./)).toBeVisible();
   await expect(page.getByText("Generation completed without a proposal. No agent draft was created.")).toHaveCount(0);
-  expect(completionReads).toBeGreaterThanOrEqual(2);
+  expect(completionReads).toBe(2);
 });
 
 test("a delayed status retry cannot replace the newly selected generation", async ({ page }) => {
