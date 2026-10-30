@@ -13,12 +13,13 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 
-const AUTH_ROUTES = [
+const UNAUTHENTICATED_ROUTES = [
   "/login",
   "/register",
   "/verify-email",
   "/forgot-password",
   "/reset-password",
+  "/public",
 ];
 
 export function ModeGuard({ children }: { children: React.ReactNode }) {
@@ -26,13 +27,13 @@ export function ModeGuard({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
 
-  const isAuthRoute = AUTH_ROUTES.some(
+  const isUnauthenticatedRoute = UNAUTHENTICATED_ROUTES.some(
     (route) => pathname === route || pathname.startsWith(`${route}/`)
   );
   // Unconditional hook execution for React hook ordering
   useEffect(() => {
     if (isLocalMode) return;
-    if (isAuthRoute) return;
+    if (isUnauthenticatedRoute) return;
 
     const search = typeof window !== "undefined" ? window.location.search : "";
     const currentPath = `${pathname}${search}` || "/";
@@ -47,15 +48,15 @@ export function ModeGuard({ children }: { children: React.ReactNode }) {
     ) {
       router.push("/admin/settings");
     }
-  }, [isLocalMode, isAuthRoute, state.status, router, pathname]);
+  }, [isLocalMode, isUnauthenticatedRoute, state.status, router, pathname]);
 
   // In local offline mode, all routes render directly as the local workspace
   if (isLocalMode) {
     return <>{children}</>;
   }
 
-  // Auth pages are guest/public and render directly
-  if (isAuthRoute) {
+  // Authentication and public guest pages render without an account
+  if (isUnauthenticatedRoute) {
     return <>{children}</>;
   }
 

@@ -121,6 +121,23 @@ describe("voice session lifecycle", () => {
     expect(peer.closed).toBe(true);
   });
 
+  test("sends a bound guest session JWT as the Pipecat request_data", async () => {
+    const { session, fetcher } = createHarness();
+    const guestRequest = {
+      session_id: "session-guest-1",
+      join_token: "signed-guest-join-token",
+    };
+
+    await session.connect({
+      offerUrl: "https://voice.example/api/offer",
+      requestData: guestRequest,
+    });
+
+    const requestBody = JSON.parse(fetcher.mock.calls[0][1].body);
+    expect(requestBody.request_data).toEqual(guestRequest);
+    expect(requestBody.request_data.agent_id).toBeUndefined();
+  });
+
   test("calls the injected fetcher with the global receiver", async () => {
     let receiver = null;
     const response = { ok: true, json: async () => ({ pc_id: "pc-1", sdp: "remote-sdp", type: "answer" }) };
