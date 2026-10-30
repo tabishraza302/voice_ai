@@ -436,3 +436,233 @@ test("Chat Test reloads a pending message and retries the exact persisted turn",
     text,
   });
 });
+
+test("Flow QA lists frozen cases, shows results, keeps suggestions draft-only, and cancels jobs", async ({ page }) => {
+  test.setTimeout(180_000);
+  await registerAndSignIn(page);
+  const scenario = {
+    scenario_id: "qa_scenario_branch_1",
+    case_key: "branch:income:0:review",
+    kind: "branch",
+    expected_edge: {
+      from_step_id: "income",
+      transition_index: 0,
+      to_step_id: "review",
+      when: { operator: "eq", field: "employment", value: "salaried" },
+    },
+    target_step_id: "income",
+    target_fields: ["employment"],
+    task: "Reach the review step with the frozen answer.",
+  };
+  const suggestions = [
+    {
+      suggestion_id: "qa_sug_apply",
+      status: "DRAFT",
+      draft_only: true,
+      title: "Review step income",
+      summary: "The flow should clarify the selected employment state.",
+      target_step_id: "income",
+      target_fields: ["employment"],
+      evidence: { scenario_id: scenario.scenario_id, assertion: "The flow did not clarify." },
+      proposed_patch: { path: "/steps/income/instruction", append_text: "Confirm the employment state." },
+    },
+    {
+      suggestion_id: "qa_sug_dismiss",
+      status: "DRAFT",
+      draft_only: true,
+      title: "Review step follow-up",
+      summary: "The flow should re-check the amount.",
+      target_step_id: "income",
+      target_fields: ["monthly_income"],
+      evidence: { scenario_id: scenario.scenario_id, assertion: "The amount was not confirmed." },
+      proposed_patch: { path: "/steps/income/instruction", append_text: "Confirm the amount." },
+    },
+  ];
+  const requests: { method: string; path: string; search: string; body: Record<string, unknown> | null }[] = [];
+  const jobs = new Map<string, {
+    request: Record<string, unknown>;
+    status: "COMPLETED" | "RUNNING" | "CANCELLED";
+    suggestions: Record<string, unknown>[];
+  }>();
+  const createBodies: Record<string, unknown>[] = [];
+  const publishCalls: string[] = [];
+  let nextJob = 0;
+
+  await page.route("**/api/v1/generation-models", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        items: [{
+          id: "qa-utterance",
+          name: "QA Utterance",
+          description: "Qualified test model",
+          supports_reasoning: false,
+        }],
+      }),
+    });
+  });
+
+  await page.route("**/api/v1/qa/**", async (route) => {
+    const request = route.request();
+    const method = request.method();
+    const url = new URL(request.url());
+    const body = method === "POST"
+      ? JSON.parse(request.postData() ?? "{}") as Record<string, unknown>
+      : null;
+    requests.push({ method, path: url.pathname, search: url.search, body });
+    const respond = (value: unknown, status = 200) => route.fulfill({
+      status,
+      contentType: "application/json",
+      body: JSON.stringify(value),
+    });
+
+    if (url.pathname === "/api/v1/qa/scenarios" && method === "GET") {
+      return respond({
+        scenarios: [scenario],
+        scenario_count: 1,
+        omitted_scenario_count: 0,
+        flow_hash: "a".repeat(64),
+      });
+    }
+    if (url.pathname === "/api/v1/qa/jobs" && method === "POST") {
+      nextJob += 1;
+      const jobId = `qa-job-${nextJob}`;
+      createBodies.push(body ?? {});
+      jobs.set(jobId, {
+        request: body ?? {},
+        status: nextJob === 1 ? "COMPLETED" : "RUNNING",
+        suggestions: nextJob === 1 ? suggestions.map((item) => ({ ...item })) : [],
+      });
+      return respond({ job_id: jobId, status: "QUEUED" }, 202);
+    }
+    const jobMatch = url.pathname.match(/\/api\/v1\/qa\/jobs\/([^/]+)$/);
+    if (jobMatch && method === "GET") {
+      const jobId = jobMatch[1]!;
+      const stored = jobs.get(jobId);
+      if (!stored) return respond({ error: "Missing test job" }, 404);
+      const jobStatus = stored.status;
+      return respond({
+        job_id: jobId,
+        agent_id: stored.request.agent_id,
+        snapshot_kind: "draft",
+        snapshot_hash: stored.request.snapshot_hash,
+        status: jobStatus,
+        config_hash: "b".repeat(64),
+        rubric_version: "flow-qa-rubric/1",
+        models: { runtime: "qwen3.5:4b", utterance: "qa-utterance", judge: null },
+        scenarios: [scenario],
+        results: jobStatus === "COMPLETED" ? [{
+          scenario_id: scenario.scenario_id,
+          kind: scenario.kind,
+          status: "FAIL",
+          assertion: "The flow did not clarify the selected state.",
+          expected_edge: scenario.expected_edge,
+          observed_edges: [],
+          turn_count: 1,
+          token_usage: { prompt_tokens: 40, completion_tokens: 12, total_tokens: 52 },
+          artifact_id: "qa_artifact_1",
+          failure_code: null,
+        }] : [],
+        suggestions: stored.suggestions,
+        coverage: {
+          scenario_count: 1,
+          covered_edge_count: 1,
+          scenario_status_counts: { PASS: 0, FAIL: 1, INCONCLUSIVE: 0, ERROR: 0 },
+        },
+        budget: { scenario_count: 1, max_turns: 12, max_tokens: 4096, max_runtime_seconds: 120 },
+        usage: { prompt_tokens: 40, completion_tokens: 12, total_tokens: 52 },
+        failure_code: null,
+        runtime_seconds: 1.2,
+        artifacts: [],
+        created_at: new Date().toISOString(),
+        started_at: new Date().toISOString(),
+        completed_at: jobStatus === "COMPLETED" || jobStatus === "CANCELLED" ? new Date().toISOString() : null,
+      });
+    }
+    const cancelMatch = url.pathname.match(/\/api\/v1\/qa\/jobs\/([^/]+)\/cancel$/);
+    if (cancelMatch && method === "POST") {
+      const stored = jobs.get(cancelMatch[1]!);
+      if (!stored) return respond({ error: "Missing test job" }, 404);
+      stored.status = "CANCELLED";
+      return respond({ job_id: cancelMatch[1], status: "CANCELLED" });
+    }
+    const applyMatch = url.pathname.match(/\/api\/v1\/qa\/jobs\/([^/]+)\/suggestions\/([^/]+)\/apply$/);
+    if (applyMatch && method === "POST") {
+      const stored = jobs.get(applyMatch[1]!);
+      const suggestion = stored?.suggestions.find((item) => item.suggestion_id === applyMatch[2]);
+      if (!stored || !suggestion) return respond({ error: "Missing suggestion" }, 404);
+      suggestion.status = "APPLIED_TO_DRAFT";
+      return respond({
+        suggestion_id: applyMatch[2],
+        draft_revision: 3,
+        authoring_hash: "c".repeat(64),
+        applied: true,
+      });
+    }
+    const dismissMatch = url.pathname.match(/\/api\/v1\/qa\/jobs\/([^/]+)\/suggestions\/([^/]+)\/dismiss$/);
+    if (dismissMatch && method === "POST") {
+      const stored = jobs.get(dismissMatch[1]!);
+      const suggestion = stored?.suggestions.find((item) => item.suggestion_id === dismissMatch[2]);
+      if (!stored || !suggestion) return respond({ error: "Missing suggestion" }, 404);
+      suggestion.status = "DISMISSED";
+      return respond({ suggestion_id: dismissMatch[2], status: "DISMISSED" });
+    }
+    return respond({ error: "Unmocked QA route" }, 404);
+  });
+
+  const agentId = await createBlankAgent(page, `Flow QA ${Date.now()}`);
+  await page.route(`**/api/v1/agents/${agentId}/publish`, async (route) => {
+    publishCalls.push(route.request().url());
+    await route.fulfill({ status: 409, contentType: "application/json", body: "{}" });
+  });
+  await page.getByRole("button", { name: "Flow JSON" }).click();
+  await page.getByLabel("Flow document").fill(JSON.stringify(loanFixture.flow, null, 2));
+  await page.getByRole("button", { name: "Apply flow JSON" }).click();
+  const saveResponse = page.waitForResponse((response) =>
+    response.request().method() === "PATCH" &&
+    new URL(response.url()).pathname.endsWith(`/agents/${agentId}/draft`)
+  );
+  await page.getByRole("button", { name: "Save draft" }).click();
+  const savedDraftResponse = await saveResponse;
+  expect(savedDraftResponse.ok()).toBe(true);
+  const savedDraft = await savedDraftResponse.json() as { snapshot_hash: string; draft_revision: number };
+  expect(savedDraft.snapshot_hash).toBeTruthy();
+
+  await expect(page.getByRole("heading", { name: "Flow QA" })).toBeVisible();
+  await page.getByRole("button", { name: "Load scenarios" }).click();
+  await expect(page.getByLabel(`Include ${scenario.case_key}`)).toBeChecked();
+  const previewRequest = requests.find((item) => item.path === "/api/v1/qa/scenarios");
+  expect(previewRequest?.method).toBe("GET");
+  const previewQuery = new URLSearchParams(previewRequest?.search ?? "");
+  expect(previewQuery.get("agent_id")).toBe(agentId);
+  expect(previewQuery.get("snapshot_hash")).toBe(savedDraft.snapshot_hash);
+  expect(previewQuery.get("scenario_count")).toBe("64");
+
+  await page.getByRole("button", { name: "Run selected scenarios" }).click();
+  await expect(page.getByRole("list", { name: "QA results" }).getByText("The flow did not clarify the selected state.")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Coverage summary" })).toBeVisible();
+  await expect(page.getByText("1 unique transitions observed.")).toBeVisible();
+  expect(createBodies[0]).toMatchObject({
+    agent_id: agentId,
+    snapshot_hash: savedDraft.snapshot_hash,
+    scenario_count: 1,
+    scenario_ids: [scenario.scenario_id],
+    utterance_model_id: "qa-utterance",
+  });
+
+  await page.getByRole("button", { name: "Apply to draft" }).click();
+  await expect(page.getByRole("status").filter({ hasText: "Suggestion applied to draft r3. It was not published." })).toBeVisible();
+  await page.getByRole("button", { name: "Dismiss" }).click();
+  await expect(page.getByText("Suggestion dismissed. The draft and published version were not changed.")).toBeVisible();
+
+  await page.getByRole("button", { name: "Run selected scenarios" }).click();
+  await expect(page.getByRole("button", { name: "Cancel job" })).toBeVisible();
+  await page.getByRole("button", { name: "Cancel job" }).click();
+  await expect(page.getByRole("status").filter({ hasText: "Cancelled" })).toBeVisible();
+  expect(createBodies).toHaveLength(2);
+  expect(requests.some((item) => item.method === "POST" && item.path.endsWith("/cancel"))).toBe(true);
+  expect(requests.some((item) => item.path.endsWith("/suggestions/qa_sug_apply/apply"))).toBe(true);
+  expect(requests.some((item) => item.path.endsWith("/suggestions/qa_sug_dismiss/dismiss"))).toBe(true);
+  expect(publishCalls).toHaveLength(0);
+});
