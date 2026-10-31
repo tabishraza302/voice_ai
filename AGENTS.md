@@ -146,6 +146,12 @@ The collector sets it, because the collector is the Phoenix boundary.
 before the demo, and the demo runs with the network off. If you add a
 component that reaches out, it breaks the project's central claim.
 
+## pstack in omp
+
+When using a pstack skill or playbook in omp, first read
+`.omp/pstack-omp.md` for the tool and harness mappings. The adapter applies
+to delegated pstack roles too.
+
 ## Layout
 
 ```
