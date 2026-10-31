@@ -94,6 +94,7 @@ export class PlatformApiClient {
   private baseUrl: string;
   // The CSRF token is kept ONLY in memory; never written to localStorage or cookies.
   private csrfToken: string | null = null;
+  private sessionBootstrap: Promise<SessionResponse> | null = null;
   private sessionListeners = new Set<(session: SessionResponse | null) => void>();
 
   constructor(baseUrl: string = DEFAULT_PLATFORM_API_URL) {
@@ -130,11 +131,55 @@ export class PlatformApiClient {
   }
 
   async request<T>(endpoint: string, options?: RequestInit): Promise<T> {
+    return this.requestOnce<T>(endpoint, options, true);
+  }
+
+  /**
+   * Obtain the anonymous session exactly once while a bootstrap is in flight.
+   *
+   * Mutations need both the session cookie and its in-memory CSRF token. If a
+   * page submits a form before the auth provider's bootstrap returns, the POST
+   * would otherwise be rejected as CSRF_INVALID. Sharing one in-flight GET
+   * also keeps the provider and the first mutation from creating two sessions.
+   */
+  private bootstrapSession(): Promise<SessionResponse> {
+    if (!this.sessionBootstrap) {
+      this.sessionBootstrap = this.requestOnce<SessionResponse>(
+        "/auth/session",
+        { method: "GET" },
+        false
+      ).finally(() => {
+        this.sessionBootstrap = null;
+      });
+    }
+    return this.sessionBootstrap;
+  }
+
+  private async requestOnce<T>(
+    endpoint: string,
+    options: RequestInit | undefined,
+    allowCsrfRetry: boolean
+  ): Promise<T> {
     const url = `${this.baseUrl}${endpoint.startsWith("/") ? endpoint : `/${endpoint}`}`;
     const method = (options?.method || "GET").toUpperCase();
     const isMutation = ["POST", "PUT", "PATCH", "DELETE"].includes(method);
 
+    // A mutation cannot be signed without the session it belongs to. Wait for
+    // the shared bootstrap; if it fails, the request still proceeds and fails
+    // closed with the server's own error.
+    if (isMutation && !this.csrfToken) {
+      try {
+        await this.bootstrapSession();
+      } catch {
+        // Keep the original request path; CSRF_INVALID is the honest failure.
+      }
+    }
+
     const headers = new Headers(options?.headers || {});
+    // Only requests that carry the server's replay-dedup key may be replayed.
+    // A non-idempotent mutation (for example a user suspend) must fail closed:
+    // the existing contract forbids replaying mutations without that key.
+    const replaySafe = headers.has("Idempotency-Key");
 
     // Ensure credentials: 'include' on every platform call
     const fetchOptions: RequestInit = {
@@ -157,6 +202,9 @@ export class PlatformApiClient {
     }
 
     fetchOptions.headers = headers;
+
+    // The token actually sent, which is what a CSRF rejection refers to.
+    const sentCsrfToken = headers.get("X-CSRF-Token");
 
     const response = await fetch(url, fetchOptions);
 
@@ -197,7 +245,7 @@ export class PlatformApiClient {
         }
       }
 
-      throw new PlatformApiError(
+      const apiError = new PlatformApiError(
         response.status,
         code,
         message,
@@ -205,6 +253,29 @@ export class PlatformApiClient {
         retryable,
         fieldErrors
       );
+
+      // A stale in-memory CSRF token (for example after the server rotated the
+      // session) is recoverable exactly once: refresh the session, then replay
+      // the mutation with the new token. Mutations are protected by their
+      // Idempotency-Key, so a replay cannot double-apply.
+      if (
+        allowCsrfRetry &&
+        isMutation &&
+        replaySafe &&
+        response.status === 403 &&
+        code === "CSRF_INVALID" &&
+        sentCsrfToken
+      ) {
+        this.csrfToken = null;
+        try {
+          await this.bootstrapSession();
+        } catch {
+          throw apiError;
+        }
+        return this.requestOnce<T>(endpoint, options, false);
+      }
+
+      throw apiError;
     }
 
     if (!isJson) {
@@ -231,9 +302,7 @@ export class PlatformApiClient {
   // --- Auth lifecycle endpoints ---
 
   async getSession(): Promise<SessionResponse> {
-    return this.request<SessionResponse>("/auth/session", {
-      method: "GET",
-    });
+    return this.bootstrapSession();
   }
 
   async register(data: RegisterRequest): Promise<Accepted> {

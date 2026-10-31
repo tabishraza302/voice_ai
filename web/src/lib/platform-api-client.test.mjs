@@ -438,3 +438,187 @@ describe("PlatformApiClient", () => {
     }
   });
 });
+
+describe("PlatformApiClient CSRF bootstrap", () => {
+  let calls = [];
+  let client;
+  const originalFetch = globalThis.fetch;
+
+  beforeEach(() => {
+    calls = [];
+    client = new PlatformApiClient("http://127.0.0.1:8000/api/v1");
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  function sessionPayload(csrfToken) {
+    return {
+      state: "anonymous",
+      user: null,
+      session_id: "00000000-0000-0000-0000-000000000001",
+      expires_at: "2026-10-31T12:00:00Z",
+      csrf_token: csrfToken,
+      step_up_expires_at: null,
+    };
+  }
+
+  function jsonResponse(body, status = 200) {
+    return new Response(JSON.stringify(body), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  function record(handler) {
+    globalThis.fetch = async (input, init = {}) => {
+      calls.push({ url: String(input), init });
+      return handler(String(input), init);
+    };
+  }
+
+  test("a mutation without a CSRF token first obtains the anonymous session", async () => {
+    let releaseSession;
+    const sessionGate = new Promise((resolve) => {
+      releaseSession = resolve;
+    });
+    record(async (url) => {
+      if (url.endsWith("/auth/session")) {
+        await sessionGate;
+        return jsonResponse(sessionPayload("csrf-bootstrapped"));
+      }
+      return new Response(null, { status: 202 });
+    });
+
+    const registration = client.register({
+      email: "new@example.com",
+      display_name: "New User",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(calls.map((call) => new URL(call.url).pathname)).toEqual([
+      "/api/v1/auth/session",
+    ]);
+
+    releaseSession();
+    await registration;
+
+    expect(calls.map((call) => new URL(call.url).pathname)).toEqual([
+      "/api/v1/auth/session",
+      "/api/v1/auth/register",
+    ]);
+    expect(calls[1].init.headers.get("X-CSRF-Token")).toBe("csrf-bootstrapped");
+  });
+
+  test("concurrent mutations share one session bootstrap", async () => {
+    record(async (url) => {
+      if (url.endsWith("/auth/session")) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return jsonResponse(sessionPayload("csrf-shared"));
+      }
+      return new Response(null, { status: 202 });
+    });
+
+    await Promise.all([
+      client.register({ email: "one@example.com", display_name: "One" }),
+      client.register({ email: "two@example.com", display_name: "Two" }),
+    ]);
+
+    const sessionCalls = calls.filter((call) =>
+      call.url.endsWith("/auth/session")
+    );
+    expect(sessionCalls).toHaveLength(1);
+
+    const registerCalls = calls.filter((call) =>
+      call.url.endsWith("/auth/register")
+    );
+    expect(registerCalls).toHaveLength(2);
+    for (const call of registerCalls) {
+      expect(call.init.headers.get("X-CSRF-Token")).toBe("csrf-shared");
+    }
+  });
+
+  test("a rejected stale CSRF token refreshes the session and retries once", async () => {
+    client.setCsrfToken("csrf-stale");
+    let mutateAttempts = 0;
+    record(async (url) => {
+      if (url.endsWith("/auth/session")) {
+        return jsonResponse(sessionPayload("csrf-refreshed"));
+      }
+      mutateAttempts += 1;
+      if (mutateAttempts === 1) {
+        return jsonResponse(
+          {
+            error: {
+              code: "CSRF_INVALID",
+              message: "Invalid or missing CSRF token",
+              request_id: "req-1",
+              retryable: false,
+            },
+          },
+          403
+        );
+      }
+      return new Response(null, { status: 202 });
+    });
+
+    await client.adminCreateTariffVersion(
+      {
+        expected_revision: 3,
+        rate_minor_per_minute: 12,
+        reason: "Quarterly price review",
+      },
+      "tariff-retry-key"
+    );
+
+    const mutationCalls = calls.filter((call) =>
+      call.url.endsWith("/admin/tariffs/versions")
+    );
+    expect(mutationCalls).toHaveLength(2);
+    expect(mutationCalls[0].init.headers.get("X-CSRF-Token")).toBe("csrf-stale");
+    expect(mutationCalls[1].init.headers.get("X-CSRF-Token")).toBe(
+      "csrf-refreshed"
+    );
+    // The replay reuses the same key so the server can deduplicate it.
+    expect(mutationCalls[1].init.headers.get("Idempotency-Key")).toBe(
+      "tariff-retry-key"
+    );
+  });
+
+  test("a mutation still fails closed when the session bootstrap is unavailable", async () => {
+    record(async (url) => {
+      if (url.endsWith("/auth/session")) {
+        return new Response("service unavailable", { status: 503 });
+      }
+      return jsonResponse(
+        {
+          error: {
+            code: "CSRF_INVALID",
+            message: "Invalid or missing CSRF token",
+            request_id: "req-2",
+            retryable: false,
+          },
+        },
+        403
+      );
+    });
+
+    await expect(
+      client.register({
+        email: "offline@example.com",
+        display_name: "Offline",
+      })
+    ).rejects.toBeInstanceOf(PlatformApiError);
+
+    const sessionCalls = calls.filter((call) =>
+      call.url.endsWith("/auth/session")
+    );
+    expect(sessionCalls).toHaveLength(1);
+
+    const registerCalls = calls.filter((call) =>
+      call.url.endsWith("/auth/register")
+    );
+    expect(registerCalls).toHaveLength(1);
+  });
+});
