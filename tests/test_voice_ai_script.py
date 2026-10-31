@@ -22,6 +22,22 @@ def _isolated_repo(tmp_path):
     return repo
 
 
+def _wait_for_nonempty_file(path, timeout=5.0):
+    """Wait for a background process to finish writing its capture file.
+
+    The launcher starts the web studio in the background and returns as soon
+    as it has launched it; the child writes the capture after it is
+    scheduled. Reading the file without a bounded wait races the child, which
+    only loses under load.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.is_file() and path.stat().st_size > 0:
+            return
+        time.sleep(0.02)
+    pytest.fail(f"{path} was not written within {timeout}s")
+
+
 def _start_with_postgres_down(tmp_path, dotenv=None, extra_env=None):
     """An isolated repo whose PostgreSQL readiness check always fails."""
     repo = _isolated_repo(tmp_path)
@@ -204,6 +220,7 @@ def test_start_web_and_stop_manage_only_the_project_process(tmp_path):
     )
     assert started.returncode == 0, started.stderr or started.stdout
     web_pid = int((repo / "data/run/web.pid").read_text().split("|", 1)[0])
+    _wait_for_nonempty_file(capture)
     lines = capture.read_text().splitlines()
     assert lines[0] == str(repo / "web")
     assert lines[2] == "1"
