@@ -300,7 +300,7 @@ async def test_recovery_rechecks_permit_renewed_after_candidate_scan(
     renewal_time = original_permit.expires_at + timedelta(milliseconds=500)
     recovery_time = original_permit.expires_at + timedelta(seconds=1)
 
-    async def renew_before_expiring(db, *, session_id, operation_id, now):
+    async def renew_before_expiring(db, *, session_id, operation_id, now, **kwargs):
         await checkpoint_and_reserve(
             db,
             runtime_principal=RuntimePrincipal(runner_id="runner-renewed-expiry"),
@@ -419,7 +419,7 @@ async def test_concurrent_recovery_sweeps_commit_one_proven_settlement(
                 select(BillingOperation).where(
                     BillingOperation.session_id == session.id,
                     BillingOperation.operation_id
-                    == f"runner_lost_expired:{session.id}",
+                    == f"__platform_internal__:runner_lost_expired:{session.id}",
                 )
             )
         ).scalars().all()
@@ -442,6 +442,95 @@ async def test_concurrent_recovery_sweeps_commit_one_proven_settlement(
         assert len(charge_entries) == 1
         assert charge_entries[0].amount_minor == -10
         await assert_wallet_invariants(db, user_id=user.id)
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_recovery_continues_after_one_candidate_operation_conflict(
+    fresh_pg: FreshPostgres,
+    caplog: pytest.LogCaptureFixture,
+):
+    """One conflicting recovery key must not abort the rest of the batch."""
+    await fresh_pg.initialize()
+    t0 = datetime(2026, 10, 28, 12, 0, 0, tzinfo=timezone.utc)
+    runner_id = "runner-recovery-batch"
+
+    async with fresh_pg.new_session() as db:
+        user = await create_test_user(db)
+        await create_funded_wallet(db, user_id=user.id, credited_minor=200)
+        blocked_session, _ = await create_test_session(
+            db,
+            owner_user_id=user.id,
+            runner_id=runner_id,
+            created_at=t0,
+        )
+        next_session, _ = await create_test_session(
+            db,
+            owner_user_id=user.id,
+            runner_id=runner_id,
+            created_at=t0,
+        )
+        await checkpoint_and_reserve(
+            db,
+            runtime_principal=RuntimePrincipal(runner_id=runner_id),
+            session_id=blocked_session.id,
+            operation_id="grant-blocked-recovery",
+            expected_budget_version=1,
+            cumulative_billable_ms=0,
+            requested_future_ms=10_000,
+            billing_slice_ms=10_000,
+            permit_ttl_ms=3_000,
+            now=t0,
+        )
+        await checkpoint_and_reserve(
+            db,
+            runtime_principal=RuntimePrincipal(runner_id=runner_id),
+            session_id=next_session.id,
+            operation_id="grant-next-recovery",
+            expected_budget_version=1,
+            cumulative_billable_ms=0,
+            requested_future_ms=10_000,
+            billing_slice_ms=10_000,
+            permit_ttl_ms=5_000,
+            now=t0,
+        )
+        db.add(
+            BillingOperation(
+                session_id=blocked_session.id,
+                operation_id=(
+                    "__platform_internal__:runner_lost_expired:"
+                    f"{blocked_session.id}"
+                ),
+                request_hash="x" * 64,
+                response_body={},
+                status_code=200,
+                created_at=t0,
+            )
+        )
+        await db.commit()
+
+    async with fresh_pg.new_session() as db:
+        recovered = await recover_expired_budgets(db, now=t0 + timedelta(seconds=6))
+        assert recovered == 1
+        blocked_budget = (
+            await db.execute(
+                select(CallBudget).where(
+                    CallBudget.session_id == blocked_session.id
+                )
+            )
+        ).scalar_one()
+        next_budget = (
+            await db.execute(
+                select(CallBudget).where(CallBudget.session_id == next_session.id)
+            )
+        ).scalar_one()
+        assert blocked_budget.status == "OPEN"
+        assert next_budget.status == "CLOSED"
+        assert (
+            f"Billing recovery candidate {blocked_session.id} failed"
+            in caplog.text
+        )
+
 
 @pytest.mark.postgres
 @pytest.mark.asyncio

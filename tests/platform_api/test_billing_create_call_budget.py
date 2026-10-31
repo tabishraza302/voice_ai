@@ -348,6 +348,39 @@ async def test_create_call_budget_input_validation():
         )
 
 
+@pytest.mark.asyncio
+async def test_create_call_budget_rejects_reserved_internal_operation_namespace():
+    """A caller-supplied key cannot enter the recovery worker's namespace."""
+    from unittest.mock import AsyncMock
+
+    with pytest.raises(BillingValidationError, match="reserved prefix"):
+        await create_call_budget(
+            AsyncMock(),
+            session_id=uuid.uuid4(),
+            operation_id="__platform_internal__:runner_lost_expired:op-1",
+            pinned_rate_minor_per_minute=200,
+        )
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_rejects_reserved_internal_operation_namespace():
+    """Runtime checkpoints cannot claim the recovery worker's operation keys."""
+    from unittest.mock import AsyncMock
+
+    with pytest.raises(BillingValidationError, match="reserved prefix"):
+        await checkpoint_and_reserve(
+            AsyncMock(),
+            runtime_principal=RuntimePrincipal(runner_id="runner-1"),
+            session_id=uuid.uuid4(),
+            operation_id="__platform_internal__:runner_lost_expired:op-1",
+            expected_budget_version=1,
+            cumulative_billable_ms=0,
+            requested_future_ms=1_000,
+            billing_slice_ms=1_000,
+            permit_ttl_ms=1_000,
+        )
+
+
 @pytest.mark.postgres
 @pytest.mark.parametrize("meter_operation", ["checkpoint", "close"])
 @pytest.mark.asyncio

@@ -822,3 +822,72 @@ def test_flow_qa_rejects_reachable_branch_count_above_the_bounded_catalog():
             flow_hash="a" * 64,
             max_scenarios=64,
         )
+
+
+def test_flow_qa_prompt_budget_uses_utf8_byte_count_for_unicode_text():
+    from platform_api.qa.worker import _TokenBudgetExhausted, _budget_model_call
+
+    with pytest.raises(_TokenBudgetExhausted):
+        _budget_model_call(
+            [{"role": "user", "content": chr(0x0928) * 60}],
+            available_tokens=64,
+            requested_completion_tokens=16,
+        )
+
+
+def test_flow_qa_worker_does_not_select_else_after_an_unknown_guard():
+    from bot.flow.compiler import compile_flow
+    from bot.flow.controller import evaluate_transitions, initial_session_state
+    from bot.flow.schemas import FlowLimits
+    from platform_api.qa.schemas import ExpectedEdge
+    from platform_api.qa.worker import UtteranceExpansion, _generated_input_selects_edge
+
+    fixture = json.loads(
+        (
+            Path(__file__).resolve().parents[2]
+            / "docs/first-release/flow-fixtures/valid-loan-en-hi.json"
+        ).read_text(encoding="utf-8")
+    )
+    flow = fixture["flow"]
+    source = next(step for step in flow["steps"] if step["id"] == "employment")
+    source["transitions"] = [
+        {
+            "when": {
+                "operator": "eq",
+                "field": "employment_type",
+                "value": "salaried",
+            },
+            "to": "salary",
+        },
+        {"when": {"operator": "else"}, "to": "business_income"},
+    ]
+    compiled = compile_flow(
+        flow=flow,
+        policy="QA predicate test",
+        limits=FlowLimits(),
+        base_prompt_hash="a" * 64,
+    )
+    state = initial_session_state(
+        compiled,
+        session_id="qa-else-unknown",
+        transport_epoch="qa-else-unknown",
+        locale="en",
+    )
+    step = next(
+        item for item in compiled.normalized["steps"] if item["id"] == "employment"
+    )
+    assert evaluate_transitions(step, state.fields, state.steps, compiled) == (
+        None,
+        None,
+        "clarify",
+    )
+    assert not _generated_input_selects_edge(
+        UtteranceExpansion(turns=["I am not sure."]),
+        compiled,
+        ExpectedEdge(
+            from_step_id="employment",
+            transition_index=1,
+            to_step_id="business_income",
+            when={"operator": "else"},
+        ),
+    )

@@ -948,6 +948,8 @@ def _generated_input_selects_edge(
     if source is None:
         return False
     selected_index: int | None = None
+    else_index: int | None = None
+    has_unknown = False
     for index, transition in enumerate(source.get("transitions", [])):
         if not isinstance(transition, dict):
             continue
@@ -955,17 +957,22 @@ def _generated_input_selects_edge(
         if not isinstance(condition, dict):
             continue
         if condition.get("operator") == "else":
-            selected_index = index
-            break
-        if evaluate_predicate(
+            else_index = index
+            continue
+        result = evaluate_predicate(
             condition,
             state.fields,
             state.steps,
             compiled,
             source_step_id=expected.from_step_id,
-        ) == "TRUE":
+        )
+        if result == "TRUE":
             selected_index = index
             break
+        if result == "UNKNOWN":
+            has_unknown = True
+    if selected_index is None and not has_unknown:
+        selected_index = else_index
     return (
         selected_index == expected.transition_index
         and source["transitions"][selected_index].get("to") == expected.to_step_id
@@ -1510,7 +1517,7 @@ def _budget_model_call(
     requested_completion_tokens: int,
 ) -> tuple[int, int]:
     prompt_tokens = _estimate_tokens(
-        "\n".join(message["content"] for message in messages)
+        "\n".join(f"{message['role']}\n{message['content']}" for message in messages)
     )
     completion_tokens = min(
         requested_completion_tokens,
@@ -1522,7 +1529,15 @@ def _budget_model_call(
 
 
 def _estimate_tokens(text: str) -> int:
-    return max(1, (len(text.encode("utf-8")) + 3) // 4)
+    """Conservative token estimate.
+
+    ASCII bytes use the standard ~4 bytes/token heuristic.  Non-ASCII
+    text uses its raw UTF-8 byte count because most tokenizers map
+    multi-byte characters to 1-2 tokens while bytes/4 underestimates
+    them.
+    """
+    ascii_bytes = sum(1 for c in text if ord(c) < 128)
+    return max(1, (ascii_bytes + 3) // 4 + len(text.encode("utf-8")) - ascii_bytes)
 
 
 def _elapsed_ms(started_clock: float) -> int:

@@ -52,6 +52,7 @@ from platform_api.sessions.models import RuntimeRegistration, SessionPeer
 BILLING_RECOVERY_INTERVAL_SECONDS = 5
 BILLING_RECOVERY_BATCH_SIZE = 100
 MAX_OPERATION_ID_LENGTH = 128
+INTERNAL_OPERATION_ID_PREFIX = "__platform_internal__:"
 
 logger = logging.getLogger(__name__)
 
@@ -177,12 +178,16 @@ def _charge_entry_operation_id(
     return f"{session_id}:{operation_id}:charge"
 
 
-def _validate_operation_id(operation_id: str) -> None:
+def _validate_operation_id(operation_id: str, *, _internal: bool = False) -> None:
     if not isinstance(operation_id, str) or not operation_id:
         raise BillingValidationError("operation_id is required")
     if len(operation_id) > MAX_OPERATION_ID_LENGTH:
         raise BillingValidationError(
             f"operation_id exceeds {MAX_OPERATION_ID_LENGTH} characters"
+        )
+    if not _internal and operation_id.startswith(INTERNAL_OPERATION_ID_PREFIX):
+        raise BillingValidationError(
+            f"operation_id uses reserved prefix '{INTERNAL_OPERATION_ID_PREFIX}'"
         )
 
 
@@ -1051,6 +1056,7 @@ async def expire_stopped_budget(
     session_id: uuid.UUID,
     operation_id: str,
     now: datetime,
+    _internal: bool = False,
 ) -> BudgetView:
     """Recover and close an abandoned session budget after permit expiry.
 
@@ -1061,7 +1067,7 @@ async def expire_stopped_budget(
     - Unproven elapsed time is waived (waived_unknown_usage=True).
     - Session marked terminal.
     """
-    _validate_operation_id(operation_id)
+    _validate_operation_id(operation_id, _internal=_internal)
     ts = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
     req_payload = {
         "action": "expire_stopped_budget",
@@ -1237,10 +1243,20 @@ async def recover_expired_budgets(
             await expire_stopped_budget(
                 db,
                 session_id=session_id,
-                operation_id=f"runner_lost_expired:{session_id}",
+                operation_id=(
+                    f"{INTERNAL_OPERATION_ID_PREFIX}"
+                    f"runner_lost_expired:{session_id}"
+                ),
                 now=ts,
+                _internal=True,
             )
         except PermitNotExpiredError:
+            await db.rollback()
+            continue
+        except Exception:
+            logger.exception(
+                "Billing recovery candidate %s failed", session_id,
+            )
             await db.rollback()
             continue
         await db.commit()
