@@ -25,7 +25,8 @@ logs/
 *.sqlite*
 
 # Evaluation harness and local fixtures
-evals
+evals/*
+!evals/wer_eval.py
 *.wav
 *.flac
 *.mp3

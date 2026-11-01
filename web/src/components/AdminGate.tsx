@@ -1,9 +1,9 @@
 "use client";
 
-import React, { useEffect } from "react";
-import { useRouter, usePathname } from "next/navigation";
+import React from "react";
+import { usePathname } from "next/navigation";
 import { useAuth } from "@/lib/auth-state";
-import { ShieldX, Loader2, ShieldAlert } from "lucide-react";
+import { ShieldX, ShieldAlert } from "lucide-react";
 import Link from "next/link";
 
 interface AdminGateProps {
@@ -11,48 +11,8 @@ interface AdminGateProps {
 }
 
 export function AdminGate({ children }: AdminGateProps) {
-  const { state, isLocalMode } = useAuth();
-  const router = useRouter();
+  const { state } = useAuth();
   const pathname = usePathname();
-
-  useEffect(() => {
-    if (isLocalMode) return;
-    if (state.status === "anonymous") {
-      router.push(`/login?next=${encodeURIComponent(pathname || "/admin/users")}`);
-    } else if (state.status === "mfa_required") {
-      router.push("/login");
-    } else if (
-      state.status === "mfa_enrollment_required" &&
-      pathname !== "/admin/settings"
-    ) {
-      router.push("/admin/settings");
-    }
-  }, [isLocalMode, state.status, router, pathname]);
-
-  // In local offline mode, all routes are open
-  if (isLocalMode) {
-    return <>{children}</>;
-  }
-  if (state.status === "loading") {
-    return (
-      <div
-        role="status"
-        aria-live="polite"
-        className="flex min-h-[50vh] flex-col items-center justify-center gap-3 text-limestone-400"
-      >
-        <Loader2 className="h-8 w-8 animate-spin text-copper-400" />
-        <span className="text-sm font-medium">Verifying administrator permissions...</span>
-      </div>
-    );
-  }
-
-  if (state.status === "anonymous") {
-    return null;
-  }
-
-  if (state.status === "mfa_required") {
-    return null;
-  }
 
   if (state.status === "mfa_enrollment_required") {
     if (pathname === "/admin/settings") {
@@ -111,5 +71,6 @@ export function AdminGate({ children }: AdminGateProps) {
     return <>{children}</>;
   }
 
+  // ModeGuard owns loading, error, anonymous, and MFA verification screens.
   return null;
 }

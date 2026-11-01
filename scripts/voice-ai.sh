@@ -91,6 +91,9 @@ PHOENIX_LOG="$LOG_DIR/phoenix.log"
 STT_LOG="$LOG_DIR/stt.log"
 AGENT_LOG="$LOG_DIR/agent.log"
 WEB_LOG="$LOG_DIR/web.log"
+PLATFORM_PORT="${PLATFORM_PORT:-8000}"
+PLATFORM_PID="$RUN_DIR/platform.pid"
+PLATFORM_LOG="$LOG_DIR/platform.log"
 WEB_PID="$RUN_DIR/web.pid"
 WEB_BIN="$REPO_ROOT/web/node_modules/next/dist/bin/next"
 OTHER_PROJECTS=(${OTHER_DOCKER_PROJECTS:-})
@@ -315,6 +318,56 @@ cmd_obs_logs() {
   docker compose logs -f
 }
 
+# --- platform API ----------------------------------------------------------
+
+# Export KEY=VALUE lines from .env into the environment.  PlatformSettings
+# sets env_file=None and reads only OS environment variables; this bridges
+# the gap.  Lines with comments, blank lines, and values with shell-hostile
+# characters are handled safely via `export` rather than raw sourcing.
+load_env() {
+  local env_file="$REPO_ROOT/.env"
+  [ -f "$env_file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    # Skip blanks and comments.
+    case "$line" in ''|\#*) continue ;; esac
+    # Only export lines that look like KEY=VALUE (no spaces around =).
+    if [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+      export "$line"
+    fi
+  done < "$env_file"
+}
+
+cmd_platform() {
+  ensure_database_url
+  load_env
+  mkdir -p "$(dirname "$PLATFORM_LOG")"
+  if [ -f "$PLATFORM_PID" ] && kill -0 "$(cat "$PLATFORM_PID")" 2>/dev/null; then
+    ok "platform API already running (pid $(cat "$PLATFORM_PID"))"
+    return 0
+  fi
+  # Initialise the platform schema if it has not been created yet.
+  if ! uv run python -m platform_api.cli check-schema >/dev/null 2>&1; then
+    log "initialising platform database schema"
+    uv run python -m platform_api.cli init-db
+  fi
+  log "starting platform API on port $PLATFORM_PORT"
+  nohup uv run python -m uvicorn \
+    platform_api.app:create_app --factory \
+    --host 127.0.0.1 --port "$PLATFORM_PORT" \
+    > "$PLATFORM_LOG" 2>&1 &
+  echo $! > "$PLATFORM_PID"
+  wait_for "http://127.0.0.1:$PLATFORM_PORT/health/live" "the platform API" 30 \
+    || die "platform API did not become ready; see $PLATFORM_LOG"
+}
+
+cmd_platform_down() {
+  if [ -f "$PLATFORM_PID" ] && kill -0 "$(cat "$PLATFORM_PID")" 2>/dev/null; then
+    kill "$(cat "$PLATFORM_PID")" && rm -f "$PLATFORM_PID" && ok "platform API stopped"
+  else
+    warn "platform API is not running"
+  fi
+}
+
 # --- the STT server and the agent ------------------------------------------
 
 cmd_stt() {
@@ -355,6 +408,8 @@ cmd_start() {
     esac
   done
 
+  load_env
+
   mkdir -p "$RUN_DIR" "$LOG_DIR"
 
   # 1. Other local stacks (if specified via OTHER_DOCKER_PROJECTS).
@@ -380,6 +435,10 @@ cmd_start() {
   # 3. Phoenix, on the host (connects to PostgreSQL).
   log "starting Phoenix"
   cmd_phoenix
+
+  # 3b. Platform API (auth, billing, admin).
+  log "starting platform API"
+  cmd_platform
 
 
   # Web studio (if requested via --web)
@@ -461,6 +520,7 @@ cmd_stop() {
   fi
   rm -f "$RUN_DIR/stt.pid"
   stop_web
+  cmd_platform_down
 
 
   cmd_obs_down
@@ -478,6 +538,7 @@ cmd_summary() {
 
   Studio:     http://localhost:$WEB_PORT
   Agent:      http://localhost:$AGENT_PORT/client
+  Platform:   http://localhost:$PLATFORM_PORT/api/v1
   Phoenix:    http://localhost:$PHOENIX_PORT
   Grafana:    http://localhost:$GRAFANA_PORT
   Prometheus: http://localhost:$PROMETHEUS_PORT
@@ -487,6 +548,7 @@ EOF
 
 cmd_status() {
   printf 'agent      %s\n' "$(curl -sf -o /dev/null -w '%{http_code}' "http://localhost:$AGENT_PORT/metrics/" 2>/dev/null || echo down)"
+  printf 'platform   %s\n' "$(curl -sf -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PLATFORM_PORT/health/live" 2>/dev/null || echo down)"
   printf 'phoenix    %s\n' "$(curl -sf -o /dev/null -w '%{http_code}' "http://localhost:$PHOENIX_PORT/" 2>/dev/null || echo down)"
   printf 'grafana    %s\n' "$(curl -sf -o /dev/null -w '%{http_code}' "http://localhost:$GRAFANA_PORT/api/health" 2>/dev/null || echo down)"
   printf 'prometheus %s\n' "$(curl -sf -o /dev/null -w '%{http_code}' "http://localhost:$PROMETHEUS_PORT/-/ready" 2>/dev/null || echo down)"
@@ -586,6 +648,8 @@ Running it:
   stt-unload         Release a model from the running server (MODEL=<repo>)
   phoenix            Phoenix alone, on the host
   phoenix-down       Stop Phoenix
+  platform           Platform API alone (auth, billing, admin)
+  platform-down      Stop the platform API
   obs-up             Phoenix, the collector, Prometheus and Grafana
   obs-down           Stop the observability stack
   obs-logs           Follow the containers' logs
@@ -649,6 +713,8 @@ main() {
     stt-unload) cmd_stt_unload "$@" ;;
     phoenix) cmd_phoenix "$@" ;;
     phoenix-down) cmd_phoenix_down "$@" ;;
+    platform) cmd_platform "$@" ;;
+    platform-down) cmd_platform_down "$@" ;;
     obs-up) cmd_obs_up "$@" ;;
     obs-down) cmd_obs_down "$@" ;;
     obs-logs) cmd_obs_logs "$@" ;;

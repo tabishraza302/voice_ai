@@ -2,7 +2,6 @@
 
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { RefreshCw } from "lucide-react";
-import { AdminGate } from "@/components/AdminGate";
 import { useAuth } from "@/lib/auth-state";
 import { PlatformApiError, platformApi } from "@/lib/platform-api-client";
 import { formatMinorCurrency, formatPlatformDate } from "@/lib/platform-format";
@@ -255,5 +254,5 @@ function AdminTariffsContent() {
 }
 
 export default function AdminTariffsPage() {
-  return <AdminGate><AdminTariffsContent /></AdminGate>;
+  return <AdminTariffsContent />;
 }

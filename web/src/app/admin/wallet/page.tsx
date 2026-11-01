@@ -2,7 +2,6 @@
 
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { RefreshCw, Search } from "lucide-react";
-import { AdminGate } from "@/components/AdminGate";
 import { PlatformApiError, platformApi } from "@/lib/platform-api-client";
 import { formatMinorCurrency, formatPlatformDate } from "@/lib/platform-format";
 import type { UserView } from "@/types/auth";
@@ -123,5 +122,5 @@ function AdminWalletContent() {
 }
 
 export default function AdminWalletPage() {
-  return <AdminGate><AdminWalletContent /></AdminGate>;
+  return <AdminWalletContent />;
 }

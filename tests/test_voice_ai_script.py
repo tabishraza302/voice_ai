@@ -195,9 +195,12 @@ def test_start_web_and_stop_manage_only_the_project_process(tmp_path):
     (fake_bin / "curl").write_text("#!/bin/sh\nexit 0\n")
     (fake_bin / "pkill").write_text("#!/bin/sh\nexit 1\n")
     (fake_bin / "docker").write_text("#!/bin/sh\nexit 0\n")
+    # This test owns web process lifecycle only; the platform API startup that
+    # now runs alongside it would otherwise need the repo's Python package.
+    (fake_bin / "uv").write_text("#!/bin/sh\nexit 0\n")
     phoenix = fake_bin / "phoenix"
     phoenix.write_text("#!/bin/sh\nexec sleep 60\n")
-    for command in ("node", "lsof", "ps", "curl", "pkill", "docker", "phoenix"):
+    for command in ("node", "lsof", "ps", "curl", "pkill", "docker", "uv", "phoenix"):
         (fake_bin / command).chmod(0o755)
     env = os.environ.copy()
     env.update(

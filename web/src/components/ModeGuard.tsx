@@ -3,14 +3,7 @@
 import { useEffect } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { useAuth } from "@/lib/auth-state";
-import {
-  Bot,
-  KeyRound,
-  Loader2,
-  Lock,
-  ScrollText,
-  ShieldAlert,
-} from "lucide-react";
+import { KeyRound, Loader2, Lock, ShieldAlert } from "lucide-react";
 import Link from "next/link";
 
 const UNAUTHENTICATED_ROUTES = [
@@ -23,44 +16,37 @@ const UNAUTHENTICATED_ROUTES = [
 ];
 
 export function ModeGuard({ children }: { children: React.ReactNode }) {
-  const { state, isLocalMode } = useAuth();
+  const { state, refreshSession } = useAuth();
   const router = useRouter();
   const pathname = usePathname();
 
   const isUnauthenticatedRoute = UNAUTHENTICATED_ROUTES.some(
     (route) => pathname === route || pathname.startsWith(`${route}/`)
   );
-  // Unconditional hook execution for React hook ordering
+
   useEffect(() => {
-    if (isLocalMode) return;
     if (isUnauthenticatedRoute) return;
 
     const search = typeof window !== "undefined" ? window.location.search : "";
     const currentPath = `${pathname}${search}` || "/";
 
     if (state.status === "anonymous") {
-      router.push(`/login?next=${encodeURIComponent(currentPath)}`);
+      router.replace(`/login?next=${encodeURIComponent(currentPath)}`);
     } else if (state.status === "mfa_required") {
-      router.push(`/login?next=${encodeURIComponent(currentPath)}`);
+      router.replace(`/login?next=${encodeURIComponent(currentPath)}`);
     } else if (
       state.status === "mfa_enrollment_required" &&
       pathname !== "/admin/settings"
     ) {
-      router.push("/admin/settings");
+      router.replace("/admin/settings");
     }
-  }, [isLocalMode, isUnauthenticatedRoute, state.status, router, pathname]);
-
-  // In local offline mode, all routes render directly as the local workspace
-  if (isLocalMode) {
-    return <>{children}</>;
-  }
+  }, [isUnauthenticatedRoute, state.status, router, pathname]);
 
   // Authentication and public guest pages render without an account
   if (isUnauthenticatedRoute) {
     return <>{children}</>;
   }
 
-  // SaaS mode loading state
   if (state.status === "loading") {
     return (
       <div
@@ -74,7 +60,26 @@ export function ModeGuard({ children }: { children: React.ReactNode }) {
     );
   }
 
-  // Anonymous in SaaS mode
+  if (state.status === "error") {
+    return (
+      <div
+        role="alert"
+        className="surface mx-auto max-w-lg space-y-4 border-rust-800 bg-rust-950/40 p-6 text-center text-rust-200"
+      >
+        <ShieldAlert className="mx-auto h-10 w-10 text-rust-400" />
+        <h2 className="text-lg font-semibold text-white">Platform Unavailable</h2>
+        <p className="text-sm text-rust-200">{state.message}</p>
+        <button
+          type="button"
+          onClick={() => void refreshSession()}
+          className="button-secondary mx-auto"
+        >
+          Try again
+        </button>
+      </div>
+    );
+  }
+
   if (state.status === "anonymous") {
     return (
       <div className="surface mx-auto max-w-md p-6 text-center space-y-4">
@@ -93,7 +98,6 @@ export function ModeGuard({ children }: { children: React.ReactNode }) {
     );
   }
 
-  // Restricted MFA states
   if (state.status === "mfa_required") {
     return (
       <div className="surface mx-auto max-w-md p-6 text-center space-y-4">
@@ -127,7 +131,6 @@ export function ModeGuard({ children }: { children: React.ReactNode }) {
     );
   }
 
-  // Authenticated state in SaaS mode
   if (state.status === "authenticated") {
     const user = state.user;
 
@@ -142,47 +145,6 @@ export function ModeGuard({ children }: { children: React.ReactNode }) {
           <p className="text-sm text-rust-200">
             This account has been suspended by an administrator. Please contact support.
           </p>
-        </div>
-      );
-    }
-
-    // Customer settings and admin routes render their owned views
-    if (pathname === "/settings" || pathname.startsWith("/admin/")) {
-      return <>{children}</>;
-    }
-
-    // Explicit mode isolation: Global base prompt is forbidden in SaaS
-    if (pathname === "/base-prompt") {
-      return (
-        <div className="surface p-8 max-w-2xl mx-auto space-y-4 border-ink-800 text-center">
-          <ScrollText className="w-10 h-10 text-limestone-500 mx-auto" />
-          <h2 className="text-xl font-bold text-white">
-            Global Instructions Not Available
-          </h2>
-          <p className="text-sm text-limestone-400 leading-relaxed">
-            Shared global prompt control is restricted to local offline studio mode. In SaaS platform mode, voice agents operate with isolated tenant configurations.
-          </p>
-          <div className="pt-2">
-            <Link href="/" className="button-secondary">
-              Back to Overview
-            </Link>
-          </div>
-        </div>
-      );
-    }
-
-    // Voice Playground stays local-only; platform customers use the pinned text Chat Test.
-    if (pathname === "/playground") {
-      return (
-        <div className="surface mx-auto max-w-2xl space-y-4 p-8 text-center">
-          <Bot className="mx-auto h-10 w-10 text-copper-300" />
-          <h2 className="text-xl font-semibold text-limestone-100">Voice Playground is local-only</h2>
-          <p className="text-sm leading-6 text-limestone-400">
-            Open an agent workspace to test a text conversation against its saved draft or published version.
-          </p>
-          <Link href="/agents" className="button-primary mx-auto">
-            Open agents
-          </Link>
         </div>
       );
     }

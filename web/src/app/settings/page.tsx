@@ -1,13 +1,11 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
-import { AuthGate } from "@/components/AuthGate";
 import { useAuth } from "@/lib/auth-state";
 import { platformApi, PlatformApiError } from "@/lib/platform-api-client";
 import { validatePassword, type SessionItem, type UserView } from "@/types/auth";
 import {
   Check,
-  Globe,
   KeyRound,
   Laptop,
   Loader2,
@@ -22,7 +20,7 @@ import {
 import { useRouter } from "next/navigation";
 
 function SettingsContent() {
-  const { state, isLocalMode, logout, refreshSession } = useAuth();
+  const { state, logout, refreshSession } = useAuth();
   const router = useRouter();
 
   // Profile state
@@ -70,7 +68,6 @@ function SettingsContent() {
   }, [state.user]);
 
   const loadSessions = async () => {
-    if (isLocalMode) return;
     setSessionsLoading(true);
     setSessionError(null);
     try {
@@ -88,22 +85,12 @@ function SettingsContent() {
   };
 
   useEffect(() => {
-    if (!isLocalMode) {
-      loadSessions();
-    }
-  }, [isLocalMode]);
+    loadSessions();
+  }, []);
 
   const handleUpdateProfile = async (e: React.FormEvent) => {
     e.preventDefault();
     if (profileSaving) return;
-
-    if (isLocalMode) {
-      setProfileMessage({
-        type: "success",
-        text: "Profile settings saved locally",
-      });
-      return;
-    }
 
     const trimmedName = displayName.trim();
     if (!trimmedName) {
@@ -141,14 +128,6 @@ function SettingsContent() {
   const handleChangePassword = async (e: React.FormEvent) => {
     e.preventDefault();
     if (passwordSaving) return;
-
-    if (isLocalMode) {
-      setPasswordMessage({
-        type: "error",
-        text: "Password management is disabled in local offline mode",
-      });
-      return;
-    }
 
     if (newPassword !== confirmPassword) {
       setPasswordMessage({ type: "error", text: "New passwords do not match" });
@@ -501,7 +480,7 @@ function SettingsContent() {
             </div>
           </div>
 
-          {!isLocalMode && sessions.length > 1 && (
+          {sessions.length > 1 && (
             <button
               type="button"
               onClick={handleLogoutAll}
@@ -522,17 +501,18 @@ function SettingsContent() {
           </div>
         )}
 
-        {isLocalMode ? (
-          <div className="text-xs text-limestone-400 p-4 border border-ink-800 rounded-lg">
-            Running in local offline mode. Browser sessions are managed locally on this machine.
-          </div>
-        ) : sessionsLoading ? (
+        {sessionsLoading ? (
           <div className="flex items-center justify-center p-6 text-limestone-400 text-xs">
             <Loader2 className="w-5 h-5 animate-spin mr-2 text-copper-400" />
             Loading sessions...
           </div>
         ) : (
           <div className="space-y-3">
+            {!sessionsLoading && !sessionError && sessions.length === 0 ? (
+              <p className="p-4 text-xs text-limestone-400">
+                No active browser sessions are recorded for this account.
+              </p>
+            ) : null}
             {sessions.map((item) => (
               <div
                 key={item.id}
@@ -607,9 +587,5 @@ function SettingsContent() {
 }
 
 export default function SettingsPage() {
-  return (
-    <AuthGate>
-      <SettingsContent />
-    </AuthGate>
-  );
+  return <SettingsContent />;
 }

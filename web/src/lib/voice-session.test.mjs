@@ -52,43 +52,19 @@ function createHarness(options = {}) {
   const peerConnectionFactory = mock((config) => new FakePeerConnection(config));
   const getUserMedia = options.getUserMedia ?? mock(async () => stream);
   const statuses = [];
-  const activated = [];
   const session = new VoiceSession({
     getUserMedia,
     createPeerConnection: peerConnectionFactory,
     fetcher,
     onStatus: (status) => statuses.push(status),
-    onActivated: (agent) => activated.push(agent),
   });
   const channel = () => [...sessions].at(-1)?.channel;
-  return { session, track, stream, fetcher, peerConnectionFactory, getUserMedia, statuses, activated, channel };
+  return { session, track, stream, fetcher, peerConnectionFactory, getUserMedia, statuses, channel };
 }
 
 const OFFER_URL = "http://localhost:7860/api/offer";
 
-const agent = {
-  id: "agent-42",
-  slug: "assistant",
-  name: "Assistant",
-  description: "A test agent",
-  persona_prompt: "Be concise.",
-  llm_model: "qwen3.5:4b",
-  llm_temperature: 0.7,
-  llm_reasoning_effort: "",
-  llm_max_tokens: 150,
-  stt_provider: "mlx-audio",
-  tts_voice_en: "af_heart",
-  tts_voice_hi: "hf_alpha",
-  tts_speed: 1,
-  is_active: false,
-  is_preset: false,
-  created_at: "2026-01-01T00:00:00Z",
-  updated_at: "2026-01-01T00:00:00Z",
-};
-
-function permissionError(name) {
-  return Object.assign(new Error("microphone unavailable"), { name });
-}
+const agent = { id: "agent-42" };
 
 afterEach(() => {
   for (const peer of sessions) peer.close();
@@ -181,83 +157,6 @@ describe("voice session lifecycle", () => {
     await expect(session.connect({ offerUrl: "http://localhost:7860/api/offer", agentId: "agent-42" })).rejects.toThrow("pipeline unavailable");
     expect(track.stopped).toBe(true);
     expect([...sessions].at(-1).closed).toBe(true);
-  });
-});
-
-describe("microphone before activation", () => {
-  test("requests media, then activates, then connects", async () => {
-    const harness = createHarness();
-    const activate = mock(async () => agent);
-
-    await harness.session.connect({ offerUrl: OFFER_URL, agentId: agent.id, isActive: false, activate });
-
-    expect(harness.statuses).toEqual(["requesting_media", "activating", "connecting"]);
-    expect(activate).toHaveBeenCalledTimes(1);
-    expect(harness.activated).toEqual([agent]);
-    expect(harness.getUserMedia).toHaveBeenCalledTimes(1);
-  });
-
-  test("does not activate when microphone permission is denied", async () => {
-    const harness = createHarness({
-      getUserMedia: mock(async () => { throw permissionError("NotAllowedError"); }),
-    });
-    const activate = mock(async () => agent);
-
-    await expect(harness.session.connect({ offerUrl: OFFER_URL, agentId: agent.id, isActive: false, activate }))
-      .rejects.toThrow("Microphone access was denied. Allow microphone access in your browser, then try again.");
-
-    expect(activate).not.toHaveBeenCalled();
-    expect(harness.activated).toEqual([]);
-    expect(harness.statuses).toEqual(["requesting_media"]);
-    expect(harness.peerConnectionFactory).not.toHaveBeenCalled();
-  });
-
-  test("skips activation when the agent is already active", async () => {
-    const harness = createHarness();
-    const activate = mock(async () => agent);
-
-    await harness.session.connect({ offerUrl: OFFER_URL, agentId: agent.id, isActive: true, activate });
-
-    expect(harness.statuses).toEqual(["requesting_media", "connecting"]);
-    expect(activate).not.toHaveBeenCalled();
-    expect(harness.activated).toEqual([]);
-  });
-
-  test("stops acquired media and propagates a rejected activation", async () => {
-    const harness = createHarness();
-    const activate = mock(async () => { throw new Error("Agent activation failed."); });
-
-    await expect(harness.session.connect({ offerUrl: OFFER_URL, agentId: agent.id, isActive: false, activate }))
-      .rejects.toThrow("Agent activation failed.");
-
-    expect(harness.track.stopped).toBe(true);
-    expect(harness.activated).toEqual([]);
-    expect(harness.statuses).toEqual(["requesting_media", "activating"]);
-    expect(harness.fetcher).not.toHaveBeenCalled();
-    expect(harness.peerConnectionFactory).not.toHaveBeenCalled();
-  });
-
-  test("stops acquired media and reports cancellation during activation", async () => {
-    let activationStarted;
-    let finishActivation;
-    const started = new Promise((resolve) => { activationStarted = resolve; });
-    const activate = mock(() => new Promise((resolve) => {
-      finishActivation = resolve;
-      activationStarted();
-    }));
-    const harness = createHarness();
-
-    const connecting = harness.session.connect({ offerUrl: OFFER_URL, agentId: agent.id, isActive: false, activate });
-    await started;
-    expect(harness.statuses).toEqual(["requesting_media", "activating"]);
-
-    harness.session.close();
-    finishActivation(agent);
-
-    await expect(connecting).rejects.toThrow("cancelled");
-    expect(harness.track.stopped).toBe(true);
-    expect(harness.activated).toEqual([]);
-    expect(harness.fetcher).not.toHaveBeenCalled();
   });
 });
 

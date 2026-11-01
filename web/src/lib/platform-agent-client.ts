@@ -4,6 +4,13 @@ export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonObject = { [key: string]: JsonValue };
 
+export interface AgentRuntimeSettings {
+  llm_model: string;
+  stt_provider: string;
+  tts_voice_en: string;
+  tts_voice_hi: string;
+}
+
 export interface AgentView {
   id: string;
   name: string;
@@ -14,6 +21,7 @@ export interface AgentView {
   published_version_id: string | null;
   created_at: string;
   updated_at: string;
+  runtime_settings?: AgentRuntimeSettings | null;
 }
 
 export interface AgentListPage {
