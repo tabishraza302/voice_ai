@@ -1,7 +1,6 @@
 "use client";
 
 import React, { useCallback, useEffect, useState } from "react";
-import { AdminGate } from "@/components/AdminGate";
 import { useAuth } from "@/lib/auth-state";
 import { platformApi, PlatformApiError } from "@/lib/platform-api-client";
 import type { UserStatus, UserView } from "@/types/auth";
@@ -528,9 +527,5 @@ function AdminUsersContent() {
 }
 
 export default function AdminUsersPage() {
-  return (
-    <AdminGate>
-      <AdminUsersContent />
-    </AdminGate>
-  );
+  return <AdminUsersContent />;
 }

@@ -80,6 +80,80 @@ describe("PlatformApiClient", () => {
     expect(calls[2].init.credentials).toBe("include");
   });
 
+  test("times out a request that never responds", async () => {
+    const shortTimeoutClient = new PlatformApiClient(
+      "http://127.0.0.1:8000/api/v1",
+      10
+    );
+    globalThis.fetch = async (_input, init = {}) =>
+      new Promise((_resolve, reject) => {
+        init.signal?.addEventListener("abort", () => {
+          reject(new DOMException("Aborted", "AbortError"));
+        });
+      });
+
+    await expect(shortTimeoutClient.getMe()).rejects.toMatchObject({
+      code: "REQUEST_TIMEOUT",
+      retryable: true,
+    });
+  });
+
+  test("maps a network failure to a retryable API error", async () => {
+    globalThis.fetch = async () => {
+      throw new TypeError("fetch failed");
+    };
+
+    await expect(client.getMe()).rejects.toMatchObject({
+      code: "NETWORK_ERROR",
+      retryable: true,
+    });
+  });
+
+  test("an expired session clears client auth and re-bootstraps anonymous", async () => {
+    const delivered = [];
+    client.onSessionChange((session) => {
+      delivered.push(session ? session.state : null);
+    });
+    client.setCsrfToken("stale-token");
+
+    mockFetch(async (url) => {
+      if (url.endsWith("/auth/session")) {
+        return new Response(
+          JSON.stringify({
+            state: "anonymous",
+            user: null,
+            session_id: "00000000-0000-0000-0000-000000000001",
+            expires_at: "2026-10-28T12:00:00Z",
+            csrf_token: "fresh-anonymous-csrf",
+            step_up_expires_at: null,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          error: {
+            code: "SESSION_EXPIRED",
+            message: "Session expired",
+            request_id: "req-expired",
+            retryable: false,
+          },
+        }),
+        { status: 401, headers: { "Content-Type": "application/json" } }
+      );
+    });
+
+    await expect(client.getMe()).rejects.toMatchObject({
+      status: 401,
+      code: "SESSION_EXPIRED",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    expect(client.getCsrfToken()).toBe("fresh-anonymous-csrf");
+    expect(delivered[0]).toBeNull();
+    expect(delivered).toContain("anonymous");
+  });
+
   test("mutation-only CSRF header: attached to POST/PATCH/DELETE, excluded on GET", async () => {
     client.setCsrfToken("csrf-active-token");
 

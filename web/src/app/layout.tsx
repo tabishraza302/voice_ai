@@ -1,4 +1,4 @@
-import React, { Suspense } from "react";
+import React from "react";
 import type { Metadata } from "next";
 import { Sidebar } from "@/components/Sidebar";
 import { AuthProvider } from "@/lib/auth-state";
@@ -8,7 +8,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Voice AI Agent Studio",
-  description: "Configure local voice agents, edit prompts, and test browser voice sessions.",
+  description: "Configure, publish, and test bilingual voice agents on the platform.",
 };
 
 export default function RootLayout({
@@ -23,9 +23,7 @@ export default function RootLayout({
           <Sidebar />
           <main className="min-w-0 flex-1 overflow-y-auto md:h-screen">
             <div className="mx-auto w-full max-w-7xl p-4 sm:p-8">
-              <Suspense fallback={null}>
-                <ModeGuard>{children}</ModeGuard>
-              </Suspense>
+              <ModeGuard>{children}</ModeGuard>
             </div>
           </main>
           <StepUpDialog />
