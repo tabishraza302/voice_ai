@@ -1408,7 +1408,7 @@ class VerificationHarness:
         web_bld_cmd = ["bun", "run", "build"]
         web_bld_env = {
             "NEXT_PUBLIC_APP_MODE": "saas",
-            "NEXT_PUBLIC_PLATFORM_API_URL": f"http://127.0.0.1:{api_port}/api/v1",
+            "PLATFORM_API_ORIGIN": f"http://127.0.0.1:{api_port}",
             "NODE_ENV": "production",
         }
         bld_rc, bld_out, bld_err = self.run_cmd("browser_web_build_dev", web_bld_cmd, cwd=web_dir, env=web_bld_env)
@@ -1426,7 +1426,7 @@ class VerificationHarness:
             "HOST": "127.0.0.1",
             "NODE_ENV": "production",
             "NEXT_PUBLIC_APP_MODE": "saas",
-            "NEXT_PUBLIC_PLATFORM_API_URL": f"http://127.0.0.1:{api_port}/api/v1",
+            "PLATFORM_API_ORIGIN": f"http://127.0.0.1:{api_port}",
         }
         web_stdout_path = self.run_dir / "web_server_dev.stdout.log"
         web_stderr_path = self.run_dir / "web_server_dev.stderr.log"
@@ -1486,7 +1486,7 @@ class VerificationHarness:
             "PLATFORM_AUTH_MAIL_DIR": str(mail_dir),
             "PLATFORM_AUTH_MAIL_MODE": "file",
             "NEXT_PUBLIC_APP_MODE": "saas",
-            "NEXT_PUBLIC_PLATFORM_API_URL": f"http://127.0.0.1:{api_port}/api/v1",
+            "PLATFORM_API_ORIGIN": f"http://127.0.0.1:{api_port}",
             "PLAYWRIGHT_BASE_URL": f"http://127.0.0.1:{web_port}",
             "PLAYWRIGHT_JSON_OUTPUT_NAME": str(playwright_json),
         }

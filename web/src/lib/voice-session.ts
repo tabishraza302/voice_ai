@@ -1,5 +1,3 @@
-import type { Agent } from "@/types/agent";
-
 export interface VoiceSessionConnection {
   peerConnection: RTCPeerConnection;
   dataChannel: RTCDataChannel;
@@ -14,8 +12,7 @@ export interface VoiceSessionDependencies {
   onDataChannelMessage?: (event: MessageEvent) => void;
   onRemoteTrack?: (event: RTCTrackEvent) => void;
   onConnectionState?: (state: RTCPeerConnectionState) => void;
-  onStatus?: (status: "activating" | "requesting_media" | "connecting") => void;
-  onActivated?: (agent: Agent) => void;
+  onStatus?: (status: "requesting_media" | "connecting") => void;
 }
 
 type GuestJoinRequestData = {
@@ -25,8 +22,6 @@ type GuestJoinRequestData = {
 
 type VoiceSessionConnectOptions = {
   offerUrl: string;
-  isActive?: boolean;
-  activate?: () => Promise<Agent>;
 } & (
   | { agentId: string; requestData?: never }
   | { agentId?: never; requestData: GuestJoinRequestData }
@@ -77,13 +72,6 @@ export class VoiceSession {
       this.localStream = stream;
       if (this.muted) {
         stream.getAudioTracks().forEach((track) => { track.enabled = false; });
-      }
-
-      if (!options.isActive && options.activate) {
-        this.dependencies.onStatus?.("activating");
-        const activated = await options.activate();
-        this.assertCurrent(isCurrent);
-        this.dependencies.onActivated?.(activated);
       }
 
       this.dependencies.onStatus?.("connecting");

@@ -64,6 +64,15 @@ class AgentUpdate(BaseModel):
             raise ValueError("persona_prompt must not be blank")
         return value
 
+class AgentRuntimeSettingsView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    llm_model: str
+    stt_provider: str
+    tts_voice_en: str
+    tts_voice_hi: str
+
+
 class AgentView(BaseModel):
     model_config = ConfigDict(from_attributes=True, extra="forbid")
 
@@ -76,6 +85,7 @@ class AgentView(BaseModel):
     published_version_id: uuid.UUID | None = None
     created_at: datetime
     updated_at: datetime
+    runtime_settings: AgentRuntimeSettingsView | None = None
 
 
 class AgentListResponse(BaseModel):

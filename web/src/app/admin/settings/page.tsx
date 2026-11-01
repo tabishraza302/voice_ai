@@ -1,7 +1,6 @@
 "use client";
 
 import React, { useState } from "react";
-import { AdminGate } from "@/components/AdminGate";
 import { useAuth } from "@/lib/auth-state";
 import { platformApi, PlatformApiError } from "@/lib/platform-api-client";
 import type { MfaSetup } from "@/types/auth";
@@ -511,9 +510,5 @@ function AdminSettingsContent() {
 }
 
 export default function AdminSettingsPage() {
-  return (
-    <AdminGate>
-      <AdminSettingsContent />
-    </AdminGate>
-  );
+  return <AdminSettingsContent />;
 }

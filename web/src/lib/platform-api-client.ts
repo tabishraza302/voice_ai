@@ -76,6 +76,7 @@ export class PlatformApiError extends Error {
 
 const DEFAULT_PLATFORM_API_URL =
   process.env.NEXT_PUBLIC_PLATFORM_API_URL || "/api/v1";
+const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
 
 function buildQuery(
   params: Record<string, string | number | boolean | null | undefined>
@@ -92,13 +93,18 @@ function buildQuery(
 
 export class PlatformApiClient {
   private baseUrl: string;
+  private timeoutMs: number;
   // The CSRF token is kept ONLY in memory; never written to localStorage or cookies.
   private csrfToken: string | null = null;
   private sessionBootstrap: Promise<SessionResponse> | null = null;
   private sessionListeners = new Set<(session: SessionResponse | null) => void>();
 
-  constructor(baseUrl: string = DEFAULT_PLATFORM_API_URL) {
+  constructor(
+    baseUrl: string = DEFAULT_PLATFORM_API_URL,
+    timeoutMs: number = DEFAULT_REQUEST_TIMEOUT_MS
+  ) {
     this.baseUrl = baseUrl.replace(/\/+$/, "");
+    this.timeoutMs = timeoutMs;
   }
 
   getBaseUrl(): string {
@@ -203,10 +209,48 @@ export class PlatformApiClient {
 
     fetchOptions.headers = headers;
 
+    // A request never hangs forever. The caller's signal, when present, can
+    // still cancel earlier; a timeout is reported as a distinct API error.
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    const callerSignal = options?.signal;
+    const onCallerAbort = () => controller.abort();
+    if (callerSignal) {
+      if (callerSignal.aborted) controller.abort();
+      else callerSignal.addEventListener("abort", onCallerAbort, { once: true });
+    }
+    fetchOptions.signal = controller.signal;
+
     // The token actually sent, which is what a CSRF rejection refers to.
     const sentCsrfToken = headers.get("X-CSRF-Token");
 
-    const response = await fetch(url, fetchOptions);
+    let response: Response;
+    try {
+      response = await fetch(url, fetchOptions);
+    } catch (error) {
+      if (callerSignal?.aborted) {
+        throw new PlatformApiError(0, "REQUEST_CANCELLED", "The request was cancelled.", "", false);
+      }
+      if (controller.signal.aborted) {
+        throw new PlatformApiError(
+          0,
+          "REQUEST_TIMEOUT",
+          "The platform API did not respond in time. Try again.",
+          "",
+          true
+        );
+      }
+      throw new PlatformApiError(
+        0,
+        "NETWORK_ERROR",
+        "Unable to reach the platform API. Check your connection and try again.",
+        "",
+        true
+      );
+    } finally {
+      clearTimeout(timeout);
+      callerSignal?.removeEventListener("abort", onCallerAbort);
+    }
 
     // 204 No Content (or 205) must not parse JSON
     if (response.status === 204 || response.status === 205) {
@@ -253,6 +297,17 @@ export class PlatformApiClient {
         retryable,
         fieldErrors
       );
+
+      // An expired or revoked session must stop trusting the in-memory auth
+      // state. Re-bootstrap so the guards can move the user to sign-in with a
+      // real anonymous session rather than spinning on a null session.
+      if (response.status === 401 && !endpoint.startsWith("/auth/")) {
+        this.csrfToken = null;
+        this.notifySessionChange(null);
+        void this.bootstrapSession().catch(() => {
+          // The next explicit refresh or request will surface the outage.
+        });
+      }
 
       // A stale in-memory CSRF token (for example after the server rotated the
       // session) is recoverable exactly once: refresh the session, then replay

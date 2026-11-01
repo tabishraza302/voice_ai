@@ -13,6 +13,7 @@ import { platformApi, PlatformApiError } from "@/lib/platform-api-client";
 
 export type AuthStatus =
   | "loading"
+  | "error"
   | "anonymous"
   | "mfa_required"
   | "mfa_enrollment_required"
@@ -20,14 +21,20 @@ export type AuthStatus =
 
 export type AuthState =
   | { status: "loading"; session: null; user: null }
+  | { status: "error"; session: null; user: null; message: string }
   | { status: "anonymous"; session: SessionResponse; user: null }
   | { status: "mfa_required"; session: SessionResponse; user: UserView | null }
   | { status: "mfa_enrollment_required"; session: SessionResponse; user: UserView | null }
   | { status: "authenticated"; session: SessionResponse; user: UserView };
 
-export function deriveAuthState(session: SessionResponse | null): AuthState {
+export function deriveAuthState(
+  session: SessionResponse | null,
+  bootstrapError: string | null = null
+): AuthState {
   if (!session) {
-    return { status: "loading", session: null, user: null };
+    return bootstrapError
+      ? { status: "error", session: null, user: null, message: bootstrapError }
+      : { status: "loading", session: null, user: null };
   }
   switch (session.state) {
     case "anonymous":
@@ -106,23 +113,12 @@ export function extractAndClearFragmentToken(): string | null {
 }
 
 /**
- * Detect mode: defaults to 'local' preserving local offline studio workflow.
- * 'saas' mode activates platform auth, account management, and admin gates.
- */
-export function getAppMode(): "local" | "saas" {
-  const mode = process.env.NEXT_PUBLIC_APP_MODE;
-  if (mode === "saas" || mode === "platform") {
-    return "saas";
-  }
-  return "local";
-}
-
-/**
  * StepUpManager handles STEP_UP_REQUIRED flows by preserving the pending mutation
  * in memory without submitting it twice.
  */
 export class StepUpManager {
   private pendingAction: (() => Promise<unknown>) | null = null;
+  private pendingReject: ((reason?: unknown) => void) | null = null;
   private isOpen: boolean = false;
   private isExecuting: boolean = false;
   private listeners = new Set<() => void>();
@@ -152,9 +148,13 @@ export class StepUpManager {
     return this.pendingAction !== null;
   }
 
-  requestStepUp(action?: () => Promise<unknown>): void {
+  requestStepUp(
+    action?: () => Promise<unknown>,
+    reject?: (reason?: unknown) => void
+  ): void {
     if (action) {
       this.pendingAction = action;
+      this.pendingReject = reject ?? null;
     }
     this.isOpen = true;
     this.notify();
@@ -170,6 +170,7 @@ export class StepUpManager {
       this.isExecuting = true;
       const action = this.pendingAction;
       this.pendingAction = null; // Clear immediately to prevent double submission
+      this.pendingReject = null;
       this.notify();
       try {
         return await action();
@@ -182,16 +183,25 @@ export class StepUpManager {
   }
 
   cancelStepUp(): void {
+    const reject = this.pendingReject;
     this.pendingAction = null;
+    this.pendingReject = null;
     this.isOpen = false;
+    reject?.(
+      new PlatformApiError(
+        0,
+        "STEP_UP_CANCELLED",
+        "Step-up authentication was cancelled.",
+        "",
+        false
+      )
+    );
     this.notify();
   }
 }
 
 export interface AuthContextValue {
   state: AuthState;
-  appMode: "local" | "saas";
-  isLocalMode: boolean;
   refreshSession: () => Promise<SessionResponse | null>;
   logout: () => Promise<void>;
   stepUpManager: StepUpManager;
@@ -202,8 +212,6 @@ const defaultStepUpManager = new StepUpManager();
 
 export const AuthContext = createContext<AuthContextValue>({
   state: { status: "loading", session: null, user: null },
-  appMode: "local",
-  isLocalMode: true,
   refreshSession: async () => null,
   logout: async () => {},
   stepUpManager: defaultStepUpManager,
@@ -212,54 +220,49 @@ export const AuthContext = createContext<AuthContextValue>({
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [session, setSession] = useState<SessionResponse | null>(null);
+  const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const [stepUpManager] = useState(() => new StepUpManager());
-  const appMode = useMemo(() => getAppMode(), []);
-  const isLocalMode = appMode === "local";
 
   const refreshSession = useCallback(async (): Promise<SessionResponse | null> => {
-    if (isLocalMode) {
-      return null;
-    }
     try {
       const freshSession = await platformApi.getSession();
+      setBootstrapError(null);
       setSession(freshSession);
       return freshSession;
     } catch (err) {
-      if (err instanceof PlatformApiError && err.status === 401) {
-        // If unauthenticated or expired, fetch anonymous session
-        try {
-          const anon = await platformApi.getSession();
-          setSession(anon);
-          return anon;
-        } catch {
-          setSession(null);
-          return null;
-        }
-      }
+      setSession(null);
+      setBootstrapError(
+        err instanceof PlatformApiError
+          ? err.message
+          : "Could not reach the platform API."
+      );
       return null;
     }
-  }, [isLocalMode]);
+  }, []);
 
   useEffect(() => {
-    if (isLocalMode) {
-      return;
-    }
-
     // Subscribe to platform API client session state changes
     const unsubscribe = platformApi.onSessionChange((updatedSession) => {
-      setSession(updatedSession);
+      if (updatedSession) {
+        setBootstrapError(null);
+        setSession(updatedSession);
+        return;
+      }
+      // A null session means the client dropped its credentials (expired or
+      // logged out). Re-bootstrap through the provider so a failed refresh
+      // surfaces a retryable error instead of an indefinite loading screen.
+      void refreshSession();
     });
 
     // Initial session bootstrap
-    refreshSession();
+    void refreshSession();
 
     return () => {
       unsubscribe();
     };
-  }, [isLocalMode, refreshSession]);
+  }, [refreshSession]);
 
   const logout = useCallback(async () => {
-    if (isLocalMode) return;
     try {
       await platformApi.logout();
     } catch {
@@ -268,7 +271,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       // Re-bootstrap anonymous session
       await refreshSession();
     }
-  }, [isLocalMode, refreshSession]);
+  }, [refreshSession]);
 
   const executeWithStepUp = useCallback(
     async <T,>(action: () => Promise<T>): Promise<T> => {
@@ -277,14 +280,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       } catch (err) {
         if (err instanceof PlatformApiError && err.code === "STEP_UP_REQUIRED") {
           const { promise, resolve, reject } = Promise.withResolvers<T>();
-          stepUpManager.requestStepUp(async () => {
-            try {
-              const result = await action();
-              resolve(result);
-            } catch (retryErr) {
-              reject(retryErr);
-            }
-          });
+          stepUpManager.requestStepUp(
+            async () => {
+              try {
+                const result = await action();
+                resolve(result);
+              } catch (retryErr) {
+                reject(retryErr);
+              }
+            },
+            reject
+          );
           return promise;
         }
         throw err;
@@ -293,56 +299,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     [stepUpManager]
   );
 
-  const authState = useMemo<AuthState>(() => {
-    if (isLocalMode) {
-      // In local mode, treat as pseudo-authenticated local workspace without backend credentials
-      return {
-        status: "authenticated",
-        session: {
-          state: "authenticated",
-          user: {
-            id: "local-user",
-            email: "local@localhost",
-            display_name: "Local Studio",
-            role: "admin",
-            status: "active",
-            email_verified_at: new Date(0).toISOString(),
-            preferred_language: "en",
-            timezone: "UTC",
-            low_balance_notifications: false,
-            mfa_enabled: false,
-            created_at: new Date(0).toISOString(),
-            updated_at: new Date(0).toISOString(),
-          },
-          session_id: "local-session",
-          expires_at: new Date(Date.now() + 86400000).toISOString(),
-          csrf_token: "local-csrf",
-          step_up_expires_at: null,
-        },
-        user: {
-          id: "local-user",
-          email: "local@localhost",
-          display_name: "Local Studio",
-          role: "admin",
-          status: "active",
-          email_verified_at: new Date(0).toISOString(),
-          preferred_language: "en",
-          timezone: "UTC",
-          low_balance_notifications: false,
-          mfa_enabled: false,
-          created_at: new Date(0).toISOString(),
-          updated_at: new Date(0).toISOString(),
-        },
-      };
-    }
-    return deriveAuthState(session);
-  }, [isLocalMode, session]);
+  const authState = useMemo<AuthState>(
+    () => deriveAuthState(session, bootstrapError),
+    [session, bootstrapError]
+  );
 
   const value = useMemo<AuthContextValue>(
     () => ({
       state: authState,
-      appMode,
-      isLocalMode,
       refreshSession,
       logout,
       stepUpManager,
@@ -350,8 +314,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }),
     [
       authState,
-      appMode,
-      isLocalMode,
       refreshSession,
       logout,
       stepUpManager,

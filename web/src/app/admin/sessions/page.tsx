@@ -2,7 +2,6 @@
 
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { RefreshCw } from "lucide-react";
-import { AdminGate } from "@/components/AdminGate";
 import { useAuth } from "@/lib/auth-state";
 import { PlatformApiError, platformApi } from "@/lib/platform-api-client";
 import { formatMinorCurrency, formatPlatformDate } from "@/lib/platform-format";
@@ -376,5 +375,5 @@ function AdminSessionsContent() {
 }
 
 export default function AdminSessionsPage() {
-  return <AdminGate><AdminSessionsContent /></AdminGate>;
+  return <AdminSessionsContent />;
 }

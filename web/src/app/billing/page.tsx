@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowRight, RefreshCw } from "lucide-react";
 import { PlatformApiError, platformApi } from "@/lib/platform-api-client";
 import { formatDurationMs, formatMinorCurrency, formatPlatformDate } from "@/lib/platform-format";
@@ -16,8 +16,10 @@ export default function BillingPage() {
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const requestIdRef = useRef(0);
 
   const refresh = useCallback(async () => {
+    const requestId = ++requestIdRef.current;
     setLoading(true);
     setError(null);
     try {
@@ -26,15 +28,18 @@ export default function BillingPage() {
         platformApi.getWalletEntries({ limit: 20 }),
         platformApi.getOwnerUsage({ limit: 20 }),
       ]);
+      if (requestId !== requestIdRef.current) return;
       setWallet(walletView);
       setEntries(ledgerPage);
       setUsage(usagePage.items);
       setEntryCursor(ledgerPage.next_cursor);
       setUsageCursor(usagePage.next_cursor);
     } catch (err: unknown) {
-      setError(err instanceof PlatformApiError ? err.message : "Could not load billing records.");
+      if (requestId === requestIdRef.current) {
+        setError(err instanceof PlatformApiError ? err.message : "Could not load billing records.");
+      }
     } finally {
-      setLoading(false);
+      if (requestId === requestIdRef.current) setLoading(false);
     }
   }, []);
 
@@ -130,7 +135,8 @@ export default function BillingPage() {
               </div>
             );
           })}
-          {!loading && usage.length === 0 ? <p className="p-4 text-sm text-limestone-400">No call usage has been recorded.</p> : null}
+          {!loading && !error && usage.length === 0 ? <p className="p-4 text-sm text-limestone-400">No call usage has been recorded.</p> : null}
+          {error && usage.length === 0 ? <p className="p-4 text-sm text-rust-200">Call usage is unavailable until the records load.</p> : null}
         </div>
       </section>
 
@@ -150,7 +156,8 @@ export default function BillingPage() {
               <p className="shrink-0 font-semibold tabular-nums text-limestone-100">{formatMinorCurrency(entry.amount_minor)}</p>
             </article>
           ))}
-          {!loading && (entries?.items.length ?? 0) === 0 ? <p className="p-4 text-sm text-limestone-400">No ledger entries have been recorded.</p> : null}
+          {!loading && !error && (entries?.items.length ?? 0) === 0 ? <p className="p-4 text-sm text-limestone-400">No ledger entries have been recorded.</p> : null}
+          {error && (entries?.items.length ?? 0) === 0 ? <p className="p-4 text-sm text-rust-200">Ledger entries are unavailable until the records load.</p> : null}
         </div>
       </section>
 

@@ -270,8 +270,8 @@ test.describe("Platform Authentication Real HTTP Journeys", () => {
     await page.getByRole("button", { name: "Cancel" }).click();
   });
 
-  // Test 5: Security Boundaries and Mode Isolation
-  test("Security Boundaries: Return path sanitization, password bounds, non-admin gate, and SaaS mode isolation", async ({
+  // Test 5: Security Boundaries and authentication gates
+  test("Security Boundaries: Return path sanitization, password bounds, and non-admin gate", async ({
     page,
   }) => {
     // 1. Client-side password validation boundary
@@ -287,54 +287,45 @@ test.describe("Platform Authentication Real HTTP Journeys", () => {
     // Form action preserves sanitized return path
     expect(page.url()).toContain("next=");
 
-    // 3. SaaS mode unauthenticated gate redirect
-    if (process.env.NEXT_PUBLIC_APP_MODE === "saas") {
-      await page.goto("/base-prompt");
-      await page.waitForURL((url) => url.pathname === "/login" && url.searchParams.get("next") === "/base-prompt");
+    // 3. Unauthenticated gate redirect
+    await page.goto("/agents");
+    await page.waitForURL((url) => url.pathname === "/login" && url.searchParams.get("next") === "/agents");
 
-      await page.goto("/agents");
-      await page.waitForURL((url) => url.pathname === "/login" && url.searchParams.get("next") === "/agents");
+    // 4. Register and log in as normal customer to verify non-admin gate
+    const normalEmail = `customer-guard-${Date.now()}@example.com`;
+    await page.goto("/register");
+    await page.getByLabel("Email address").fill(normalEmail);
+    await page.getByLabel("Display name").fill("Customer Guard");
+    await page.getByRole("button", { name: "Continue with Email" }).click();
 
-      // 4. Register and log in as normal customer to verify authenticated mode isolation & non-admin gate
-      const normalEmail = `customer-guard-${Date.now()}@example.com`;
-      await page.goto("/register");
-      await page.getByLabel("Email address").fill(normalEmail);
-      await page.getByLabel("Display name").fill("Customer Guard");
-      await page.getByRole("button", { name: "Continue with Email" }).click();
+    const mail = getLatestMail({ email: normalEmail, purpose: "register", maxWaitMs: 8000 });
+    await page.goto(`/verify-email#token=${mail.token}`);
+    await page.getByLabel("New password", { exact: true }).fill("PasswordForCustomer123");
+    await page.getByLabel("Confirm password").fill("PasswordForCustomer123");
+    await page.getByRole("button", { name: "Create Account & Set Password" }).click();
+    await expect(page.getByRole("heading", { name: "Account created!" })).toBeVisible();
+    // Log in as normal customer
+    await page.goto("/login");
+    await page.getByLabel("Email address").fill(normalEmail);
+    await page.getByLabel("Password").fill("PasswordForCustomer123");
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await page.waitForURL((url) => url.pathname === "/" || url.pathname === "/settings");
 
-      const mail = getLatestMail({ email: normalEmail, purpose: "register", maxWaitMs: 8000 });
-      await page.goto(`/verify-email#token=${mail.token}`);
-      await page.getByLabel("New password", { exact: true }).fill("PasswordForCustomer123");
-      await page.getByLabel("Confirm password").fill("PasswordForCustomer123");
-      await page.getByRole("button", { name: "Create Account & Set Password" }).click();
-      await expect(page.getByRole("heading", { name: "Account created!" })).toBeVisible();
-      // Log in as normal customer
-      await page.goto("/login");
-      await page.getByLabel("Email address").fill(normalEmail);
-      await page.getByLabel("Password").fill("PasswordForCustomer123");
-      await page.getByRole("button", { name: "Sign in" }).click();
-      await page.waitForURL((url) => url.pathname === "/" || url.pathname === "/settings");
+    // The agent directory must load owner-scoped platform agents only.
+    const localAgentRequests: string[] = [];
+    page.on("request", (request) => {
+      if (new URL(request.url()).pathname === "/api/agents") localAgentRequests.push(request.url());
+    });
+    const platformAgents = page.waitForResponse((response) =>
+      new URL(response.url()).pathname === "/api/v1/agents" && response.request().method() === "GET"
+    );
+    await page.goto("/agents");
+    expect((await platformAgents).status()).toBe(200);
+    await expect(page.getByRole("heading", { name: "No agents yet" })).toBeVisible();
+    expect(localAgentRequests).toEqual([]);
 
-      // Authenticated customer visiting /base-prompt sees global prompt isolation notice
-      await page.goto("/base-prompt");
-      await expect(page.getByText("Global Instructions Not Available")).toBeVisible();
-
-      // The SaaS directory must load owner-scoped agents, not the local studio API.
-      const localAgentRequests: string[] = [];
-      page.on("request", (request) => {
-        if (new URL(request.url()).pathname === "/api/agents") localAgentRequests.push(request.url());
-      });
-      const platformAgents = page.waitForResponse((response) =>
-        new URL(response.url()).pathname === "/api/v1/agents" && response.request().method() === "GET"
-      );
-      await page.goto("/agents");
-      expect((await platformAgents).status()).toBe(200);
-      await expect(page.getByRole("heading", { name: "No agents yet" })).toBeVisible();
-      expect(localAgentRequests).toEqual([]);
-
-      // Authenticated customer visiting /admin/users sees 403 Access Denied
-      await page.goto("/admin/users");
-      await expect(page.getByRole("alert").filter({ hasText: "403 Access Denied" })).toBeVisible();
-    }
+    // Authenticated customer visiting /admin/users sees 403 Access Denied
+    await page.goto("/admin/users");
+    await expect(page.getByRole("alert").filter({ hasText: "403 Access Denied" })).toBeVisible();
   });
 });
