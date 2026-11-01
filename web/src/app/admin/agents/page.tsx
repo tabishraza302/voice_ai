@@ -2,7 +2,6 @@
 
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { RefreshCw, Search } from "lucide-react";
-import { AdminGate } from "@/components/AdminGate";
 import { PlatformApiError, platformApi } from "@/lib/platform-api-client";
 import { formatPlatformDate } from "@/lib/platform-format";
 import type { AdminAgentDetail, AdminAgentItem, AdminAgentPage } from "@/types/platform";
@@ -171,5 +170,5 @@ function AdminAgentsContent() {
 }
 
 export default function AdminAgentsPage() {
-  return <AdminGate><AdminAgentsContent /></AdminGate>;
+  return <AdminAgentsContent />;
 }

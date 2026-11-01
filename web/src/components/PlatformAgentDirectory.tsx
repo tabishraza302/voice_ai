@@ -18,10 +18,21 @@ import {
 } from "@/lib/platform-agent-client";
 import {
   getVisibleAgents,
-  summarizeRuntimeSettings,
   type AgentListQuery,
-  type RuntimeSettingsSummary,
 } from "@/lib/platform-agent-model";
+
+function runtimeSummary(agent: AgentView) {
+  const settings = agent.runtime_settings;
+  if (!settings) return null;
+  const textOnly = !settings.tts_voice_en && !settings.tts_voice_hi;
+  return {
+    llmModel: settings.llm_model,
+    sttProvider: settings.stt_provider,
+    voices: textOnly
+      ? "Text only"
+      : `${settings.tts_voice_en || "Not set"} / ${settings.tts_voice_hi || "Not set"}`,
+  };
+}
 
 export function CreateAgentMenu() {
   return (
@@ -45,11 +56,6 @@ export function CreateAgentMenu() {
 
 interface PlatformAgentDirectoryProps {
   compact?: boolean;
-}
-
-interface DraftSummaryState {
-  summary?: RuntimeSettingsSummary;
-  error?: string;
 }
 
 interface PendingDuplicate {
@@ -136,7 +142,6 @@ export function PlatformAgentDirectory({ compact = false }: PlatformAgentDirecto
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
-  const [draftSummaries, setDraftSummaries] = useState<Record<string, DraftSummaryState>>({});
   const [query, setQuery] = useState<AgentListQuery>(() => defaultQuery(compact));
   const [reloadKey, setReloadKey] = useState(0);
 
@@ -158,27 +163,6 @@ export function PlatformAgentDirectory({ compact = false }: PlatformAgentDirecto
     () => getVisibleAgents(agents, query),
     [agents, query]
   );
-
-  useEffect(() => {
-    let current = true;
-    if (visible.items.length === 0) {
-      setDraftSummaries({});
-      return () => { current = false; };
-    }
-    const requestSummaries = async () => {
-      const entries = await Promise.all(visible.items.map(async (agent) => {
-        try {
-          const draft = await platformAgentApi.getDraft(agent.id);
-          return [agent.id, { summary: summarizeRuntimeSettings(draft.config) }] as const;
-        } catch (error: unknown) {
-          return [agent.id, { error: displayError(error) }] as const;
-        }
-      }));
-      if (current) setDraftSummaries(Object.fromEntries(entries));
-    };
-    void requestSummaries();
-    return () => { current = false; };
-  }, [visible.items]);
 
   const updateQuery = (updates: Partial<AgentListQuery>) => {
     setQuery((current) => ({ ...current, ...updates, page: 1 }));
@@ -352,14 +336,14 @@ export function PlatformAgentDirectory({ compact = false }: PlatformAgentDirecto
             <AgentListRow
               key={agent.id}
               agent={agent}
-              summaryState={draftSummaries[agent.id]}
+              summary={runtimeSummary(agent)}
               compact
             />
           )) : visible.items.map((agent) => (
             <AgentListRow
               key={agent.id}
               agent={agent}
-              summaryState={draftSummaries[agent.id]}
+              summary={runtimeSummary(agent)}
               actionLoading={actionLoading}
               onEnabledChange={() => void handleEnabledChange(agent)}
               onDuplicate={() => void handleDuplicate(agent)}
@@ -405,7 +389,7 @@ export function PlatformAgentDirectory({ compact = false }: PlatformAgentDirecto
 
 interface AgentListRowProps {
   agent: AgentView;
-  summaryState?: DraftSummaryState;
+  summary?: { llmModel: string; sttProvider: string; voices: string } | null;
   compact?: boolean;
   actionLoading?: string | null;
   onEnabledChange?: () => void;
@@ -419,7 +403,7 @@ function settingLabel(value: string | null | undefined): string {
 
 function AgentListRow({
   agent,
-  summaryState,
+  summary,
   compact = false,
   actionLoading,
   onEnabledChange,
@@ -448,25 +432,24 @@ function AgentListRow({
           <div>
             <dt className="text-limestone-500">Runtime model</dt>
             <dd className="mt-0.5 break-all text-limestone-200">
-              {!summaryState ? "Loading…" : summaryState.error ? "Settings unavailable" : settingLabel(summaryState.summary?.llmModel)}
+              {summary ? settingLabel(summary.llmModel) : "Settings unavailable"}
             </dd>
           </div>
           <div>
             <dt className="text-limestone-500">Speech recognition</dt>
             <dd className="mt-0.5 break-all text-limestone-200">
-              {!summaryState ? "Loading…" : summaryState.error ? "Settings unavailable" : settingLabel(summaryState.summary?.sttProvider)}
+              {summary ? settingLabel(summary.sttProvider) : "Settings unavailable"}
             </dd>
           </div>
           <div>
             <dt className="text-limestone-500">English / Hindi voices</dt>
             <dd className="mt-0.5 break-all text-limestone-200">
-              {!summaryState ? "Loading…" : summaryState.error ? "Settings unavailable" : settingLabel(summaryState.summary?.voices)}
+              {summary ? summary.voices : "Settings unavailable"}
             </dd>
           </div>
         </dl>
         <p className="mt-2 text-xs text-limestone-500">
           Updated <time dateTime={agent.updated_at}>{displayDate(agent.updated_at)}</time>
-          {summaryState?.error ? <span className="sr-only"> Could not load runtime settings: {summaryState.error}</span> : null}
         </p>
       </div>
       <div className="flex flex-wrap items-center gap-2">

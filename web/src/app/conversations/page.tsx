@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { ArrowRight, RefreshCw } from "lucide-react";
 import { PlatformApiError, platformApi } from "@/lib/platform-api-client";
@@ -13,6 +13,14 @@ function sessionLabel(session: SessionHistoryItem): string {
 }
 
 export default function ConversationsPage() {
+  return (
+    <Suspense fallback={<div role="status" className="p-6 text-sm text-limestone-400">Loading call history…</div>}>
+      <ConversationsPageContent />
+    </Suspense>
+  );
+}
+
+function ConversationsPageContent() {
   const searchParams = useSearchParams();
   const selectedSessionId = searchParams.get("session");
   const [page, setPage] = useState<OwnerSessionsPage | null>(null);
@@ -30,11 +38,18 @@ export default function ConversationsPage() {
   const [transcript, setTranscript] = useState<TranscriptPageView | null>(null);
   const [transcriptCursor, setTranscriptCursor] = useState<string | null>(null);
   const [transcriptLoadingMore, setTranscriptLoadingMore] = useState(false);
+  const sessionsRequestRef = useRef(0);
 
   const loadSessions = useCallback(async (targetCursor: string | null = null, append = false) => {
+    const requestId = ++sessionsRequestRef.current;
     setLoading(!append);
     setLoadingMore(append);
     setError(null);
+    if (!append) {
+      setSessions([]);
+      setPage(null);
+      setCursor(null);
+    }
     try {
       const result = await platformApi.getOwnerSessions({
         cursor: targetCursor,
@@ -44,14 +59,19 @@ export default function ConversationsPage() {
           ? (activeFilters.kind as "voice" | "chat" | "voice_test")
           : undefined,
       });
+      if (requestId !== sessionsRequestRef.current) return;
       setPage(result);
       setSessions((current) => append ? [...current, ...result.items] : result.items);
       setCursor(result.next_cursor);
     } catch (err: unknown) {
-      setError(err instanceof PlatformApiError ? err.message : "Could not load call history.");
+      if (requestId === sessionsRequestRef.current) {
+        setError(err instanceof PlatformApiError ? err.message : "Could not load call history.");
+      }
     } finally {
-      setLoading(false);
-      setLoadingMore(false);
+      if (requestId === sessionsRequestRef.current) {
+        setLoading(false);
+        setLoadingMore(false);
+      }
     }
   }, [activeFilters]);
 
@@ -178,7 +198,8 @@ export default function ConversationsPage() {
                 </Link>
               );
             })}
-            {!loading && sessions.length === 0 ? <p className="p-4 text-sm text-limestone-400">No conversations match these filters.</p> : null}
+            {!loading && !error && sessions.length === 0 ? <p className="p-4 text-sm text-limestone-400">No conversations match these filters.</p> : null}
+            {error && sessions.length === 0 ? <p className="p-4 text-sm text-rust-200">Call history is unavailable until the request succeeds.</p> : null}
           </div>
           {cursor ? <button className="button-secondary w-full" onClick={() => void loadSessions(cursor, true)} disabled={loadingMore}>{loadingMore ? "Loading…" : "Load more calls"}</button> : null}
           {page?.next_cursor === null && sessions.length > 0 ? <p className="text-xs text-limestone-500">End of available call history.</p> : null}

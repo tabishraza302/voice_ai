@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowRight, RefreshCw, UserRound } from "lucide-react";
 import { PlatformAgentDirectory } from "@/components/PlatformAgentDirectory";
 import { useAuth } from "@/lib/auth-state";
@@ -17,8 +17,10 @@ export function PlatformCustomerDashboard() {
   const [usage, setUsage] = useState<OwnerUsagePage | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const requestIdRef = useRef(0);
 
   const refresh = useCallback(async () => {
+    const requestId = ++requestIdRef.current;
     setLoading(true);
     setError(null);
     try {
@@ -26,12 +28,15 @@ export function PlatformCustomerDashboard() {
         platformApi.getWallet(),
         platformApi.getOwnerUsage({ limit: 5 }),
       ]);
+      if (requestId !== requestIdRef.current) return;
       setWallet(walletView);
       setUsage(usagePage);
     } catch (err: unknown) {
-      setError(err instanceof PlatformApiError ? err.message : "Could not load account activity.");
+      if (requestId === requestIdRef.current) {
+        setError(err instanceof PlatformApiError ? err.message : "Could not load account activity.");
+      }
     } finally {
-      setLoading(false);
+      if (requestId === requestIdRef.current) setLoading(false);
     }
   }, []);
 
@@ -132,6 +137,8 @@ export function PlatformCustomerDashboard() {
                 </span>
               </Link>
             ))
+          ) : error ? (
+            <p className="p-4 text-sm text-rust-200">Recent call usage is unavailable until the account request succeeds.</p>
           ) : (
             <p className="p-4 text-sm text-limestone-400">No call usage has been recorded.</p>
           )}

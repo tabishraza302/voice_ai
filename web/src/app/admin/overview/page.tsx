@@ -3,7 +3,6 @@
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { ArrowRight, RefreshCw } from "lucide-react";
-import { AdminGate } from "@/components/AdminGate";
 import { PlatformApiError, platformApi } from "@/lib/platform-api-client";
 import { formatMinorCurrency, formatPlatformDate } from "@/lib/platform-format";
 import type { AdminOverview } from "@/types/platform";
@@ -62,5 +61,5 @@ function AdminOverviewContent() {
 }
 
 export default function AdminOverviewPage() {
-  return <AdminGate><AdminOverviewContent /></AdminGate>;
+  return <AdminOverviewContent />;
 }

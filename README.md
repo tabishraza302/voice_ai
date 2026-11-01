@@ -79,24 +79,22 @@ To stop the entire stack cleanly:
 scripts/voice-ai.sh stop
 ```
 
-### Local Agent Studio
+### Platform Web App
 
-The optional browser studio and its `/api` endpoints are intended for one
-trusted user on the same machine. They have no sign-in, authorization, or
-multi-user isolation. Keep the Studio, agent API, and database bound to
-loopback. The API lets the browser edit local agent profiles and
-prompts. The browser sends the selected saved profile id with its WebRTC
-request, and that profile applies to that session only. Explicitly requesting
-an unavailable or deleted profile id fails the session request instead of
-falling back to a different profile. Prebuilt clients with no profile id keep
-the measured `.env` settings. The studio indicates when a profile's selected
-LLM model is unavailable in the local catalog. Built-in profiles use batch STT
-(`mlx-audio`), which supports pinned languages; the default `.env` configuration
-uses realtime STT. A control-page STT mode override takes precedence over a
-selected profile's STT choice. In-call text turns sent from the client are
-limited to 4,000 Unicode characters.
-The studio uses the local PostgreSQL service started by Docker Compose. Install
-the web dependencies once, then start the studio alongside the stack:
+`web/` is the SaaS control plane UI: sign-in, customer dashboard, agent
+authoring, conversation history, billing, settings, and administrator tools.
+It talks only to the platform API (`platform_api`, port 8000); it does not
+call the local voice runner.
+
+The web app needs an account. The platform API owns authentication, CSRF,
+tenant isolation, and agent versions. Set `PLATFORM_WEB_ORIGIN` to the exact
+origin you open in the browser (default `http://127.0.0.1:3001`); a mismatched
+host such as `localhost` versus `127.0.0.1` fails CSRF validation. Browser
+requests use same-origin `/api/v1` paths; the Next server proxies them to
+`PLATFORM_API_ORIGIN` (default `http://127.0.0.1:8000`, set it in
+`web/.env.local` when the platform API runs elsewhere).
+
+Install the web dependencies once, then start the stack:
 
 ```bash
 cd web && bun install   # or: npm install
@@ -104,23 +102,23 @@ cd ..
 scripts/voice-ai.sh start --web
 ```
 
-Open [http://localhost:3001](http://localhost:3001). The in-call transcript
-streams each turn into one bubble and times it by what happened, not when the
-browser received the text: a user turn is stamped at the measured microphone
-onset (falling back to receipt time when no onset was observed), and an
-assistant turn at its first token. The final STT transcript replaces the live
-bubble in place, keeping that onset time, and re-arms the onset clock for the
-next turn. To run the studio alone,
-use `scripts/voice-ai.sh web`; `scripts/voice-ai.sh stop` stops only the studio
-process whose PID and command match this repository. If port 3001 is already
-in use, the script reports the conflict and leaves that process alone.
-Set `WEB_PORT=3010` before invoking the script to select another port; the
-agent and Studio use the same exported value for the CORS allowlist.
-The local management API is under `/api` (including `/api/agents`,
-`/api/prompts/base`, and `/api/catalog`); the runner's OpenAPI page is at
-`http://localhost:7860/docs`. The runner's `--host` setting must stay
-`localhost` or a literal loopback IP (such as `127.0.0.1` or `::1`) because
-management endpoints have no authentication.
+Open [http://127.0.0.1:3001](http://127.0.0.1:3001). To run the web app
+alone, start the platform API and then use `scripts/voice-ai.sh web`.
+`scripts/voice-ai.sh stop` stops only the web process whose PID and command
+match this repository. If port 3001 is already in use, the script reports the
+conflict and leaves that process alone. Set `WEB_PORT=3010` before invoking
+the script to select another port, and update `PLATFORM_WEB_ORIGIN` to match.
+
+The local voice runtime keeps its own browser client and management API:
+
+- `http://localhost:7860/client/` — talk to the local agent
+- `http://localhost:7860/settings` — switch batch vs streaming STT
+- `http://localhost:7860/api` — local agent/profile management
+  (`/api/agents`, `/api/prompts/base`, `/api/catalog`)
+- `http://localhost:7860/docs` — runner OpenAPI page
+
+The management API has no authentication. The runner's `--host` setting must
+stay `localhost` or a literal loopback IP (such as `127.0.0.1` or `::1`).
 
 PostgreSQL is the single runtime database for the project (including Arize Phoenix).
 It is published on loopback port 5439 by default. Set `POSTGRES_PORT` to move the
@@ -133,7 +131,7 @@ can start before a connection attempt. `GET /api/storage` reports
 Phoenix connects to the same configured PostgreSQL database using schema isolation
 (`PHOENIX_SQL_DATABASE_SCHEMA=phoenix`), preventing table and migration collisions
 with agent storage.
-The Studio, API, database, and preset prompts are new code paths; the published
+The local browser client, management API, database, and preset prompts are new code paths; the published
 STT, TTS, memory, and turn-latency tables describe the original measured
 configuration. The profile prompt check below used the compiled built-in
 prompts with each preset's model parameters. It is six individual streamed
@@ -374,7 +372,7 @@ database.
 | **`mlx-audio` Server** | Host | 8020 | Serves STT WebSocket & TTS endpoints on Metal GPU. |
 | **Ollama** | Host | 11434 | Standard Ollama inference port. |
 | **PostgreSQL** | Container | 5439 (configurable) | Single runtime database for agent configuration and Phoenix traces; loopback only. |
-| **Studio/API** | Host | 3001 / 7860 `/api` | Optional single-user local management interface; no authentication. |
+| **Platform Web App / Local Runtime API** | Host | 3001 / 7860 `/api` | SaaS UI on 3001; local single-user voice management API on 7860, no authentication. |
 
 ### The Metrics Contract
 

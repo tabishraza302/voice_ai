@@ -2,7 +2,6 @@ import { describe, expect, test, beforeEach } from "bun:test";
 import {
   deriveAuthState,
   extractAndClearFragmentToken,
-  getAppMode,
   sanitizeReturnPath,
   StepUpManager,
 } from "./auth-state.tsx";
@@ -40,7 +39,7 @@ describe("AuthState and security helpers", () => {
 
     test("uses provided safe fallback when input is invalid or missing", () => {
       expect(sanitizeReturnPath(null, "/agents")).toBe("/agents");
-      expect(sanitizeReturnPath(undefined, "/playground")).toBe("/playground");
+      expect(sanitizeReturnPath(undefined, "/agents")).toBe("/agents");
       expect(sanitizeReturnPath("", "/settings")).toBe("/settings");
       expect(sanitizeReturnPath("//evil.com", "/fallback")).toBe("/fallback");
     });
@@ -156,9 +155,35 @@ describe("AuthState and security helpers", () => {
 
       expect(executionCount).toBe(0);
     });
+    test("canceling step-up settles a waiting caller with a cancellation error", async () => {
+      const manager = new StepUpManager();
+      let rejection = null;
+
+      manager.requestStepUp(
+        async () => undefined,
+        (reason) => {
+          rejection = reason;
+        }
+      );
+
+      manager.cancelStepUp();
+      expect(rejection).not.toBeNull();
+      expect(rejection.code).toBe("STEP_UP_CANCELLED");
+      expect(manager.hasPendingAction).toBe(false);
+    });
   });
 
   describe("deriveAuthState and session gates", () => {
+    test("reports a bootstrap failure instead of loading forever", () => {
+      const state = deriveAuthState(null, "Unable to reach the platform API.");
+      expect(state.status).toBe("error");
+      expect(state.message).toBe("Unable to reach the platform API.");
+    });
+
+    test("reports loading only before the first bootstrap", () => {
+      expect(deriveAuthState(null).status).toBe("loading");
+    });
+
     test("derives anonymous auth state", () => {
       const session = {
         state: "anonymous",
