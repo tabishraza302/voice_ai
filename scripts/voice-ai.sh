@@ -593,6 +593,12 @@ cmd_flow_qualify() {
   # or mocked pass never qualifies voice playback.
   exec uv run --frozen python -m bot.adapter_qualification "$@"
 }
+cmd_seed_dev_accounts() {
+  ensure_database_url
+  load_env
+  uv run python -m scripts.seed_dev_accounts
+}
+
 cmd_verify() {
   exec uv run --frozen python "$REPO_ROOT/scripts/verify.py" "$@"
 }
@@ -641,6 +647,7 @@ Running it:
   stop               Stop everything, in reverse
     --start-others     bring the other projects' stacks back up too
   status             What is running, and where
+  seed-dev-accounts  Create local development login accounts
   run                The agent alone, in the foreground
   run-eval           The agent alone, for the eval harness
   stt                The mlx-audio server alone (STT + TTS)
@@ -735,6 +742,7 @@ main() {
     test) cmd_test "$@" ;;
     flow-qualify) cmd_flow_qualify "$@" ;;
     verify) cmd_verify "$@" ;;
+    seed-dev-accounts) cmd_seed_dev_accounts "$@" ;;
     schema) cmd_schema "$@" ;;
     clean) cmd_clean "$@" ;;
     others)
