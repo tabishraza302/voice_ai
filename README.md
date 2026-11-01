@@ -102,6 +102,13 @@ cd ..
 scripts/voice-ai.sh start --web
 ```
 
+For local development, run `scripts/voice-ai.sh seed-dev-accounts` after the
+platform database has been initialized. The login page on localhost in the
+Next.js development server then lists customer and administrator shortcuts.
+The command only accepts a local database in the development environment and
+never overwrites an existing account. The administrator must enroll in MFA.
+These shared accounts are for local development only.
+
 Open [http://127.0.0.1:3001](http://127.0.0.1:3001). To run the web app
 alone, start the platform API and then use `scripts/voice-ai.sh web`.
 `scripts/voice-ai.sh stop` stops only the web process whose PID and command
