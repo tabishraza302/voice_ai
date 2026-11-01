@@ -1,11 +1,12 @@
 "use client";
 
-import React, { useState, Suspense } from "react";
+import React, { useState, useEffect, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { platformApi, PlatformApiError } from "@/lib/platform-api-client";
 import { sanitizeReturnPath, useAuth } from "@/lib/auth-state";
 import { validatePassword } from "@/types/auth";
+import devAccounts from "@/lib/dev-accounts.json";
 import { KeyRound, Loader2, LogIn, ShieldAlert } from "lucide-react";
 
 function LoginForm() {
@@ -22,18 +23,22 @@ function LoginForm() {
   const [isMfaStep, setIsMfaStep] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showDevAccounts, setShowDevAccounts] = useState(false);
 
-  const handlePasswordLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
+  useEffect(() => {
+    setShowDevAccounts(process.env.NODE_ENV === "development" && ["localhost", "127.0.0.1", "::1", "[::1]"].includes(window.location.hostname));
+  }, []);
+
+  const signIn = async (loginEmail: string, loginPassword: string) => {
     if (loading) return;
 
-    const trimmedEmail = email.trim();
+    const trimmedEmail = loginEmail.trim();
     if (!trimmedEmail) {
       setError("Please enter your email address");
       return;
     }
 
-    const passwordCheck = validatePassword(password);
+    const passwordCheck = validatePassword(loginPassword);
     if (!passwordCheck.valid) {
       setError(passwordCheck.error || "Password does not meet length requirements");
       return;
@@ -45,7 +50,7 @@ function LoginForm() {
     try {
       const response = await platformApi.login({
         email: trimmedEmail,
-        password,
+        password: loginPassword,
       });
 
       if (response.state === "authenticated") {
@@ -74,6 +79,11 @@ function LoginForm() {
       }
       setLoading(false);
     }
+  };
+
+  const handlePasswordLogin = (e: React.FormEvent) => {
+    e.preventDefault();
+    void signIn(email, password);
   };
 
   const handleMfaVerify = async (e: React.FormEvent) => {
@@ -250,6 +260,23 @@ function LoginForm() {
             )}
           </button>
         </form>
+      )}
+
+      {!isMfaStep && showDevAccounts && (
+        <section className="border-t border-ink-800 pt-4 space-y-3" aria-label="Local development accounts">
+          <h2 className="text-sm font-semibold text-white">Local development accounts</h2>
+          <p className="text-xs text-limestone-400">Administrator access requires authenticator setup.</p>
+          {devAccounts.map((account) => (
+            <div key={account.email} className="rounded-lg border border-ink-800 p-3 space-y-2">
+              <p className="text-sm text-white">{account.label}</p>
+              <p className="text-xs text-limestone-400 break-all">{account.email} · {account.password}</p>
+              <button type="button" disabled={loading} className="button-secondary w-full"
+                onClick={() => { setEmail(account.email); setPassword(account.password); void signIn(account.email, account.password); }}>
+                Sign in as {account.label}
+              </button>
+            </div>
+          ))}
+        </section>
       )}
 
       {!isMfaStep && (
