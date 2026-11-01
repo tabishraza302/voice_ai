@@ -32,6 +32,7 @@ from bot.flow.validation import normalize_executable
 from platform_api.agents.config import (
     AgentConfigError,
     extract_flow,
+    extract_settings,
     validate_config_bounds,
 )
 from platform_api.agents.defaults import DEFAULT_AGENT_TEMPLATES
@@ -50,6 +51,7 @@ from platform_api.agents.snapshots import (
 from platform_api.agents.schemas import (
     AgentCreate,
     AgentListResponse,
+    AgentRuntimeSettingsView,
     AgentUpdate,
     AgentView,
     DraftUpdate,
@@ -310,7 +312,31 @@ async def list_agents(
         # Keep the cursor URL-safe: '+' in an ISO offset is decoded as a space.
         next_cursor = f"{last.created_at.isoformat().replace('+00:00', 'Z')}_{last.id}"
 
-    views = [AgentView.model_validate(a) for a in agents]
+    views = []
+    if agents:
+        draft_res = await db.execute(
+            select(AgentDraft.agent_id, AgentDraft.authoring_json).where(
+                AgentDraft.agent_id.in_([agent.id for agent in agents])
+            )
+        )
+        configs = {agent_id: config for agent_id, config in draft_res.all()}
+        for agent in agents:
+            view = AgentView.model_validate(agent)
+            config = configs.get(agent.id)
+            if config is not None:
+                try:
+                    view = view.model_copy(
+                        update={
+                            "runtime_settings": AgentRuntimeSettingsView.model_validate(
+                                extract_settings(config)
+                            )
+                        }
+                    )
+                except AgentConfigError:
+                    # A draft that cannot be summarized is reported as
+                    # unavailable by the client rather than failing the list.
+                    pass
+            views.append(view)
     return AgentListResponse(items=views, next_cursor=next_cursor)
 
 
