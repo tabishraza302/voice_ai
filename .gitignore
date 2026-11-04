@@ -1,0 +1,12 @@
+# Local secrets and tooling — never committed
+.env
+.env.*
+.omp/
+
+# Generated state
+.venv/
+__pycache__/
+*.py[cod]
+.cache/
+data/
+logs/
