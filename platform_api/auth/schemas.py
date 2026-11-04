@@ -37,7 +37,6 @@ class UserView(StrictModel):
     preferred_language: Literal["en", "hi"]
     timezone: str
     low_balance_notifications: bool
-    mfa_enabled: bool
     created_at: datetime
     updated_at: datetime
 
@@ -45,12 +44,7 @@ class UserView(StrictModel):
 class SessionResponse(StrictModel):
     """Current session state and CSRF token."""
 
-    state: Literal[
-        "anonymous",
-        "mfa_required",
-        "mfa_enrollment_required",
-        "authenticated",
-    ]
+    state: Literal["anonymous", "authenticated"]
     user: UserView | None = None
     session_id: uuid.UUID
     expires_at: datetime
@@ -79,14 +73,6 @@ class SessionList(StrictModel):
     """List of active authenticated sessions for current user."""
 
     items: list[SessionItem]
-
-
-class MfaSetup(StrictModel):
-    """One-time TOTP enrollment response containing setup secret."""
-
-    secret: str
-    provisioning_uri: str
-    expires_at: datetime
 
 
 class UserPage(StrictModel):
@@ -163,33 +149,14 @@ class ChangePasswordRequest(StrictModel):
     new_password: str
 
 
-class MfaEnrollRequest(StrictModel):
-    """Admin TOTP enrollment initiation requiring current password."""
-
-    current_password: str
-
-
-class MfaConfirmRequest(StrictModel):
-    """Confirmation of pending TOTP enrollment."""
-
-    code: str
-
-
-class MfaVerifyRequest(StrictModel):
-    """Submission of TOTP code for mfa_required session."""
-
-    code: str
-
-
 class StepUpRequest(StrictModel):
-    """Fresh step-up authentication for privileged mutations."""
+    """Fresh password reauthentication for privileged mutations."""
 
     password: str
-    code: str
 
 
 class UpdateProfileRequest(StrictModel):
-    """User profile preference updates."""
+    """Update profile preferences."""
 
     display_name: str | None = None
     preferred_language: Literal["en", "hi"] | None = None
@@ -217,3 +184,5 @@ class AdminRestoreRequest(StrictModel):
     """Administrative user restoration request."""
 
     reason: str
+
+

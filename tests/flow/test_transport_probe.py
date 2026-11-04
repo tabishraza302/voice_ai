@@ -156,8 +156,12 @@ def test_probe_existing_webrtc_transport_with_explicit_identity_binds_report_wit
         adapter_version="1.0.0",
         model_revision="qwen3.5:4b@sha256:abc123def456",
         agent_settings=AgentQualificationSettings(
+            llm_provider="ollama",
             llm_model="qwen3.5:4b",
             stt_provider="mlx-audio",
+            stt_model="mlx-community/nemotron-3.5-asr-streaming-0.6b",
+            tts_provider="mlx-audio",
+            tts_model="mlx-community/Kokoro-82M-4bit",
             tts_voice_en="af_heart",
             tts_voice_hi="hf_alpha",
         ),
@@ -174,6 +178,8 @@ def test_probe_existing_webrtc_transport_with_explicit_identity_binds_report_wit
 
     report = result.report
     assert report is not None
+    assert report.protocol_version == 4
+    assert report.agent_settings.llm_provider == "ollama"
     assert report.playback == "unqualified"
     assert report.model_revision == "qwen3.5:4b@sha256:abc123def456"
     assert report.locales == ["en", "hi"]
@@ -202,8 +208,12 @@ def test_probe_existing_webrtc_transport_canonicalizes_sink_latency_measurement(
         adapter_version="1.0.0",
         model_revision="qwen3.5:4b@sha256:abc123def456",
         agent_settings=AgentQualificationSettings(
+            llm_provider="ollama",
             llm_model="qwen3.5:4b",
             stt_provider="mlx-audio",
+            stt_model="mlx-community/nemotron-3.5-asr-streaming-0.6b",
+            tts_provider="mlx-audio",
+            tts_model="mlx-community/Kokoro-82M-4bit",
             tts_voice_en="af_heart",
             tts_voice_hi="hf_alpha",
         ),
@@ -212,6 +222,7 @@ def test_probe_existing_webrtc_transport_canonicalizes_sink_latency_measurement(
         profile_hash="profile:test_hash",
     )
     assert result.report is not None
+    assert result.report.protocol_version == 4
     assert result.report.measurements.get("sink_latency_ms") == "12.5"
 
 

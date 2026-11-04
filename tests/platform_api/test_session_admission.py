@@ -16,6 +16,7 @@ from sqlalchemy import select
 
 from bot.flow.qualification import AgentQualificationSettings
 from bot.flow.schemas import AdapterCapabilities
+from platform_api.agents.config import DEFAULT_AGENT_SETTINGS
 from platform_api.agents.models import IdempotencyRecord
 from platform_api.auth.errors import ConflictError, DependencyUnavailableError, ForbiddenError
 from platform_api.auth.sessions import create_authenticated_session
@@ -50,12 +51,8 @@ from tests.support.billing import (
 from tests.support.postgres import FreshPostgres
 
 
-TEST_PINS = {
-    "llm_model": "qualification-test-model",
-    "stt_provider": "qualification-test-stt",
-    "tts_voice_en": "qualification-test-en",
-    "tts_voice_hi": "qualification-test-hi",
-}
+TEST_PINS = dict(DEFAULT_AGENT_SETTINGS)
+TEST_QUALIFICATION_PINS = dict(TEST_PINS)
 
 
 def _b64url(raw: bytes) -> str:
@@ -114,7 +111,7 @@ def _qualification() -> tuple[AdapterCapabilities, AgentQualificationSettings]:
             locales=["en", "hi"],
             report_hash="a" * 64,
         ),
-        AgentQualificationSettings(**TEST_PINS),
+        AgentQualificationSettings(**TEST_QUALIFICATION_PINS),
     )
 
 
@@ -147,6 +144,10 @@ async def _owner_auth(
 
 async def _fake_owned_voice_version(*args, **kwargs):
     return None, None, {"model_pins": dict(TEST_PINS)}
+
+async def _fake_session_model_identity(*args, **kwargs):
+    """Match the synthetic version used by the funding and retry tests."""
+
 
 
 @pytest.mark.asyncio
@@ -279,11 +280,13 @@ async def test_owner_and_runtime_session_routes_are_mounted(
 async def test_admission_funds_before_jti_and_releases_capacity_before_budget_close(
     test_platform_settings: PlatformSettings,
     initialized_pg: FreshPostgres,
+    qualified_test_llm,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _session_settings(test_platform_settings, owner_capacity=1, runner_capacity=1)
     capabilities, qualification_settings = _qualification()
     monkeypatch.setattr(service, "_load_owned_version", _fake_owned_voice_version)
+    monkeypatch.setattr(service, "_validate_session_model_identity", _fake_session_model_identity)
     registration_calls: list[RuntimeRegistrationRequest] = []
     release_calls: list[RuntimeReleaseRequest] = []
 
@@ -576,12 +579,14 @@ async def test_admission_funds_before_jti_and_releases_capacity_before_budget_cl
 async def test_admission_retry_uses_the_session_tariff_after_active_rate_changes(
     test_platform_settings: PlatformSettings,
     initialized_pg: FreshPostgres,
+    qualified_test_llm,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A retry reuses the rate/slice/TTL pinned before a current tariff change."""
     settings = _session_settings(test_platform_settings)
     capabilities, qualification_settings = _qualification()
     monkeypatch.setattr(service, "_load_owned_version", _fake_owned_voice_version)
+    monkeypatch.setattr(service, "_validate_session_model_identity", _fake_session_model_identity)
     start = datetime.now(timezone.utc)
     monkeypatch.setattr(service, "_utc_now", lambda: start)
     registration_calls: list[RuntimeRegistrationRequest] = []
@@ -696,6 +701,7 @@ async def test_admission_retry_uses_the_session_tariff_after_active_rate_changes
 async def test_admission_pause_blocks_new_owner_and_guest_sessions(
     test_platform_settings: PlatformSettings,
     initialized_pg: FreshPostgres,
+    qualified_test_llm,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _session_settings(test_platform_settings)
@@ -921,11 +927,13 @@ async def test_admin_termination_is_audited_idempotent_and_waits_for_runner_ack(
 async def test_funding_denial_releases_registered_runner_and_closes_any_open_budget(
     test_platform_settings: PlatformSettings,
     initialized_pg: FreshPostgres,
+    qualified_test_llm,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _session_settings(test_platform_settings)
     capabilities, qualification_settings = _qualification()
     monkeypatch.setattr(service, "_load_owned_version", _fake_owned_voice_version)
+    monkeypatch.setattr(service, "_validate_session_model_identity", _fake_session_model_identity)
     registrations: list[uuid.UUID] = []
     releases: list[RuntimeReleaseRequest] = []
 

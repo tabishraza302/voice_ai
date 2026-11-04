@@ -36,7 +36,7 @@ from platform_api.auth.mfa import (
     verify_mfa_login,
 )
 from platform_api.auth.passwords import get_password_hasher
-from platform_api.auth.sessions import create_authenticated_session, create_mfa_pending_session
+from platform_api.auth.sessions import create_authenticated_session
 from platform_api.config import PlatformSettings
 from platform_api.models.auth import AuthMfa, AuthSession, User
 from tests.support.postgres import FreshPostgres
@@ -105,56 +105,6 @@ def test_fernet_user_id_binding_verification():
     with pytest.raises(ValueError):
         decrypt_totp_secret(fernet_key, user_b, ciphertext)
 
-
-@pytest.mark.postgres
-@pytest.mark.asyncio
-async def test_restricted_mfa_session_cannot_access_resources(
-    app_client: httpx.AsyncClient,
-    test_platform_settings: PlatformSettings,
-    initialized_pg: FreshPostgres,
-):
-    """Admin sessions in mfa_required state cannot access /me or other resources (403 MFA_REQUIRED)."""
-    now = datetime.now(timezone.utc)
-    hasher = get_password_hasher()
-    pw_hash = await hasher.hash_password("admin-secret-password-123")
-
-    async with initialized_pg.sessions() as session:
-        admin = User(
-            id=uuid.uuid4(),
-            email="mfa-restricted@example.com",
-            email_key="mfa-restricted@example.com",
-            display_name="MFA Admin",
-            password_hash=pw_hash,
-            role="admin",
-            status="active",
-            email_verified_at=now,
-            preferred_language="en",
-            timezone="Asia/Kolkata",
-            low_balance_notifications=True,
-            auth_version=1,
-            created_at=now,
-            updated_at=now,
-        )
-        session.add(admin)
-        await session.flush()
-
-        sess, secret = await create_mfa_pending_session(
-            session,
-            test_platform_settings,
-            user=admin,
-            state="mfa_required",
-            client_ip="127.0.0.1",
-            user_agent="RestrictedAgent",
-            now=now,
-        )
-        await session.commit()
-
-    cookie_header = f"{test_platform_settings.session_cookie_name}={secret}"
-
-    # Accessing /me with restricted session returns 403 MFA_REQUIRED
-    res = await app_client.get("/api/v1/me", headers={"Cookie": cookie_header})
-    assert res.status_code == 403
-    assert res.json()["error"]["code"] == "MFA_REQUIRED"
 
 
 @pytest.mark.postgres
@@ -240,118 +190,6 @@ async def test_concurrent_totp_login_replay_single_winner(
         m = (await session.execute(select(AuthMfa).where(AuthMfa.user_id == user_id))).scalar_one()
         assert m.last_accepted_step == 4
 
-
-@pytest.mark.postgres
-@pytest.mark.asyncio
-async def test_concurrent_totp_http_verify_single_winner(
-    test_platform_settings: PlatformSettings,
-    initialized_pg: FreshPostgres,
-):
-    """Simultaneous HTTP requests to /api/v1/auth/mfa/verify allow exactly one winner."""
-    import asyncio
-    from platform_api.app import create_app
-
-    now = datetime.now(timezone.utc)
-    # Avoid boundary rollover by sleeping slightly if close to interval edge (>= 27s into 30s window)
-    if int(now.timestamp()) % 30 >= 27:
-        import asyncio
-        await asyncio.sleep(4)
-        now = datetime.now(timezone.utc)
-    current_step = int(now.timestamp()) // 30
-    secret_b32 = "GEZDGNBVGY3TQOJQGEZDGNBVGY"
-    totp = pyotp.TOTP(secret_b32, digits=6, interval=30)
-    code = totp.at(int(now.timestamp()))
-    user_id = uuid.uuid4()
-
-    hasher = get_password_hasher()
-    pw_hash = await hasher.hash_password("admin-http-totp-pw-1234")
-    fernet_key = test_platform_settings.auth_mfa_key
-    ciphertext = encrypt_totp_secret(fernet_key, user_id, secret_b32)
-
-    async with initialized_pg.sessions() as session:
-        admin = User(
-            id=user_id,
-            email="totp-http-replay@example.com",
-            email_key="totp-http-replay@example.com",
-            display_name="TOTP HTTP Admin",
-            password_hash=pw_hash,
-            role="admin",
-            status="active",
-            email_verified_at=now,
-            preferred_language="en",
-            timezone="Asia/Kolkata",
-            low_balance_notifications=True,
-            auth_version=1,
-            created_at=now,
-            updated_at=now,
-        )
-        session.add(admin)
-        await session.flush()
-        mfa = AuthMfa(
-            user_id=user_id,
-            secret_ciphertext=ciphertext,
-            pending_secret_ciphertext=None,
-            pending_expires_at=None,
-            enabled_at=now,
-            last_accepted_step=current_step - 1,
-        )
-        session.add(mfa)
-        await session.flush()
-
-        # Create mfa_required pending session
-        sess, secret = await create_mfa_pending_session(
-            session,
-            test_platform_settings,
-            user=admin,
-            state="mfa_required",
-            client_ip="127.0.0.1",
-            user_agent="ReplayAgent",
-            now=now,
-        )
-        await session.commit()
-
-    app = create_app(test_platform_settings)
-    cookie_name = test_platform_settings.session_cookie_name
-    cookie_header = f"{cookie_name}={secret}"
-
-    barrier = asyncio.Barrier(2)
-
-    async with app.router.lifespan_context(app):
-        async with (
-            httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8000") as client1,
-            httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8000") as client2,
-        ):
-            # Fetch CSRF token for the session
-            sess_info = await client1.get("/api/v1/auth/session", headers={"Cookie": cookie_header, "Origin": test_platform_settings.web_origin})
-            csrf_token = sess_info.json()["csrf_token"]
-
-            async def _post_mfa_verify(client: httpx.AsyncClient) -> httpx.Response:
-                await barrier.wait()
-                return await client.post(
-                    "/api/v1/auth/mfa/verify",
-                    json={"code": code},
-                    headers={
-                        "Origin": test_platform_settings.web_origin,
-                        "X-CSRF-Token": csrf_token,
-                        "Cookie": cookie_header,
-                    },
-                )
-
-            resp1, resp2 = await asyncio.gather(
-                _post_mfa_verify(client1),
-                _post_mfa_verify(client2),
-            )
-
-            status_codes = [resp1.status_code, resp2.status_code]
-            # One request rotates session to authenticated (200), other is rejected (400 MFA_INVALID or 403 CSRF_INVALID due to rotation)
-            assert 200 in status_codes
-            loser_resp = resp1 if resp1.status_code != 200 else resp2
-            assert loser_resp.status_code in (400, 403)
-
-    # Verify durable invariant in PostgreSQL: last_accepted_step matches current_step
-    async with initialized_pg.sessions() as session:
-        m = (await session.execute(select(AuthMfa).where(AuthMfa.user_id == user_id))).scalar_one()
-        assert m.last_accepted_step == current_step
 
 
 @pytest.mark.postgres
@@ -441,7 +279,7 @@ async def test_failed_step_up_does_not_expire_session_cookie(
     # 2. Attempt step-up with WRONG password
     fail_res = await app_client.post(
         "/api/v1/auth/step-up",
-        json={"password": "wrong-admin-password", "code": code},
+        json={"password": "wrong-admin-password"},
         headers={
             "Origin": test_platform_settings.web_origin,
             "X-CSRF-Token": csrf_token,
@@ -463,7 +301,7 @@ async def test_failed_step_up_does_not_expire_session_cookie(
     # 4. Retry step-up with CORRECT password succeeds
     success_res = await app_client.post(
         "/api/v1/auth/step-up",
-        json={"password": correct_pw, "code": code},
+        json={"password": correct_pw},
         headers={
             "Origin": test_platform_settings.web_origin,
             "X-CSRF-Token": csrf_token,
@@ -477,38 +315,23 @@ async def test_failed_step_up_does_not_expire_session_cookie(
 
 @pytest.mark.postgres
 @pytest.mark.asyncio
-async def test_fifth_failed_mfa_attempt_revokes_restricted_session(
+async def test_admin_login_without_mfa_authenticates_directly(
     app_client: httpx.AsyncClient,
     test_platform_settings: PlatformSettings,
     initialized_pg: FreshPostgres,
 ):
-    """Contract line 206: on fifth failed MFA credential attempt, revoke restricted session and delete cookie.
-
-    Attempts 1–4 fail without revocation; a valid code prior to 5th can upgrade; 5th failure revokes.
-    """
+    """Admin login with password immediately enters authenticated state without MFA prompts."""
     now = datetime.now(timezone.utc)
-    if int(now.timestamp()) % 30 >= 26:
-        import asyncio
-        await asyncio.sleep(5)
-        now = datetime.now(timezone.utc)
-
-    current_step = int(now.timestamp()) // 30
-    secret_b32 = "GEZDGNBVGY3TQOJQGEZDGNBVGY"
-    totp = pyotp.TOTP(secret_b32, digits=6, interval=30)
-    valid_code = totp.at(int(now.timestamp()))
-    user_id = uuid.uuid4()
-
     hasher = get_password_hasher()
-    pw_hash = await hasher.hash_password("admin-fifth-fail-pw-123")
-    fernet_key = test_platform_settings.auth_mfa_key
-    ciphertext = encrypt_totp_secret(fernet_key, user_id, secret_b32)
+    pw = "admin-login-direct-pw-12345"
+    pw_hash = await hasher.hash_password(pw)
 
     async with initialized_pg.sessions() as session:
         admin = User(
-            id=user_id,
-            email="fifth-mfa-fail@example.com",
-            email_key="fifth-mfa-fail@example.com",
-            display_name="Fifth Fail Admin",
+            id=uuid.uuid4(),
+            email="admin-direct@example.com",
+            email_key="admin-direct@example.com",
+            display_name="Direct Admin",
             password_hash=pw_hash,
             role="admin",
             status="active",
@@ -521,202 +344,44 @@ async def test_fifth_failed_mfa_attempt_revokes_restricted_session(
             updated_at=now,
         )
         session.add(admin)
-        await session.flush()
-
-        mfa = AuthMfa(
-            user_id=user_id,
-            secret_ciphertext=ciphertext,
-            pending_secret_ciphertext=None,
-            pending_expires_at=None,
-            enabled_at=now,
-            last_accepted_step=current_step - 2,
-        )
-        session.add(mfa)
-        await session.flush()
-
-        sess, secret = await create_mfa_pending_session(
-            session,
-            test_platform_settings,
-            user=admin,
-            state="mfa_required",
-            client_ip="127.0.0.1",
-            user_agent="FifthFailAgent",
-            now=now,
-        )
         await session.commit()
 
-    cookie_name = test_platform_settings.session_cookie_name
-    cookie_header = f"{cookie_name}={secret}"
-
-    # Bootstrap session to get CSRF token
-    sess_res = await app_client.get(
+    # 1. Bootstrap anonymous session
+    boot = await app_client.get(
         "/api/v1/auth/session",
-        headers={"Cookie": cookie_header, "Origin": test_platform_settings.web_origin},
+        headers={"Origin": test_platform_settings.web_origin},
     )
-    csrf_token = sess_res.json()["csrf_token"]
+    assert boot.status_code == 200
+    csrf = boot.json()["csrf_token"]
 
-    # Attempts 1–4 with invalid code: fail with 400 MFA_INVALID, do NOT revoke or expire cookie
-    for attempt in range(1, 5):
-        bad_res = await app_client.post(
-            "/api/v1/auth/mfa/verify",
-            json={"code": "000000"},
-            headers={
-                "Origin": test_platform_settings.web_origin,
-                "X-CSRF-Token": csrf_token,
-                "Cookie": cookie_header,
-            },
-        )
-        assert bad_res.status_code == 400
-        assert bad_res.json()["error"]["code"] == "MFA_INVALID"
-        set_cookie = bad_res.headers.get("set-cookie")
-        if set_cookie:
-            assert "Max-Age=0" not in set_cookie
-
-        # Verify session is still active in DB
-        async with initialized_pg.sessions() as session:
-            s = (await session.execute(select(AuthSession).where(AuthSession.id == sess.id))).scalar_one()
-            assert s.revoked_at is None
-
-    # Attempt 5 with invalid code: fails and revokes restricted session + expires cookie
-    fifth_res = await app_client.post(
-        "/api/v1/auth/mfa/verify",
-        json={"code": "000000"},
+    # 2. Login as admin
+    login_res = await app_client.post(
+        "/api/v1/auth/login",
+        json={"email": "admin-direct@example.com", "password": pw},
         headers={
             "Origin": test_platform_settings.web_origin,
-            "X-CSRF-Token": csrf_token,
-            "Cookie": cookie_header,
+            "X-CSRF-Token": csrf,
         },
     )
-    assert fifth_res.status_code == 400
-    assert fifth_res.json()["error"]["code"] == "MFA_INVALID"
-    set_cookie_fifth = fifth_res.headers.get("set-cookie")
-    assert set_cookie_fifth is not None
-    assert "Max-Age=0" in set_cookie_fifth
+    assert login_res.status_code == 200
+    data = login_res.json()
+    assert data["state"] == "authenticated"
+    assert data["user"]["role"] == "admin"
 
-    # Verify session is durably revoked in PostgreSQL
-    async with initialized_pg.sessions() as session:
-        s = (await session.execute(select(AuthSession).where(AuthSession.id == sess.id))).scalar_one()
-        assert s.revoked_at is not None
+    # 3. Can immediately access /api/v1/me
+    me_res = await app_client.get("/api/v1/me")
+    assert me_res.status_code == 200
+    assert me_res.json()["role"] == "admin"
 
-    # Subsequent attempt with previously valid code is rejected because session is revoked
-    subsequent_res = await app_client.post(
-        "/api/v1/auth/mfa/verify",
-        json={"code": valid_code},
+    # 4. Privileged step-up succeeds with password only
+    csrf = login_res.json()["csrf_token"]
+    step_up_res = await app_client.post(
+        "/api/v1/auth/step-up",
+        json={"password": pw},
         headers={
             "Origin": test_platform_settings.web_origin,
-            "X-CSRF-Token": csrf_token,
-            "Cookie": cookie_header,
+            "X-CSRF-Token": csrf,
         },
     )
-    assert subsequent_res.status_code == 403
-    assert subsequent_res.json()["error"]["code"] == "CSRF_INVALID"
-
-
-@pytest.mark.postgres
-@pytest.mark.asyncio
-async def test_valid_code_prior_to_fifth_failure_upgrades_session(
-    app_client: httpx.AsyncClient,
-    test_platform_settings: PlatformSettings,
-    initialized_pg: FreshPostgres,
-):
-    """MFA verification with failures 1–3 still succeeds on 4th attempt with valid code."""
-    now = datetime.now(timezone.utc)
-    if int(now.timestamp()) % 30 >= 26:
-        import asyncio
-        await asyncio.sleep(5)
-        now = datetime.now(timezone.utc)
-
-    current_step = int(now.timestamp()) // 30
-    secret_b32 = "GEZDGNBVGY3TQOJQGEZDGNBVGY"
-    totp = pyotp.TOTP(secret_b32, digits=6, interval=30)
-    valid_code = totp.at(int(now.timestamp()))
-    user_id = uuid.uuid4()
-
-    hasher = get_password_hasher()
-    pw_hash = await hasher.hash_password("admin-valid-prior-fifth-pw-123")
-    fernet_key = test_platform_settings.auth_mfa_key
-    ciphertext = encrypt_totp_secret(fernet_key, user_id, secret_b32)
-
-    async with initialized_pg.sessions() as session:
-        admin = User(
-            id=user_id,
-            email="valid-prior-fifth@example.com",
-            email_key="valid-prior-fifth@example.com",
-            display_name="Valid Prior Fifth Admin",
-            password_hash=pw_hash,
-            role="admin",
-            status="active",
-            email_verified_at=now,
-            preferred_language="en",
-            timezone="Asia/Kolkata",
-            low_balance_notifications=True,
-            auth_version=1,
-            created_at=now,
-            updated_at=now,
-        )
-        session.add(admin)
-        await session.flush()
-
-        mfa = AuthMfa(
-            user_id=user_id,
-            secret_ciphertext=ciphertext,
-            pending_secret_ciphertext=None,
-            pending_expires_at=None,
-            enabled_at=now,
-            last_accepted_step=current_step - 2,
-        )
-        session.add(mfa)
-        await session.flush()
-
-        sess, secret = await create_mfa_pending_session(
-            session,
-            test_platform_settings,
-            user=admin,
-            state="mfa_required",
-            client_ip="127.0.0.1",
-            user_agent="ValidPriorFifthAgent",
-            now=now,
-        )
-        await session.commit()
-
-    cookie_name = test_platform_settings.session_cookie_name
-    cookie_header = f"{cookie_name}={secret}"
-
-    # Bootstrap session to get CSRF token
-    sess_res = await app_client.get(
-        "/api/v1/auth/session",
-        headers={"Cookie": cookie_header, "Origin": test_platform_settings.web_origin},
-    )
-    csrf_token = sess_res.json()["csrf_token"]
-
-    # 3 bad attempts
-    for _ in range(3):
-        bad_res = await app_client.post(
-            "/api/v1/auth/mfa/verify",
-            json={"code": "000000"},
-            headers={
-                "Origin": test_platform_settings.web_origin,
-                "X-CSRF-Token": csrf_token,
-                "Cookie": cookie_header,
-            },
-        )
-        assert bad_res.status_code == 400
-        assert bad_res.json()["error"]["code"] == "MFA_INVALID"
-
-    # 4th attempt with valid code upgrades session
-    good_res = await app_client.post(
-        "/api/v1/auth/mfa/verify",
-        json={"code": valid_code},
-        headers={
-            "Origin": test_platform_settings.web_origin,
-            "X-CSRF-Token": csrf_token,
-            "Cookie": cookie_header,
-        },
-    )
-    assert good_res.status_code == 200
-    assert good_res.json()["state"] == "authenticated"
-
-    # Verify durable invariant in PostgreSQL
-    async with initialized_pg.sessions() as session:
-        m = (await session.execute(select(AuthMfa).where(AuthMfa.user_id == user_id))).scalar_one()
-        assert m.last_accepted_step == current_step
+    assert step_up_res.status_code == 200
+    assert step_up_res.json()["step_up_expires_at"] is not None

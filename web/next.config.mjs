@@ -7,6 +7,10 @@ const nextConfig = {
   async rewrites() {
     return [
       {
+        source: "/api/v1/catalog",
+        destination: `${platformApiOrigin}/catalog`,
+      },
+      {
         source: "/api/v1/:path*",
         destination: `${platformApiOrigin}/api/v1/:path*`,
       },

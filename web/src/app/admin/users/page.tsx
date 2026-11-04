@@ -13,7 +13,6 @@ import {
   RefreshCw,
   Search,
   ShieldAlert,
-  ShieldCheck,
   UserCheck,
   UserX,
   Users,
@@ -221,7 +220,6 @@ function AdminUsersContent() {
                 <th className="px-4 py-3">User</th>
                 <th className="px-4 py-3">Role</th>
                 <th className="px-4 py-3">Status</th>
-                <th className="px-4 py-3">MFA</th>
                 <th className="px-4 py-3">Created</th>
                 <th className="px-4 py-3 text-right">Actions</th>
               </tr>
@@ -229,14 +227,14 @@ function AdminUsersContent() {
             <tbody className="divide-y divide-ink-800/60">
               {loading && users.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="px-4 py-8 text-center text-limestone-400">
+                  <td colSpan={5} className="px-4 py-8 text-center text-limestone-400">
                     <Loader2 className="w-5 h-5 animate-spin mx-auto text-copper-400 mb-2" />
                     Loading user accounts...
                   </td>
                 </tr>
               ) : users.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="px-4 py-8 text-center text-limestone-400">
+                  <td colSpan={5} className="px-4 py-8 text-center text-limestone-400">
                     No accounts found matching your query.
                   </td>
                 </tr>
@@ -268,16 +266,6 @@ function AdminUsersContent() {
                       >
                         {user.status}
                       </span>
-                    </td>
-                    <td className="px-4 py-3">
-                      {user.mfa_enabled ? (
-                        <span className="flex items-center gap-1 text-[11px] text-moss-400 font-medium">
-                          <ShieldCheck className="w-3.5 h-3.5" />
-                          Enabled
-                        </span>
-                      ) : (
-                        <span className="text-[11px] text-limestone-500">None</span>
-                      )}
                     </td>
                     <td className="px-4 py-3 text-[11px] text-limestone-400 whitespace-nowrap">
                       {new Date(user.created_at).toLocaleDateString()}
@@ -488,12 +476,6 @@ function AdminUsersContent() {
                 <span className="text-limestone-500 block">Language / Timezone</span>
                 <span className="text-white font-medium">
                   {detailUser.preferred_language} · {detailUser.timezone}
-                </span>
-              </div>
-              <div className="surface p-3 bg-ink-900 border-ink-800">
-                <span className="text-limestone-500 block">MFA Status</span>
-                <span className="text-white font-medium">
-                  {detailUser.mfa_enabled ? "Enabled" : "Not configured"}
                 </span>
               </div>
               <div className="surface p-3 bg-ink-900 border-ink-800">

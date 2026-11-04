@@ -37,9 +37,24 @@ const flow = {
 };
 
 describe("platform agent authoring model", () => {
-  test("reads bare and enveloped flow documents without changing their schema", () => {
-    const bare = { ...flow, llm_model: "runtime-model" };
-    const enveloped = { flow, llm_model: "runtime-model", tts_voice_en: "voice-en" };
+  test("preserves optional LLM settings outside bare and enveloped flow snapshots", () => {
+    const bare = {
+      ...flow,
+      llm_provider: "ollama",
+      llm_model: "runtime-model",
+      llm_temperature: 0.4,
+      llm_max_tokens: 777,
+      stt_model: "speech-model",
+      tts_provider: "speech-provider",
+      tts_model: "voice-model",
+    };
+    const enveloped = {
+      flow,
+      llm_model: "runtime-model",
+      llm_temperature: 0.7,
+      llm_max_tokens: 2048,
+      tts_voice_en: "voice-en",
+    };
 
     expect(getFlowFromConfig(bare)).toEqual(flow);
     expect(getFlowFromConfig(enveloped)).toEqual(flow);
@@ -48,11 +63,19 @@ describe("platform agent authoring model", () => {
       entry_step_id: "welcome",
       exit_step_id: "finish",
       steps: [],
+      llm_provider: "ollama",
       llm_model: "runtime-model",
+      llm_temperature: 0.4,
+      llm_max_tokens: 777,
+      stt_model: "speech-model",
+      tts_provider: "speech-provider",
+      tts_model: "voice-model",
     });
     expect(configWithFlow(enveloped, { ...flow, steps: [] })).toEqual({
       flow: { ...flow, steps: [] },
       llm_model: "runtime-model",
+      llm_temperature: 0.7,
+      llm_max_tokens: 2048,
       tts_voice_en: "voice-en",
     });
     expect(bare.steps).toHaveLength(2);

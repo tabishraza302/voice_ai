@@ -3,7 +3,7 @@
 import { useEffect } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { useAuth } from "@/lib/auth-state";
-import { KeyRound, Loader2, Lock, ShieldAlert } from "lucide-react";
+import { Loader2, Lock, ShieldAlert } from "lucide-react";
 import Link from "next/link";
 
 const UNAUTHENTICATED_ROUTES = [
@@ -32,13 +32,6 @@ export function ModeGuard({ children }: { children: React.ReactNode }) {
 
     if (state.status === "anonymous") {
       router.replace(`/login?next=${encodeURIComponent(currentPath)}`);
-    } else if (state.status === "mfa_required") {
-      router.replace(`/login?next=${encodeURIComponent(currentPath)}`);
-    } else if (
-      state.status === "mfa_enrollment_required" &&
-      pathname !== "/admin/settings"
-    ) {
-      router.replace("/admin/settings");
     }
   }, [isUnauthenticatedRoute, state.status, router, pathname]);
 
@@ -98,38 +91,6 @@ export function ModeGuard({ children }: { children: React.ReactNode }) {
     );
   }
 
-  if (state.status === "mfa_required") {
-    return (
-      <div className="surface mx-auto max-w-md p-6 text-center space-y-4">
-        <KeyRound className="mx-auto h-10 w-10 text-copper-400" />
-        <h2 className="text-lg font-semibold text-white">Two-Factor Authentication Required</h2>
-        <p className="text-sm text-limestone-400">
-          Enter your 6-digit authenticator code to proceed.
-        </p>
-        <Link href="/login" className="button-primary w-full">
-          Complete Verification
-        </Link>
-      </div>
-    );
-  }
-
-  if (state.status === "mfa_enrollment_required") {
-    if (pathname === "/admin/settings") {
-      return <>{children}</>;
-    }
-    return (
-      <div className="surface mx-auto max-w-md p-6 text-center space-y-4">
-        <ShieldAlert className="mx-auto h-10 w-10 text-copper-400" />
-        <h2 className="text-lg font-semibold text-white">Administrator MFA Enrollment</h2>
-        <p className="text-sm text-limestone-400">
-          Administrator accounts require multi-factor authentication setup before accessing platform resources.
-        </p>
-        <Link href="/admin/settings" className="button-primary w-full">
-          Set Up Authenticator
-        </Link>
-      </div>
-    );
-  }
 
   if (state.status === "authenticated") {
     const user = state.user;

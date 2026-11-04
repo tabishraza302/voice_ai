@@ -54,6 +54,57 @@ export interface ValidationSummary {
   errors: AgentDiagnostic[];
   warnings: AgentDiagnostic[];
 }
+export interface CatalogLlmModel {
+  id: string;
+  name: string;
+  provider_id?: string;
+  provider_name?: string;
+  selectable?: boolean;
+  description?: string;
+  supports_reasoning?: boolean;
+}
+
+export interface CatalogSttProvider {
+  id: string;
+  name: string;
+  languages?: string[];
+  models: CatalogSttModel[];
+}
+
+export interface CatalogSttModel {
+  id: string;
+  name: string;
+  languages?: string[];
+  selectable: boolean;
+}
+
+export interface CatalogTtsVoice {
+  id: string;
+  name: string;
+  language?: string;
+  gender?: string;
+  selectable: boolean;
+}
+
+export interface CatalogTtsProvider {
+  id: string;
+  name: string;
+  models: CatalogTtsModel[];
+}
+
+export interface CatalogTtsModel {
+  id: string;
+  name: string;
+  voices: CatalogTtsVoice[];
+  selectable: boolean;
+}
+
+export interface PlatformCatalogView {
+  llm_models: CatalogLlmModel[];
+  stt_providers: CatalogSttProvider[];
+  tts_voices: CatalogTtsVoice[];
+  tts_providers: CatalogTtsProvider[];
+}
 
 export interface DraftView {
   agent_id: string;
@@ -449,6 +500,116 @@ function requireJsonObject(value: unknown, name: string): JsonObject {
 function requireStringArray(value: unknown, name: string): string[] {
   if (!Array.isArray(value)) throw new Error(`Invalid platform response: ${name} must be an array.`);
   return value.map((item, index) => requireString(item, `${name}[${index}]`));
+}
+
+function parseCatalogModel(value: unknown): CatalogLlmModel {
+  const row = requireRecord(value, "catalog.llm_model");
+  const providerId = row.provider_id == null ? undefined : requireString(row.provider_id, "catalog.llm_model.provider_id");
+  const providerName = row.provider_name == null ? undefined : requireString(row.provider_name, "catalog.llm_model.provider_name");
+  const selectable = row.selectable === undefined ? undefined : requireBoolean(row.selectable, "catalog.llm_model.selectable");
+  const description = row.description === undefined
+    ? undefined
+    : requireString(row.description, "catalog.llm_model.description");
+  const supportsReasoning = row.supports_reasoning === undefined
+    ? undefined
+    : requireBoolean(row.supports_reasoning, "catalog.llm_model.supports_reasoning");
+  return {
+    id: requireString(row.id, "catalog.llm_model.id"),
+    name: requireString(row.name, "catalog.llm_model.name"),
+    ...(providerId === undefined ? {} : { provider_id: providerId }),
+    ...(providerName === undefined ? {} : { provider_name: providerName }),
+    ...(selectable === undefined ? {} : { selectable }),
+    ...(description === undefined ? {} : { description }),
+    ...(supportsReasoning === undefined ? {} : { supports_reasoning: supportsReasoning }),
+  };
+}
+
+function parseCatalogSttProvider(value: unknown): CatalogSttProvider {
+  const row = requireRecord(value, "catalog.stt_provider");
+  if (!Array.isArray(row.models)) {
+    throw new Error("Invalid platform response: catalog.stt_provider.models must be an array.");
+  }
+  return {
+    id: requireString(row.id, "catalog.stt_provider.id"),
+    name: requireString(row.name, "catalog.stt_provider.name"),
+    models: row.models.map((item) => {
+      const model = requireRecord(item, "catalog.stt_model");
+      return {
+        id: requireString(model.id, "catalog.stt_model.id"),
+        name: requireString(model.name, "catalog.stt_model.name"),
+        selectable: requireBoolean(model.selectable, "catalog.stt_model.selectable"),
+        ...(model.languages === undefined ? {} : {
+          languages: requireStringArray(model.languages, "catalog.stt_model.languages"),
+        }),
+      };
+    }),
+  };
+}
+
+function parseCatalogTtsVoice(value: unknown): CatalogTtsVoice {
+  const row = requireRecord(value, "catalog.tts_voice");
+  const language = row.language === undefined
+    ? undefined
+    : requireString(row.language, "catalog.tts_voice.language");
+  const gender = row.gender === undefined
+    ? undefined
+    : requireString(row.gender, "catalog.tts_voice.gender");
+  return {
+    id: requireString(row.id, "catalog.tts_voice.id"),
+    name: requireString(row.name, "catalog.tts_voice.name"),
+    selectable: requireBoolean(row.selectable, "catalog.tts_voice.selectable"),
+    ...(language === undefined ? {} : { language }),
+    ...(gender === undefined ? {} : { gender }),
+  };
+}
+
+function parseCatalogTtsProvider(value: unknown): CatalogTtsProvider {
+  const row = requireRecord(value, "catalog.tts_provider");
+  if (!Array.isArray(row.models)) {
+    throw new Error("Invalid platform response: catalog.tts_provider.models must be an array.");
+  }
+  return {
+    id: requireString(row.id, "catalog.tts_provider.id"),
+    name: requireString(row.name, "catalog.tts_provider.name"),
+    models: row.models.map((item) => {
+      const model = requireRecord(item, "catalog.tts_model");
+      if (!Array.isArray(model.voices)) {
+        throw new Error("Invalid platform response: catalog.tts_model.voices must be an array.");
+      }
+      return {
+        id: requireString(model.id, "catalog.tts_model.id"),
+        name: requireString(model.name, "catalog.tts_model.name"),
+        selectable: requireBoolean(model.selectable, "catalog.tts_model.selectable"),
+        voices: model.voices.map(parseCatalogTtsVoice),
+      };
+    }),
+  };
+}
+
+function parseCatalog(value: unknown): PlatformCatalogView {
+  const row = requireRecord(value, "catalog");
+  const llmModels = row.llm_models;
+  const sttProviders = row.stt_providers;
+  const ttsVoices = row.tts_voices;
+  const ttsProviders = row.tts_providers;
+  if (!Array.isArray(llmModels)) {
+    throw new Error("Invalid platform response: catalog.llm_models must be an array.");
+  }
+  if (!Array.isArray(sttProviders)) {
+    throw new Error("Invalid platform response: catalog.stt_providers must be an array.");
+  }
+  if (!Array.isArray(ttsVoices)) {
+    throw new Error("Invalid platform response: catalog.tts_voices must be an array.");
+  }
+  if (!Array.isArray(ttsProviders)) {
+    throw new Error("Invalid platform response: catalog.tts_providers must be an array.");
+  }
+  return {
+    llm_models: llmModels.map(parseCatalogModel),
+    stt_providers: sttProviders.map(parseCatalogSttProvider),
+    tts_voices: ttsVoices.map(parseCatalogTtsVoice),
+    tts_providers: ttsProviders.map(parseCatalogTtsProvider),
+  };
 }
 
 function parseAgent(value: unknown): AgentView {
@@ -951,6 +1112,9 @@ export class PlatformAgentClient {
       if (cursor) seenCursors.add(cursor);
     } while (cursor);
     return agents;
+  }
+  async getCatalog(): Promise<PlatformCatalogView> {
+    return parseCatalog(await this.api.request<unknown>("/catalog"));
   }
 
   async getAgent(agentId: string): Promise<AgentView> {

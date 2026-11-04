@@ -1354,13 +1354,17 @@ class TestContractReviewerInvariants:
         ]
 
         valid_report = CapabilityReport(
-            protocol_version=2,
+            protocol_version=4,
             adapter_id="webrtc_browser_transport",
             adapter_version="1.0.0",
             model_revision="pinned/qwen-3.5",
             agent_settings={
+                "llm_provider": "ollama",
                 "llm_model": "qwen3.5:4b",
                 "stt_provider": "mlx-audio",
+                "stt_model": "mlx-community/nemotron-3.5-asr-streaming-0.6b",
+                "tts_provider": "mlx-audio",
+                "tts_model": "mlx-community/Kokoro-82M-4bit",
                 "tts_voice_en": "af_heart",
                 "tts_voice_hi": "hf_alpha",
             },

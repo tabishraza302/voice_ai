@@ -29,8 +29,10 @@ from urllib.parse import urlsplit
 
 import httpx
 from loguru import logger
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 from pipecat.services.llm_service import LLMService
 from pipecat.services.ollama.llm import OLLamaLLMService
+from pipecat.services.openai.base_llm import connection_limits
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.stt_service import STTService
 from pipecat.services.tts_service import TTSService, TextAggregationMode
@@ -47,20 +49,15 @@ from bot.stt_realtime import LocalMlxRealtimeSTTService
 from bot.stt_service import LocalMlxSTTService
 from bot.tts_service import LocalMlxTTSService
 
-# The two STT checkpoints this repo knows about. They are named here so a
-# provider swap that leaves the model behind fails with a clear message
-# instead of a checkpoint loader error. Nemotron serves both STT paths:
-# the batch endpoint loads it for whole-turn transcription, and
-# `/v1/realtime` streams it through `create_streaming_session`.
-NEMOTRON_MODEL = "mlx-community/nemotron-3.5-asr-streaming-0.6b"
-WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
-KOKORO_MODEL = "kokoro"
-# The two mlx-audio TTS checkpoints this repo knows about. Kokoro-82M is
-# the default: same model and same voice packs as the in-process ONNX
-# build, on the Metal GPU. Chatterbox is the multilingual escape hatch —
-# it clones a voice from reference audio and ignores a voice id.
-MLX_KOKORO_MODEL = "mlx-community/Kokoro-82M-4bit"
-CHATTERBOX_MODEL = "mlx-community/chatterbox-multilingual-v3"
+from bot.provider_registry import (
+    CHATTERBOX_MODEL,
+    KOKORO_MODEL,
+    MLX_KOKORO_MODEL,
+    NEMOTRON_MODEL,
+    STT_PROVIDER_REGISTRY,
+    TTS_PROVIDER_REGISTRY,
+    WHISPER_MODEL,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -307,10 +304,16 @@ def build_stt_mlx_whisper(settings: Settings) -> STTService:
     )
 
 
-STT_BACKENDS: dict[str, Callable[[Settings], STTService]] = {
+_STT_BACKEND_FACTORIES: dict[str, Callable[[Settings], STTService]] = {
     "mlx-audio": build_stt_mlx_audio,
     "mlx-audio-realtime": build_stt_mlx_audio_realtime,
     "mlx-whisper": build_stt_mlx_whisper,
+}
+if set(_STT_BACKEND_FACTORIES) != {provider.id for provider in STT_PROVIDER_REGISTRY}:
+    raise RuntimeError("STT adapter metadata does not match registered runtime factories")
+STT_BACKENDS = {
+    provider.id: _STT_BACKEND_FACTORIES[provider.id]
+    for provider in STT_PROVIDER_REGISTRY
 }
 
 
@@ -349,6 +352,35 @@ def _openai_llm_settings(settings: Settings) -> dict[str, Any]:
     return llm_settings
 
 
+class _LoopbackOllamaLLMService(OLLamaLLMService):
+    """Ollama client that cannot inherit proxy settings from the environment."""
+
+    def create_client(
+        self,
+        api_key=None,
+        base_url=None,
+        organization=None,
+        project=None,
+        default_headers=None,
+        **kwargs,
+    ):
+        return AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            organization=organization,
+            project=project,
+            http_client=DefaultAsyncHttpxClient(
+                limits=connection_limits(
+                    max_keepalive_connections=100,
+                    max_connections=1000,
+                    keepalive_expiry=None,
+                ),
+                trust_env=False,
+            ),
+            default_headers=default_headers,
+        )
+
+
 def build_llm_ollama(settings: Settings) -> LLMService:
     """Ollama — the default local LLM runtime.
 
@@ -366,7 +398,7 @@ def build_llm_ollama(settings: Settings) -> LLMService:
     if settings.llm_reasoning_effort:
         extra_body["reasoning_effort"] = settings.llm_reasoning_effort
     llm_settings["extra"] = {"extra_body": extra_body}
-    return OLLamaLLMService(
+    return _LoopbackOllamaLLMService(
         base_url=settings.llm_base_url,
         api_key="ollama",
         settings=OLLamaLLMService.Settings(**llm_settings),
@@ -434,9 +466,15 @@ def build_tts_mlx_audio(settings: Settings) -> TTSService:
     )
 
 
-TTS_BACKENDS: dict[str, Callable[[Settings], TTSService]] = {
+_TTS_BACKEND_FACTORIES: dict[str, Callable[[Settings], TTSService]] = {
     "kokoro": build_tts_kokoro,
     "mlx-audio": build_tts_mlx_audio,
+}
+if set(_TTS_BACKEND_FACTORIES) != {provider.id for provider in TTS_PROVIDER_REGISTRY}:
+    raise RuntimeError("TTS adapter metadata does not match registered runtime factories")
+TTS_BACKENDS = {
+    provider.id: _TTS_BACKEND_FACTORIES[provider.id]
+    for provider in TTS_PROVIDER_REGISTRY
 }
 
 

@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import uuid
 
+from bot.provider_registry import MLX_KOKORO_MODEL, NEMOTRON_MODEL
 import httpx
 import pytest
 import pytest_asyncio
@@ -18,10 +19,12 @@ from platform_api.auth.passwords import get_password_hasher
 from platform_api.auth.sessions import create_authenticated_session
 from platform_api.config import PlatformSettings
 from platform_api.model_client import ModelCompletion, ModelUsage
+from platform_api.catalog import CatalogModelItem, ModelCatalog
 from platform_api.models.auth import User
 from platform_api.agents.models import AgentDraft, AgentVersion
 from platform_api.qa.models import FlowQAJob
 from tests.support.postgres import FreshPostgres
+from platform_api.qa.worker import _runtime_model_is_selectable
 
 
 class FakeQAModelClient:
@@ -42,11 +45,13 @@ class FakeQAModelClient:
         temperature: float,
         reasoning_effort: str | None,
         max_tokens_parameter: str,
+        provider_id: str | None = None,
     ) -> ModelCompletion:
         self.calls.append(
             {
                 "endpoint": endpoint,
                 "model": model,
+                "provider_id": provider_id,
                 "messages": messages,
                 "max_tokens": max_tokens,
             }
@@ -93,13 +98,80 @@ class FakeQAModelClient:
         )
 
 
+def test_qa_worker_requires_exact_selectable_provider_model_pair():
+    snapshot = {
+        "model_pins": {"llm_provider": "ollama", "llm_model": "qwen3.5:4b"},
+        "runtime_profile": {"provider_id": "ollama", "model_id": "qwen3.5:4b"},
+    }
+    models_json = {"runtime_provider": "ollama"}
+    disabled_catalog = ModelCatalog(
+        llm_models=[
+            CatalogModelItem(
+                id="qwen3.5:4b",
+                name="Runtime QA model",
+                provider_id="ollama",
+                provider_name="Ollama",
+                selectable=False,
+            )
+        ]
+    )
+    assert not _runtime_model_is_selectable(
+        snapshot, models_json, "qwen3.5:4b", disabled_catalog
+    )
+
+    enabled_catalog = ModelCatalog(
+        llm_models=[
+            CatalogModelItem(
+                id="qwen3.5:4b",
+                name="Runtime QA model",
+                provider_id="ollama",
+                provider_name="Ollama",
+                selectable=True,
+            )
+        ]
+    )
+    assert _runtime_model_is_selectable(
+        snapshot, models_json, "qwen3.5:4b", enabled_catalog
+    )
+    assert not _runtime_model_is_selectable(
+        snapshot,
+        {"runtime_provider": "openai-compatible"},
+        "qwen3.5:4b",
+        enabled_catalog,
+    )
+
+
 def _catalog_file(tmp_path: Path) -> str:
     data = {
-        "llm_models": [
-            {"id": "qwen3.5:4b", "name": "Runtime QA model", "supports_reasoning": True}
-        ],
         "stt_providers": [
-            {"id": "mlx-audio", "name": "Batch ASR", "languages": ["en", "hi"]}
+            {
+                "id": "mlx-audio",
+                "name": "Batch ASR",
+                "languages": ["en", "hi"],
+                "models": [
+                    {
+                        "id": NEMOTRON_MODEL,
+                        "name": "Nemotron 3.5 ASR Streaming 0.6B",
+                        "languages": ["en", "hi"],
+                    }
+                ],
+            }
+        ],
+        "tts_providers": [
+            {
+                "id": "mlx-audio",
+                "name": "MLX Audio",
+                "models": [
+                    {
+                        "id": MLX_KOKORO_MODEL,
+                        "name": "Kokoro 82M (4-bit)",
+                        "voices": [
+                            {"id": "af_heart", "name": "English voice", "language": "en"},
+                            {"id": "hf_alpha", "name": "Hindi voice", "language": "hi"},
+                        ],
+                    }
+                ],
+            }
         ],
         "tts_voices": [
             {"id": "af_heart", "name": "English voice", "language": "en"},
@@ -118,6 +190,7 @@ def _catalog_file(tmp_path: Path) -> str:
 async def qa_app_client(
     test_platform_settings: PlatformSettings,
     initialized_pg: FreshPostgres,
+    qualified_test_llm,
     tmp_path: Path,
 ):
     settings = test_platform_settings.model_copy(
@@ -212,6 +285,8 @@ async def _create_qa_agent(
     )
     config = {
         **current.json()["config"],
+        "llm_provider": "ollama",
+        "llm_model": "qwen3.5:4b",
         "tts_voice_en": "",
         "tts_voice_hi": "",
     }

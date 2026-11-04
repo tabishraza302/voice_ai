@@ -16,7 +16,11 @@ from platform_api.agents.service import update_draft
 from platform_api.auth.dependencies import require_csrf, require_user
 from platform_api.auth.errors import ConflictError, DependencyUnavailableError, NotFoundError
 from platform_api.auth.types import AuthSessionContext, Principal
-from platform_api.catalog import ModelCatalog
+from platform_api.catalog import (
+    ModelCatalog,
+    catalog_with_managed_llms,
+    load_catalog,
+)
 from platform_api.config import PlatformSettings
 from platform_api.db.session import get_db
 from platform_api.qa.models import FlowQAJob
@@ -53,7 +57,7 @@ async def get_qa_scenarios(
     db: AsyncSession = Depends(get_db),
 ) -> QACatalogResponse:
     settings = _settings(request)
-    catalog = _catalog(request)
+    catalog = await _catalog(request, db)
     scenarios, flow_hash, available_count = await preview_qa_scenarios(
         db,
         settings=settings,
@@ -86,7 +90,7 @@ async def post_qa_job(
     db: AsyncSession = Depends(get_db),
 ) -> QAJobQueued:
     settings = _settings(request)
-    catalog = _catalog(request)
+    catalog = await _catalog(request, db)
     _model_client(request)
     job = await enqueue_qa_job(
         db,
@@ -191,7 +195,7 @@ async def apply_qa_suggestion(
     step["instruction"] = (
         f"{current_instruction.rstrip()}\n\n{append_text}".strip()
     )
-    catalog = _catalog(request)
+    catalog = await _catalog(request, db)
     view = await update_draft(
         db,
         agent_id=job.agent_id,
@@ -285,12 +289,11 @@ def _settings(request: Request) -> PlatformSettings:
     return settings
 
 
-def _catalog(request: Request) -> ModelCatalog:
+async def _catalog(request: Request, db: AsyncSession) -> ModelCatalog:
     catalog = getattr(request.app.state, "catalog", None)
     if catalog is None:
-        raise DependencyUnavailableError("Flow QA model catalog is unavailable")
-    return catalog
-
+        catalog = load_catalog(_settings(request).catalog_path)
+    return await catalog_with_managed_llms(catalog, db)
 
 def _model_client(request: Request):
     client = getattr(request.app.state, "model_client", None)

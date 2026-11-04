@@ -1,9 +1,5 @@
 import { test, expect } from "@playwright/test";
-import {
-  createAdminUser,
-  generateTotpCode,
-  getLatestMail,
-} from "./fixtures/auth";
+import { createAdminUser, getLatestMail } from "./fixtures/auth";
 
 test.describe("Platform Authentication Real HTTP Journeys", () => {
   // Test 1: User Registration, File Mail Token, and Email Verification
@@ -180,77 +176,36 @@ test.describe("Platform Authentication Real HTTP Journeys", () => {
     await page.waitForURL((url) => url.pathname === "/" || url.pathname === "/settings");
   });
 
-  // Test 4: Admin Bootstrap/Enrollment, Real TOTP Verification, and User Management
-  test("Admin MFA Enrollment & User Management with Real TOTP Step-Up", async ({
+  // Test 4: Password-only admin sign-in, authorization, and privileged step-up
+  test("Admin role access and password-only privileged step-up", async ({
     page,
   }) => {
     const adminEmail = `admin-${Date.now()}@example.com`;
     const adminPassword = "AdminSecurePassword12345";
 
-    // Create admin via platform CLI
     createAdminUser({
       email: adminEmail,
       displayName: "Admin Operator",
       password: adminPassword,
     });
 
-    // Sign in with admin password
     await page.goto("/login");
     await page.getByLabel("Email address").fill(adminEmail);
     await page.getByLabel("Password").fill(adminPassword);
     await page.getByRole("button", { name: "Sign in" }).click();
+    await page.waitForURL((url) => url.pathname === "/" || url.pathname === "/settings");
 
-    // Admin without factor is redirected to MFA enrollment
-    await page.waitForURL("**/admin/settings");
+    await page.goto("/admin/settings");
     await expect(page.getByRole("heading", { name: "Administrator Security" })).toBeVisible();
-    await expect(page.getByText("Required")).toBeVisible();
-
-    // Enter current password to begin MFA enrollment
-    await page.getByLabel("Current admin password").fill(adminPassword);
-    await page.getByRole("button", { name: "Begin MFA Enrollment" }).click();
-
-    // Step 2: Extract base32 secret from field
-    const secretInput = page.getByLabel("TOTP Secret Key (Base32)");
-    await expect(secretInput).toBeVisible();
-    const secret = await secretInput.inputValue();
-    expect(secret).toBeTruthy();
-
-    // Generate real 6-digit TOTP code
-    const totpCode = generateTotpCode(secret);
-
-    // Enter code and confirm
-    await page.getByLabel("Step 3: Enter the generated 6-digit code").fill(totpCode);
-    await page.getByRole("button", { name: "Confirm & Enable MFA" }).click();
-
-    // Verify MFA active badge scoped to MFA section
-    const mfaSection = page.locator('section[aria-labelledby="mfa-section-heading"]');
-    await expect(mfaSection.getByText("Active", { exact: true })).toBeVisible();
-    await expect(
-      page.getByText("MFA has been successfully verified and activated")
-    ).toBeVisible();
-
-    // Test replay protection on step-up: replayed code is rejected
-    await page.getByLabel("Password").fill(adminPassword);
-    await page.getByLabel("6-Digit TOTP Code").fill(totpCode);
+    await expect(page.getByLabel(/authenticator|TOTP/i)).toHaveCount(0);
+    await page.getByLabel("Admin password").fill(adminPassword);
     await page.getByRole("button", { name: "Refresh Step-Up Authorization" }).click();
     await expect(
-      page.getByRole("alert").filter({ hasText: "Invalid admin password or authenticator code" })
+      page.getByText("Password confirmed. Privileged mutations are unlocked for 5 minutes.")
     ).toBeVisible();
 
-    // Perform genuine POST /auth/step-up using freshly valid next timestep (+1)
-    const freshTotpCode = generateTotpCode(secret, 1);
-    await page.getByLabel("Password").fill(adminPassword);
-    await page.getByLabel("6-Digit TOTP Code").fill(freshTotpCode);
-    await page.getByRole("button", { name: "Refresh Step-Up Authorization" }).click();
-    await expect(
-      page.getByText("Step-up authentication confirmed. Privileged mutations are unlocked for 5 minutes.")
-    ).toBeVisible();
-
-    // Navigate to admin user management
     await page.goto("/admin/users");
     await expect(page.getByRole("heading", { name: "User Management" })).toBeVisible();
-
-    // Search for self and verify exact scoped role badge
     await page.getByPlaceholder("Search by email or display name...").fill(adminEmail);
     await page.getByRole("button", { name: "Search" }).click();
 
@@ -258,7 +213,6 @@ test.describe("Platform Authentication Real HTTP Journeys", () => {
     await expect(userRow).toBeVisible();
     await expect(userRow.locator("td").nth(1)).toHaveText("admin");
 
-    // Exercise privileged step-up mutation: suspend self triggers LAST_ADMIN check
     await userRow.getByRole("button", { name: "Suspend" }).click();
     await expect(page.getByRole("heading", { name: "Suspend Account" })).toBeVisible();
     await page.getByLabel(/Audit reason/).fill("Testing privileged step-up suspension and last admin protection");

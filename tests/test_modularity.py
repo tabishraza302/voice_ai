@@ -127,6 +127,30 @@ class TestRegistries:
         service = build_llm(settings)
         assert service._settings.extra["extra_body"]["reasoning_effort"] == "none"
 
+    @pytest.mark.asyncio
+    async def test_ollama_runtime_http_client_ignores_proxy_environment(self, monkeypatch):
+        for name in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ):
+            monkeypatch.setenv(name, "http://127.0.0.1:9")
+        monkeypatch.setenv("NO_PROXY", "")
+        monkeypatch.setenv("no_proxy", "")
+
+        service = build_llm(Settings(_env_file=None, llm_provider="ollama"))
+        client = service._client
+        try:
+            http_client = client._client
+            assert http_client._trust_env is False
+            assert not http_client.is_closed
+        finally:
+            await client.close()
+        assert http_client.is_closed
+
 
 class TestRouterCoverage:
     """A provider with a service but no router is a latent bug."""

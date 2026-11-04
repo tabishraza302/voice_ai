@@ -8,16 +8,25 @@ from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Mapping
 from uuid import UUID
-
+from bot.provider_registry import model_for
 from bot.agents.compiler import compile_system_prompt
 from bot.config import Settings
 from bot.flow.canonical import compute_authoring_hash, compute_limits_hash
 from bot.flow.compiler import compile_flow
 from bot.flow.schemas import AdapterCapabilities, CompiledFlow, FlowLimits
 from platform_api.agents.config import (
+    LEGACY_AGENT_SETTING_KEYS,
+    V2_AGENT_SETTING_KEYS,
+    SUPPORTED_AGENT_LLM_PROVIDERS,
+    compute_legacy_model_hash,
+    compute_legacy_settings_hash,
+    compute_legacy_voice_hash,
     compute_model_hash,
+    compute_model_hash_v3,
     compute_settings_hash,
+    compute_settings_hash_v3,
     compute_voice_hash,
+    compute_voice_hash_v3,
     extract_flow,
     extract_settings,
 )
@@ -47,9 +56,25 @@ _POLICY_KEYS = frozenset(
     {"version_id", "version", "slug", "policy_hash", "prompt_text"}
 )
 _SETTING_KEYS = frozenset(
-    {"llm_model", "stt_provider", "tts_voice_en", "tts_voice_hi"}
+    {
+        "llm_model",
+        "stt_provider",
+        "stt_model",
+        "tts_provider",
+        "tts_model",
+        "tts_voice_en",
+        "tts_voice_hi",
+    }
 )
+_V3_SETTING_KEYS = _SETTING_KEYS | {"llm_provider"}
+_V3_PIN_KEYS = _V3_SETTING_KEYS | {"model_hash", "voice_hash", "settings_hash"}
 _PIN_KEYS = _SETTING_KEYS | {"model_hash", "voice_hash", "settings_hash"}
+_LEGACY_SETTING_KEYS = LEGACY_AGENT_SETTING_KEYS
+_LEGACY_PIN_KEYS = _LEGACY_SETTING_KEYS | {
+    "model_hash",
+    "voice_hash",
+    "settings_hash",
+}
 _HASH_KEYS = frozenset(
     {
         "authoring_hash",
@@ -95,6 +120,20 @@ class RuntimeSnapshot:
 
     def settings_for(self, base: Settings) -> Settings:
         """Return a per-session copy with every published pin applied."""
+        provider_id = self.model_pins.get("llm_provider")
+        if (
+            provider_id not in SUPPORTED_AGENT_LLM_PROVIDERS
+            or base.llm_provider != provider_id
+        ):
+            raise RuntimeSnapshotError(
+                "Published LLM provider does not match the configured local provider"
+            )
+        from bot.services import local_llm_tags_url
+
+        if local_llm_tags_url(base) is None:
+            raise RuntimeSnapshotError(
+                "Published Ollama provider does not match a local Ollama endpoint"
+            )
         return base.model_copy(
             deep=True,
             update={
@@ -147,7 +186,12 @@ def validate_runtime_snapshot(
     config = view.immutable_config
     if not isinstance(config, dict) or set(config) != _CONFIG_KEYS:
         raise RuntimeSnapshotError("Immutable session config has an unsupported shape")
-    if config.get("schema_version") != 1 or config.get("compiler_version") != "flow-compiler/1":
+    schema_version = config.get("schema_version")
+    if (
+        type(schema_version) is not int
+        or schema_version not in {1, 2, 3}
+        or config.get("compiler_version") != "flow-compiler/1"
+    ):
         raise RuntimeSnapshotError("Immutable session config version is unsupported")
 
     authoring_config = config.get("authoring_config")
@@ -169,7 +213,18 @@ def validate_runtime_snapshot(
         or not isinstance(persona_prompt, str)
     ):
         raise RuntimeSnapshotError("Immutable session config is incomplete")
-    if set(policy) != _POLICY_KEYS or set(model_pins) != _PIN_KEYS or set(hashes) != _HASH_KEYS:
+    expected_pin_keys = (
+        _LEGACY_PIN_KEYS
+        if schema_version == 1
+        else _PIN_KEYS
+        if schema_version == 2
+        else _V3_PIN_KEYS
+    )
+    if (
+        set(policy) != _POLICY_KEYS
+        or set(model_pins) != expected_pin_keys
+        or set(hashes) != _HASH_KEYS
+    ):
         raise RuntimeSnapshotError("Immutable session config pins have an unsupported shape")
 
     for value in hashes.values():
@@ -192,7 +247,28 @@ def validate_runtime_snapshot(
         raise RuntimeSnapshotError("Immutable authoring source cannot be hashed") from exc
     if source_hash != view.authoring_hash:
         raise RuntimeSnapshotError("Published authoring hash does not match its source config")
-    if set(extracted_settings) != _SETTING_KEYS:
+    if schema_version == 1:
+        extracted_settings = {
+            key: extracted_settings[key] for key in _LEGACY_SETTING_KEYS
+        }
+        expected_model_hash = compute_legacy_model_hash(extracted_settings)
+        expected_voice_hash = compute_legacy_voice_hash(extracted_settings)
+        expected_settings_hash = compute_legacy_settings_hash(extracted_settings)
+        setting_keys = _LEGACY_SETTING_KEYS
+    elif schema_version == 2:
+        extracted_settings = {
+            key: extracted_settings[key] for key in V2_AGENT_SETTING_KEYS
+        }
+        expected_model_hash = compute_model_hash(extracted_settings)
+        expected_voice_hash = compute_voice_hash(extracted_settings)
+        expected_settings_hash = compute_settings_hash(extracted_settings)
+        setting_keys = V2_AGENT_SETTING_KEYS
+    else:
+        expected_model_hash = compute_model_hash_v3(extracted_settings)
+        expected_voice_hash = compute_voice_hash_v3(extracted_settings)
+        expected_settings_hash = compute_settings_hash_v3(extracted_settings)
+        setting_keys = _V3_SETTING_KEYS
+    if set(extracted_settings) != setting_keys:
         raise RuntimeSnapshotError("Published model settings are incomplete")
     if any(model_pins.get(name) != value for name, value in extracted_settings.items()):
         raise RuntimeSnapshotError("Published model pins do not match their authoring source")
@@ -201,11 +277,38 @@ def validate_runtime_snapshot(
         if not isinstance(model_pins.get(name), str) or model_pins[name] != hashes[name]:
             raise RuntimeSnapshotError(f"Published {name} does not match its immutable config")
     if (
-        compute_model_hash(extracted_settings) != hashes["model_hash"]
-        or compute_voice_hash(extracted_settings) != hashes["voice_hash"]
-        or compute_settings_hash(extracted_settings) != hashes["settings_hash"]
+        expected_model_hash != hashes["model_hash"]
+        or expected_voice_hash != hashes["voice_hash"]
+        or expected_settings_hash != hashes["settings_hash"]
     ):
         raise RuntimeSnapshotError("Published provider and voice hashes do not match their pins")
+    if schema_version < 3:
+        raise RuntimeSnapshotError(
+            "Published runtime version does not pin an LLM provider"
+        )
+    if extracted_settings.get("llm_provider") not in SUPPORTED_AGENT_LLM_PROVIDERS:
+        raise RuntimeSnapshotError("Published LLM provider is not supported")
+    if schema_version in {2, 3}:
+        if model_for(
+            "stt", extracted_settings["stt_provider"], extracted_settings["stt_model"]
+        ) is None:
+            raise RuntimeSnapshotError("Published STT provider and model are not registered")
+        tts_model = model_for(
+            "tts", extracted_settings["tts_provider"], extracted_settings["tts_model"]
+        )
+        if tts_model is None:
+            raise RuntimeSnapshotError("Published TTS provider and model are not registered")
+        supported_voices = {voice.id for voice in tts_model.voices}
+        if any(
+            voice and voice not in supported_voices
+            for voice in (
+                extracted_settings["tts_voice_en"],
+                extracted_settings["tts_voice_hi"],
+            )
+        ):
+            raise RuntimeSnapshotError(
+                "Published TTS voice is not supported by its pinned model"
+            )
 
     prompt_text = policy.get("prompt_text")
     if (

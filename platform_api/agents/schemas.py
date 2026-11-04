@@ -67,8 +67,12 @@ class AgentUpdate(BaseModel):
 class AgentRuntimeSettingsView(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    llm_provider: str
     llm_model: str
     stt_provider: str
+    stt_model: str
+    tts_provider: str
+    tts_model: str
     tts_voice_en: str
     tts_voice_hi: str
 

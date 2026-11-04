@@ -17,16 +17,11 @@ export interface UserView {
   preferred_language: PreferredLanguage;
   timezone: string;
   low_balance_notifications: boolean;
-  mfa_enabled: boolean;
   created_at: string; // UTC ISO string
   updated_at: string; // UTC ISO string
 }
 
-export type SessionState =
-  | "anonymous"
-  | "mfa_required"
-  | "mfa_enrollment_required"
-  | "authenticated";
+export type SessionState = "anonymous" | "authenticated";
 
 export interface SessionResponse {
   state: SessionState;
@@ -52,12 +47,6 @@ export interface SessionItem {
 
 export interface SessionList {
   items: SessionItem[];
-}
-
-export interface MfaSetup {
-  secret: string;
-  provisioning_uri: string;
-  expires_at: string; // UTC ISO string
 }
 
 export interface UserPage {
@@ -112,21 +101,8 @@ export interface ChangePasswordRequest {
   new_password: string;
 }
 
-export interface MfaEnrollRequest {
-  current_password: string;
-}
-
-export interface MfaConfirmRequest {
-  code: string;
-}
-
-export interface MfaVerifyRequest {
-  code: string;
-}
-
 export interface StepUpRequest {
   password: string;
-  code: string;
 }
 
 export interface UpdateMeRequest {

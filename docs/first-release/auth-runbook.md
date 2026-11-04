@@ -39,7 +39,7 @@ Run the schema initialization command against the shared database:
 uv run python -m platform_api.cli init-db
 ```
 
-This verifies that the `platform` schema is absent or empty, acquires an exclusive advisory lock, and atomically applies the platform metadata, `schema_info` record (version `platform-v1`), and explicitly configured first tariff. For a fresh schema, set `PLATFORM_INITIAL_SESSION_RATE_MINOR_PER_MINUTE`, `PLATFORM_INITIAL_BILLING_SLICE_MS`, and `PLATFORM_INITIAL_BILLING_PERMIT_TTL_MS` together; `init-db` never invents a rate or billing policy. A nonempty unknown `platform` schema or a mismatched recorded schema fails with `SCHEMA_MISMATCH`; the command never repairs or converts local or Phoenix tables.
+This verifies that the `platform` schema is absent or empty, acquires an exclusive advisory lock, and atomically applies the platform metadata, `schema_info` record (version `platform-v3`), and explicitly configured first tariff. For a fresh schema, set `PLATFORM_INITIAL_SESSION_RATE_MINOR_PER_MINUTE`, `PLATFORM_INITIAL_BILLING_SLICE_MS`, and `PLATFORM_INITIAL_BILLING_PERMIT_TTL_MS` together; `init-db` never invents a rate or billing policy. The same command upgrades exact `platform-v1` and `platform-v2` schemas after checking their historical metadata hashes and object inventories, adding the missing provider tables and updating `schema_info` atomically. Any other nonempty unknown `platform` schema or mismatched recorded schema fails with `SCHEMA_MISMATCH`; the command never repairs or converts local or Phoenix tables.
 
 ### 2.2 Verify Schema Readiness
 
@@ -60,7 +60,7 @@ uv run python -m platform_api.cli check-schema
 
 ## 3. Administrator Bootstrap
 
-Before the platform ingress can report readiness (`/health/ready` returns 200), at least one active administrator with enrolled MFA must exist.
+Before the platform ingress can report readiness (`/health/ready` returns 200), at least one active administrator must exist.
 
 ### 3.1 First Administrator Creation
 
@@ -79,15 +79,11 @@ uv run python -m platform_api.cli bootstrap-admin \
 - Generates bounded scrypt hash and active `User` record.
 - Emits: `{"user_id": "<uuid>", "result": "bootstrapped"}`.
 
-### 3.2 MFA Enrollment
+### 3.2 Administrator Login and Privileged Step-Up
 
 1. Operator navigates to the login page (`http://127.0.0.1:3001/login` or public ingress).
-2. Submits email and password. The system responds with session state `mfa_enrollment_required`.
-3. Operator enters password on enrollment screen to generate TOTP secret and provisioning URI (`otpauth://`).
-4. Operator imports the secret into an offline authenticator (e.g. 1Password, Google Authenticator).
-5. Operator confirms enrollment with a fresh 6-digit TOTP code.
-6. The session rotates to `authenticated`, and readiness checks begin passing.
-
+2. Submits email and password. The system verifies credentials and rotates directly to an `authenticated` session.
+3. Privileged administrative mutations (such as user suspension or provider credential edits) require fresh password reauthentication (step-up) within 5 minutes.
 ### 3.3 Adding Additional Administrators
 
 Subsequent administrators must be created via the operator CLI, not public signup:
