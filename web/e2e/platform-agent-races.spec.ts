@@ -15,7 +15,6 @@ const session = {
     preferred_language: "en",
     timezone: "UTC",
     low_balance_notifications: false,
-    mfa_enabled: false,
     created_at: stamp,
     updated_at: stamp,
   },
