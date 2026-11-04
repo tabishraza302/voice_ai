@@ -17,6 +17,7 @@ import re
 import ipaddress
 from typing import Any
 from bot.flow.canonical import canonical_json_v1
+from bot.provider_registry import model_for
 from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
 
@@ -762,7 +763,15 @@ def _validate_qualification(config: Mapping[str, Any], profile: str) -> None:
     if not isinstance(qualification.get("adapter_version"), str) or not qualification["adapter_version"].strip():
         raise ValueError(f"{profile} adapter_version is missing")
     settings = qualification.get("agent_settings")
-    setting_fields = {"llm_model", "stt_provider", "tts_voice_en", "tts_voice_hi"}
+    setting_fields = {
+        "llm_model",
+        "stt_provider",
+        "stt_model",
+        "tts_provider",
+        "tts_model",
+        "tts_voice_en",
+        "tts_voice_hi",
+    }
     if (
         not isinstance(settings, Mapping)
         or set(settings) != setting_fields
@@ -771,6 +780,17 @@ def _validate_qualification(config: Mapping[str, Any], profile: str) -> None:
         raise ValueError(f"{profile} agent settings are missing or malformed")
     if settings["llm_model"] != config["models"]["llm"]["id"]:
         raise ValueError(f"{profile} agent LLM setting does not match the pinned LLM model ID")
+    if settings["stt_model"] != config["models"]["stt"]["id"]:
+        raise ValueError(f"{profile} agent STT setting does not match the pinned STT model ID")
+    if (
+        settings["tts_model"] != config["models"]["tts_en"]["id"]
+        or settings["tts_model"] != config["models"]["tts_hi"]["id"]
+    ):
+        raise ValueError(f"{profile} agent TTS setting does not match the pinned voice models")
+    if model_for("stt", settings["stt_provider"], settings["stt_model"]) is None:
+        raise ValueError(f"{profile} agent STT provider/model is not registered")
+    if model_for("tts", settings["tts_provider"], settings["tts_model"]) is None:
+        raise ValueError(f"{profile} agent TTS provider/model is not registered")
     locales = qualification.get("locales")
     if not isinstance(locales, list) or locales != ["en", "hi"]:
         raise ValueError(f"{profile} qualification locales must be exactly English and Hindi")
