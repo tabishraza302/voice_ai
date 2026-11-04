@@ -17,6 +17,7 @@ The platform manages bilingual English and Hindi voice agents through the local 
 ## Capabilities and Constraints
 
 - The web app uses the authenticated platform API for owner-scoped agent lists, versioned templates, manual or generated drafts, compare-and-swap flow saves, validation, immutable publication, version restore, and enable/disable. Customers also see their real wallet balance and ledger, persisted call history and usage, pinned config snapshots, and owner-visible transcript state; admins get searchable inventories and audited operational controls.
+- Administrators review registered STT and TTS providers, see whether each declared secret is configured, and set or replace secrets through fresh step-up authorization. The UI never reads back or displays stored secret values.
 - Step, graph, and JSON views edit the same versioned flow. Chat Test is text-only and pinned to a server-provided draft snapshot or immutable published artifact; it does not consume a voice slot.
 - Flow QA lists frozen cases from saved draft or published snapshots, creates bounded owner-scoped jobs, and shows results and cancellation. Suggestions remain draft-only and require an explicit apply-to-draft or dismiss action; QA never publishes.
 - Generated proposals are bounded, reviewed by the customer, and never saved or published without an explicit action. Unknown business facts remain visible for confirmation.
