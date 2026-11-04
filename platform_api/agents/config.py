@@ -3,8 +3,9 @@
 A draft's ``config`` may be either a bare flow document (the form used by the
 flow editor) or an envelope::
 
-    {"flow": {...}, "llm_model": "...", "stt_provider": "...",
-     "tts_voice_en": "...", "tts_voice_hi": "..."}
+    {"flow": {...}, "llm_provider": "ollama", "llm_model": "...",
+     "stt_provider": "...", "stt_model": "...", "tts_provider": "...",
+     "tts_model": "...", "tts_voice_en": "...", "tts_voice_hi": "..."}
 
 Both forms are accepted so existing clients keep working, while provider and
 voice selections remain outside the flow schema (which forbids unknown root
@@ -20,26 +21,40 @@ import json
 from typing import Any
 
 from bot.flow.canonical import canonical_json_v1
+from bot.provider_registry import MLX_KOKORO_MODEL, NEMOTRON_MODEL
 
 DEFAULT_AGENT_SETTINGS: dict[str, str] = {
+    "llm_provider": "ollama",
     "llm_model": "qwen3.5:4b",
     "stt_provider": "mlx-audio",
+    "stt_model": NEMOTRON_MODEL,
+    "tts_provider": "mlx-audio",
+    "tts_model": MLX_KOKORO_MODEL,
     "tts_voice_en": "af_heart",
     "tts_voice_hi": "hf_alpha",
 }
 AGENT_SETTING_KEYS = frozenset(DEFAULT_AGENT_SETTINGS)
 TTS_VOICE_SETTING_KEYS = frozenset(("tts_voice_en", "tts_voice_hi"))
+SUPPORTED_AGENT_LLM_PROVIDERS = frozenset({"ollama"})
 AGENT_SETTING_MAX_LENGTHS = {
+    "llm_provider": 32,
     "llm_model": 64,
     "stt_provider": 32,
+    "stt_model": 128,
+    "tts_provider": 32,
+    "tts_model": 128,
     "tts_voice_en": 32,
     "tts_voice_hi": 32,
 }
 DEFAULT_AGENT_CONFIG_MAX_BYTES = 262_144
 
-MODEL_PIN_PREFIX = b"voice-ai/model-pins/v1\0"
-VOICE_PIN_PREFIX = b"voice-ai/voice-pins/v1\0"
-SETTINGS_PIN_PREFIX = b"voice-ai/agent-settings/v1\0"
+IMMUTABLE_CONFIG_SCHEMA_VERSION = 3
+MODEL_PIN_PREFIX = b"voice-ai/model-pins/v2\0"
+VOICE_PIN_PREFIX = b"voice-ai/voice-pins/v2\0"
+SETTINGS_PIN_PREFIX = b"voice-ai/agent-settings/v2\0"
+MODEL_PIN_V3_PREFIX = b"voice-ai/model-pins/v3\0"
+VOICE_PIN_V3_PREFIX = b"voice-ai/voice-pins/v3\0"
+SETTINGS_PIN_V3_PREFIX = b"voice-ai/agent-settings/v3\0"
 
 
 class AgentConfigError(ValueError):
@@ -110,6 +125,11 @@ def extract_settings(config: dict[str, Any]) -> dict[str, str]:
                 f"/{key}",
             )
         settings[key] = value.strip()
+    if settings["llm_provider"] not in SUPPORTED_AGENT_LLM_PROVIDERS:
+        raise AgentConfigError(
+            f"Unsupported llm_provider {settings['llm_provider']!r}",
+            "/llm_provider",
+        )
 
     voices = tuple(settings[key] for key in TTS_VOICE_SETTING_KEYS)
     if any(voices) and not all(voices):
@@ -151,6 +171,7 @@ def compute_model_hash(settings: dict[str, str]) -> str:
         {
             "llm_model": settings["llm_model"],
             "stt_provider": settings["stt_provider"],
+            "stt_model": settings["stt_model"],
         },
     )
 
@@ -159,7 +180,80 @@ def compute_voice_hash(settings: dict[str, str]) -> str:
     return _pin_hash(
         VOICE_PIN_PREFIX,
         {
+            "tts_provider": settings["tts_provider"],
+            "tts_model": settings["tts_model"],
             "tts_voice_en": settings["tts_voice_en"],
             "tts_voice_hi": settings["tts_voice_hi"],
         },
     )
+
+def compute_settings_hash_v3(settings: dict[str, str]) -> str:
+    return _pin_hash(SETTINGS_PIN_V3_PREFIX, settings)
+
+
+def compute_model_hash_v3(settings: dict[str, str]) -> str:
+    return _pin_hash(
+        MODEL_PIN_V3_PREFIX,
+        {
+            "llm_provider": settings["llm_provider"],
+            "llm_model": settings["llm_model"],
+            "stt_provider": settings["stt_provider"],
+            "stt_model": settings["stt_model"],
+        },
+    )
+
+
+def compute_voice_hash_v3(settings: dict[str, str]) -> str:
+    return _pin_hash(
+        VOICE_PIN_V3_PREFIX,
+        {
+            "tts_provider": settings["tts_provider"],
+            "tts_model": settings["tts_model"],
+            "tts_voice_en": settings["tts_voice_en"],
+            "tts_voice_hi": settings["tts_voice_hi"],
+        },
+    )
+
+
+LEGACY_MODEL_PIN_PREFIX = b"voice-ai/model-pins/v1\0"
+LEGACY_VOICE_PIN_PREFIX = b"voice-ai/voice-pins/v1\0"
+LEGACY_SETTINGS_PIN_PREFIX = b"voice-ai/agent-settings/v1\0"
+LEGACY_AGENT_SETTING_KEYS = frozenset(
+    {"llm_model", "stt_provider", "tts_voice_en", "tts_voice_hi"}
+)
+V2_AGENT_SETTING_KEYS = frozenset(
+    {
+        "llm_model",
+        "stt_provider",
+        "stt_model",
+        "tts_provider",
+        "tts_model",
+        "tts_voice_en",
+        "tts_voice_hi",
+    }
+)
+
+
+def compute_legacy_model_hash(settings: dict[str, str]) -> str:
+    return _pin_hash(
+        LEGACY_MODEL_PIN_PREFIX,
+        {
+            "llm_model": settings["llm_model"],
+            "stt_provider": settings["stt_provider"],
+        },
+    )
+
+
+def compute_legacy_voice_hash(settings: dict[str, str]) -> str:
+    return _pin_hash(
+        LEGACY_VOICE_PIN_PREFIX,
+        {
+            "tts_voice_en": settings["tts_voice_en"],
+            "tts_voice_hi": settings["tts_voice_hi"],
+        },
+    )
+
+
+def compute_legacy_settings_hash(settings: dict[str, str]) -> str:
+    legacy_settings = {key: settings[key] for key in LEGACY_AGENT_SETTING_KEYS}
+    return _pin_hash(LEGACY_SETTINGS_PIN_PREFIX, legacy_settings)

@@ -15,7 +15,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from bot.flow.qualification import AgentQualificationSettings
+from bot.flow.qualification import (
+    AgentQualificationSettings,
+    LegacyAgentQualificationSettings,
+    ProviderlessAgentQualificationSettings,
+)
 from bot.flow.schemas import AdapterCapabilities, FlowDiagnostic, FlowLimits
 from bot.flow.validation import (
     normalize_executable,
@@ -93,7 +97,12 @@ def validate_draft_semantics(
     limits: FlowLimits | None = None,
     capabilities: AdapterCapabilities | None = None,
     tools: ToolRegistry | None = None,
-    qualification_settings: AgentQualificationSettings | None = None,
+    qualification_settings: (
+        AgentQualificationSettings
+        | ProviderlessAgentQualificationSettings
+        | LegacyAgentQualificationSettings
+        | None
+    ) = None,
     require_voice_capability: bool = True,
 ) -> tuple[list[FlowDiagnostic], list[FlowDiagnostic]]:
     """Normalize and validate executable semantics.
@@ -137,7 +146,7 @@ def validate_catalog_eligibility(
     config: dict[str, Any],
     catalog: ModelCatalog | None = None,
 ) -> list[FlowDiagnostic]:
-    """Ensure configured model, STT, and voice items are qualified in the platform catalog."""
+    """Ensure configured models and voices are real, catalogued, and selectable."""
     cat = catalog if catalog is not None else load_catalog()
     diagnostics: list[FlowDiagnostic] = []
 
@@ -145,52 +154,127 @@ def validate_catalog_eligibility(
         settings = extract_settings(config)
     except AgentConfigError as exc:
         return [_config_error(exc)]
+    if "llm_provider" not in config:
+        diagnostics.append(
+            FlowDiagnostic(
+                code="MODEL_PROVIDER_REQUIRED",
+                path="/llm_provider",
+                message="Select the serving provider for this model before using the agent.",
+                severity="error",
+            )
+        )
 
-    valid_llms = {m.id for m in cat.llm_models}
-    if settings["llm_model"] not in valid_llms:
+    valid_llms = {
+        (model.provider_id, model.id)
+        for model in cat.llm_models
+        if model.selectable
+    }
+    llm_identity = (settings["llm_provider"], settings["llm_model"])
+    if llm_identity not in valid_llms:
         diagnostics.append(
             FlowDiagnostic(
                 code="MODEL_UNQUALIFIED",
                 path="/llm_model",
                 message=(
-                    f"Model '{settings['llm_model']}' is not qualified in the "
+                    f"Model '{settings['llm_model']}' for provider "
+                    f"'{settings['llm_provider']}' is not selectable in the "
                     "platform catalog"
                 ),
                 severity="error",
             )
         )
 
-    valid_stts = {s.id for s in cat.stt_providers}
-    if settings["stt_provider"] not in valid_stts:
+    stt_provider = next(
+        (provider for provider in cat.stt_providers if provider.id == settings["stt_provider"]),
+        None,
+    )
+    if stt_provider is None:
         diagnostics.append(
             FlowDiagnostic(
                 code="MODEL_UNQUALIFIED",
                 path="/stt_provider",
-                message=(
-                    f"STT provider '{settings['stt_provider']}' is not qualified "
-                    "in the platform catalog"
-                ),
+                message="Selected STT provider is not qualified in the platform catalog",
                 severity="error",
             )
         )
-    valid_voices = {voice.id for voice in cat.tts_voices}
-
-    for key, label in (
-        ("tts_voice_en", "English TTS voice"),
-        ("tts_voice_hi", "Hindi TTS voice"),
-    ):
-        if settings[key] and settings[key] not in valid_voices:
+    else:
+        stt_model = next(
+            (model for model in stt_provider.models if model.id == settings["stt_model"]),
+            None,
+        )
+        if stt_model is None or not stt_model.selectable:
             diagnostics.append(
                 FlowDiagnostic(
                     code="MODEL_UNQUALIFIED",
-                    path=f"/{key}",
-                    message=(
-                        f"{label} '{settings[key]}' is not qualified in the "
-                        "platform catalog"
-                    ),
+                    path="/stt_model",
+                    message="Selected STT model is not qualified for this deployment",
                     severity="error",
                 )
             )
+
+    tts_provider = next(
+        (provider for provider in cat.tts_providers if provider.id == settings["tts_provider"]),
+        None,
+    )
+    tts_model = (
+        next(
+            (model for model in tts_provider.models if model.id == settings["tts_model"]),
+            None,
+        )
+        if tts_provider is not None
+        else None
+    )
+    uses_voice = bool(settings["tts_voice_en"] or settings["tts_voice_hi"])
+    if tts_provider is None:
+        diagnostics.append(
+            FlowDiagnostic(
+                code="MODEL_UNQUALIFIED",
+                path="/tts_provider",
+                message="Selected TTS provider is not registered in the platform catalog",
+                severity="error",
+            )
+        )
+    elif tts_model is None:
+        diagnostics.append(
+            FlowDiagnostic(
+                code="MODEL_UNQUALIFIED",
+                path="/tts_model",
+                message="Selected TTS model is not registered for the provider",
+                severity="error",
+            )
+        )
+    elif uses_voice and not tts_model.selectable:
+        diagnostics.append(
+            FlowDiagnostic(
+                code="MODEL_UNQUALIFIED",
+                path="/tts_model",
+                message="Selected TTS model is not qualified for this deployment",
+                severity="error",
+            )
+        )
+
+    if uses_voice:
+        for key, label in (
+            ("tts_voice_en", "English TTS voice"),
+            ("tts_voice_hi", "Hindi TTS voice"),
+        ):
+            voice = (
+                next(
+                    (item for item in tts_model.voices if item.id == settings[key]),
+                    None,
+                )
+                if settings[key] and tts_model is not None
+                else None
+            )
+            if settings[key] and (voice is None or not voice.selectable):
+                diagnostics.append(
+                    FlowDiagnostic(
+                        code="MODEL_UNQUALIFIED",
+                        path=f"/{key}",
+                        message=f"{label} is not qualified for the selected provider and model",
+                        severity="error",
+                    )
+                )
 
     return diagnostics
 
@@ -214,7 +298,7 @@ def validate_chat_test_eligibility(
     catalog_errors = [
         diagnostic
         for diagnostic in validate_catalog_eligibility(config, catalog)
-        if diagnostic.path == "/llm_model"
+        if diagnostic.path in {"/llm_model", "/llm_provider"}
     ]
     semantic_errors, warnings = validate_draft_semantics(
         config,
@@ -227,7 +311,12 @@ def validate_chat_test_eligibility(
 def validate_voice_capability(
     config: dict[str, Any],
     capabilities: AdapterCapabilities | None,
-    qualification_settings: AgentQualificationSettings | None = None,
+    qualification_settings: (
+        AgentQualificationSettings
+        | ProviderlessAgentQualificationSettings
+        | LegacyAgentQualificationSettings
+        | None
+    ) = None,
 ) -> list[FlowDiagnostic]:
     """Require voice settings to match a trusted, pinned deployment report."""
     try:
@@ -236,15 +325,44 @@ def validate_voice_capability(
         return []
     if not (settings["tts_voice_en"] or settings["tts_voice_hi"]):
         return []
-    if not isinstance(qualification_settings, AgentQualificationSettings):
+
+    if isinstance(
+        qualification_settings,
+        (ProviderlessAgentQualificationSettings, LegacyAgentQualificationSettings),
+    ):
         return [
             FlowDiagnostic(
                 code="PLAYBACK_UNQUALIFIED",
                 path="/qualification",
                 message=(
-                    "Voice settings require a pinned report for the exact model, "
-                    "STT provider, voices, and trusted deployment identity"
+                    "This legacy qualification report does not bind the serving "
+                    "llm_provider; rerun qualification with protocol version 4"
                 ),
+                severity="error",
+            )
+        ]
+    if isinstance(qualification_settings, AgentQualificationSettings):
+        report_setting_keys = (
+            "llm_provider",
+            "llm_model",
+            "stt_provider",
+            "stt_model",
+            "tts_provider",
+            "tts_model",
+            "tts_voice_en",
+            "tts_voice_hi",
+        )
+    else:
+        return [
+            FlowDiagnostic(
+                code="PLAYBACK_UNQUALIFIED",
+                path="/qualification",
+                message=(
+                    "Voice settings require a provider-bound protocol-version-4 report "
+                    "for the exact LLM, STT provider/model, TTS provider/model, voices, "
+                    "and deployment identity"
+                ),
+                severity="error",
             )
         ]
 
@@ -255,7 +373,7 @@ def validate_voice_capability(
             message="Selected setting does not match the pinned qualification report",
             severity="error",
         )
-        for key in ("llm_model", "stt_provider", "tts_voice_en", "tts_voice_hi")
+        for key in report_setting_keys
         if settings[key] != getattr(qualification_settings, key)
     ]
     if mismatched_settings:
@@ -288,7 +406,12 @@ def validate_agent_config(
     capabilities: AdapterCapabilities | None = None,
     tools: ToolRegistry | None = None,
     catalog: ModelCatalog | None = None,
-    qualification_settings: AgentQualificationSettings | None = None,
+    qualification_settings: (
+        AgentQualificationSettings
+        | ProviderlessAgentQualificationSettings
+        | LegacyAgentQualificationSettings
+        | None
+    ) = None,
 ) -> tuple[list[FlowDiagnostic], list[FlowDiagnostic]]:
     """Return (blocking errors, warnings) for a complete agent config.
 

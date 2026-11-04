@@ -1,7 +1,7 @@
 """Qualification harness contracts and report validation per flow contract section 9.
 
 Validates immutable qualification reports:
-- protocol_version: 2
+- protocol_version: 4 for provider-bound reports; versions 2 and 3 remain readable without inferring their missing provider
 - Immutable deployment capability and selected agent settings tuple
 - Required seven scenario groups executed and passed
 - Verified actual latency/resource measurements and raw evidence references
@@ -16,7 +16,7 @@ import re
 from decimal import Decimal
 from typing import Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from bot.flow.canonical import canonical_json_v1
 from bot.flow.schemas import MAX_SAFE_INTEGER, MIN_SAFE_INTEGER, FlowDiagnostic
@@ -119,7 +119,36 @@ class ScenarioResult(BaseModel):
 
 
 class AgentQualificationSettings(BaseModel):
-    """Exact model, STT, and voice settings covered by a deployment report."""
+    """Version-four pins bind the serving LLM provider as well as every speech setting."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    llm_provider: str = Field(min_length=1, max_length=32)
+    llm_model: str = Field(min_length=1, max_length=64)
+    stt_provider: str = Field(min_length=1, max_length=32)
+    stt_model: str = Field(min_length=1, max_length=128)
+    tts_provider: str = Field(min_length=1, max_length=32)
+    tts_model: str = Field(min_length=1, max_length=128)
+    tts_voice_en: str = Field(min_length=1, max_length=32)
+    tts_voice_hi: str = Field(min_length=1, max_length=32)
+
+
+class ProviderlessAgentQualificationSettings(BaseModel):
+    """Version-three measured pins retained exactly, without inferring an LLM provider."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    llm_model: str = Field(min_length=1, max_length=64)
+    stt_provider: str = Field(min_length=1, max_length=32)
+    stt_model: str = Field(min_length=1, max_length=128)
+    tts_provider: str = Field(min_length=1, max_length=32)
+    tts_model: str = Field(min_length=1, max_length=128)
+    tts_voice_en: str = Field(min_length=1, max_length=32)
+    tts_voice_hi: str = Field(min_length=1, max_length=32)
+
+
+class LegacyAgentQualificationSettings(BaseModel):
+    """Version-two report pins retained exactly for existing snapshots."""
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
@@ -132,11 +161,15 @@ class AgentQualificationSettings(BaseModel):
 class CapabilityReport(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
-    protocol_version: int = 2
+    protocol_version: Literal[2, 3, 4] = 4
     adapter_id: str
     adapter_version: str
     model_revision: str
-    agent_settings: AgentQualificationSettings
+    agent_settings: (
+        AgentQualificationSettings
+        | ProviderlessAgentQualificationSettings
+        | LegacyAgentQualificationSettings
+    )
     metadata: Literal["separate_stream", "complete_tool", "none"]
     speech_gating: bool
     cancel_generation: bool
@@ -153,6 +186,20 @@ class CapabilityReport(BaseModel):
     limitations: list[str] = Field(default_factory=list)
     report_hash: str = ""
 
+    @model_validator(mode="after")
+    def validate_versioned_agent_settings(self) -> CapabilityReport:
+        expected_settings_type = {
+            2: LegacyAgentQualificationSettings,
+            3: ProviderlessAgentQualificationSettings,
+            4: AgentQualificationSettings,
+        }[self.protocol_version]
+        if not isinstance(self.agent_settings, expected_settings_type):
+            raise ValueError(
+                f"protocol_version {self.protocol_version} requires "
+                f"{expected_settings_type.__name__}"
+            )
+        return self
+
     @field_validator("measurements", "budgets", mode="before")
     @classmethod
     def validate_measurements(cls, v: dict[str, Any]) -> dict[str, CanonicalMeasurement]:
@@ -165,26 +212,66 @@ class CapabilityReport(BaseModel):
             _validate_measurements_dict(case.measurements)
         dump = self.model_dump()
         dump.pop("report_hash", None)
-        return hashlib.sha256(
-            b"voice-ai/capability-report/v2\0" + canonical_json_v1(dump)
-        ).hexdigest()
+        protocol_prefix = {
+            2: b"voice-ai/capability-report/v2\0",
+            3: b"voice-ai/capability-report/v3\0",
+            4: b"voice-ai/capability-report/v4\0",
+        }[self.protocol_version]
+        return hashlib.sha256(protocol_prefix + canonical_json_v1(dump)).hexdigest()
 
 
 def validate_capability_report(report_data: dict[str, Any]) -> list[FlowDiagnostic]:
-    """Validate qualification report format, required seven scenario groups, and report hash."""
+    """Validate report shape, required scenario groups, and canonical report hash."""
     diagnostics: list[FlowDiagnostic] = []
 
-    if (
-        type(report_data.get("protocol_version")) is not int
-        or report_data.get("protocol_version") != 2
-    ):
+    protocol_version = report_data.get("protocol_version")
+    if type(protocol_version) is not int or protocol_version not in {2, 3, 4}:
         diagnostics.append(
             FlowDiagnostic(
                 code="QUALIFICATION_INVALID",
                 path="/protocol_version",
-                message="Qualification report must have integer protocol_version: 2",
+                message="Qualification report must have integer protocol_version: 2, 3, or 4",
             )
         )
+    settings_data = report_data.get("agent_settings")
+    expected_settings = {
+        2: {
+            "llm_model",
+            "stt_provider",
+            "tts_voice_en",
+            "tts_voice_hi",
+        },
+        3: {
+            "llm_model",
+            "stt_provider",
+            "stt_model",
+            "tts_provider",
+            "tts_model",
+            "tts_voice_en",
+            "tts_voice_hi",
+        },
+        4: {
+            "llm_provider",
+            "llm_model",
+            "stt_provider",
+            "stt_model",
+            "tts_provider",
+            "tts_model",
+            "tts_voice_en",
+            "tts_voice_hi",
+        },
+    }.get(protocol_version) if type(protocol_version) is int else None
+    if expected_settings is not None and (
+        not isinstance(settings_data, dict) or set(settings_data) != expected_settings
+    ):
+        diagnostics.append(
+            FlowDiagnostic(
+                code="QUALIFICATION_INVALID",
+                path="/agent_settings",
+                message="Qualification report agent settings do not match its protocol version",
+            )
+        )
+
 
     for req_field in (
         "adapter_id",
@@ -443,8 +530,16 @@ def validate_capability_report(report_data: dict[str, Any]) -> list[FlowDiagnost
         clean_data = dict(report_data)
         clean_data.pop("report_hash", None)
         try:
+            protocol_version = report_data.get("protocol_version")
+            protocol_prefix = {
+                2: b"voice-ai/capability-report/v2\0",
+                3: b"voice-ai/capability-report/v3\0",
+                4: b"voice-ai/capability-report/v4\0",
+            }.get(protocol_version)
+            if protocol_prefix is None:
+                raise ValueError("Unsupported qualification report protocol version")
             expected_hash = hashlib.sha256(
-                b"voice-ai/capability-report/v2\0" + canonical_json_v1(clean_data)
+                protocol_prefix + canonical_json_v1(clean_data)
             ).hexdigest()
             if given_hash != expected_hash:
                 diagnostics.append(
