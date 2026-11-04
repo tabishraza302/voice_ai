@@ -106,8 +106,32 @@ For local development, run `scripts/voice-ai.sh seed-dev-accounts` after the
 platform database has been initialized. The login page on localhost in the
 Next.js development server then lists customer and administrator shortcuts.
 The command only accepts a local database in the development environment and
-never overwrites an existing account. The administrator must enroll in MFA.
+never overwrites an existing account.
 These shared accounts are for local development only.
+Administrators can review registered providers and manage Ollama model entries
+under **Admin → Providers**. Install each model in Ollama separately, then add
+its exact Ollama model ID and a display name. Enable and qualify the entry only
+after checking it for the deployment; qualification is an operator decision,
+not proof that a model is installed or that a test has run. Agents select both
+the serving provider and model ID; removing or disabling a choice does not
+substitute another model.
+The old `llm_models` entries in `PLATFORM_CATALOG_PATH` are not imported as
+managed models: add each model under its actual serving provider and qualify it
+for this deployment. Existing published snapshots without a provider pin cannot
+run; explicitly select the provider in the draft and publish a new version.
+Existing immutable snapshots are not rewritten.
+Voice publication additionally requires a newly measured provider-bound
+protocol-v4 qualification report; older reports do not establish which LLM
+provider was used and cannot qualify playback.
+
+Provider credentials are encrypted with the separately configured
+`PLATFORM_PROVIDER_SECRET_KEY`; local providers that require no credentials do
+not need this key. The workspace lists speech provider, model, and voice metadata
+from the local registry, but selection requires exact nested provider/model
+entries and a matching deployment qualification report. Configure
+`PLATFORM_CATALOG_PATH` for deployment-qualified speech and generation choices;
+its flat `tts_voices` compatibility list does not qualify TTS choices.
+
 
 Open [http://127.0.0.1:3001](http://127.0.0.1:3001). To run the web app
 alone, start the platform API and then use `scripts/voice-ai.sh web`.
