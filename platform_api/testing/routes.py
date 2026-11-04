@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from platform_api.auth.dependencies import get_request_settings, require_csrf, require_user
 from platform_api.auth.types import AuthSessionContext, Principal
-from platform_api.catalog import ModelCatalog, load_catalog
+from platform_api.catalog import ModelCatalog, catalog_with_managed_llms, load_catalog
 from platform_api.config import PlatformSettings
 from platform_api.db.session import get_db
 from platform_api.testing.chat import get_chat_recovery, post_chat_turn
@@ -30,11 +30,11 @@ async def _set_chat_transaction_isolation(
     await db.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
 
 
-def _request_catalog(request: Request, settings: PlatformSettings) -> ModelCatalog:
+async def _request_catalog(request: Request, settings: PlatformSettings, db: AsyncSession) -> ModelCatalog:
     catalog = getattr(request.app.state, "catalog", None)
-    if catalog is not None:
-        return catalog
-    return load_catalog(settings.catalog_path)
+    if catalog is None:
+        catalog = load_catalog(settings.catalog_path)
+    return await catalog_with_managed_llms(catalog, db)
 
 
 @router.post("/agents/{agent_id}/test/chat", response_model=ChatTurnResponse)
@@ -54,7 +54,7 @@ async def create_chat_turn(
     return await post_chat_turn(
         db,
         settings=settings,
-        catalog=_request_catalog(request, settings),
+        catalog=await _request_catalog(request, settings, db),
         model_client=getattr(request.app.state, "model_client", None),
         owner_user_id=principal.user_id,
         agent_id=agent_id,

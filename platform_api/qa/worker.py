@@ -38,7 +38,7 @@ from bot.flow.schemas import (
     UserTurnAcceptedEvent,
 )
 from platform_api.auth.errors import DependencyUnavailableError
-from platform_api.catalog import ModelCatalog
+from platform_api.catalog import ModelCatalog, catalog_with_managed_llms
 from platform_api.config import PlatformSettings
 from platform_api.model_client import ModelClientError, ModelCompletion, ModelUsage
 from platform_api.qa.models import FlowQAJob
@@ -59,6 +59,35 @@ MAX_UTTERANCE_CHARS = 512
 MAX_REPLY_CHARS = 2048
 MAX_TRANSCRIPT_TURNS = 50
 MAX_HISTORY_MESSAGES = 8
+
+
+def _runtime_model_is_selectable(
+    snapshot: dict[str, Any],
+    models_json: dict[str, Any],
+    model_id: str | None,
+    catalog: ModelCatalog,
+) -> bool:
+    if not isinstance(snapshot, dict) or not isinstance(models_json, dict):
+        return False
+    provider_id = models_json.get("runtime_provider")
+    if provider_id != "ollama" or not isinstance(model_id, str):
+        return False
+    snapshot_pins = snapshot.get("model_pins")
+    runtime_profile = snapshot.get("runtime_profile")
+    return (
+        (provider_id, model_id)
+        in {
+            (item.provider_id, item.id)
+            for item in catalog.llm_models
+            if item.selectable
+        }
+        and isinstance(snapshot_pins, dict)
+        and snapshot_pins.get("llm_provider") == provider_id
+        and snapshot_pins.get("llm_model") == model_id
+        and isinstance(runtime_profile, dict)
+        and runtime_profile.get("provider_id") == provider_id
+        and runtime_profile.get("model_id") == model_id
+    )
 
 
 class GeneratedFieldAssertion(BaseModel):
@@ -157,11 +186,13 @@ async def qa_worker_loop(app: Any) -> None:
                 job_id = await next_claimable_qa_job(session_factory)
                 if job_id is None or job_id in tasks:
                     break
+                async with session_factory() as db:
+                    current_catalog = await catalog_with_managed_llms(catalog, db)
                 task = asyncio.create_task(
                     run_qa_job_once(
                         session_factory,
                         settings,
-                        catalog,
+                        current_catalog,
                         model_client,
                         job_id,
                     ),
@@ -191,6 +222,31 @@ async def _execute_claimed_job(
             claimed,
             status="FAILED",
             failure_code="MODEL_ENDPOINT_UNAVAILABLE",
+        )
+        return
+    try:
+        async with session_factory() as db:
+            catalog = await catalog_with_managed_llms(catalog, db)
+    except Exception:
+        await finish_qa_job(
+            session_factory,
+            claimed,
+            status="FAILED",
+            failure_code="MODEL_CATALOG_UNAVAILABLE",
+        )
+        return
+
+    if not _runtime_model_is_selectable(
+        claimed.snapshot_json,
+        claimed.models_json,
+        claimed.runtime_model_id,
+        catalog,
+    ):
+        await finish_qa_job(
+            session_factory,
+            claimed,
+            status="FAILED",
+            failure_code="RUNTIME_MODEL_UNAVAILABLE",
         )
         return
 
@@ -1091,6 +1147,11 @@ async def _complete_with_interrupt_monitor(
             endpoint,
             model=model,
             messages=messages,
+            provider_id=(
+                job.models_json.get("runtime_provider")
+                if endpoint == "runtime"
+                else None
+            ),
             max_tokens=max_tokens,
             temperature=temperature,
             reasoning_effort=reasoning_effort,

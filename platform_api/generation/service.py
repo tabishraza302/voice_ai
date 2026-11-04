@@ -29,7 +29,7 @@ from platform_api.auth.errors import (
     RateLimitedError,
     ValidationError,
 )
-from platform_api.catalog import ModelCatalog
+from platform_api.catalog import ModelCatalog, catalog_with_managed_llms
 from platform_api.config import PlatformSettings
 from platform_api.generation.models import GenerationJob, MAX_GENERATION_ATTEMPTS
 from platform_api.generation.schemas import AgentProposal, GenerationModelOutput
@@ -422,7 +422,7 @@ async def generation_worker_loop(app: Any) -> None:
     """Run a bounded set of leased durable jobs until application shutdown."""
     session_factory = app.state.session_factory
     settings: PlatformSettings = app.state.settings
-    catalog: ModelCatalog = app.state.catalog
+    base_catalog: ModelCatalog = app.state.catalog
     model_client = app.state.model_client
     tasks: dict[uuid.UUID, asyncio.Task[None]] = {}
     app.state.generation_job_tasks = tasks
@@ -431,6 +431,7 @@ async def generation_worker_loop(app: Any) -> None:
             async with session_factory() as db:
                 now = datetime.now(timezone.utc)
                 await _expire_stale_jobs(db, settings, now)
+                catalog = await catalog_with_managed_llms(base_catalog, db)
                 await db.commit()
 
             while len(tasks) < settings.generation_max_running_jobs:
@@ -486,6 +487,25 @@ async def _execute_claimed_job(
     model_client: Any,
     claimed: ClaimedGenerationJob,
 ) -> None:
+    try:
+        async with session_factory() as db:
+            catalog = await catalog_with_managed_llms(catalog, db)
+    except Exception:
+        await _finish_job(
+            session_factory,
+            claimed,
+            status="FAILED",
+            failure_code="MODEL_CATALOG_UNAVAILABLE",
+            warnings=[
+                _diagnostic(
+                    "MODEL_CATALOG_UNAVAILABLE",
+                    "config.settings.llm_model",
+                    "The current qualified model catalog is unavailable.",
+                )
+            ],
+        )
+        return
+
     model_ids = {item.id for item in catalog.generation_models}
     if claimed.generation_model_id not in model_ids:
         await _finish_job(
@@ -834,7 +854,11 @@ def _generation_messages(
     catalog: ModelCatalog,
 ) -> list[dict[str, str]]:
     allowed = {
-        "runtime_models": [item.id for item in catalog.llm_models],
+        "runtime_models": [
+            {"provider_id": item.provider_id, "id": item.id}
+            for item in catalog.llm_models
+            if item.selectable
+        ],
         "speech_providers": [item.id for item in catalog.stt_providers],
         "speech_voices": [item.id for item in catalog.tts_voices],
     }
@@ -843,8 +867,9 @@ def _generation_messages(
         "Return only a JSON object with exactly these fields: name, description, "
         "persona_prompt, config, unknown_business_facts. `config` must be the full "
         "agent authoring envelope with a `flow` object and the platform settings "
-        "llm_model, stt_provider, tts_voice_en, and tts_voice_hi. Use only model, "
-        "speech-provider, and voice IDs in this allowlist: "
+        "llm_provider, llm_model, stt_provider, tts_voice_en, and tts_voice_hi. "
+        "Use only runtime model provider/model pairs and speech-provider and voice "
+        "IDs in this allowlist: "
         f"{json.dumps(allowed, ensure_ascii=False, separators=(',', ':'))}. "
         "Use only business facts explicitly present in the requirement. Do not add "
         "prices, rates, eligibility rules, policies, or guarantees unless the user "
