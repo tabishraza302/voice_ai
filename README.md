@@ -123,6 +123,9 @@ Existing immutable snapshots are not rewritten.
 Voice publication additionally requires a newly measured provider-bound
 protocol-v4 qualification report; older reports do not establish which LLM
 provider was used and cannot qualify playback.
+The flow editor preserves `llm_temperature` and `llm_max_tokens` when editing
+existing drafts, but the platform API does not currently accept these as agent
+configuration settings; do not add them to drafts for publication.
 
 Provider credentials are encrypted with the separately configured
 `PLATFORM_PROVIDER_SECRET_KEY`; local providers that require no credentials do

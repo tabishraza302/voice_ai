@@ -3,6 +3,8 @@ import type { AgentView, JsonObject, JsonValue } from "@/lib/platform-agent-clie
 const RUNTIME_SETTING_KEYS = {
   llm_provider: true,
   llm_model: true,
+  llm_temperature: true,
+  llm_max_tokens: true,
   stt_provider: true,
   stt_model: true,
   tts_provider: true,
