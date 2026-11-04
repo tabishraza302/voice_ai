@@ -1,13 +1,10 @@
 [project]
 name = "voice-ai"
 version = "0.1.0"
-description = "Fully local, air-gapped English + Hindi voice agent with an AI-observability layer."
+description = ""
 readme = "README.md"
 requires-python = ">=3.12"
 
-# Every version is pinned exactly. Rationale (see AGENTS.md): this project is
-# measured, not vibe-coded — the WER/latency numbers in the README are only
-# reproducible against these exact versions.
 dependencies = [
     # Orchestration. `runner` brings the dev runner AND pipecat-ai-prebuilt
     # (the browser client at /client). `kokoro` = default TTS. `webrtc` =

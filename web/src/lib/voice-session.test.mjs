@@ -17,11 +17,18 @@ class FakePeerConnection {
   tracks = [];
   transceivers = [];
   channel = {
+    ordered: true,
     readyState: "connecting",
     closed: false,
     sent: [],
     onopen: null,
-    close() { this.closed = true; this.readyState = "closed"; },
+    onmessage: null,
+    onclose: null,
+    close() {
+      this.closed = true;
+      this.readyState = "closed";
+      this.onclose?.();
+    },
     send(message) { this.sent.push(message); },
   };
   constructor(config) { this.config = config; sessions.add(this); }
@@ -40,7 +47,10 @@ class FakePeerConnection {
   }
   async createOffer() { return { sdp: "local-sdp", type: "offer" }; }
   async setLocalDescription(description) { this.localDescription = description; }
-  async setRemoteDescription(description) { this.remoteDescription = description; }
+  async setRemoteDescription(description) {
+    this.remoteDescription = description;
+    this.connectionState = "connected";
+  }
   close() { this.closed = true; this.connectionState = "closed"; }
 }
 
@@ -56,6 +66,9 @@ function createHarness(options = {}) {
     getUserMedia,
     createPeerConnection: peerConnectionFactory,
     fetcher,
+    onDataChannelMessage: options.onDataChannelMessage,
+    onDataChannelOpen: options.onDataChannelOpen,
+    onDataChannelClose: options.onDataChannelClose,
     onStatus: (status) => statuses.push(status),
   });
   const channel = () => [...sessions].at(-1)?.channel;
@@ -167,6 +180,82 @@ describe("sendText", () => {
     expect(harness.session.sendText("hello")).toBe(false);
   });
 
+});
+describe("playback data channel", () => {
+  const receipt = {
+    type: "flow-playback-receipt",
+    version: 1,
+    binding: {
+      session_id: "session-1",
+      transport_epoch: "epoch-1",
+      turn_id: "turn-1",
+      generation_id: "generation-1",
+      manifest_id: "manifest-1",
+      fragment_id: "fragment-1",
+      content_hash: "b".repeat(64),
+      capability_report_hash: "a".repeat(64),
+    },
+    media_samples: { sample_start: 240, sample_end: 480, sample_rate: 48_000 },
+    rendered_frames: { frame_start: 480, frame_end: 960, sample_rate: 96_000 },
+    evidence_id: "c".repeat(32),
+  };
+
+  test("sends only validated receipts over the active ordered chat channel", async () => {
+    const harness = createHarness();
+    await harness.session.connect({ offerUrl: OFFER_URL, agentId: agent.id });
+    const channel = harness.channel();
+
+    expect(channel.options).toEqual({ ordered: true });
+    expect(harness.session.sendPlaybackReceipt(receipt)).toBe(true);
+    expect(channel.sent.at(-1)).toBe(JSON.stringify(receipt));
+    expect(harness.session.sendPlaybackReceipt({ ...receipt, unbound: true })).toBe(false);
+    channel.ordered = false;
+    expect(harness.session.sendPlaybackReceipt(receipt)).toBe(false);
+  });
+
+  test("sends only exact v1 browser capabilities over the active ordered channel", async () => {
+    const harness = createHarness();
+    await harness.session.connect({ offerUrl: OFFER_URL, agentId: agent.id });
+    const channel = harness.channel();
+    const capabilities = {
+      type: "flow-playback-capabilities",
+      version: 1,
+      session_id: "session-1",
+      browser_tuple_hash: "d".repeat(64),
+    };
+
+    expect(harness.session.sendPlaybackCapabilities(capabilities)).toBe(true);
+    expect(channel.sent.at(-1)).toBe(JSON.stringify(capabilities));
+    expect(harness.session.sendPlaybackCapabilities({ ...capabilities, report_hash: "e".repeat(64) })).toBe(false);
+    channel.ordered = false;
+    expect(harness.session.sendPlaybackCapabilities(capabilities)).toBe(false);
+  });
+
+  test("dispatches control messages only from the current channel and ignores stale peer events", async () => {
+    const received = [];
+    const harness = createHarness({
+      onDataChannelMessage: (event, channel) => received.push({ event, channel }),
+    });
+    await harness.session.connect({ offerUrl: OFFER_URL, agentId: agent.id });
+    const activeChannel = harness.channel();
+    const peer = [...sessions].at(-1);
+    const otherChannel = {
+      ordered: true,
+      closed: false,
+      close() { this.closed = true; },
+    };
+
+    peer.ondatachannel({ channel: otherChannel });
+    otherChannel.onmessage?.({ data: "forged-channel" });
+    activeChannel.onmessage({ data: "active-peer" });
+    expect(otherChannel.closed).toBe(true);
+    expect(received.map(({ event }) => event.data)).toEqual(["active-peer"]);
+    expect(received[0].channel).toBe(activeChannel);
+
+    harness.session.close();
+    activeChannel.onmessage({ data: "stale-peer" });
+    expect(received).toHaveLength(1);
+  });
 });
 
 describe("mute management", () => {

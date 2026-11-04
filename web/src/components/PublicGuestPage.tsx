@@ -17,7 +17,16 @@ import type {
   GuestSessionStatus,
   PublicDeploymentBootstrap,
 } from "@/lib/public-guest-client";
+import type { PlaybackEnableGrant } from "@/lib/playback-protocol";
 import { VoiceSession } from "@/lib/voice-session";
+import {
+  computePlaybackBrowserTupleHash,
+  PlaybackRenderer,
+} from "@/lib/playback-renderer";
+import {
+  parsePlaybackControl,
+  parsePlaybackEnableGrant,
+} from "@/lib/playback-protocol";
 
 type PageState =
   | "loading"
@@ -179,6 +188,23 @@ function isTerminal(status: GuestSessionStatus | { state: string }): boolean {
   return TERMINAL_STATES[status.state] === true;
 }
 
+function openPlaybackAudioContext(): AudioContext | null {
+  const webkitWindow = window as Window & { webkitAudioContext?: typeof AudioContext };
+  const AudioContextConstructor = window.AudioContext || webkitWindow.webkitAudioContext;
+  if (!AudioContextConstructor) return null;
+  try {
+    const context = new AudioContextConstructor();
+    if (context.state !== "running") void context.resume().catch(() => {});
+    return context;
+  } catch {
+    return null;
+  }
+}
+
+function closePlaybackAudioContext(context: AudioContext | null): void {
+  if (context && context.state !== "closed") void context.close().catch(() => {});
+}
+
 export function PublicGuestPage({ publicId }: { publicId: string }) {
   const client = useMemo(() => new PublicGuestClient(), []);
   const [bootstrap, setBootstrap] = useState<PublicDeploymentBootstrap | null>(null);
@@ -195,6 +221,10 @@ export function PublicGuestPage({ publicId }: { publicId: string }) {
   const admissionAttemptRef = useRef<SavedGuestAdmissionAttempt | null>(null);
   const voiceSessionRef = useRef<VoiceSession | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
+  const playbackRendererRef = useRef<PlaybackRenderer | null>(null);
+  const remoteTrackRef = useRef<MediaStreamTrack | null>(null);
+  const remoteStreamRef = useRef<MediaStream | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
   const connectedRef = useRef(false);
 
   const showState = useCallback((next: PageState) => {
@@ -202,15 +232,44 @@ export function PublicGuestPage({ publicId }: { publicId: string }) {
     setPageState(next);
   }, []);
 
-  const disposeVoiceSession = useCallback(() => {
+  const disposeVoiceSession = useCallback((preserveAudioContext: AudioContext | null = null) => {
+    const renderer = playbackRendererRef.current;
+    playbackRendererRef.current = null;
+    renderer?.close();
     const voiceSession = voiceSessionRef.current;
     voiceSessionRef.current = null;
     voiceSession?.close();
     connectedRef.current = false;
+    remoteTrackRef.current = null;
+    remoteStreamRef.current = null;
+    const context = audioContextRef.current;
+    audioContextRef.current = preserveAudioContext;
+    if (context !== preserveAudioContext) closePlaybackAudioContext(context);
     if (remoteAudioRef.current) {
       remoteAudioRef.current.pause();
       remoteAudioRef.current.srcObject = null;
     }
+  }, []);
+
+  const playRemoteAudioFallback = useCallback((track: MediaStreamTrack, stream?: MediaStream) => {
+    const audio = remoteAudioRef.current;
+    if (!audio || track.readyState !== "live") return;
+    audio.srcObject = stream ?? remoteStreamRef.current ?? new MediaStream([track]);
+    void audio.play().then(
+      () => setAudioBlocked(false),
+      () => setAudioBlocked(true),
+    );
+  }, []);
+
+  const openAudioContextFromGesture = useCallback(() => {
+    const current = audioContextRef.current;
+    if (current && current.state !== "closed") {
+      if (current.state !== "running") void current.resume().catch(() => {});
+      return current;
+    }
+    const context = openPlaybackAudioContext();
+    audioContextRef.current = context;
+    return context;
   }, []);
 
   useEffect(() => {
@@ -348,16 +407,211 @@ export function PublicGuestPage({ publicId }: { publicId: string }) {
 
   const connectTransport = useCallback(async (
     session: Pick<GuestAdmission | GuestReconnectToken, "session_id" | "signaling_url" | "join_token">,
+    playbackContext: AudioContext | null,
   ) => {
-    disposeVoiceSession();
+    disposeVoiceSession(playbackContext);
+    if (playbackContext) audioContextRef.current = playbackContext;
     connectedRef.current = false;
     setAudioBlocked(false);
     showState("connecting");
 
-    const voiceSession = new VoiceSession({
+    let activeChannel: RTCDataChannel | null = null;
+    let authorizationAttempt = 0;
+    let grantPending = false;
+    let pendingGrant: PlaybackEnableGrant | null = null;
+    let pendingControls: unknown[] = [];
+    let capabilitiesSentChannel: RTCDataChannel | null = null;
+    let voiceSession!: VoiceSession;
+    const isCurrentSession = () => voiceSessionRef.current === voiceSession;
+    let browserTupleHashPromise: Promise<string | null> | null = null;
+    const getBrowserTupleHash = () => {
+      if (!playbackContext) return Promise.resolve(null);
+      browserTupleHashPromise ??= computePlaybackBrowserTupleHash(playbackContext.sampleRate);
+      return browserTupleHashPromise;
+    };
+    const announceCapabilities = async (channel: RTCDataChannel) => {
+      const context = playbackContext;
+      if (!context) return;
+      if (context.state !== "running") {
+        try {
+          await context.resume();
+        } catch {
+          return;
+        }
+      }
+      if (context.state !== "running") return;
+      const browserTupleHash = await getBrowserTupleHash();
+      if (
+        !browserTupleHash
+        || context.state !== "running"
+        || !isCurrentSession()
+        || channel !== activeChannel
+        || !channel.ordered
+        || channel.readyState !== "open"
+        || capabilitiesSentChannel === channel
+      ) return;
+
+      if (voiceSession.sendPlaybackCapabilities({
+        type: "flow-playback-capabilities",
+        version: 1,
+        session_id: session.session_id,
+        browser_tuple_hash: browserTupleHash,
+      })) capabilitiesSentChannel = channel;
+    };
+    const closeInterruptedTransport = () => {
+      if (!isCurrentSession()) return;
+      disposeVoiceSession();
+      setError("Playback was interrupted. The browser stopped this voice connection.");
+      if (!["ending", "ended"].includes(pageStateRef.current)) showState("disconnected");
+    };
+    const handleControl = (event: MessageEvent, channel: RTCDataChannel) => {
+      if (!isCurrentSession() || channel !== activeChannel || !channel.ordered) return;
+      const grant = parsePlaybackEnableGrant(event.data);
+      if (grant) {
+        if (
+          grantPending
+          || grant.session_id !== session.session_id
+          || capabilitiesSentChannel !== channel
+        ) return;
+        pendingGrant = grant;
+        grantPending = true;
+        const attempt = ++authorizationAttempt;
+        void enableRenderer(grant, channel, attempt);
+        return;
+      }
+
+      const control = parsePlaybackControl(event.data);
+      if (!control || control.kind === "invalid-marker" || control.kind === "invalid-cancel") return;
+      if (
+        control.kind === "cancel"
+        && control.cancellation.session_id === session.session_id
+        && !playbackRendererRef.current
+      ) {
+        if (pendingGrant && control.cancellation.transport_epoch !== pendingGrant.transport_epoch) return;
+        closeInterruptedTransport();
+        return;
+      }
+      if (!grantPending) return;
+      const renderer = playbackRendererRef.current;
+      if (renderer) {
+        renderer.handleControlMessage(event.data);
+        return;
+      }
+      if (pendingControls.length >= 128) {
+        authorizationAttempt += 1;
+        grantPending = false;
+        pendingControls = [];
+        pendingGrant = null;
+        return;
+      }
+      pendingControls.push(event.data);
+    };
+
+    const enableRenderer = async (
+      grant: PlaybackEnableGrant,
+      channel: RTCDataChannel,
+      attempt: number,
+    ) => {
+      const context = playbackContext;
+      if (!context || context.state !== "running") {
+        grantPending = false;
+        pendingGrant = null;
+        pendingControls = [];
+        return;
+      }
+      const browserTupleHash = await getBrowserTupleHash();
+      if (
+        !browserTupleHash
+        || browserTupleHash !== grant.browser_tuple_hash
+        || grant.session_id !== session.session_id
+        || !grant.interruption_stop_drain_proven
+        || attempt !== authorizationAttempt
+        || !isCurrentSession()
+        || channel !== activeChannel
+        || !channel.ordered
+        || channel.readyState !== "open"
+      ) {
+        if (attempt === authorizationAttempt) {
+          grantPending = false;
+          pendingGrant = null;
+          pendingControls = [];
+        }
+        return;
+      }
+
+      let renderer: PlaybackRenderer;
+      renderer = new PlaybackRenderer(context, {
+        authorization: grant,
+        sendReceipt: (receipt) => isCurrentSession()
+          && channel === activeChannel
+          && channel.readyState === "open"
+          && voiceSession.sendPlaybackReceipt(receipt),
+        onUnsupported: () => {
+          if (playbackRendererRef.current !== renderer) return;
+          playbackRendererRef.current = null;
+          grantPending = false;
+          pendingGrant = null;
+          pendingControls = [];
+          authorizationAttempt += 1;
+          if (audioContextRef.current === context) audioContextRef.current = null;
+          closePlaybackAudioContext(context);
+          const track = remoteTrackRef.current;
+          if (track) playRemoteAudioFallback(track, remoteStreamRef.current ?? undefined);
+        },
+        onInterrupted: () => closeInterruptedTransport(),
+      });
+      renderer.setChannelOpen(true);
+      playbackRendererRef.current = renderer;
+      const prepared = await renderer.prepare();
+      if (
+        !prepared
+        || attempt !== authorizationAttempt
+        || !isCurrentSession()
+        || channel !== activeChannel
+        || playbackRendererRef.current !== renderer
+      ) {
+        renderer.close();
+        return;
+      }
+      const controls = pendingControls;
+      pendingControls = [];
+      for (const control of controls) {
+        renderer.handleControlMessage(control);
+        if (playbackRendererRef.current !== renderer) return;
+      }
+      const track = remoteTrackRef.current;
+      if (track) {
+        remoteAudioRef.current?.pause();
+        if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
+        if (!renderer.attach(track)) {
+          playRemoteAudioFallback(track, remoteStreamRef.current ?? undefined);
+        } else {
+          setAudioBlocked(false);
+        }
+      }
+    };
+
+    voiceSession = new VoiceSession({
       getUserMedia: (constraints) => navigator.mediaDevices.getUserMedia(constraints),
       createPeerConnection: (configuration) => new RTCPeerConnection(configuration),
       fetcher: fetch,
+      onDataChannelMessage: handleControl,
+      onDataChannelOpen: (channel) => {
+        if (isCurrentSession()) {
+          activeChannel = channel;
+          playbackRendererRef.current?.setChannelOpen(true);
+          void announceCapabilities(channel);
+        }
+      },
+      onDataChannelClose: (channel) => {
+        if (!isCurrentSession() || channel !== activeChannel) return;
+        authorizationAttempt += 1;
+        grantPending = false;
+        pendingGrant = null;
+        pendingControls = [];
+        playbackRendererRef.current?.setChannelOpen(false);
+        closeInterruptedTransport();
+      },
       onStatus: (status) => {
         if (pageStateRef.current === "ending" || pageStateRef.current === "ended") return;
         showState(status === "requesting_media" ? "requesting_media" : "connecting");
@@ -365,19 +619,33 @@ export function PublicGuestPage({ publicId }: { publicId: string }) {
       onConnectionState: (connectionState) => {
         if (connectionState === "connected") {
           connectedRef.current = true;
+          playbackRendererRef.current?.setChannelOpen(Boolean(activeChannel?.ordered && activeChannel.readyState === "open"));
           showState("connected");
         } else if (["disconnected", "failed", "closed"].includes(connectionState)) {
+          authorizationAttempt += 1;
+          grantPending = false;
+          pendingGrant = null;
+          pendingControls = [];
           connectedRef.current = false;
-          if (!["ending", "ended"].includes(pageStateRef.current)) {
-            showState("disconnected");
-          }
+          playbackRendererRef.current?.setChannelOpen(false);
+          closeInterruptedTransport();
         }
       },
       onRemoteTrack: (event) => {
-        const audio = remoteAudioRef.current;
-        if (!audio) return;
-        audio.srcObject = event.streams[0] || new MediaStream([event.track]);
-        audio.play().catch(() => setAudioBlocked(true));
+        if (event.track.kind !== "audio") return;
+        const stream = event.streams[0] || new MediaStream([event.track]);
+        remoteTrackRef.current = event.track;
+        remoteStreamRef.current = stream;
+        const renderer = playbackRendererRef.current;
+        if (renderer?.available) {
+          remoteAudioRef.current?.pause();
+          if (remoteAudioRef.current) remoteAudioRef.current.srcObject = null;
+          if (renderer.attach(event.track)) {
+            setAudioBlocked(false);
+            return;
+          }
+        }
+        playRemoteAudioFallback(event.track, stream);
       },
     });
     voiceSession.setMuted(muted);
@@ -392,15 +660,16 @@ export function PublicGuestPage({ publicId }: { publicId: string }) {
         },
       });
     } catch (connectionError) {
-      voiceSession.close();
-      if (voiceSessionRef.current === voiceSession) voiceSessionRef.current = null;
+      if (voiceSessionRef.current === voiceSession) disposeVoiceSession();
+      else voiceSession.close();
       connectedRef.current = false;
       throw connectionError;
     }
-  }, [disposeVoiceSession, muted, showState]);
+  }, [disposeVoiceSession, muted, playRemoteAudioFallback, showState]);
 
   const startSession = async () => {
     if (!bootstrap || !acknowledged || pageStateRef.current === "admitting") return;
+    const playbackContext = openAudioContextFromGesture();
     setError(null);
     showState("admitting");
     let admitted = false;
@@ -437,8 +706,9 @@ export function PublicGuestPage({ publicId }: { publicId: string }) {
         clearSavedAdmissionAttempt(publicId);
         admissionAttemptRef.current = null;
       }
-      await connectTransport(session);
+      await connectTransport(session, playbackContext);
     } catch (startError) {
+      disposeVoiceSession();
       setError(messageFor(startError));
       if (
         !admitted &&
@@ -459,13 +729,15 @@ export function PublicGuestPage({ publicId }: { publicId: string }) {
   const reconnectSession = async () => {
     if (!sessionId || !guestCsrf || !sessionState || connectedRef.current) return;
     if (!RECONNECTABLE_STATES[sessionState]) return;
+    const playbackContext = openAudioContextFromGesture();
     setError(null);
     showState("connecting");
     try {
       const join = await client.reconnect(sessionId, guestCsrf, crypto.randomUUID());
       setSessionState(join.state);
-      await connectTransport(join);
+      await connectTransport(join, playbackContext);
     } catch (reconnectError) {
+      disposeVoiceSession();
       setError(messageFor(reconnectError));
       if (!["ending", "ended"].includes(pageStateRef.current)) {
         showState("disconnected");

@@ -1,3 +1,12 @@
+import {
+  parsePlaybackCapabilities,
+  parsePlaybackReceipt,
+} from "./playback-protocol";
+import type {
+  PlaybackCapabilitiesMessage,
+  PlaybackReceiptMessage,
+} from "./playback-protocol";
+
 export interface VoiceSessionConnection {
   peerConnection: RTCPeerConnection;
   dataChannel: RTCDataChannel;
@@ -9,7 +18,9 @@ export interface VoiceSessionDependencies {
   getUserMedia: (constraints: MediaStreamConstraints) => Promise<MediaStream>;
   createPeerConnection: (configuration: RTCConfiguration) => RTCPeerConnection;
   fetcher: typeof fetch;
-  onDataChannelMessage?: (event: MessageEvent) => void;
+  onDataChannelMessage?: (event: MessageEvent, channel: RTCDataChannel) => void;
+  onDataChannelOpen?: (channel: RTCDataChannel) => void;
+  onDataChannelClose?: (channel: RTCDataChannel) => void;
   onRemoteTrack?: (event: RTCTrackEvent) => void;
   onConnectionState?: (state: RTCPeerConnectionState) => void;
   onStatus?: (status: "requesting_media" | "connecting") => void;
@@ -85,11 +96,15 @@ export class VoiceSession {
 
       const dataChannel = peerConnection.createDataChannel("chat", { ordered: true });
       this.dataChannel = dataChannel;
+      const isActiveDataChannel = () => isCurrent()
+        && this.peerConnection === peerConnection
+        && this.dataChannel === dataChannel
+        && dataChannel.ordered;
       dataChannel.onmessage = (event) => {
-        if (isCurrent()) this.dependencies.onDataChannelMessage?.(event);
+        if (isActiveDataChannel()) this.dependencies.onDataChannelMessage?.(event, dataChannel);
       };
       dataChannel.onopen = () => {
-        if (!isCurrent()) return;
+        if (!isActiveDataChannel()) return;
         this.sendMessage({
           type: "signalling",
           message: { type: "trackStatus", receiver_index: 0, enabled: !this.muted },
@@ -100,11 +115,13 @@ export class VoiceSession {
           id: "client-ready",
           data: { version: "1.0.0", about: { library: "voice-ai-web", platform: "browser" } },
         });
+        this.dependencies.onDataChannelOpen?.(dataChannel);
+      };
+      dataChannel.onclose = () => {
+        if (isActiveDataChannel()) this.dependencies.onDataChannelClose?.(dataChannel);
       };
       peerConnection.ondatachannel = ({ channel }) => {
-        channel.onmessage = (event) => {
-          if (isCurrent()) this.dependencies.onDataChannelMessage?.(event);
-        };
+        if (channel !== dataChannel) channel.close();
       };
       peerConnection.ontrack = (event) => {
         if (isCurrent()) this.dependencies.onRemoteTrack?.(event);
@@ -173,6 +190,20 @@ export class VoiceSession {
 
   sendText(text: string): boolean {
     return this.sendMessage({ type: "send-text", text });
+  }
+
+  sendPlaybackCapabilities(capabilities: PlaybackCapabilitiesMessage): boolean {
+    if (!parsePlaybackCapabilities(capabilities) || !this.dataChannel?.ordered) return false;
+    return this.sendMessage(capabilities);
+  }
+
+  sendPlaybackReceipt(receipt: PlaybackReceiptMessage): boolean {
+    if (
+      !parsePlaybackReceipt(receipt)
+      || this.peerConnection?.connectionState !== "connected"
+      || !this.dataChannel?.ordered
+    ) return false;
+    return this.sendMessage(receipt);
   }
 
   sendPing(): void {

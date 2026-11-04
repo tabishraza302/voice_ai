@@ -16,6 +16,9 @@ from tests.test_voice_live_integration import validate_loopback_base_url
 def test_defaults(monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("database_url", raising=False)
+    monkeypatch.delenv("PLATFORM_DATABASE_URL", raising=False)
+    monkeypatch.delenv("PLATFORM_POSTGRES_SCHEMA", raising=False)
+    monkeypatch.delenv("PLATFORM_SCHEMA", raising=False)
     s = Settings(_env_file=None)
     assert s.stt_provider == "mlx-audio-realtime"
     assert s.stt_model == "mlx-community/nemotron-3.5-asr-streaming-0.6b"
@@ -33,6 +36,8 @@ def test_defaults(monkeypatch):
     assert s.vad_min_volume == 0.6
     assert s.vad_confidence == 0.7
     assert s.database_url == "postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai"
+    assert s.platform_database_url is None
+    assert s.platform_postgres_schema == "platform"
     assert s.web_port == 3001
     assert s.host == "localhost"
 
@@ -67,6 +72,32 @@ def test_database_url_rejects_non_async_postgres(invalid_url):
         Settings(_env_file=None, database_url=invalid_url)
     assert "postgresql+asyncpg" in str(exc_info.value)
 
+
+def test_platform_store_does_not_reuse_agent_profile_database():
+    settings = Settings(
+        _env_file=None,
+        database_url="postgresql+asyncpg://local:local@127.0.0.1:5432/agent_profiles",
+    )
+    assert settings.platform_database_url is None
+
+
+@pytest.mark.parametrize(
+    "platform_url",
+    [
+        "sqlite+aiosqlite:///platform.db",
+        "postgresql://user:password@localhost/platform",
+        "",
+    ],
+)
+def test_platform_store_rejects_non_async_postgres(platform_url):
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, platform_database_url=platform_url)
+
+
+@pytest.mark.parametrize("schema", ["", "Platform", "platform;drop", "a" * 64])
+def test_platform_store_rejects_invalid_schema_identifier(schema):
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, platform_postgres_schema=schema)
 
 
 def test_env_overrides(monkeypatch):

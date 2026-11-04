@@ -53,3 +53,20 @@ def test_platform_catalog_does_not_import_gpu_services():
         text=True,
     )
     assert check.returncode == 0, check.stderr
+
+
+def test_session_models_register_without_import_order_cycle():
+    check = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import platform_api.sessions.models; "
+            "from platform_api.db.base import Base; "
+            "expected = {'flow_runtime_states', 'flow_runtime_events', "
+            "'committed_playback_receipts', 'runtime_stop_records'}; "
+            "assert expected <= set(Base.metadata.tables)",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert check.returncode == 0, check.stderr

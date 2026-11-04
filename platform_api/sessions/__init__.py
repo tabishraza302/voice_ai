@@ -3,12 +3,13 @@
 from platform_api.sessions.models import (
     RunnerCapacity,
     RuntimeRegistration,
-    Session,
     SessionJoinJti,
     SessionParticipant,
     SessionPeer,
     SessionSlot,
 )
+
+from platform_api.models.session import Session
 
 __all__ = [
     "RunnerCapacity",

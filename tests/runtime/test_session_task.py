@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import pytest
 
-from bot.config import Settings
+from bot.runtime.snapshots import RuntimeSnapshot
 from bot.runtime.session_task import (
     PendingSession,
     RetainedSession,
@@ -75,9 +75,16 @@ class BlockingRuntimeConfigPlatform(NoPlatformCalls):
 class RecordingStopStore:
     storage_backend = "postgresql"
 
-    def __init__(self, events: list[str]) -> None:
+    def __init__(self, events: list[str], *, ready_error: bool = False) -> None:
         self.events = events
         self.records = {}
+        self.ready_error = ready_error
+        self.ready_checks = 0
+
+    async def ensure_ready(self) -> None:
+        self.ready_checks += 1
+        if self.ready_error:
+            raise RuntimeError("schema unavailable")
 
     async def load_stop_record(self, session_id: str, session_version: int):
         return self.records.get((session_id, session_version))
@@ -86,6 +93,50 @@ class RecordingStopStore:
         self.events.append("stop_record_saved")
         self.records[(session_id, session_version)] = record
 
+
+
+class RecordingPlaybackMessageRuntime:
+    def __init__(self, *, block: bool = False) -> None:
+        self.calls = []
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        if not block:
+            self.release.set()
+        self.deny_calls = 0
+
+    async def accept_playback_receipt(self, message, *, sender_peer_id: str):
+        self.calls.append((message, sender_peer_id))
+        self.started.set()
+        await self.release.wait()
+        return True
+
+    def deny_speech(self) -> None:
+        self.deny_calls += 1
+
+
+def _bound_message_manager(*, block: bool = False):
+    manager = SessionTaskManager(
+        platform=NoPlatformCalls(),
+        base_settings=_settings(),
+    )
+    session_id = uuid4()
+    peer_id = uuid4()
+    pc_id = "smallwebrtc-pc"
+    origin = "https://voice.example.test"
+    runtime = RecordingPlaybackMessageRuntime(block=block)
+    pending = SimpleNamespace(
+        snapshot=SimpleNamespace(session_id=session_id),
+        peer_id=peer_id,
+        origin=origin,
+        pc_id=pc_id,
+        platform_release=False,
+        pipeline_done=asyncio.Event(),
+        playback_receipt_lock=asyncio.Lock(),
+        runtime=runtime,
+    )
+    manager._pending[session_id] = pending
+    manager._pc_bindings[pc_id] = (session_id, peer_id, origin)
+    return manager, pending, runtime
 
 class RecordingMeter:
     receipt_source = "committed_playback_receipts"
@@ -295,6 +346,68 @@ async def test_session_offer_fails_closed_before_platform_join_without_postgres_
 
 
 @pytest.mark.asyncio
+async def test_begin_pipeline_applies_published_settings_to_base_settings():
+    base_settings = _settings().model_copy(
+        update={
+            "llm_provider": "ollama",
+            "llm_base_url": "http://localhost:11434/v1",
+        }
+    )
+    manager = SessionTaskManager(platform=NoPlatformCalls(), base_settings=base_settings)
+    session_id = uuid4()
+    peer_id = uuid4()
+    now = datetime.now(timezone.utc)
+    snapshot = RuntimeSnapshot(
+        session_id=session_id,
+        owner_user_id=uuid4(),
+        participant_id=peer_id,
+        auth_session_id=None,
+        participant_kind="owner",
+        origin="https://voice.example.test",
+        runner_id="runner-local",
+        registration_id=uuid4(),
+        config_version_id=uuid4(),
+        session_version=1,
+        state="RECONNECTING",
+        connect_deadline=now,
+        hard_end_deadline=now + timedelta(minutes=10),
+        budget=None,
+        hashes=(),
+        capabilities=None,
+        compiled=None,
+        model_pins={"llm_provider": "ollama", "llm_model": "published-model"},
+        policy_prompt="",
+        system_instruction="Published system instruction",
+    )
+    pending = PendingSession(
+        snapshot=snapshot,
+        join=JoinConsumptionView(
+            session_id=session_id,
+            peer_id=peer_id,
+            runner_id="runner-local",
+            session_version=1,
+            state="RECONNECTING",
+            reconnect=True,
+        ),
+        peer_id=peer_id,
+        token_digest="join-token-digest",
+        origin=snapshot.origin,
+        runtime=None,
+        playback_verifier=None,
+        usage_meter=None,
+        speech_gate=asyncio.Event(),
+    )
+
+    session_settings = await manager.begin_pipeline(pending)
+
+    assert session_settings is not base_settings
+    assert session_settings.llm_model == "published-model"
+    assert session_settings.system_instruction == "Published system instruction"
+    assert base_settings.llm_model != "published-model"
+    assert base_settings.system_instruction != "Published system instruction"
+
+
+@pytest.mark.asyncio
 async def test_terminal_flow_teardown_uses_ending_and_durable_stop_before_completion():
     manager, platform, pending, store, budget, events = await _lifecycle_manager(
         terminal=True,
@@ -376,9 +489,143 @@ async def test_transport_disconnect_keeps_the_reconnect_peer_release_path():
 
 
 @pytest.mark.asyncio
+async def test_registration_fails_closed_when_store_schema_is_unready():
+    platform = NoPlatformCalls()
+    store = RecordingStopStore([], ready_error=True)
+    manager = SessionTaskManager(
+        platform=platform,
+        base_settings=_settings(),
+        event_store=store,
+    )
+
+    with pytest.raises(SessionAdmissionError, match="unavailable"):
+        await manager.register(_registration_request(uuid4(), uuid4()))
+
+    assert manager._registrations == {}
+    assert store.ready_checks == 1
+
+
+@pytest.mark.asyncio
+async def test_playback_callback_maps_bound_pc_sender_to_platform_peer():
+    manager, pending, runtime = _bound_message_manager()
+    message = {"type": "flow-playback-receipt", "version": 1}
+
+    assert await manager._accept_bound_playback_message(
+        pending,
+        message,
+        pending.pc_id,
+    ) is True
+    assert runtime.calls == [(message, str(pending.peer_id))]
+
+    assert await manager._accept_bound_playback_message(
+        pending,
+        message,
+        str(pending.peer_id),
+    ) is None
+    assert await manager._accept_bound_playback_message(
+        pending,
+        message,
+        "unexpected-pc",
+    ) is None
+
+    manager._pc_bindings[pending.pc_id] = (
+        pending.snapshot.session_id,
+        uuid4(),
+        pending.origin,
+    )
+    assert await manager._accept_bound_playback_message(
+        pending,
+        message,
+        pending.pc_id,
+    ) is None
+    assert len(runtime.calls) == 1
+    manager._pc_bindings[pending.pc_id] = (
+        pending.snapshot.session_id,
+        pending.peer_id,
+        pending.origin,
+    )
+    manager._pending[pending.snapshot.session_id] = SimpleNamespace()
+    assert await manager._accept_bound_playback_message(
+        pending,
+        message,
+        pending.pc_id,
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_playback_callback_serializes_receipt_with_release():
+    manager, pending, runtime = _bound_message_manager(block=True)
+    message = {"type": "flow-playback-receipt", "version": 1}
+    receipt_task = asyncio.create_task(
+        manager._accept_bound_playback_message(pending, message, pending.pc_id)
+    )
+    await runtime.started.wait()
+
+    release_task = asyncio.create_task(manager._mark_platform_release(pending))
+    await asyncio.sleep(0)
+    assert not release_task.done()
+    assert not pending.platform_release
+
+    runtime.release.set()
+    assert await receipt_task is True
+    await release_task
+    assert pending.platform_release
+    assert runtime.deny_calls == 1
+    assert await manager._accept_bound_playback_message(
+        pending,
+        message,
+        pending.pc_id,
+    ) is None
+    assert len(runtime.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_abort_transport_halts_output_before_closing_connection():
+    events = []
+
+    class Cursor:
+        halted = False
+
+        def halt(self):
+            events.append("halt")
+            self.halted = True
+
+        def can_write(self):
+            return not self.halted
+
+    cursor = Cursor()
+
+    class Connection:
+        connected = True
+
+        def is_connected(self):
+            return self.connected
+
+        async def disconnect(self):
+            assert cursor.halted
+            events.append("disconnect")
+            self.connected = False
+
+    manager = SessionTaskManager(
+        platform=NoPlatformCalls(),
+        base_settings=_settings(),
+    )
+    pending = SimpleNamespace(media_stopped=False)
+
+    assert await manager._abort_transport(pending, cursor, Connection()) is True
+    assert events == ["halt", "disconnect"]
+    assert not cursor.can_write()
+    assert pending.media_stopped is True
+
+@pytest.mark.asyncio
 async def test_invalid_session_requests_reclaim_admission_locks(monkeypatch):
     platform = NoPlatformCalls()
-    manager = SessionTaskManager(platform=platform, base_settings=_settings())
+    store = RecordingStopStore([])
+    manager = SessionTaskManager(
+        platform=platform,
+        base_settings=_settings(),
+        event_store=store,
+    )
     monkeypatch.setattr(manager, "_require_session_prerequisites", lambda: None)
 
     for _ in range(20):
@@ -403,7 +650,12 @@ async def test_invalid_session_requests_reclaim_admission_locks(monkeypatch):
 @pytest.mark.asyncio
 async def test_admission_lock_waiters_share_the_lock_until_they_finish(monkeypatch):
     platform = BlockingRuntimeConfigPlatform()
-    manager = SessionTaskManager(platform=platform, base_settings=_settings())
+    store = RecordingStopStore([])
+    manager = SessionTaskManager(
+        platform=platform,
+        base_settings=_settings(),
+        event_store=store,
+    )
     monkeypatch.setattr(manager, "_require_session_prerequisites", lambda: None)
     session_id = uuid4()
     registration_id = uuid4()
