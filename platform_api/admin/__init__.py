@@ -1,1 +1,0 @@
-"""Platform operator API package."""
