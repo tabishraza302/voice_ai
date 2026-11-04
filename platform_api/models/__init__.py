@@ -19,6 +19,8 @@ from platform_api.models.auth import (
     AuthToken,
     User,
 )
+from platform_api.models.provider_secret import ProviderSecret
+from platform_api.models.provider_model_entry import ProviderModelEntry
 from platform_api.models.session import Session
 from platform_api.sessions.models import (
     RunnerCapacity,
@@ -100,4 +102,6 @@ __all__ = [
     "PublicDeployment",
     "PublicGuestCapability",
     "FlowQAJob",
+    "ProviderSecret",
+    "ProviderModelEntry",
 ]

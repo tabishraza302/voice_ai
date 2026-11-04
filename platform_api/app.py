@@ -20,6 +20,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from platform_api.accounts.admin_routes import router as admin_router
 from platform_api.accounts.routes import router as account_router
 from platform_api.admin.routes import router as platform_admin_api_router
+from platform_api.admin.provider_routes import router as admin_provider_router
 from platform_api.sessions.history_routes import router as session_history_router
 from platform_api.agents.config import DEFAULT_AGENT_CONFIG_MAX_BYTES
 from platform_api.agents.routes import router as agents_router
@@ -51,6 +52,8 @@ from platform_api.health import router as health_router
 from platform_api.qualification import (
     DeploymentIdentity,
     load_deployment_capability_report,
+    has_qualified_voice_playback,
+    is_trusted_deployment_report,
 )
 from platform_api.sessions.routes import (
     internal_router as internal_sessions_router,
@@ -61,7 +64,21 @@ import platform_api.models  # Register complete platform models onto Base.metada
 
 AUTH_ROUTE_BODY_LIMIT = 8192  # 8 KiB
 AGENT_REQUEST_BODY_LIMIT = DEFAULT_AGENT_CONFIG_MAX_BYTES + 1024
-SESSION_REQUEST_BODY_LIMIT = 8192
+PROVIDER_SECRET_REQUEST_BODY_LIMIT = 8192
+PROVIDER_MODEL_REQUEST_BODY_LIMIT = 8192
+SESSION_REQUEST_BODY_LIMIT = 8192  # 8 KiB
+
+
+def _request_path_without_root_path(scope: Scope) -> str:
+    path = str(scope.get("path", ""))
+    root_path = str(scope.get("root_path", ""))
+    if not root_path or not path.startswith(root_path):
+        return path
+    if path == root_path:
+        return ""
+    if path.startswith(f"{root_path}/"):
+        return path[len(root_path) :]
+    return path
 
 
 class RequestContextMiddleware:
@@ -96,7 +113,7 @@ class RequestContextMiddleware:
                 message = {**message, "headers": headers}
             await send(message)
 
-        path = request.url.path
+        path = _request_path_without_root_path(scope)
         is_agent_body_request = (
             (path == "/api/v1/agents" or path.startswith("/api/v1/agents/"))
             and request.method in {"POST", "PATCH", "PUT", "DELETE"}
@@ -117,6 +134,16 @@ class RequestContextMiddleware:
             )
             and request.method == "POST"
         )
+        is_provider_secret_update = (
+            path.startswith("/api/v1/admin/providers/")
+            and path.endswith("/secrets")
+            and request.method == "PUT"
+        )
+        is_provider_model_mutation = (
+            path.startswith("/api/v1/admin/providers/")
+            and (path.endswith("/models") or "/models/" in path)
+            and request.method in {"POST", "PATCH", "PUT", "DELETE"}
+        )
         if path.startswith("/api/v1/auth"):
             body_limit = AUTH_ROUTE_BODY_LIMIT
             too_large_message = "Request body exceeds 8 KiB limit"
@@ -129,6 +156,12 @@ class RequestContextMiddleware:
                 "Agent request body exceeds "
                 f"{AGENT_REQUEST_BODY_LIMIT} byte limit"
             )
+        elif is_provider_secret_update:
+            body_limit = PROVIDER_SECRET_REQUEST_BODY_LIMIT
+            too_large_message = "Provider secret update body exceeds 8 KiB limit"
+        elif is_provider_model_mutation:
+            body_limit = PROVIDER_MODEL_REQUEST_BODY_LIMIT
+            too_large_message = "Provider model update body exceeds 8 KiB limit"
         else:
             body_limit = None
             too_large_message = ""
@@ -210,10 +243,31 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     billing_recovery_worker_task: asyncio.Task[None] | None = None
 
     try:
-        app.state.catalog = load_catalog(settings.catalog_path)
         app.state.adapter_capability_report = load_deployment_capability_report(
             settings.adapter_capability_report_path,
             settings.adapter_capability_report_hash,
+        )
+        trusted_report = is_trusted_deployment_report(
+            app.state.adapter_capability_report,
+            settings,
+        )
+        qualified_settings = (
+            app.state.adapter_capability_report.agent_settings.model_dump(
+                mode="python",
+                exclude_none=True,
+            )
+            if trusted_report and app.state.adapter_capability_report is not None
+            else None
+        )
+        app.state.catalog = load_catalog(
+            settings.catalog_path,
+            qualified_settings=qualified_settings,
+            tts_playback_qualified=(
+                trusted_report
+                and has_qualified_voice_playback(
+                    app.state.adapter_capability_report
+                )
+            ),
         )
 
         try:
@@ -327,7 +381,7 @@ def create_app(settings: PlatformSettings | None = None) -> FastAPI:
             CORSMiddleware,
             allow_origins=resolved_settings.cors_origins,
             allow_credentials=True,
-            allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+            allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
             allow_headers=[
                 "Content-Type",
                 "X-CSRF-Token",
@@ -380,6 +434,7 @@ def create_app(settings: PlatformSettings | None = None) -> FastAPI:
     api_v1.include_router(account_router)
     api_v1.include_router(admin_router)
     api_v1.include_router(platform_admin_api_router)
+    api_v1.include_router(admin_provider_router)
     api_v1.include_router(admin_billing_router)
     api_v1.include_router(billing_router)
     api_v1.include_router(health_router)

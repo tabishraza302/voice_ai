@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from platform_api.config import PlatformSettings, get_settings
+from platform_api.auth.errors import DependencyUnavailableError
 from platform_api.db.base import DEFAULT_PLATFORM_SCHEMA
 
 
@@ -89,7 +90,8 @@ def get_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]
 async def get_db(request: Request) -> AsyncIterator[AsyncSession]:
     """FastAPI dependency yielding an isolated AsyncSession from request.app.state.
 
-    Explicitly requires app.state.session_factory. No global session fallback is permitted.
+    It requires an app-state session factory and never falls back globally. Once lifespan
+    marks the schema unready, database-backed routes fail before opening a session.
     """
     if (
         request is None
@@ -101,6 +103,9 @@ async def get_db(request: Request) -> AsyncIterator[AsyncSession]:
             "Database session factory is not configured on app.state. "
             "Ensure the FastAPI app was created via create_app() with lifespan active."
         )
+
+    if getattr(request.app.state, "schema_ready", None) is False:
+        raise DependencyUnavailableError("Platform schema is not ready")
 
     factory: async_sessionmaker[AsyncSession] = request.app.state.session_factory
 
