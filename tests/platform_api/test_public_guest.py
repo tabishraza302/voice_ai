@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 import uuid
 
 import httpx
@@ -15,21 +17,24 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from pydantic import SecretStr
 from sqlalchemy import select
 
-from platform_api.auth.errors import DependencyUnavailableError
-from platform_api.agents.models import Agent, AgentVersion
+from platform_api.agents.config import DEFAULT_AGENT_SETTINGS
 from platform_api.app import create_app
+from platform_api.auth.errors import DependencyUnavailableError
 from platform_api.auth.sessions import create_authenticated_session
 from platform_api.billing.models import CallBudget, WalletAccount
 from platform_api.config import PlatformSettings
 from platform_api.models.auth import User
+from platform_api.models.provider_model_entry import ProviderModelEntry
 from platform_api.models.session import Session
 from platform_api.sessions.models import (
     RuntimeRegistration,
     SessionJoinJti,
     SessionParticipant,
     SessionPeer,
+    SessionSlot,
 )
 from platform_api.sessions.admission import public_session_admission_config
+from platform_api.sessions import service as session_service
 from tests.support.billing import create_funded_wallet, create_test_user
 from tests.support.postgres import FreshPostgres
 
@@ -38,6 +43,7 @@ from tests.support.postgres import FreshPostgres
 async def guest_client(
     initialized_pg: FreshPostgres,
     test_platform_settings: PlatformSettings,
+    qualified_test_llm,
     monkeypatch: pytest.MonkeyPatch,
 ):
     key = Ed25519PrivateKey.generate()
@@ -87,22 +93,6 @@ async def guest_client(
     )
     app = create_app(settings)
 
-    from platform_api import sessions as session_package
-    from platform_api.sessions import service as session_service
-
-    async def ready_published_version(*args, **kwargs):
-        return None, None, {
-            "model_pins": {
-                "llm_model": "qualification-test-model",
-                "stt_provider": "qualification-test-stt",
-                "tts_voice_en": "qualification-test-en",
-                "tts_voice_hi": "qualification-test-hi",
-            }
-        }
-
-    monkeypatch.setattr(session_service, "_load_owned_version", ready_published_version)
-    monkeypatch.setattr(session_service, "_validate_voice_qualification", lambda *a, **k: None)
-
     async def register_runtime(config, command):
         from platform_api.sessions.schemas import RuntimeReservation
 
@@ -126,10 +116,6 @@ async def guest_client(
 
     monkeypatch.setattr(session_service, "register_with_runtime", register_runtime)
     monkeypatch.setattr(session_service, "release_from_runtime", release_runtime)
-    monkeypatch.setattr(
-        "platform_api.public.routes._publication_context",
-        lambda request: (None, None),
-    )
 
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
@@ -160,6 +146,22 @@ async def test_public_signaling_requires_https_api_offer(
         public_session_admission_config(invalid_settings)
 
 
+def _guest_agent_config() -> dict[str, object]:
+    fixture_path = (
+        Path(__file__).resolve().parents[1]
+        / "fixtures"
+        / "flow"
+        / "valid-loan-en-hi.json"
+    )
+    flow = json.loads(fixture_path.read_text(encoding="utf-8"))["flow"]
+    return {
+        **flow,
+        **DEFAULT_AGENT_SETTINGS,
+        "llm_provider": "ollama",
+        "llm_model": "qwen3.5:4b",
+    }
+
+
 async def _owner_and_agent(
     initialized_pg: FreshPostgres,
     settings: PlatformSettings,
@@ -179,38 +181,6 @@ async def _owner_and_agent(
             user_agent="Task 7 guest contract test",
             now=now,
         )
-        agent_id = uuid.uuid4()
-        version_id = uuid.uuid4()
-        agent = Agent(
-            id=agent_id,
-            owner_user_id=owner.id,
-            name="Guest contract agent",
-            description="Public guest fixture",
-            persona_prompt="Be helpful.",
-            enabled=True,
-            draft_revision=1,
-            current_published_version_id=None,
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(agent)
-        await db.flush()
-        version = AgentVersion(
-            id=version_id,
-            agent_id=agent_id,
-            version=1,
-            immutable_config_json={},
-            authoring_hash="a" * 64,
-            flow_hash="b" * 64,
-            artifact_hash="c" * 64,
-            policy_version_id=None,
-            compiler_version="flow-compiler/test",
-            changelog="fixture",
-            created_at=now,
-        )
-        db.add(version)
-        await db.flush()
-        agent.current_published_version_id = version_id
         await create_funded_wallet(db, user_id=owner.id, credited_minor=wallet_minor)
         await db.commit()
 
@@ -226,6 +196,32 @@ async def _owner_and_agent(
         "X-CSRF-Token": boot.json()["csrf_token"],
         "Content-Type": "application/json",
     }
+
+    created = await client.post(
+        "/api/v1/agents",
+        headers=owner_headers,
+        json={"name": "Guest contract agent", "description": "Public guest fixture"},
+    )
+    assert created.status_code == 201, created.text
+    agent_id = uuid.UUID(created.json()["id"])
+    patched = await client.patch(
+        f"/api/v1/agents/{agent_id}/draft",
+        headers=owner_headers,
+        json={"expected_revision": 1, "config": _guest_agent_config()},
+    )
+    assert patched.status_code == 200, patched.text
+    published = await client.post(
+        f"/api/v1/agents/{agent_id}/publish",
+        headers={**owner_headers, "Idempotency-Key": f"guest-publish-{agent_id}"},
+        json={"expected_revision": 2, "changelog": "Publish guest contract agent"},
+    )
+    assert published.status_code == 201, published.text
+    version_id = uuid.UUID(published.json()["version_id"])
+    enabled = await client.post(
+        f"/api/v1/agents/{agent_id}/enable",
+        headers=owner_headers,
+    )
+    assert enabled.status_code == 200, enabled.text
     return owner, agent_id, version_id, owner_headers
 
 
@@ -701,6 +697,150 @@ async def test_expired_guest_capability_is_rejected_and_revoked_on_terminal_stat
         headers={"Origin": settings.web_origin, "Cookie": guest_cookie},
     )
     assert expired.status_code == 401
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_guest_admission_rejects_disabled_pinned_model(
+    guest_client,
+    initialized_pg: FreshPostgres,
+):
+    client, settings = guest_client
+    owner, agent_id, _version_id, owner_headers = await _owner_and_agent(
+        initialized_pg,
+        settings,
+        client,
+        email="guest-disabled-model@example.com",
+    )
+    public_id = await _create_deployment(
+        client, agent_id=agent_id, owner_headers=owner_headers
+    )
+
+    async with initialized_pg.sessions() as db:
+        model = (
+            await db.execute(
+                select(ProviderModelEntry).where(
+                    ProviderModelEntry.provider_id == "ollama",
+                    ProviderModelEntry.model_id == "qwen3.5:4b",
+                )
+            )
+        ).scalar_one()
+        model.enabled = False
+        await db.commit()
+
+    admitted = await _bootstrap_and_admit(
+        client, settings, public_id, key="disabled-model-admission"
+    )
+    assert admitted.status_code == 409, admitted.text
+    assert admitted.json()["error"]["message"] == (
+        "Published agent runtime model is no longer qualified"
+    )
+
+    async with initialized_pg.sessions() as db:
+        sessions = (
+            await db.execute(
+                select(Session).where(Session.owner_user_id == owner.id)
+            )
+        ).scalars().all()
+        assert not sessions
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remove_model", [False, True], ids=["disabled", "deleted"])
+async def test_guest_admission_compensates_when_pinned_model_changes_after_reservation(
+    guest_client,
+    initialized_pg: FreshPostgres,
+    monkeypatch: pytest.MonkeyPatch,
+    remove_model: bool,
+):
+    client, settings = guest_client
+    owner, agent_id, _version_id, owner_headers = await _owner_and_agent(
+        initialized_pg,
+        settings,
+        client,
+        email=f"guest-model-race-{remove_model}@example.com",
+    )
+    public_id = await _create_deployment(
+        client,
+        agent_id=agent_id,
+        owner_headers=owner_headers,
+        key=f"guest-model-race-deployment-{remove_model}",
+    )
+    original_register = session_service.register_runtime
+    registration_calls = []
+    release_calls = []
+
+    async def disable_before_pre_registration(db, **kwargs):
+        async with initialized_pg.sessions() as model_db:
+            model = await model_db.get(ProviderModelEntry, ("ollama", "qwen3.5:4b"))
+            assert model is not None
+            if remove_model:
+                await model_db.delete(model)
+            else:
+                model.enabled = False
+            await model_db.commit()
+        return await original_register(db, **kwargs)
+
+    async def register_runner(config, command):
+        from platform_api.sessions.schemas import RuntimeReservation
+
+        registration_calls.append(command)
+        return RuntimeReservation(
+            session_id=command.session_id,
+            runner_id=command.runner_id,
+            registration_id=command.registration_id,
+            expires_at=command.connect_deadline,
+        )
+
+    async def release_runner(config, command):
+        from platform_api.sessions.schemas import RuntimeReleaseAcknowledgement
+
+        release_calls.append(command)
+        return RuntimeReleaseAcknowledgement(
+            session_id=command.session_id,
+            runner_id=command.runner_id,
+            registration_id=command.registration_id,
+            session_version=command.session_version,
+            released=True,
+        )
+
+    monkeypatch.setattr(session_service, "register_runtime", disable_before_pre_registration)
+    monkeypatch.setattr(session_service, "register_with_runtime", register_runner)
+    monkeypatch.setattr(session_service, "release_from_runtime", release_runner)
+
+    admitted = await _bootstrap_and_admit(
+        client,
+        settings,
+        public_id,
+        key=f"guest-model-race-admission-{remove_model}",
+    )
+    assert admitted.status_code == 409, admitted.text
+    assert admitted.json()["error"]["message"] == (
+        "Published agent runtime model is no longer qualified"
+    )
+    assert registration_calls == []
+    assert release_calls == []
+
+    async with initialized_pg.sessions() as db:
+        sessions = (
+            await db.execute(
+                select(Session).where(Session.owner_user_id == owner.id)
+            )
+        ).scalars().all()
+        assert len(sessions) == 1
+        session = sessions[0]
+        assert session.state == "FAILED"
+        assert session.failure_code == "MODEL_UNAVAILABLE"
+        registration = await db.get(RuntimeRegistration, session.id)
+        assert registration is not None
+        assert registration.status == "RELEASED"
+        slot = (
+            await db.execute(
+                select(SessionSlot).where(SessionSlot.session_id == session.id)
+            )
+        ).scalar_one()
+        assert slot.released_at is not None
 
 
 @pytest.mark.postgres

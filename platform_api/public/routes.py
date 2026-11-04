@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from platform_api.agents.routes import _publication_context
+from platform_api.agents.routes import _publication_context, _request_catalog
 from platform_api.auth.csrf import validate_content_type, validate_origin
 from platform_api.auth.dependencies import (
     get_client_ip,
@@ -172,6 +172,7 @@ async def post_public_guest_session(
         operation_id=idempotency_key,
         capabilities=capabilities,
         qualification_settings=qualification_settings,
+        catalog=await _request_catalog(request, db),
         settings=settings,
     )
     max_age = max(

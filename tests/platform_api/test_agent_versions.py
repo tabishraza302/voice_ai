@@ -18,6 +18,7 @@ import uuid
 
 import httpx
 import pytest
+from bot.provider_registry import provider_registry
 
 from bot.flow.schemas import FlowLimits
 from platform_api.app import create_app
@@ -38,9 +39,10 @@ def load_valid_flow() -> dict[str, Any]:
 
 
 def load_text_only_flow() -> dict[str, Any]:
-    """Load a flow with both TTS voices explicitly disabled."""
     return {
         **load_valid_flow(),
+        "llm_provider": "ollama",
+        "llm_model": "qwen3.5:4b",
         "tts_voice_en": "",
         "tts_voice_hi": "",
     }
@@ -182,6 +184,7 @@ async def test_structurally_valid_incomplete_autosave(
     app_client: httpx.AsyncClient,
     test_platform_settings: PlatformSettings,
     initialized_pg: FreshPostgres,
+    qualified_test_llm,
 ):
     """Schema-valid but semantically incomplete drafts save successfully with diagnostics."""
     user, headers = await create_test_user_session(
@@ -197,6 +200,10 @@ async def test_structurally_valid_incomplete_autosave(
 
     # Incomplete flow: valid schema, but missing transitions, entry/exit steps, etc.
     incomplete_flow = {
+        "llm_provider": "ollama",
+        "llm_model": "qwen3.5:4b",
+        "tts_voice_en": "",
+        "tts_voice_hi": "",
         "schema_version": 1,
         "steps": [
             {
@@ -291,6 +298,7 @@ async def test_envelope_unknown_setting_fails_save(
 
     envelope = {
         "flow": load_valid_flow(),
+        "llm_provider": "ollama",
         "llm_model": "qwen3.5:4b",
         "unexpected_setting": "not_allowed",
     }
@@ -317,6 +325,7 @@ async def test_draft_validate_endpoint_and_stale_hash(
     app_client: httpx.AsyncClient,
     test_platform_settings: PlatformSettings,
     initialized_pg: FreshPostgres,
+    qualified_test_llm,
 ):
     """POST /agents/{id}/validate validates draft and detects stale authoring hashes."""
     user, headers = await create_test_user_session(
@@ -370,9 +379,87 @@ async def test_draft_validate_endpoint_and_stale_hash(
     assert val_valid_res.json()["eligible_for_publish"] is True
 
 
+def test_unconfigured_catalog_has_no_fabricated_model_entries() -> None:
+    catalog = load_catalog()
+
+    assert catalog.llm_models == []
+    assert catalog.generation_models == []
+
+
+def test_file_catalog_does_not_approve_llms_and_uses_registered_speech_metadata(tmp_path) -> None:
+    catalog_path = tmp_path / "qualified-catalog.json"
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "llm_models": [
+                    {
+                        "id": "reviewed-model",
+                        "name": "Reviewed model",
+                        "brand": "Reviewed brand",
+                    },
+                    {"id": "brandless-model", "name": "Brandless model"},
+                ],
+                "stt_providers": [{"id": "reviewed-stt", "name": "Reviewed STT"}],
+                "tts_voices": [{"id": "reviewed-voice", "name": "Reviewed voice"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    catalog = load_catalog(catalog_path)
+
+    assert catalog.llm_models == []
+    assert [item.id for item in catalog.stt_providers] == [
+        provider.id for provider in provider_registry("stt")
+    ]
+    assert all(
+        not model.selectable
+        for provider in catalog.stt_providers
+        for model in provider.models
+    )
+    expected_voices = list(
+        dict.fromkeys(
+            voice.id
+            for provider in provider_registry("tts")
+            for model in provider.models
+            for voice in model.voices
+        )
+    )
+    assert [item.id for item in catalog.tts_voices] == expected_voices
+    assert "reviewed-stt" not in {item.id for item in catalog.stt_providers}
+    assert "reviewed-voice" not in {item.id for item in catalog.tts_voices}
+    assert all(not model.selectable for provider in catalog.tts_providers for model in provider.models)
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_catalog_endpoint_returns_configured_qualified_data(
+    app_client: httpx.AsyncClient,
+    qualified_test_llm,
+) -> None:
+    response = await app_client.get("/api/v1/catalog")
+
+    assert response.status_code == 200
+    catalog = response.json()
+    assert [item["id"] for item in catalog["llm_models"]] == ["qwen3.5:4b"]
+    assert catalog["llm_models"][0]["provider_id"] == "ollama"
+    assert [item["id"] for item in catalog["stt_providers"]] == [
+        provider.id for provider in provider_registry("stt")
+    ]
+    expected_voices = list(
+        dict.fromkeys(
+            voice.id
+            for provider in provider_registry("tts")
+            for model in provider.models
+            for voice in model.voices
+        )
+    )
+    assert [item["id"] for item in catalog["tts_voices"]] == expected_voices
+
+
 def test_explicit_missing_catalog_path_fails_closed(tmp_path) -> None:
     with pytest.raises(ValueError):
         load_catalog(tmp_path / "missing-catalog.json")
+
 
 
 @pytest.mark.postgres
@@ -423,6 +510,7 @@ async def test_agent_draft_bounds_reject_without_changing_saved_hash(
 
     oversized_full_config = {
         **near_limit_flow,
+        "llm_provider": "ollama",
         "llm_model": "qwen3.5:4b",
         "stt_provider": "mlx-audio",
         "tts_voice_en": "",
@@ -521,6 +609,7 @@ async def test_restore_draft_from_published_version(
     app_client: httpx.AsyncClient,
     test_platform_settings: PlatformSettings,
     initialized_pg: FreshPostgres,
+    qualified_test_llm,
 ):
     """Restoring draft from a published version copies the pinned authoring flow into the draft."""
     user, headers = await create_test_user_session(

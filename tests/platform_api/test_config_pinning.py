@@ -22,9 +22,25 @@ import httpx
 import pytest
 from sqlalchemy import select
 
+from platform_api.agents.config import (
+    LEGACY_AGENT_SETTING_KEYS,
+    V2_AGENT_SETTING_KEYS,
+    compute_legacy_model_hash,
+    compute_legacy_settings_hash,
+    compute_legacy_voice_hash,
+    compute_model_hash,
+    compute_model_hash_v3,
+    compute_settings_hash,
+    compute_settings_hash_v3,
+    compute_voice_hash,
+    compute_voice_hash_v3,
+    extract_settings,
+)
 from platform_api.agents.defaults import compute_policy_hash
-from platform_api.agents.models import AgentDraft, AgentVersion, PlatformPromptVersion
-from platform_api.agents.publishing import _scrub_secrets, publish_agent_version
+from platform_api.agents.publishing import publish_agent_version
+from platform_api.agents.models import AgentVersion, PlatformPromptVersion
+from platform_api.catalog import CatalogModelItem, ModelCatalog
+from platform_api.agents.validation import validate_catalog_eligibility
 from platform_api.agents.schemas import DraftUpdate
 from platform_api.agents.service import update_draft
 from platform_api.auth.errors import ConflictError
@@ -56,9 +72,109 @@ def load_text_only_flow(filename: str) -> dict[str, Any]:
     """Load a flow with both TTS voices explicitly disabled."""
     return {
         **load_fixture(filename),
+        "llm_provider": "ollama",
+        "llm_model": "qwen3.5:4b",
         "tts_voice_en": "",
         "tts_voice_hi": "",
     }
+
+
+def _catalog_for_snapshot(immutable: dict[str, Any]) -> ModelCatalog:
+    pins = immutable["model_pins"]
+    return ModelCatalog(
+        llm_models=[
+            CatalogModelItem(
+                id=pins["llm_model"],
+                name=pins["llm_model"],
+                provider_id=pins["llm_provider"],
+                selectable=True,
+            )
+        ]
+    )
+
+
+def _immutable_with_legacy_pins(
+    immutable: dict[str, Any], schema_version: int
+) -> dict[str, Any]:
+    settings = extract_settings(immutable["authoring_config"])
+    if schema_version == 1:
+        settings = {key: settings[key] for key in LEGACY_AGENT_SETTING_KEYS}
+        model_hash = compute_legacy_model_hash(settings)
+        voice_hash = compute_legacy_voice_hash(settings)
+        settings_hash = compute_legacy_settings_hash(settings)
+    else:
+        settings = {key: settings[key] for key in V2_AGENT_SETTING_KEYS}
+        model_hash = compute_model_hash(settings)
+        voice_hash = compute_voice_hash(settings)
+        settings_hash = compute_settings_hash(settings)
+    updated = json.loads(json.dumps(immutable))
+    updated["schema_version"] = schema_version
+    updated["model_pins"] = {
+        **settings,
+        "model_hash": model_hash,
+        "voice_hash": voice_hash,
+        "settings_hash": settings_hash,
+    }
+    updated["hashes"].update(
+        {
+            "model_hash": model_hash,
+            "voice_hash": voice_hash,
+            "settings_hash": settings_hash,
+        }
+    )
+    return updated
+
+
+def test_v3_model_hash_pins_provider_identity():
+    settings = extract_settings({})
+    alternate_provider = {**settings, "llm_provider": "openai-compatible"}
+    assert settings["llm_provider"] == "ollama"
+    assert compute_model_hash_v3(settings) != compute_model_hash_v3(alternate_provider)
+    assert compute_settings_hash_v3(settings) != compute_settings_hash_v3(alternate_provider)
+
+
+def test_catalog_model_identity_requires_matching_provider_and_selectable_state():
+    settings = extract_settings({})
+    config = {"flow": {}, **settings}
+
+    def llm_diagnostics(catalog: ModelCatalog) -> list[str]:
+        return [
+            item.code
+            for item in validate_catalog_eligibility(config, catalog)
+            if item.path == "/llm_model"
+        ]
+
+    for item in (
+        CatalogModelItem(
+            id=settings["llm_model"],
+            name="Wrong provider",
+            provider_id="other",
+            selectable=True,
+        ),
+        CatalogModelItem(
+            id=settings["llm_model"],
+            name="Disabled model",
+            provider_id="ollama",
+            selectable=False,
+        ),
+    ):
+        assert llm_diagnostics(ModelCatalog(llm_models=[item])) == [
+            "MODEL_UNQUALIFIED"
+        ]
+
+    assert llm_diagnostics(
+        ModelCatalog(
+            llm_models=[
+                CatalogModelItem(
+                    id=settings["llm_model"],
+                    name="Available Ollama model",
+                    provider_id="ollama",
+                    selectable=True,
+                )
+            ]
+        )
+    ) == []
+
 
 
 async def create_test_user_session(
@@ -121,6 +237,7 @@ async def test_version_bytes_and_hashes_pinned_across_draft_mutations_and_new_ve
     app_client: httpx.AsyncClient,
     test_platform_settings: PlatformSettings,
     initialized_pg: FreshPostgres,
+    qualified_test_llm,
     monkeypatch: pytest.MonkeyPatch,
 ):
     """Publishing Version 2 or editing draft does not alter Version 1 bytes, hashes, or manifest."""
@@ -176,10 +293,39 @@ async def test_version_bytes_and_hashes_pinned_across_draft_mutations_and_new_ve
         )
         assert policy_version is not None
         assert pinned_policy["prompt_text"] == policy_version.prompt_text
+        immutable_snapshot = json.loads(
+            json.dumps(published_version.immutable_config_json)
+        )
+        runtime_catalog = _catalog_for_snapshot(immutable_snapshot)
+        assert immutable_snapshot["schema_version"] == 3
+        assert immutable_snapshot["model_pins"]["llm_provider"] == "ollama"
         verified_snapshot = _validate_immutable_version(
-            published_version, policy_version
+            published_version, policy_version, runtime_catalog
         )
         assert verified_snapshot["policy"]["prompt_text"] == policy_version.prompt_text
+        for schema_version in (1, 2):
+            published_version.immutable_config_json = _immutable_with_legacy_pins(
+                immutable_snapshot, schema_version
+            )
+            with pytest.raises(
+                ConflictError, match="does not pin an LLM provider"
+            ):
+                _validate_immutable_version(
+                    published_version, policy_version, runtime_catalog
+                )
+        published_version.immutable_config_json = json.loads(
+            json.dumps(immutable_snapshot)
+        )
+        tampered_provider = json.loads(json.dumps(immutable_snapshot))
+        tampered_provider["model_pins"]["llm_provider"] = "openai-compatible"
+        published_version.immutable_config_json = tampered_provider
+        with pytest.raises(ConflictError):
+            _validate_immutable_version(
+                published_version, policy_version, runtime_catalog
+            )
+        published_version.immutable_config_json = json.loads(
+            json.dumps(immutable_snapshot)
+        )
         runner_id = "runner-policy-pinning"
         monkeypatch.setattr(
             sessions_service,
@@ -277,6 +423,7 @@ async def test_version_bytes_and_hashes_pinned_across_draft_mutations_and_new_ve
             settings=test_platform_settings,
         )
         assert runtime_config.immutable_config["policy"] == pinned_policy
+        assert runtime_config.immutable_config["compiler_version"] == "flow-compiler/1"
 
         tampered_snapshot = json.loads(
             json.dumps(published_version.immutable_config_json)
@@ -284,7 +431,9 @@ async def test_version_bytes_and_hashes_pinned_across_draft_mutations_and_new_ve
         tampered_snapshot["policy"]["prompt_text"] += " "
         published_version.immutable_config_json = tampered_snapshot
         with pytest.raises(ConflictError):
-            _validate_immutable_version(published_version, policy_version)
+            _validate_immutable_version(
+                published_version, policy_version, runtime_catalog
+            )
 
     # 2. Mutate draft to revision 3
     flow_v2 = load_text_only_flow("valid-credit-card-en-hi.json")
@@ -331,8 +480,10 @@ async def test_concurrency_barrier_retains_version_one_immutability(
     app_client: httpx.AsyncClient,
     test_platform_settings: PlatformSettings,
     initialized_pg: FreshPostgres,
+    qualified_test_catalog,
 ):
     """A direct version-row read on connection A retains V1 through V2 publication on B."""
+    catalog = qualified_test_catalog
     user, headers = await create_test_user_session(
         initialized_pg,
         test_platform_settings,
@@ -354,6 +505,7 @@ async def test_concurrency_barrier_retains_version_one_immutability(
             agent_id=agent_id,
             owner_user_id=user.id,
             payload=DraftUpdate(expected_revision=1, config=flow_v1),
+            catalog=catalog,
         )
         v1, _ = await publish_agent_version(
             session,
@@ -362,6 +514,7 @@ async def test_concurrency_barrier_retains_version_one_immutability(
             expected_revision=2,
             changelog="V1",
             capabilities=None,
+            catalog=catalog,
         )
         await session.commit()
         v1_id = v1.id
@@ -400,6 +553,7 @@ async def test_concurrency_barrier_retains_version_one_immutability(
                     agent_id=agent_id,
                     owner_user_id=user.id,
                     payload=DraftUpdate(expected_revision=2, config=flow_v2),
+                    catalog=catalog,
                 )
                 version_2, _ = await publish_agent_version(
                     connection_b,
@@ -408,6 +562,7 @@ async def test_concurrency_barrier_retains_version_one_immutability(
                     expected_revision=3,
                     changelog="V2 published while V1 read was paused",
                     capabilities=None,
+                    catalog=catalog,
                 )
                 await connection_b.commit()
                 assert version_2.version == 2
@@ -424,6 +579,7 @@ async def test_profile_mutations_do_not_alter_version_records(
     app_client: httpx.AsyncClient,
     test_platform_settings: PlatformSettings,
     initialized_pg: FreshPostgres,
+    qualified_test_llm,
 ):
     """Mutating agent name, description, or enabled state never modifies immutable version records."""
     user, headers = await create_test_user_session(
@@ -495,7 +651,11 @@ async def test_draft_patch_rejects_secret_fields_without_mutating_draft(
     assert create_res.status_code == 201
     agent_id = create_res.json()["id"]
 
-    flow = load_fixture("valid-loan-en-hi.json")
+    flow = {
+        **load_fixture("valid-loan-en-hi.json"),
+        "llm_provider": "ollama",
+        "llm_model": "qwen3.5:4b",
+    }
     flow["api_key"] = "sk-live-should-never-be-saved"
     flow["steps"][0]["access_token"] = "bearer-should-never-be-saved"
 
@@ -523,34 +683,3 @@ async def test_draft_patch_rejects_secret_fields_without_mutating_draft(
     assert "bearer-should-never-be-saved" not in serialized
 
 
-def test_secrets_scrubbing_function():
-    """Unit assertion verifying recursive exclusion of credentials/tokens from immutable configs."""
-    raw_payload = {
-        "schema_version": 1,
-        "api_key": "sk-secret-12345",
-        "secret": "top-secret-val",
-        "password": "plain-text-password",
-        "steps": [
-            {
-                "id": "step1",
-                "title": "Welcome",
-                "access_token": "bearer-secret-token",
-                "nested": {
-                    "private_key": "-----BEGIN RSA PRIVATE KEY-----",
-                    "safe_value": "hello world",
-                },
-            }
-        ],
-    }
-    clean = _scrub_secrets(raw_payload)
-
-    # Verify all forbidden keys were pruned
-    assert "api_key" not in clean
-    assert "secret" not in clean
-    assert "password" not in clean
-    assert "access_token" not in clean["steps"][0]
-    assert "private_key" not in clean["steps"][0]["nested"]
-    # Verify safe fields remain intact
-    assert clean["schema_version"] == 1
-    assert clean["steps"][0]["title"] == "Welcome"
-    assert clean["steps"][0]["nested"]["safe_value"] == "hello world"

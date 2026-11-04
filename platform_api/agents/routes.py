@@ -76,7 +76,7 @@ from platform_api.auth.dependencies import (
 from platform_api.auth.errors import ValidationError
 from platform_api.auth.types import AuthSessionContext, Principal
 from platform_api.db.session import get_db
-from platform_api.catalog import ModelCatalog, load_catalog
+from platform_api.catalog import ModelCatalog, catalog_with_managed_llms, load_catalog
 
 router = APIRouter(tags=["agents"])
 
@@ -110,11 +110,11 @@ def _request_context(request: Request) -> tuple[str | None, uuid.UUID]:
     return client_ip, req_id
 
 
-def _request_catalog(request: Request) -> ModelCatalog:
+async def _request_catalog(request: Request, db: AsyncSession) -> ModelCatalog:
     catalog = getattr(request.app.state, "catalog", None)
-    if catalog is not None:
-        return catalog
-    return load_catalog(get_request_settings(request).catalog_path)
+    if catalog is None:
+        catalog = load_catalog(get_request_settings(request).catalog_path)
+    return await catalog_with_managed_llms(catalog, db)
 
 
 def _publication_context(
@@ -386,7 +386,7 @@ async def get_agent_draft(
         db,
         agent_id=agent_id,
         owner_user_id=principal.user_id,
-        catalog=_request_catalog(request),
+        catalog=await _request_catalog(request, db),
         capabilities=capabilities,
         qualification_settings=qualification_settings,
     )
@@ -411,7 +411,7 @@ async def patch_agent_draft(
         agent_id=agent_id,
         owner_user_id=principal.user_id,
         payload=payload,
-        catalog=_request_catalog(request),
+        catalog=await _request_catalog(request, db),
         capabilities=capabilities,
         qualification_settings=qualification_settings,
         session_id=principal.session_id,
@@ -442,7 +442,7 @@ async def post_validate_agent_draft(
         payload=payload,
         capabilities=capabilities,
         qualification_settings=qualification_settings,
-        catalog=_request_catalog(request),
+        catalog=await _request_catalog(request, db),
     )
 
 
@@ -506,7 +506,7 @@ async def post_publish_agent(
         agent_id=agent_id,
         owner_user_id=principal.user_id,
         payload=payload,
-        catalog=_request_catalog(request),
+        catalog=await _request_catalog(request, db),
         capabilities=capabilities,
         qualification_settings=qualification_settings,
         session_id=principal.session_id,
@@ -587,7 +587,7 @@ async def post_restore_draft(
         agent_id=agent_id,
         owner_user_id=principal.user_id,
         payload=payload,
-        catalog=_request_catalog(request),
+        catalog=await _request_catalog(request, db),
         capabilities=capabilities,
         qualification_settings=qualification_settings,
         session_id=principal.session_id,

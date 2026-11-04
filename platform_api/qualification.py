@@ -9,7 +9,11 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from bot.flow.qualification import CapabilityReport, validate_capability_report
+from bot.flow.qualification import (
+    AgentQualificationSettings,
+    CapabilityReport,
+    validate_capability_report,
+)
 
 
 @dataclass(frozen=True)
@@ -45,6 +49,49 @@ class DeploymentIdentity:
         )
 
 
+def has_qualified_voice_playback(report: CapabilityReport | None) -> bool:
+    """Return whether a provider-bound report qualifies voice playback for publication."""
+    return bool(
+        report is not None
+        and report.protocol_version == 4
+        and isinstance(report.agent_settings, AgentQualificationSettings)
+        and report.playback == "qualified_fragment_completion"
+        and report.speech_gating
+        and report.cancel_generation
+        and report.metadata != "none"
+        and {"en", "hi"}.issubset(report.locales)
+        and len(report.report_hash) == 64
+        and all(char in "0123456789abcdef" for char in report.report_hash)
+    )
+
+
+def is_trusted_deployment_report(
+    report: CapabilityReport | None,
+    settings: Any,
+) -> bool:
+    """Return whether the report hash and independently configured identity agree."""
+    expected_hash = getattr(settings, "adapter_capability_report_hash", None)
+    identity = DeploymentIdentity.from_settings(settings)
+    if (
+        report is None
+        or report.protocol_version != 4
+        or not isinstance(report.agent_settings, AgentQualificationSettings)
+        or not isinstance(expected_hash, str)
+        or not expected_hash
+        or identity is None
+    ):
+        return False
+    try:
+        actual_hash = report.compute_hash()
+    except (TypeError, ValueError):
+        return False
+    return (
+        report.report_hash == expected_hash
+        and actual_hash == expected_hash
+        and identity.matches_report(report)
+    )
+
+
 def load_deployment_capability_report(
     report_path: str | None,
     expected_report_hash: str | None,
@@ -72,7 +119,7 @@ def load_deployment_capability_report(
         raise ValueError("Configured adapter qualification report is incomplete")
     if (
         type(report_data["protocol_version"]) is not int
-        or report_data["protocol_version"] != 2
+        or report_data["protocol_version"] not in {2, 3, 4}
     ):
         raise ValueError(
             "Configured adapter qualification report has an invalid protocol version"

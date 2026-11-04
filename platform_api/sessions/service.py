@@ -23,9 +23,19 @@ from bot.flow.canonical import (
 )
 from platform_api.agents.validation import validate_voice_capability
 from platform_api.agents.config import (
+    LEGACY_AGENT_SETTING_KEYS,
+    V2_AGENT_SETTING_KEYS,
+    SUPPORTED_AGENT_LLM_PROVIDERS,
+    compute_legacy_model_hash,
+    compute_legacy_settings_hash,
+    compute_legacy_voice_hash,
     compute_model_hash,
+    compute_model_hash_v3,
     compute_settings_hash,
+    compute_settings_hash_v3,
     compute_voice_hash,
+    compute_voice_hash_v3,
+    extract_settings,
 )
 from platform_api.agents.defaults import compute_policy_hash
 from platform_api.agents.models import (
@@ -66,6 +76,7 @@ from platform_api.billing.service import (
 )
 from platform_api.billing.tariffs import resolve_active_tariff
 from platform_api.config import PlatformSettings
+from platform_api.catalog import ModelCatalog, catalog_with_managed_llms, load_catalog
 from platform_api.models.auth import AuthSession, User
 from platform_api.models.session import Session
 from platform_api.sessions.admission import (
@@ -102,6 +113,10 @@ from platform_api.sessions.schemas import (
     SessionStateView,
     SessionTransitionRequest,
 )
+
+
+class _RuntimeModelUnavailableError(ConflictError):
+    """The pinned runtime model lost eligibility after a session was reserved."""
 
 
 SESSION_ADMISSION_ACTION = "session.admit"
@@ -242,6 +257,7 @@ async def _verify_owner_session(
 def _validate_immutable_version(
     version: AgentVersion,
     policy_version: PlatformPromptVersion,
+    catalog: ModelCatalog,
 ) -> dict[str, Any]:
     """Recompute every published pin needed by the runtime; never use mutable defaults."""
     snapshot = version.immutable_config_json
@@ -260,22 +276,49 @@ def _validate_immutable_version(
         raise ConflictError("Published agent version is missing required immutable fields")
     if version.policy_version_id is None:
         raise ConflictError("Published agent version has no pinned policy version")
+    schema_version = snapshot.get("schema_version")
+    if type(schema_version) is not int or schema_version not in {1, 2, 3}:
+        raise ConflictError("Published agent version schema is unsupported")
     try:
         authoring_hash = compute_authoring_hash(source)
         flow_hash = compute_flow_hash(normalized)
         artifact_hash = compute_artifact_hash(manifest)
-        settings = {
-            key: value
-            for key, value in pins.items()
-            if key not in {"model_hash", "voice_hash", "settings_hash"}
-        }
-        if not settings or any(not isinstance(key, str) or not isinstance(value, str) for key, value in settings.items()):
+        settings = extract_settings(source)
+        if schema_version == 1:
+            settings = {key: settings[key] for key in LEGACY_AGENT_SETTING_KEYS}
+            expected_hashes = (
+                compute_legacy_model_hash(settings),
+                compute_legacy_voice_hash(settings),
+                compute_legacy_settings_hash(settings),
+            )
+        elif schema_version == 2:
+            settings = {key: settings[key] for key in V2_AGENT_SETTING_KEYS}
+            expected_hashes = (
+                compute_model_hash(settings),
+                compute_voice_hash(settings),
+                compute_settings_hash(settings),
+            )
+        else:
+            expected_hashes = (
+                compute_model_hash_v3(settings),
+                compute_voice_hash_v3(settings),
+                compute_settings_hash_v3(settings),
+            )
+        if set(pins) != set(settings) | {
+            "model_hash",
+            "voice_hash",
+            "settings_hash",
+        }:
             raise ValueError("Invalid immutable setting pins")
-        model_hash = compute_model_hash(settings)
-        voice_hash = compute_voice_hash(settings)
-        settings_hash = compute_settings_hash(settings)
+        if any(pins.get(key) != value for key, value in settings.items()):
+            raise ValueError("Model pins do not match immutable authoring settings")
+        if not all(isinstance(value, str) for value in settings.values()):
+            raise ValueError("Invalid immutable setting pins")
+        model_hash, voice_hash, settings_hash = expected_hashes
     except (KeyError, TypeError, ValueError) as exc:
-        raise ConflictError("Published agent version hashes cannot be verified") from exc
+        raise ConflictError(
+            "Published agent version hashes cannot be verified"
+        ) from exc
 
     try:
         pinned_policy_text = policy["prompt_text"]
@@ -323,6 +366,24 @@ def _validate_immutable_version(
         or hashes.get("settings_hash") != settings_hash
     ):
         raise ConflictError("Published agent snapshot does not match its pinned hashes")
+    if schema_version < 3:
+        raise ConflictError("Published agent version does not pin an LLM provider")
+    llm_provider = settings.get("llm_provider")
+    llm_model = settings.get("llm_model")
+    if (
+        llm_provider not in SUPPORTED_AGENT_LLM_PROVIDERS
+        or not isinstance(llm_model, str)
+    ):
+        raise ConflictError("Published agent version has an unsupported LLM identity")
+    if not any(
+        item.provider_id == llm_provider
+        and item.id == llm_model
+        and item.selectable
+        for item in catalog.llm_models
+    ):
+        raise _RuntimeModelUnavailableError(
+            "Published agent runtime model is no longer qualified"
+        )
     return snapshot
 
 
@@ -332,6 +393,7 @@ async def _load_owned_version(
     owner_user_id: uuid.UUID,
     agent_id: uuid.UUID,
     agent_version_id: uuid.UUID,
+    catalog: ModelCatalog,
 ) -> tuple[AgentVersion, PlatformPromptVersion, dict[str, Any]]:
     result = await db.execute(
         select(AgentVersion, PlatformPromptVersion)
@@ -351,8 +413,44 @@ async def _load_owned_version(
     if row is None:
         raise NotFoundError("Enabled immutable agent version not found")
     version, policy = row
-    snapshot = _validate_immutable_version(version, policy)
+    snapshot = _validate_immutable_version(version, policy, catalog)
     return version, policy, snapshot
+
+
+async def _live_model_catalog(
+    db: AsyncSession, catalog: ModelCatalog | None
+) -> ModelCatalog:
+    base_catalog = catalog if catalog is not None else load_catalog()
+    return await catalog_with_managed_llms(base_catalog, db)
+
+
+async def _validate_session_model_identity(
+    db: AsyncSession,
+    *,
+    session: Session,
+    catalog: ModelCatalog,
+) -> None:
+    if session.agent_version_id is None:
+        raise ConflictError("Registered immutable agent version is unavailable")
+    version_row = (
+        await db.execute(
+            select(AgentVersion, PlatformPromptVersion)
+            .join(
+                PlatformPromptVersion,
+                PlatformPromptVersion.id == AgentVersion.policy_version_id,
+            )
+            .where(
+                AgentVersion.id == session.agent_version_id,
+                AgentVersion.agent_id.in_(
+                    select(Agent.id).where(Agent.owner_user_id == session.owner_user_id)
+                ),
+            )
+        )
+    ).one_or_none()
+    if version_row is None:
+        raise ConflictError("Registered immutable agent version is unavailable")
+    version, policy = version_row
+    _validate_immutable_version(version, policy, catalog)
 
 
 def _validate_voice_qualification(
@@ -473,6 +571,7 @@ async def _create_or_replay_reservation(
     config: SessionAdmissionConfig,
     settings: PlatformSettings,
     now: datetime,
+    catalog: ModelCatalog,
     participant_kind: str = "owner",
     public_deployment_id: uuid.UUID | None = None,
     capability_digest: str | None = None,
@@ -553,6 +652,7 @@ async def _create_or_replay_reservation(
         owner_user_id=owner.id,
         agent_id=agent_id,
         agent_version_id=agent_version_id,
+        catalog=catalog,
     )
     _validate_voice_qualification(
         snapshot,
@@ -690,13 +790,13 @@ async def _load_reservation(
     session_id: uuid.UUID,
 ) -> tuple[Session, RuntimeRegistration, SessionParticipant]:
     session = (
-        await db.execute(select(Session).where(Session.id == session_id))
+        await db.execute(select(Session).where(Session.id == session_id).execution_options(populate_existing=True))
     ).scalar_one_or_none()
     registration = (
         await db.execute(
             select(RuntimeRegistration).where(
                 RuntimeRegistration.session_id == session_id
-            )
+            ).execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     participant = (
@@ -1300,8 +1400,6 @@ async def _registered_guest_result(
             expires_at=join.expires_at,
         ),
     )
-
-
 async def register_runtime(
     db: AsyncSession,
     *,
@@ -1309,11 +1407,12 @@ async def register_runtime(
     runner_id: str,
     registration_id: uuid.UUID,
     settings: PlatformSettings,
+    catalog: ModelCatalog | None = None,
 ) -> RuntimeReservation:
     """Call the configured local runner using the already-persisted registration ID."""
     config = session_runtime_config(settings)
+    # Model rows may have changed since the reservation transaction committed.
     session, registration, _ = await _load_reservation(db, session_id=session_id)
-    await db.commit()
     if (
         runner_id != config.runner_id
         or runner_id != session.runner_id
@@ -1322,6 +1421,9 @@ async def register_runtime(
         or session.state != "RESERVED"
     ):
         raise ForbiddenError("Runtime registration identity does not match reservation")
+    live_catalog = await _live_model_catalog(db, catalog)
+    await _validate_session_model_identity(db, session=session, catalog=live_catalog)
+    await db.commit()
     command = RuntimeRegistrationRequest(
         session_id=session.id,
         runner_id=runner_id,
@@ -1332,8 +1434,6 @@ async def register_runtime(
         hard_end_deadline=session.hard_end_deadline,
     )
     return await register_with_runtime(config, command)
-
-
 async def reserve_session(
     db: AsyncSession,
     *,
@@ -1346,6 +1446,7 @@ async def reserve_session(
     qualification_settings: AgentQualificationSettings | None,
     operation_id: str,
     settings: PlatformSettings,
+    catalog: ModelCatalog | None = None,
 ) -> RegisteredSession:
     result = await _reserve_session(
         db,
@@ -1359,12 +1460,11 @@ async def reserve_session(
         qualification_settings=qualification_settings,
         operation_id=operation_id,
         settings=settings,
+        catalog=catalog,
     )
     if not isinstance(result, RegisteredSession):
         raise DependencyUnavailableError("Owner admission returned a guest result")
     return result
-
-
 async def reserve_guest_session(
     db: AsyncSession,
     *,
@@ -1378,6 +1478,7 @@ async def reserve_guest_session(
     operation_id: str,
     capability_digest: str,
     settings: PlatformSettings,
+    catalog: ModelCatalog | None = None,
 ) -> GuestSessionAdmission:
     result = await _reserve_session(
         db,
@@ -1391,6 +1492,7 @@ async def reserve_guest_session(
         qualification_settings=qualification_settings,
         operation_id=operation_id,
         settings=settings,
+        catalog=catalog,
         participant_kind="guest",
         public_deployment_id=deployment_id,
         capability_digest=capability_digest,
@@ -1413,6 +1515,7 @@ async def _reserve_session(
     qualification_settings: AgentQualificationSettings | None,
     operation_id: str,
     settings: PlatformSettings,
+    catalog: ModelCatalog | None = None,
     participant_kind: str = "owner",
     public_deployment_id: uuid.UUID | None = None,
     capability_digest: str | None = None,
@@ -1445,6 +1548,7 @@ async def _reserve_session(
         kind=kind,
         public_deployment_id=public_deployment_id,
     )
+    catalog = await _live_model_catalog(db, catalog)
     now = _utc_now()
     session_id, outcome, stored_jti = await _create_or_replay_reservation(
         db,
@@ -1460,6 +1564,7 @@ async def _reserve_session(
         request_hash=request_hash,
         config=config,
         settings=settings,
+        catalog=catalog,
         now=now,
         participant_kind=participant_kind,
         public_deployment_id=public_deployment_id,
@@ -1556,7 +1661,19 @@ async def _reserve_session(
             runner_id=registration.runner_id,
             registration_id=registration.registration_id,
             settings=settings,
+            catalog=catalog,
         )
+    except _RuntimeModelUnavailableError:
+        await _mark_admission_failure(
+            db,
+            session_id=session_id,
+            user_id=owner_user_id,
+            operation_id=operation_id,
+            failure_code="MODEL_UNAVAILABLE",
+            now=_utc_now(),
+            action=action,
+        )
+        raise
     except RuntimeRegistrationRejectedError:
         await _mark_admission_failure(
             db,
@@ -1757,8 +1874,10 @@ async def get_runtime_config(
     session_id: uuid.UUID,
     runtime_principal: RuntimePrincipal,
     settings: PlatformSettings,
+    catalog: ModelCatalog | None = None,
 ) -> RuntimeConfigView:
     """Return only the registered immutable version and its current funded permit."""
+    catalog = await _live_model_catalog(db, catalog)
     now = _utc_now()
     config = session_runtime_config(settings)
     if runtime_principal.service_id != "voice-runtime" or runtime_principal.runner_id != config.runner_id:
@@ -1886,7 +2005,7 @@ async def get_runtime_config(
     if version_row is None:
         raise ConflictError("Registered immutable agent version is unavailable")
     version, policy = version_row
-    snapshot = _validate_immutable_version(version, policy)
+    snapshot = _validate_immutable_version(version, policy, catalog)
     budget = (
         await db.execute(select(CallBudget).where(CallBudget.session_id == session_id))
     ).scalar_one_or_none()
