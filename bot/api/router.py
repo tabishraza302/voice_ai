@@ -2,7 +2,7 @@ from fastapi import APIRouter
 from bot.api.routes_agents import router as agents_router
 from bot.api.routes_prompts import router as prompts_router
 from bot.api.routes_models import create_models_router, list_models
-from bot.api.routes_voices import router as voices_router, KOKORO_VOICES
+from bot.api.routes_voices import router as voices_router, TTS_VOICES
 from bot.config import Settings
 from bot.db import session as db_session
 
@@ -38,7 +38,7 @@ def create_api_router(settings: Settings) -> APIRouter:
         return {
             "llm_models": llm_list,
             "stt_providers": models_data["stt_providers"],
-            "tts_voices": KOKORO_VOICES,
+            "tts_voices": TTS_VOICES,
         }
 
     return api
