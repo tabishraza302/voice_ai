@@ -51,6 +51,45 @@ def make_settings(**overrides) -> PlatformSettings:
     kwargs.update(overrides)
     return PlatformSettings(**kwargs)
 
+def test_provider_secret_key_is_optional_dedicated_and_redacted() -> None:
+    from pydantic import SecretStr
+
+    from cryptography.fernet import Fernet
+
+    assert make_settings().provider_secret_key is None
+    key = Fernet.generate_key().decode("ascii")
+    settings = make_settings(provider_secret_key=key)
+    assert isinstance(settings.provider_secret_key, SecretStr)
+    assert settings.provider_secret_key.get_secret_value() == key
+    assert key not in repr(settings)
+
+
+@pytest.mark.parametrize(
+    "provider_secret_key",
+    [
+        "not-a-fernet-key",
+        VALID_CSRF_KEY,
+        VALID_RATE_KEY,
+        VALID_MFA_KEY,
+    ],
+)
+def test_provider_secret_key_rejects_invalid_or_reused_keys(provider_secret_key) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        make_settings(provider_secret_key=provider_secret_key)
+    assert provider_secret_key not in str(exc_info.value)
+
+
+
+def test_provider_secret_key_rejects_base64_alias_of_auth_key() -> None:
+    key = base64.urlsafe_b64encode(b"F" * 32).decode("ascii")
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    last_character = alphabet.index(key[-2])
+    alias = f"{key[:-2]}{alphabet[last_character + 1]}="
+    assert base64.urlsafe_b64decode(alias) == base64.urlsafe_b64decode(key)
+
+    with pytest.raises(ValidationError):
+        make_settings(auth_mfa_key=key, provider_secret_key=alias)
+
 
 def test_operations_policy_limits_have_documented_defaults():
     settings = make_settings()

@@ -28,7 +28,7 @@ from platform_api.health import router as health_router
 def mock_settings() -> PlatformSettings:
     return PlatformSettings(
         database_url="postgresql+asyncpg://voice_ai:voice_ai@127.0.0.1:5439/voice_ai_platform",
-        schema_version="platform-v1",
+        schema_version="platform-v2",
         auth_csrf_key=base64.urlsafe_b64encode(b"C" * 32).decode("ascii"),
         auth_rate_key=base64.urlsafe_b64encode(b"R" * 32).decode("ascii"),
         auth_mfa_key=base64.urlsafe_b64encode(b"M" * 32).decode("ascii"),
@@ -99,6 +99,28 @@ def test_readiness_fails_closed_when_schema_not_ready(mock_settings):
         assert data["status"] == "not_ready"
         assert "schema" in data["error"].lower()
         assert response.headers.get("Retry-After") == "5"
+
+
+def test_readiness_stays_failed_after_schema_recovers_without_restart(mock_settings):
+    app = FastAPI()
+    app.state.settings = mock_settings
+    app.state.engine = MagicMock()
+    app.state.session_factory = MagicMock()
+    app.state.schema_ready = False
+    app.include_router(health_router)
+    client = TestClient(app)
+
+    with patch(
+        "platform_api.health.check_schema_readiness",
+        new=AsyncMock(return_value=True),
+    ) as schema_check:
+        response = client.get("/health/ready")
+
+    assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+    assert response.json()["status"] == "not_ready"
+    assert "restart" in response.json()["error"].lower()
+    assert response.headers.get("Retry-After") == "5"
+    schema_check.assert_not_awaited()
 
 
 def test_readiness_fails_closed_absent_enrolled_admin(mock_settings):
@@ -200,7 +222,7 @@ async def test_lifespan_cancels_billing_recovery_worker_on_shutdown(mock_setting
         patch("platform_api.app.load_catalog", return_value=object()),
         patch(
             "platform_api.app.load_deployment_capability_report",
-            return_value=object(),
+            return_value=None,
         ),
         patch("platform_api.app.check_schema_readiness", new=AsyncMock(return_value=True)),
         patch("platform_api.app.billing_recovery_worker_loop", new=billing_worker),

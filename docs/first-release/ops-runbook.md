@@ -58,6 +58,22 @@ Both operations replace transcript segments, chat-test messages and quarantined 
 
 Verify schema health, free space and protected encrypted-at-rest backup storage. The ZIP contains exact PostgreSQL binary-COPY table rows, including transcripts and secrets; the archive is **not encrypted by this command**. Never put it in a home directory or ordinary ticket attachment.
 
+After upgrading to `platform-v3`, grant the existing read-only backup role access
+to the provider tables before the next backup. The
+migration does not assume it can identify or grant privileges to the role in
+`PLATFORM_BACKUP_DATABASE_URL`. As the database owner, run this against the
+effective platform schema, replacing the placeholders with
+`PLATFORM_POSTGRES_SCHEMA` and that URL's login name:
+
+```sql
+GRANT SELECT ON TABLE "<platform_schema>".provider_secrets TO "<backup_role>";
+GRANT SELECT ON TABLE "<platform_schema>".provider_model_entries TO "<backup_role>";
+```
+
+No write or schema-ownership privileges are needed. Until this grant exists,
+the backup command fails closed on the table; after granting it, rerun with a
+fresh output path. A failed backup leaves no archive.
+
 ```sh
 python -m platform_api.cli backup \
   --output '/secure-backups/platform-<change-id>.zip' \

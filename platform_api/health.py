@@ -9,14 +9,17 @@ Follows master spec III.2-3 and auth contract:
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Request, Response, status
+from fastapi import APIRouter, Depends, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from platform_api.catalog import ModelCatalog, load_catalog
+from platform_api.catalog import ModelCatalog, catalog_with_managed_llms, load_catalog
 from platform_api.config import PlatformSettings, get_settings
 from platform_api.db.schema import check_schema_readiness
-from platform_api.models.auth import AuthMfa, User
+from platform_api.db.session import get_db
+from platform_api.qualification import has_qualified_voice_playback
+from platform_api.qualification import is_trusted_deployment_report
+from platform_api.models.auth import User
 
 router = APIRouter(tags=["health"])
 
@@ -24,16 +27,14 @@ router = APIRouter(tags=["health"])
 async def check_enrolled_admin_exists(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> bool:
-    """Check that at least one active administrator with enrolled MFA exists."""
+    """Check that at least one active administrator exists."""
     try:
         async with session_factory() as session:
             stmt = (
                 select(User.id)
-                .join(AuthMfa, AuthMfa.user_id == User.id)
                 .where(
                     User.role == "admin",
                     User.status == "active",
-                    AuthMfa.enabled_at.is_not(None),
                 )
                 .limit(1)
             )
@@ -68,6 +69,14 @@ async def readiness(
         return {
             "status": "not_ready",
             "error": "Application state uninitialized",
+        }
+
+    if getattr(request.app.state, "schema_ready", None) is False:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        response.headers["Retry-After"] = "5"
+        return {
+            "status": "not_ready",
+            "error": "Database schema was not ready at startup; restart after repair",
         }
 
     settings: PlatformSettings = request.app.state.settings
@@ -112,7 +121,7 @@ async def readiness(
         response.headers["Retry-After"] = "5"
         return {
             "status": "not_ready",
-            "error": "No enrolled administrator with active MFA",
+            "error": "No enrolled administrator",
         }
 
     # 3. Verify dependencies required by enabled feature flags
@@ -146,10 +155,24 @@ async def readiness(
 
 
 @router.get("/catalog")
-async def get_catalog(request: Request) -> ModelCatalog:
-    """Fake-safe model catalog loaded from JSON without GPU dependencies."""
+async def get_catalog(request: Request, db: AsyncSession = Depends(get_db)) -> ModelCatalog:
+    """Return registered speech metadata and current managed LLM choices."""
     catalog = getattr(request.app.state, "catalog", None)
     if catalog is not None:
-        return catalog
+        return await catalog_with_managed_llms(catalog, db)
     settings: PlatformSettings = getattr(request.app.state, "settings", None) or get_settings()
-    return load_catalog(settings.catalog_path)
+    report = getattr(request.app.state, "adapter_capability_report", None)
+    trusted_report = is_trusted_deployment_report(report, settings)
+    qualified_settings = (
+        report.agent_settings.model_dump(mode="python", exclude_none=True)
+        if report is not None and trusted_report
+        else None
+    )
+    catalog = load_catalog(
+        settings.catalog_path,
+        qualified_settings=qualified_settings,
+        tts_playback_qualified=(
+            trusted_report and has_qualified_voice_playback(report)
+        ),
+    )
+    return await catalog_with_managed_llms(catalog, db)

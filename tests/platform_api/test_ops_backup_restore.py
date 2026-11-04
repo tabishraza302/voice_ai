@@ -4,13 +4,15 @@ from datetime import datetime, timezone
 import os
 import uuid
 
+import asyncpg
+
 import pytest
 from sqlalchemy import func, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from platform_api.db.base import Base
-from platform_api.db.schema import compute_metadata_hash
+from platform_api.db.schema import CURRENT_SCHEMA_VERSION, compute_metadata_hash
 from platform_api.db.session import create_engine, get_session_factory
 from platform_api.events.models import TranscriptSegment
 from platform_api.models.auth import AuditLog, User
@@ -122,7 +124,7 @@ async def test_backup_restores_platform_data_into_fresh_owned_database(
         initialized_pg.url,
         output_path=backup_path,
         schema=schema,
-        schema_version="platform-v1",
+        schema_version=CURRENT_SCHEMA_VERSION,
         metadata_hash=metadata_hash,
         max_bytes=64 * 1024 * 1024,
     )
@@ -154,7 +156,7 @@ async def test_backup_restores_platform_data_into_fresh_owned_database(
             backup_path,
             target_url,
             schema=schema,
-            schema_version="platform-v1",
+            schema_version=CURRENT_SCHEMA_VERSION,
             metadata_hash=metadata_hash,
             max_bytes=64 * 1024 * 1024,
             reason="verify backup restore transaction",
@@ -188,7 +190,7 @@ async def test_backup_restores_platform_data_into_fresh_owned_database(
                 backup_path,
                 target_url,
                 schema=schema,
-                schema_version="platform-v1",
+                schema_version=CURRENT_SCHEMA_VERSION,
                 metadata_hash=metadata_hash,
                 max_bytes=64 * 1024 * 1024,
                 reason="verify refusal to merge restored database",
@@ -211,6 +213,104 @@ async def test_backup_restores_platform_data_into_fresh_owned_database(
                 {"name": db_name},
             )
             await conn.execute(text(f'DROP DATABASE IF EXISTS "{db_name}"'))
+        await admin_engine.dispose()
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_backup_requires_read_access_to_new_provider_secret_table(
+    initialized_pg: FreshPostgres, tmp_path
+):
+    schema = "platform"
+    metadata_hash = compute_metadata_hash(Base.metadata)
+    denied_path = tmp_path / "provider-secrets-denied.zip"
+    recovered_path = tmp_path / "provider-secrets-recovered.zip"
+    role_name = f"backup_reader_{uuid.uuid4().hex}"
+    role_password = uuid.uuid4().hex
+    database_name = initialized_pg.db_name
+    backup_url = make_url(initialized_pg.url).set(
+        username=role_name, password=role_password
+    ).render_as_string(hide_password=False)
+    admin_url = make_url(initialized_pg.admin_url)
+    admin_engine = create_async_engine(
+        admin_url.render_as_string(hide_password=False), isolation_level="AUTOCOMMIT"
+    )
+    platform_admin_engine = create_async_engine(
+        admin_url.set(database=database_name).render_as_string(hide_password=False),
+        isolation_level="AUTOCOMMIT",
+    )
+    role_created = False
+    try:
+        async with admin_engine.connect() as conn:
+            await conn.execute(
+                text(
+                    f'CREATE ROLE "{role_name}" LOGIN PASSWORD \'{role_password}\''
+                )
+            )
+            role_created = True
+            await conn.execute(
+                text(f'GRANT CONNECT ON DATABASE "{database_name}" TO "{role_name}"')
+            )
+        async with platform_admin_engine.connect() as conn:
+            await conn.execute(
+                text(f'GRANT USAGE ON SCHEMA "{schema}" TO "{role_name}"')
+            )
+            await conn.execute(
+                text(f'GRANT SELECT ON ALL TABLES IN SCHEMA "{schema}" TO "{role_name}"')
+            )
+            await conn.execute(
+                text(
+                    f'REVOKE SELECT ON TABLE "{schema}"."provider_secrets" '
+                    f'FROM "{role_name}"'
+                )
+            )
+
+        with pytest.raises(asyncpg.exceptions.InsufficientPrivilegeError):
+            await create_backup(
+                backup_url,
+                output_path=denied_path,
+                schema=schema,
+                schema_version=CURRENT_SCHEMA_VERSION,
+                metadata_hash=metadata_hash,
+                max_bytes=64 * 1024 * 1024,
+            )
+        assert not denied_path.exists()
+
+        async with platform_admin_engine.connect() as conn:
+            await conn.execute(
+                text(
+                    f'GRANT SELECT ON TABLE "{schema}"."provider_secrets" '
+                    f'TO "{role_name}"'
+                )
+            )
+            await conn.execute(
+                text(
+                    f'GRANT SELECT ON TABLE "{schema}"."provider_model_entries" '
+                    f'TO "{role_name}"'
+                )
+            )
+        backup = await create_backup(
+            backup_url,
+            output_path=recovered_path,
+            schema=schema,
+            schema_version=CURRENT_SCHEMA_VERSION,
+            metadata_hash=metadata_hash,
+            max_bytes=64 * 1024 * 1024,
+        )
+        assert recovered_path.is_file()
+        assert backup.row_counts["provider_secrets"] == 0
+    finally:
+        if role_created:
+            async with platform_admin_engine.connect() as conn:
+                await conn.execute(text(f'DROP OWNED BY "{role_name}"'))
+            async with admin_engine.connect() as conn:
+                await conn.execute(
+                    text(
+                        f'REVOKE CONNECT ON DATABASE "{database_name}" '
+                        f'FROM "{role_name}"'
+                    )
+                )
+                await conn.execute(text(f'DROP ROLE "{role_name}"'))
+        await platform_admin_engine.dispose()
         await admin_engine.dispose()
 
 
