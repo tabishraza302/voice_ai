@@ -1,8 +1,12 @@
 import type { AgentView, JsonObject, JsonValue } from "@/lib/platform-agent-client";
 
 const RUNTIME_SETTING_KEYS = {
+  llm_provider: true,
   llm_model: true,
   stt_provider: true,
+  stt_model: true,
+  tts_provider: true,
+  tts_model: true,
   tts_voice_en: true,
   tts_voice_hi: true,
 } as const;

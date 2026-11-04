@@ -46,3 +46,5 @@ evals/*
 web/playwright-report/
 web/test-results/
 web/playwright/.auth/
+
+.omp
