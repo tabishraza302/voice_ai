@@ -30,9 +30,14 @@ from platform_api.config import PlatformSettings
 from platform_api.db.base import Base
 from platform_api.db.schema import (
     CURRENT_SCHEMA_VERSION,
+    FLOW_EVENT_TABLE,
+    FLOW_STATE_TABLE,
     INTERMEDIATE_SCHEMA_VERSION,
     LEGACY_SCHEMA_VERSION,
     MODEL_ENTRY_TABLE,
+    PLAYBACK_RECEIPT_TABLE,
+    PREVIOUS_SCHEMA_VERSION,
+    RUNTIME_STOP_RECORD_TABLE,
     SchemaMismatch,
     compute_metadata_hash,
     initialize_schema,
@@ -54,6 +59,13 @@ TEST_INITIAL_TARIFF = InitialSessionTariff(
     billing_slice_ms=1000,
     permit_ttl_ms=5000,
 )
+FLOW_TABLES = (
+    FLOW_STATE_TABLE,
+    FLOW_EVENT_TABLE,
+    PLAYBACK_RECEIPT_TABLE,
+    RUNTIME_STOP_RECORD_TABLE,
+)
+FLOW_TABLE_FULLNAMES = {f"platform.{table}" for table in FLOW_TABLES}
 
 def test_platform_settings_no_implicit_dotenv(monkeypatch):
     """PlatformSettings must never implicitly load root .env when env vars are absent."""
@@ -326,7 +338,11 @@ async def test_platform_v1_migration_adds_provider_entries_without_losing_data(
 ) -> None:
     current_hash = compute_metadata_hash(Base.metadata)
     legacy_hash = compute_metadata_hash(
-        exclude_tables={"platform.provider_secrets", f"platform.{MODEL_ENTRY_TABLE}"}
+        exclude_tables={
+            "platform.provider_secrets",
+            f"platform.{MODEL_ENTRY_TABLE}",
+            *FLOW_TABLE_FULLNAMES,
+        }
     )
     await initialize_schema(
         fresh_pg.engine,
@@ -336,6 +352,13 @@ async def test_platform_v1_migration_adds_provider_entries_without_losing_data(
     )
 
     async with fresh_pg.engine.begin() as conn:
+        for table in (
+            PLAYBACK_RECEIPT_TABLE,
+            FLOW_EVENT_TABLE,
+            FLOW_STATE_TABLE,
+            RUNTIME_STOP_RECORD_TABLE,
+        ):
+            await conn.execute(text(f"DROP TABLE platform.{table}"))
         await conn.execute(text(f"DROP TABLE platform.{MODEL_ENTRY_TABLE}"))
         await conn.execute(text("DROP TABLE platform.provider_secrets"))
         await conn.execute(
@@ -389,6 +412,13 @@ async def test_platform_v1_migration_rejects_unrecognized_legacy_hash(
         initial_tariff=TEST_INITIAL_TARIFF,
     )
     async with fresh_pg.engine.begin() as conn:
+        for table in (
+            PLAYBACK_RECEIPT_TABLE,
+            FLOW_EVENT_TABLE,
+            FLOW_STATE_TABLE,
+            RUNTIME_STOP_RECORD_TABLE,
+        ):
+            await conn.execute(text(f"DROP TABLE platform.{table}"))
         await conn.execute(text(f"DROP TABLE platform.{MODEL_ENTRY_TABLE}"))
         await conn.execute(text("DROP TABLE platform.provider_secrets"))
         await conn.execute(
@@ -419,7 +449,9 @@ async def test_platform_v2_migration_adds_model_entries_without_losing_data(
     fresh_pg: FreshPostgres,
 ) -> None:
     current_hash = compute_metadata_hash(Base.metadata)
-    v2_hash = compute_metadata_hash(exclude_tables={f"platform.{MODEL_ENTRY_TABLE}"})
+    v2_hash = compute_metadata_hash(
+        exclude_tables={f"platform.{MODEL_ENTRY_TABLE}", *FLOW_TABLE_FULLNAMES}
+    )
     await initialize_schema(
         fresh_pg.engine,
         expected_version=CURRENT_SCHEMA_VERSION,
@@ -436,6 +468,13 @@ async def test_platform_v2_migration_adds_model_entries_without_losing_data(
             )
         )
         await conn.execute(text(f"DROP TABLE platform.{MODEL_ENTRY_TABLE}"))
+        for table in (
+            PLAYBACK_RECEIPT_TABLE,
+            FLOW_EVENT_TABLE,
+            FLOW_STATE_TABLE,
+            RUNTIME_STOP_RECORD_TABLE,
+        ):
+            await conn.execute(text(f"DROP TABLE platform.{table}"))
         await conn.execute(
             text(
                 "UPDATE platform.schema_info "
@@ -465,6 +504,70 @@ async def test_platform_v2_migration_adds_model_entries_without_losing_data(
                 "WHERE provider_id = 'tts:kokoro' AND field_name = 'API_KEY'"
             )
         ) == "historical-ciphertext"
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_platform_v3_migration_adds_flow_storage_tables_without_losing_data(
+    fresh_pg: FreshPostgres,
+) -> None:
+    current_hash = compute_metadata_hash(Base.metadata)
+    v3_hash = compute_metadata_hash(exclude_tables=FLOW_TABLE_FULLNAMES)
+    await initialize_schema(
+        fresh_pg.engine,
+        expected_version=CURRENT_SCHEMA_VERSION,
+        metadata_hash=current_hash,
+        initial_tariff=TEST_INITIAL_TARIFF,
+    )
+
+    async with fresh_pg.engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO platform.provider_secrets "
+                "(provider_id, field_name, secret_ciphertext) "
+                "VALUES ('tts:kokoro', 'API_KEY', 'historical-ciphertext')"
+            )
+        )
+        for table in (
+            PLAYBACK_RECEIPT_TABLE,
+            FLOW_EVENT_TABLE,
+            FLOW_STATE_TABLE,
+            RUNTIME_STOP_RECORD_TABLE,
+        ):
+            await conn.execute(text(f"DROP TABLE platform.{table}"))
+        await conn.execute(
+            text(
+                "UPDATE platform.schema_info "
+                "SET version = :version, metadata_hash = :metadata_hash"
+            ),
+            {"version": PREVIOUS_SCHEMA_VERSION, "metadata_hash": v3_hash},
+        )
+
+    assert await check_schema_readiness(fresh_pg.engine) is False
+    await initialize_schema(
+        fresh_pg.engine,
+        expected_version=CURRENT_SCHEMA_VERSION,
+        metadata_hash=current_hash,
+    )
+    assert await check_schema_readiness(fresh_pg.engine)
+
+    async with fresh_pg.engine.connect() as conn:
+        for table in FLOW_TABLES:
+            assert await conn.scalar(
+                text(f"SELECT to_regclass('platform.{table}')")
+            ) is not None
+        assert await conn.scalar(
+            text(
+                "SELECT secret_ciphertext FROM platform.provider_secrets "
+                "WHERE provider_id = 'tts:kokoro' AND field_name = 'API_KEY'"
+            )
+        ) == "historical-ciphertext"
+        schema_row = (
+            await conn.execute(
+                text("SELECT version, metadata_hash FROM platform.schema_info")
+            )
+        ).one()
+        assert schema_row == (CURRENT_SCHEMA_VERSION, current_hash)
 
 @pytest.mark.postgres
 @pytest.mark.asyncio

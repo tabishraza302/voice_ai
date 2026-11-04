@@ -10,6 +10,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
@@ -290,13 +291,220 @@ class SessionPeer(Base):
         CheckConstraint("length(runner_id) BETWEEN 1 AND 64", name="ck_session_peers_runner_id"),
     )
 
-from platform_api.models.session import Session  # noqa: E402
+
+class FlowRuntimeState(Base):
+    """Latest durable reducer snapshot for one canonical platform session."""
+
+    __tablename__ = "flow_runtime_states"
+
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        postgresql.UUID(as_uuid=True),
+        ForeignKey("sessions.id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    flow_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    state_json: Mapped[dict] = mapped_column(postgresql.JSONB, nullable=False)
+    event_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "length(flow_hash) = 64",
+            name="ck_flow_runtime_states_flow_hash",
+        ),
+        CheckConstraint(
+            "event_count >= 0",
+            name="ck_flow_runtime_states_event_count",
+        ),
+    )
+
+
+class FlowRuntimeEvent(Base):
+    """Append-only event and resulting reduction committed as one sequence."""
+
+    __tablename__ = "flow_runtime_events"
+
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        postgresql.UUID(as_uuid=True),
+        ForeignKey("sessions.id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    sequence: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    event_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    reduction_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_json: Mapped[dict] = mapped_column(postgresql.JSONB, nullable=False)
+    reduction_json: Mapped[dict] = mapped_column(postgresql.JSONB, nullable=False)
+    committed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id",
+            "event_id",
+            name="uq_flow_runtime_events_session_event",
+        ),
+        CheckConstraint(
+            "sequence >= 1",
+            name="ck_flow_runtime_events_sequence",
+        ),
+        CheckConstraint(
+            "length(event_id) BETWEEN 1 AND 256",
+            name="ck_flow_runtime_events_event_id",
+        ),
+        CheckConstraint(
+            "length(event_digest) = 64 AND length(reduction_digest) = 64",
+            name="ck_flow_runtime_events_digests",
+        ),
+    )
+
+
+class CommittedPlaybackReceipt(Base):
+    """Verifier-issued sample evidence committed with its reducer event."""
+
+    __tablename__ = "committed_playback_receipts"
+
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        postgresql.UUID(as_uuid=True),
+        primary_key=True,
+    )
+    evidence_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    event_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    transport_epoch: Mapped[str] = mapped_column(String(256), nullable=False)
+    turn_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    generation_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    manifest_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    fragment_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    capability_report_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    peer_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    verifier_identity: Mapped[str] = mapped_column(String(256), nullable=False)
+    sample_start: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sample_end: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sample_rate: Mapped[int] = mapped_column(Integer, nullable=False)
+    frame_start: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    frame_end: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    render_sample_rate: Mapped[int] = mapped_column(Integer, nullable=False)
+    receipt_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    committed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["session_id", "event_id"],
+            ["flow_runtime_events.session_id", "flow_runtime_events.event_id"],
+            ondelete="RESTRICT",
+            name="fk_committed_playback_receipts_event",
+        ),
+        UniqueConstraint(
+            "session_id",
+            "event_id",
+            name="uq_committed_playback_receipts_event",
+        ),
+        Index(
+            "ix_committed_playback_receipts_epoch_samples",
+            "session_id",
+            "transport_epoch",
+            "sample_start",
+            "sample_end",
+        ),
+        CheckConstraint(
+            "length(evidence_id) BETWEEN 1 AND 128",
+            name="ck_committed_playback_receipts_evidence_id",
+        ),
+        CheckConstraint(
+            "sample_start >= 0 AND sample_end > sample_start",
+            name="ck_committed_playback_receipts_sample_range",
+        ),
+        CheckConstraint(
+            "sample_rate BETWEEN 8000 AND 192000",
+            name="ck_committed_playback_receipts_sample_rate",
+        ),
+        CheckConstraint(
+            "frame_start >= 0 AND frame_end > frame_start",
+            name="ck_committed_playback_receipts_frame_range",
+        ),
+        CheckConstraint(
+            "render_sample_rate BETWEEN 8000 AND 192000",
+            name="ck_committed_playback_receipts_render_rate",
+        ),
+        CheckConstraint(
+            "length(content_hash) = 64 AND length(capability_report_hash) = 64 "
+            "AND length(receipt_digest) = 64",
+            name="ck_committed_playback_receipts_digests",
+        ),
+        CheckConstraint(
+            "length(transport_epoch) BETWEEN 1 AND 256 "
+            "AND length(turn_id) BETWEEN 1 AND 256 "
+            "AND length(generation_id) BETWEEN 1 AND 256 "
+            "AND length(manifest_id) BETWEEN 1 AND 256 "
+            "AND length(fragment_id) BETWEEN 1 AND 256 "
+            "AND length(peer_id) BETWEEN 1 AND 256 "
+            "AND length(verifier_identity) BETWEEN 1 AND 256",
+            name="ck_committed_playback_receipts_binding_text",
+        ),
+    )
+
+
+class RuntimeStopRecordRow(Base):
+    """Immutable idempotent runner stop proof for one session version."""
+
+    __tablename__ = "runtime_stop_records"
+
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        postgresql.UUID(as_uuid=True),
+        ForeignKey("sessions.id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    session_version: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    attestation_json: Mapped[dict] = mapped_column(postgresql.JSONB, nullable=False)
+    expected_budget_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    cumulative_billable_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    record_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    saved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "session_version >= 1",
+            name="ck_runtime_stop_records_session_version",
+        ),
+        CheckConstraint(
+            "expected_budget_version >= 1",
+            name="ck_runtime_stop_records_budget_version",
+        ),
+        CheckConstraint(
+            "cumulative_billable_ms >= 0",
+            name="ck_runtime_stop_records_billable_ms",
+        ),
+        CheckConstraint(
+            "length(record_digest) = 64",
+            name="ck_runtime_stop_records_digest",
+        ),
+    )
 
 
 __all__ = [
+    "CommittedPlaybackReceipt",
+    "FlowRuntimeEvent",
+    "FlowRuntimeState",
     "RunnerCapacity",
     "RuntimeRegistration",
-    "Session",
+    "RuntimeStopRecordRow",
     "SessionJoinJti",
     "SessionParticipant",
     "SessionPeer",

@@ -36,11 +36,16 @@ if TYPE_CHECKING:
 
 
 # Unique 64-bit advisory lock ID for serializing platform schema operations
-CURRENT_SCHEMA_VERSION = "platform-v3"
+CURRENT_SCHEMA_VERSION = "platform-v4"
+PREVIOUS_SCHEMA_VERSION = "platform-v3"
 INTERMEDIATE_SCHEMA_VERSION = "platform-v2"
 LEGACY_SCHEMA_VERSION = "platform-v1"
 PROVIDER_SECRET_TABLE = "provider_secrets"
 MODEL_ENTRY_TABLE = "provider_model_entries"
+FLOW_STATE_TABLE = "flow_runtime_states"
+FLOW_EVENT_TABLE = "flow_runtime_events"
+PLAYBACK_RECEIPT_TABLE = "committed_playback_receipts"
+RUNTIME_STOP_RECORD_TABLE = "runtime_stop_records"
 PLATFORM_SCHEMA_ADVISORY_LOCK_ID = 8100984920448107368
 
 
@@ -375,10 +380,9 @@ async def initialize_schema(
     - Non-PostgreSQL dialect: raises SchemaMismatch.
     - Missing or empty platform schema creates tables and records the schema only after an
       explicit tariff seed; only backup restore may set `allow_unseeded_restore=True` to import the archived tariff.
-    - An exact platform-v1 inventory migrates to platform-v3 by adding provider_secrets
-      and provider_model_entries; an exact platform-v2 inventory migrates by adding only
-      provider_model_entries. Each migration preserves existing rows and records schema_info
-      in the same transaction; unknown drift is refused.
+    - An exact platform-v1, v2, or v3 inventory migrates atomically to platform-v4,
+      adding only tables absent from that supported historical version. Existing rows
+      are preserved; unknown drift is refused.
     - Non-empty unknown platform schema (lacks schema_info or has unexpected objects): raises SchemaMismatch.
     - Matching schema_info with missing/extra tables, missing generated sequences, or unexpected objects: raises SchemaMismatch.
     - Identical recorded schema and tables: safe no-op; initial tariff values are ignored.
@@ -458,12 +462,52 @@ async def initialize_schema(
         expected_tables = {t.name for t in Base.metadata.tables.values()}
         migration_additions = {
             LEGACY_SCHEMA_VERSION: (
-                {PROVIDER_SECRET_TABLE, MODEL_ENTRY_TABLE},
-                (PROVIDER_SECRET_TABLE, MODEL_ENTRY_TABLE),
+                {
+                    PROVIDER_SECRET_TABLE,
+                    MODEL_ENTRY_TABLE,
+                    FLOW_STATE_TABLE,
+                    FLOW_EVENT_TABLE,
+                    PLAYBACK_RECEIPT_TABLE,
+                    RUNTIME_STOP_RECORD_TABLE,
+                },
+                (
+                    PROVIDER_SECRET_TABLE,
+                    MODEL_ENTRY_TABLE,
+                    FLOW_STATE_TABLE,
+                    FLOW_EVENT_TABLE,
+                    PLAYBACK_RECEIPT_TABLE,
+                    RUNTIME_STOP_RECORD_TABLE,
+                ),
             ),
             INTERMEDIATE_SCHEMA_VERSION: (
-                {MODEL_ENTRY_TABLE},
-                (MODEL_ENTRY_TABLE,),
+                {
+                    MODEL_ENTRY_TABLE,
+                    FLOW_STATE_TABLE,
+                    FLOW_EVENT_TABLE,
+                    PLAYBACK_RECEIPT_TABLE,
+                    RUNTIME_STOP_RECORD_TABLE,
+                },
+                (
+                    MODEL_ENTRY_TABLE,
+                    FLOW_STATE_TABLE,
+                    FLOW_EVENT_TABLE,
+                    PLAYBACK_RECEIPT_TABLE,
+                    RUNTIME_STOP_RECORD_TABLE,
+                ),
+            ),
+            PREVIOUS_SCHEMA_VERSION: (
+                {
+                    FLOW_STATE_TABLE,
+                    FLOW_EVENT_TABLE,
+                    PLAYBACK_RECEIPT_TABLE,
+                    RUNTIME_STOP_RECORD_TABLE,
+                },
+                (
+                    FLOW_STATE_TABLE,
+                    FLOW_EVENT_TABLE,
+                    PLAYBACK_RECEIPT_TABLE,
+                    RUNTIME_STOP_RECORD_TABLE,
+                ),
             ),
         }
         migration = (

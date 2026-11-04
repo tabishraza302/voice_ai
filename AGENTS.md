@@ -2,22 +2,16 @@
 
 Last reviewed: 2026-10-19.
 
-This file is the contract for anyone (human or agent) changing this
-repository. It is short on purpose: the rules below are the ones that
-have actually prevented mistakes, not a restatement of the code.
+This file is the contract for anyone (human or agent) changing this repository. It is short on purpose: the rules below are the ones that have actually prevented mistakes, not a restatement of the code.
 
 ## What this project is
 
-A fully local, air-gapped English + Hindi voice agent with an AI
-observability layer, on one Apple Silicon MacBook Air (M5, 16 GB unified
-memory). Nothing in it talks to the internet at runtime, and the README's
-numbers are measured on this machine, not copied from a paper.
+A fully local, voice agent with an AI observability layer, on one Apple Silicon MacBook Air (M5, 16 GB unified
+memory). The README's numbers are measured on this machine, not copied from a paper.
 
 ## The rules that matter
 
 ### 1. Measure before you assume
-
-Every claim in the README has a script behind it:
 
 | Claim | Script |
 |---|---|
@@ -25,78 +19,45 @@ Every claim in the README has a script behind it:
 | How fast the STT is | `scripts/voice-ai.sh bench` |
 | How accurate the STT is | `scripts/voice-ai.sh eval` |
 
-If you change a model, a prompt, a chunking rule or a latency budget,
-**re-run the relevant script and update the README's table with the new
-number**. A number in the README that no longer matches a measurement is
-worse than no number.
+If you change a model, a prompt, a chunking rule or a latency budget, **re-run the relevant script and update the README's table with the new number**. A number in the README that no longer matches a measurement is worse than no number.
 
-Do not cite a remembered benchmark. The published figures are recorded in
-`evals/wer_eval.py` under `published_reference`, with their source, and
-they are the *comparison* baseline — the measured numbers are the ones
-this repo publishes.
+Do not cite a remembered benchmark. The published figures are recorded in `evals/wer_eval.py` under `published_reference`, with their source, and they are the *comparison* baseline — the measured numbers are the ones this repo publishes.
 
-**A measurement is a claim about the conditions it was measured under.**
-Speed and memory are properties of this machine; a WER is a property of
-this model on this corpus; a latency budget is a property of this
-deployment. Say the conditions with the number, every time.
+**A measurement is a claim about the conditions it was measured under.** Speed and memory are properties of this machine; a WER is a property of this model on this corpus; a latency budget is a property of this deployment. Say the conditions with the number, every time.
 
-**A local baseline is not a production number.** Anything another
-deployment depends on — a threshold, a budget, a tier, a timeout — must
-be re-derived in that deployment's environment, from that environment's
-own measurements. The rule that *re-derives* travels; the number it
-produced here does not. The tier rule is the model for this: it re-runs
-the memory baseline on whatever machine it is asked about, so the same
-rule selects the right tier in production. A hard-coded number would
+**A local baseline is not a production number.** Anything another deployment depends on — a threshold, a budget, a tier, a timeout — must be re-derived in that deployment's environment, from that environment's own measurements. The rule that *re-derives* travels; the number it produced here does not. The tier rule is the model for this: it re-runs the memory baseline on whatever machine it is asked about, so the same rule selects the right tier in production. A hard-coded number would
 not.
 
-So: a rule that needs a value from the environment takes it from config,
-and the config is where the deployment's own value goes. Never smuggle a
-number measured here into a claim about somewhere else.
+So: a rule that needs a value from the environment takes it from config, and the config is where the deployment's own value goes. Never smuggle a number measured here into a claim about somewhere else.
 
 ### 2. Keep the three layers swappable
 
-STT, TTS and LLM are selected by config, and swapping one must not
-require touching the pipeline, the observers, the collector config, the
-metric names, the dashboard, the alert rules or the eval scenarios.
+STT, TTS and LLM are selected by config, and swapping one must not require touching the pipeline, the observers, the collector config, the metric names, the dashboard, the alert rules or the eval scenarios.
 
 The mechanism, in three places:
 
 - `bot/services.py` — the three registries. A new backend is a factory
-  and a registry entry.
-- `bot/language.py` — the `VoiceRouter` and `SttLanguageRouter`
-  protocols. Settings deltas are backend-specific types, so the delta
-  construction lives behind a protocol, one implementation per backend.
+and a registry entry.
+- `bot/language.py` — the `VoiceRouter` and `SttLanguageRouter` protocols. Settings deltas are backend-specific types, so the delta construction lives behind a protocol, one implementation per backend.
 - `bot/pipeline.py` — names no backend at all.
 
-`tests/test_modularity.py` enforces this mechanically, including an
-assertion that the pipeline module imports no concrete service class. If
-a change to add a backend makes that test fail by importing a backend
-into the pipeline, the change is wrong — fix the design, not the test.
+`tests/test_modularity.py` enforces this mechanically, including an assertion that the pipeline module imports no concrete service class. If a change to add a backend makes that test fail by importing a backend into the pipeline, the change is wrong — fix the design, not the test.
 
 ### 3. A new backend is a new implementation, not a special case
 
 When you add a backend:
 
 - add a factory in `bot/services.py` and register it;
-- add its router in `bot/language.py` and register it there too — a
-  backend with a service but no router is a latent bug, because the
-  first language change will push a delta it silently ignores;
-- add it to the swap catalogue in the README, with its **real** cost
-  (memory, quality, latency) and the trigger for using it.
+- add its router in `bot/language.py` and register it there too — a backend with a service but no router is a latent bug, because the first language change will push a delta it silently ignores;
+- add it to the swap catalogue in the README, with its **real** cost (memory, quality, latency) and the trigger for using it.
 
-Never add a branch like `if settings.stt_provider == "x"` inside the
-pipeline. That is the thing the registries exist to prevent.
+Never add a branch like `if settings.stt_provider == "x"` inside the pipeline. That is the thing the registries exist to prevent.
 
 ### 4. The metric names are a contract
 
-`bot/observers.py` lists them in `METRIC_NAMES`.
-`observability/alerts.yml` and
-`observability/grafana/dashboards/voice-ai.json` reference them by
-name; `observability/prometheus.yml` is coupled to them by endpoint —
-it scrapes the agent and the collector, it does not name a series.
+`bot/observers.py` lists them in `METRIC_NAMES`. `observability/alerts.yml` and`observability/grafana/dashboards/voice-ai.json` reference them by name; `observability/prometheus.yml` is coupled to them by endpoint — it scrapes the agent and the collector, it does not name a series.
 Renaming one breaks the alerts and the dashboard, silently.
-`tests/test_observers.py` asserts the declared set matches the
-instruments.
+`tests/test_observers.py` asserts the declared set matches the instruments.
 
 Label cardinality is bounded to a fixed set: `processor` and `model` on
 the pipeline metrics, `kind` on the token counter, `component` on the
@@ -135,7 +96,7 @@ it on the host, and the collector reaches it over OTLP/HTTP at
 `http://host.docker.internal:6006`. Its internal Prometheus endpoint is off:
 it binds 9090 with a hardcoded port and no env var to move it.
 
-**Phoenix files a trace under `openinference.project.name`,** not under
+**Phoenix files a trace under** `openinference.project.name`**,** not under
 `service.name`. With only `service.name`, every trace lands in Phoenix's
 `default` project and the traces look empty even though they arrived.
 The collector sets it, because the collector is the Phoenix boundary.
@@ -183,9 +144,9 @@ data/           generated measurements (gitignored)
 
 - `scripts/voice-ai.sh test` passes.
 - If you touched a model, a prompt or a latency path: the relevant
-  measurement script has been re-run and the README updated.
+measurement script has been re-run and the README updated.
 - If you touched a metric: `tests/test_observers.py` passes, and the
-  dashboard and alert rules still reference the right names.
+dashboard and alert rules still reference the right names.
 - If you added a backend: `tests/test_modularity.py` passes without
-  edits, and the README's swap catalogue lists it.
+edits, and the README's swap catalogue lists it.
 - Nothing under `data/` or `evals/fixtures/audio/` is committed.

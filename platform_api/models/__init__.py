@@ -23,8 +23,12 @@ from platform_api.models.provider_secret import ProviderSecret
 from platform_api.models.provider_model_entry import ProviderModelEntry
 from platform_api.models.session import Session
 from platform_api.sessions.models import (
+    CommittedPlaybackReceipt,
+    FlowRuntimeEvent,
+    FlowRuntimeState,
     RunnerCapacity,
     RuntimeRegistration,
+    RuntimeStopRecordRow,
     SessionJoinJti,
     SessionParticipant,
     SessionPeer,
@@ -78,6 +82,10 @@ __all__ = [
     "BillingOperation",
     "MeterCheckpoint",
     "RunnerCapacity",
+    "FlowRuntimeState",
+    "FlowRuntimeEvent",
+    "CommittedPlaybackReceipt",
+    "RuntimeStopRecordRow",
     "Session",
     "RuntimeRegistration",
     "SessionParticipant",

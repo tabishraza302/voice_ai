@@ -43,6 +43,7 @@ evals/*
 !/docs/first-release/
 
 # Browser test output and credentials
+web/playwright.json
 web/playwright-report/
 web/test-results/
 web/playwright/.auth/

@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 
 from bot.config import Settings
 from bot.flow.schemas import SessionState
+from bot.flow.qualification import CapabilityReport
 from bot.flow_runtime import FlowEventStore, FlowRuntime
 from bot.runtime.budget_client import (
     BudgetPrerequisiteError,
@@ -131,6 +132,7 @@ class PendingSession:
     checkpoint_sequence: int = 0
     budget_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     finish_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    playback_receipt_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     billing_task: asyncio.Task[None] | None = None
     cursor: Any | None = None
 
@@ -158,19 +160,31 @@ class SessionTaskManager:
         event_store: DurablePostgresFlowStore | None = None,
         usage_meter_factory: UsageMeterFactory | None = None,
         installed_adapter_report_hash: str | None = None,
+        installed_adapter_report: CapabilityReport | None = None,
     ) -> None:
+        if (
+            installed_adapter_report is not None
+            and installed_adapter_report_hash is not None
+            and installed_adapter_report.report_hash != installed_adapter_report_hash
+        ):
+            raise ValueError("Installed adapter report and hash do not match")
         self._platform = platform
         self._budget = RuntimeBudgetClient(platform)
-        self._base_settings = base_settings.model_copy(deep=True)
         self._event_store = event_store
         self._usage_meter_factory = usage_meter_factory
-        self._installed_adapter_report_hash = installed_adapter_report_hash
+        self.installed_adapter_report = installed_adapter_report
+        self._installed_adapter_report_hash = (
+            installed_adapter_report.report_hash
+            if installed_adapter_report is not None
+            else installed_adapter_report_hash
+        )
         self._registrations: dict[UUID, SessionRegistration] = {}
         self._sessions: dict[UUID, RetainedSession] = {}
         self._pending: dict[UUID, PendingSession] = {}
         self._pc_bindings: dict[str, tuple[UUID, UUID, str]] = {}
         self._admission_locks: dict[UUID, _AdmissionLock] = {}
         self._registry_lock = asyncio.Lock()
+        self._base_settings = base_settings
         self._billing_slice_ms_raw = base_settings.platform_billing_slice_ms
         self._permit_ttl_ms_raw = base_settings.platform_billing_permit_ttl_ms
 
@@ -182,6 +196,7 @@ class SessionTaskManager:
         event_store: DurablePostgresFlowStore | None = None,
         usage_meter_factory: UsageMeterFactory | None = None,
         installed_adapter_report_hash: str | None = None,
+        installed_adapter_report: CapabilityReport | None = None,
     ) -> "SessionTaskManager":
         return cls(
             platform=PlatformRuntimeClient.from_settings(settings),
@@ -189,6 +204,7 @@ class SessionTaskManager:
             event_store=event_store,
             usage_meter_factory=usage_meter_factory,
             installed_adapter_report_hash=installed_adapter_report_hash,
+            installed_adapter_report=installed_adapter_report,
         )
 
     def authenticate_internal(self, authorization: str | None, runner_id: str | None) -> bool:
@@ -208,6 +224,7 @@ class SessionTaskManager:
             raise SessionAdmissionError("Registration deadlines must be timezone-aware", status_code=400)
         if request.connect_deadline >= request.hard_end_deadline:
             raise SessionAdmissionError("Registration deadlines are inconsistent", status_code=400)
+        await self._ensure_event_store_ready()
         async with self._registry_lock:
             existing = self._registrations.get(request.session_id)
             if existing is not None:
@@ -248,6 +265,7 @@ class SessionTaskManager:
             if session_id in self._pending:
                 raise SessionAdmissionError("A browser peer is already being admitted", status_code=409)
             self._require_session_prerequisites()
+            await self._ensure_event_store_ready()
             registration = self._registrations.get(session_id)
             if registration is None or registration.released:
                 raise SessionAdmissionError("Session is not registered on this runner", status_code=404)
@@ -475,18 +493,21 @@ class SessionTaskManager:
             async def send_marker(message: dict[str, Any]) -> None:
                 await send_message(OutputTransportMessageUrgentFrame(message=message))
 
+            async def abort_transport() -> bool:
+                return await self._abort_transport(pending, cursor, connection)
+
             pending.runtime.configure_playback(
                 cursor=cursor,
                 verifier=pending.playback_verifier,
                 marker_sender=send_marker,
+                abort_transport=abort_transport,
             )
 
             @transport.event_handler("on_app_message")
             async def on_session_app_message(_transport, message, sender):
-                await pending.runtime.accept_playback_receipt(
-                    message,
-                    sender_peer_id=str(sender),
-                )
+                # Capability negotiation must branch here after the same peer
+                # binding check; receipts keep the verifier's platform peer ID.
+                await self._accept_bound_playback_message(pending, message, sender)
 
             pending.cursor = cursor
             pending.connection = connection
@@ -496,6 +517,21 @@ class SessionTaskManager:
                 "Qualified SmallWebRTC playback could not be installed",
                 status_code=503,
             ) from exc
+
+    async def _abort_transport(
+        self,
+        pending: PendingSession,
+        cursor: Any,
+        connection: Any,
+    ) -> bool:
+        try:
+            cursor.halt()
+        except Exception:
+            pending.media_stopped = await _close_connection(connection)
+            raise
+        pending.media_stopped = await _close_connection(connection)
+        return pending.media_stopped
+
     async def wait_until_active(self, pending: PendingSession) -> None:
         try:
             await pending.runtime.wait_for_pipeline_start()
@@ -540,16 +576,49 @@ class SessionTaskManager:
         pc_id = pc_id.strip()
         if not pc_id or len(pc_id) > 256:
             raise SessionAdmissionError("SmallWebRTC returned an invalid pc_id", status_code=502)
-        pending = self._pending.get(session_id)
-        if pending is None:
-            raise SessionAdmissionError("Offer response has no pending session admission", status_code=409)
-        existing = self._pc_bindings.get(pc_id)
-        if existing is not None and existing != (session_id, pending.peer_id, pending.origin):
-            raise SessionAdmissionError("SmallWebRTC pc_id is already bound to another session", status_code=409)
-        pending.pc_id = pc_id
-        self._pc_bindings[pc_id] = (session_id, pending.peer_id, pending.origin)
-        pending.pc_bound.set()
+        async with self._lock_for(session_id):
+            pending = self._pending.get(session_id)
+            if pending is None or pending.platform_release or pending.pipeline_done.is_set():
+                raise SessionAdmissionError("Offer response has no active pending session admission", status_code=409)
+            existing = self._pc_bindings.get(pc_id)
+            if existing is not None and existing != (session_id, pending.peer_id, pending.origin):
+                raise SessionAdmissionError("SmallWebRTC pc_id is already bound to another session", status_code=409)
+            pending.pc_id = pc_id
+            self._pc_bindings[pc_id] = (session_id, pending.peer_id, pending.origin)
+            pending.pc_bound.set()
 
+
+    async def _accept_bound_playback_message(
+        self,
+        pending: PendingSession,
+        message: object,
+        sender: object,
+    ) -> object:
+        session_id = pending.snapshot.session_id
+        async with self._lock_for(session_id):
+            async with pending.playback_receipt_lock:
+                if (
+                    not isinstance(sender, str)
+                    or pending.pc_id is None
+                    or sender != pending.pc_id
+                    or pending.platform_release
+                    or pending.pipeline_done.is_set()
+                    or self._pending.get(session_id) is not pending
+                    or self._pc_bindings.get(sender)
+                    != (session_id, pending.peer_id, pending.origin)
+                ):
+                    return None
+                # Capability negotiation branches after this binding check, using
+                # the same platform peer ID; transport pc_id is never verifier identity.
+                return await pending.runtime.accept_playback_receipt(
+                    message,
+                    sender_peer_id=str(pending.peer_id),
+                )
+
+    async def _mark_platform_release(self, pending: PendingSession) -> None:
+        async with pending.playback_receipt_lock:
+            pending.platform_release = True
+            pending.runtime.deny_speech()
     def authorize_patch(self, pc_id: str | None, origin: str | None) -> bool:
         if not pc_id or origin != self._platform.credentials.web_origin:
             return False
@@ -599,8 +668,8 @@ class SessionTaskManager:
                         if not pending.media_stopped:
                             raise SessionAdmissionError("Media stop could not be verified", status_code=503)
                         # ENDING synchronously calls back into this runner's release endpoint.
-                        # Signal pipeline completion after media stop so that callback can settle.
-                        pending.pipeline_done.set()
+                        async with pending.playback_receipt_lock:
+                            pending.pipeline_done.set()
                         failure_code = "FLOW_FAILED" if terminal_state.outcome == "failed" else None
                         ending = await self._transition(
                             pending,
@@ -637,9 +706,10 @@ class SessionTaskManager:
                             # The platform keeps the peer for its reconciliation path.
                             pass
             finally:
-                if not terminal or terminal_finalized:
-                    self._forget_pending(pending.snapshot.session_id, pending)
-                pending.pipeline_done.set()
+                async with pending.playback_receipt_lock:
+                    if not terminal or terminal_finalized:
+                        self._forget_pending(pending.snapshot.session_id, pending)
+                    pending.pipeline_done.set()
 
     async def release_registration(self, request: RuntimeReleaseRequest) -> RuntimeReleaseAcknowledgement:
         async with self._lock_for(request.session_id):
@@ -664,8 +734,7 @@ class SessionTaskManager:
             pending = self._pending.get(request.session_id)
             retained = self._sessions.get(request.session_id)
             if pending is not None:
-                pending.platform_release = True
-                pending.runtime.deny_speech()
+                await self._mark_platform_release(pending)
                 await pending.runtime.interrupt()
                 if pending.connection is not None:
                     pending.media_stopped = await _close_connection(pending.connection)
@@ -751,7 +820,9 @@ class SessionTaskManager:
                     released_version=request.session_version,
                     stop_record=record,
                 )
-            self._forget_pending(request.session_id, pending)
+            if pending is not None:
+                async with pending.playback_receipt_lock:
+                    self._forget_pending(request.session_id, pending)
             self._sessions.pop(request.session_id, None)
             return _release_ack(request)
 
@@ -925,6 +996,31 @@ class SessionTaskManager:
             raise SessionAdmissionError("Durable flow state does not match the immutable session version", status_code=409)
         return state
 
+    async def _ensure_event_store_ready(self) -> None:
+        store = self._event_store
+        if store is None or getattr(store, "storage_backend", None) != "postgresql":
+            raise SessionAdmissionError(
+                "A durable PostgreSQL flow store is required before admission",
+                status_code=503,
+            )
+        ensure_ready = getattr(store, "ensure_ready", None)
+        if not callable(ensure_ready):
+            raise SessionAdmissionError(
+                "The durable PostgreSQL flow store cannot verify its schema",
+                status_code=503,
+            )
+        try:
+            result = ensure_ready()
+            if not inspect.isawaitable(result):
+                raise TypeError("ensure_ready must be asynchronous")
+            if await result is False:
+                raise RuntimeError("flow store schema is not ready")
+        except Exception:
+            raise SessionAdmissionError(
+                "The durable PostgreSQL flow store is unavailable",
+                status_code=503,
+            ) from None
+
     def _require_session_prerequisites(self) -> None:
         store = self._event_store
         if (
@@ -985,9 +1081,13 @@ class SessionTaskManager:
     def _forget_pending(self, session_id: UUID, pending: PendingSession | None) -> None:
         if pending is None:
             return
-        if pending.pc_id is not None:
-            self._pc_bindings.pop(pending.pc_id, None)
         if self._pending.get(session_id) is pending:
+            if (
+                pending.pc_id is not None
+                and self._pc_bindings.get(pending.pc_id)
+                == (session_id, pending.peer_id, pending.origin)
+            ):
+                self._pc_bindings.pop(pending.pc_id, None)
             self._pending.pop(session_id)
         retained = self._sessions.get(session_id)
         if retained is not None and retained.current_pending is pending:

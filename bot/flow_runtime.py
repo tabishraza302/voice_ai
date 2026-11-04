@@ -79,8 +79,14 @@ class FlowEventStore(Protocol):
     deliberately disables transport completion receipts.
     """
 
-    async def commit(self, event: FlowEvent, reduction: Reduction) -> None:
-        """Persist the event and reduction atomically, or raise without commit."""
+    async def commit(
+        self,
+        event: FlowEvent,
+        reduction: Reduction,
+        *,
+        verified_receipts: tuple[Any, ...] = (),
+    ) -> None:
+        """Persist the event, reduction and any verified receipts atomically."""
         ...
 
 
@@ -217,6 +223,7 @@ class FlowRuntime:
         )
         self._playback_cursor = playback_cursor
         self._playback_marker_sender = playback_marker_sender
+        self._playback_abort_transport: Callable[[], Awaitable[bool]] | None = None
         self._playback_active_generations: set[str] = set()
         self._session_managed = session_managed
         self._speech_authorization_gate = speech_authorization_gate
@@ -364,6 +371,7 @@ class FlowRuntime:
                 self._transport_event_verifier = playback_receipt_verifier.verify_event
                 self._playback_cursor = None
                 self._playback_marker_sender = None
+                self._playback_abort_transport = None
                 self._playback_active_generations.clear()
 
     @property
@@ -481,20 +489,23 @@ class FlowRuntime:
         cursor: Any,
         verifier: Any,
         marker_sender: Callable[[dict[str, Any]], Awaitable[None]],
+        abort_transport: Callable[[], Awaitable[bool]],
     ) -> None:
         """Bind actual transport cursor and receipt verifier for this peer."""
         if not self._session_managed:
             raise RuntimeError("Only a platform session can install qualified playback")
         if not self._event_store or not callable(getattr(verifier, "verify_event", None)):
             raise RuntimeError("Qualified playback requires durable storage and a trusted verifier")
-        if not callable(getattr(cursor, "begin_fragment", None)) or not callable(
-            getattr(cursor, "finish_fragment", None)
-        ):
-            raise RuntimeError("Qualified playback requires a fragment sample cursor")
+        if not all(
+            callable(getattr(cursor, name, None))
+            for name in ("begin_fragment", "finish_fragment", "halt", "wait_for_inflight_writes")
+        ) or not callable(abort_transport):
+            raise RuntimeError("Qualified playback requires a stoppable fragment cursor and transport")
         self._playback_cursor = cursor
         self._playback_receipt_verifier = verifier
         self._transport_event_verifier = verifier.verify_event
         self._playback_marker_sender = marker_sender
+        self._playback_abort_transport = abort_transport
         self._playback_active_generations.clear()
 
     async def begin_playback_fragment(self, fragment: SpeechFragment) -> Any | None:
@@ -583,6 +594,28 @@ class FlowRuntime:
         verifier = self._playback_receipt_verifier
         cursor = self._playback_cursor
         if verifier is None and cursor is None:
+            return
+        if self._session_managed:
+            self.deny_speech()
+            abort_transport = self._playback_abort_transport
+            halt = getattr(cursor, "halt", None)
+            wait_for_writes = getattr(cursor, "wait_for_inflight_writes", None)
+            if not callable(halt) or not callable(wait_for_writes) or abort_transport is None:
+                raise RuntimeError("Playback transport cannot be stopped safely")
+            halt()
+            if await abort_transport() is not True:
+                raise RuntimeError("Playback transport could not be stopped")
+            await wait_for_writes()
+            cancel_verifier = getattr(verifier, "cancel_generation", None)
+            if callable(cancel_verifier):
+                result = cancel_verifier(generation_id)
+                if inspect.isawaitable(result):
+                    await result
+            cancel_cursor = getattr(cursor, "cancel_generation", None)
+            if callable(cancel_cursor):
+                result = cancel_cursor(generation_id)
+                if inspect.isawaitable(result):
+                    await result
             return
         from bot.flow.playback_receipts import merge_playback_cancellations
 
@@ -839,8 +872,8 @@ class FlowRuntime:
         finally:
             self._teardown_callbacks.clear()
 
-    async def interrupt(self, generation_id: str | None = None) -> None:
-        """Discard unplayed output and persist its cancellation under the session lock."""
+    async def interrupt(self, generation_id: str | None = None) -> str | None:
+        """Discard unplayed output and return the generation that was cancelled."""
         async with self._lock:
             target = generation_id or self._state.generation_id
             if (
@@ -854,16 +887,17 @@ class FlowRuntime:
                 self._welcome_status = "cancelled"
                 self._cancelled_generations.add(target)
                 self._interrupted_generations.add(target)
-                return
+                return target
             if target in self._interrupted_generations:
                 await self._record_output_cancelled_locked(target, [])
-                return
+                return target
             self._interrupted_generations.add(target)
             self._cancelled_generations.add(target)
             if target == self._welcome_generation_id and self._welcome_status != "played":
                 self._welcome_status = "cancelled"
             discarded = self._discard_generation_fragments_locked(target)
             await self._record_output_cancelled_locked(target, discarded)
+            return target
 
     async def _cancel_welcome_locked(self) -> None:
         if self._welcome_status == "pending":
@@ -1373,8 +1407,7 @@ class FlowRuntime:
                 "Event ID was reused with different event content",
             )
         result = self._no_op_locked()
-        if self._event_store is not None:
-            await self._event_store.commit(event, result)
+        await self._commit_flow_event(event, result)
         event_hash = hashlib.sha256(
             canonical_json_v1(event.model_dump(mode="json"))
         ).hexdigest()
@@ -1389,6 +1422,23 @@ class FlowRuntime:
             if self._welcome_played_fragment_ids >= self._welcome_fragment_ids:
                 self._welcome_status = "played"
         return result
+
+    async def _commit_flow_event(self, event: FlowEvent, reduction: Reduction) -> None:
+        if self._event_store is None:
+            return
+        verifier = self._playback_receipt_verifier
+        if isinstance(event, FragmentPlayedOutputEvent) and verifier is not None:
+            lookup = getattr(verifier, "verified_receipt_for_event", None)
+            if not callable(lookup):
+                raise RuntimeError("Playback verifier cannot provide committed receipt evidence")
+            receipt = lookup(event)
+            if inspect.isawaitable(receipt):
+                receipt = await receipt
+            if receipt is None:
+                raise RuntimeError("Playback event has no verified receipt evidence")
+            await self._event_store.commit(event, reduction, verified_receipts=(receipt,))
+            return
+        await self._event_store.commit(event, reduction)
 
     async def _apply_event_locked(
         self,
@@ -1444,8 +1494,7 @@ class FlowRuntime:
                 "Generation exceeds max_adapter_events_per_generation",
             )
         reduction = reduce_event(self.compiled, self._state, event)
-        if self._event_store is not None:
-            await self._event_store.commit(event, reduction)
+        await self._commit_flow_event(event, reduction)
         self._state = reduction.state
         self._event_hashes[event.event_id] = event_digest
         self._event_count_by_generation[generation_id] += 1
@@ -1673,7 +1722,9 @@ class FlowInputProcessor(FrameProcessor):
         if isinstance(frame, InterruptionFrame):
             generation_id = frame.metadata.get("flow_cancel_generation_id")
             try:
-                await self._runtime.interrupt(generation_id)
+                cancelled = await self._runtime.interrupt(generation_id)
+                if cancelled:
+                    frame.metadata["flow_cancel_generation_id"] = cancelled
             finally:
                 await self.push_frame(frame, direction)
             return
@@ -1867,7 +1918,7 @@ class FlowAudioProcessor(FrameProcessor):
             if target is None and self._active_fragment:
                 target = self._active_fragment.generation_id
             try:
-                await self._runtime.interrupt(target)
+                target = await self._runtime.interrupt(target) or target
             finally:
                 try:
                     await self._runtime.cancel_playback_generation(target)

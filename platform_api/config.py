@@ -603,7 +603,7 @@ class PlatformSettings(BaseSettings):
 
     # --- Schema and Catalog ---------------------------------------------------
     schema_version: str = Field(
-        default="platform-v3",
+        default="platform-v4",
         validation_alias=AliasChoices("PLATFORM_SCHEMA_VERSION", "schema_version"),
     )
     catalog_path: str | None = Field(

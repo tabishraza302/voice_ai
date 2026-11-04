@@ -238,10 +238,11 @@ class Settings(BaseSettings):
     # to both Next.js and the agent's CORS allowlist.
     web_port: int = Field(default=3001, ge=1, le=65535)
 
-    # --- Optional platform session bridge -------------------------------
     # These settings are read only by the session-owned runtime path. They
     # remain optional so the legacy local runner is unaffected when the
-    # platform bridge is not installed.
+    # platform bridge is not installed. The managed flow store requires its
+    # own explicit platform database URL; it never reuses database_url, which
+    # belongs to local agent-profile storage.
     platform_api_base_url: str | None = None
     platform_session_runner_id: str | None = None
     platform_runtime_service_token: str | None = None
@@ -249,3 +250,45 @@ class Settings(BaseSettings):
     platform_billing_slice_ms: str | None = None
     platform_billing_permit_ttl_ms: str | None = None
     platform_session_runtime_timeout_seconds: str | None = None
+    platform_database_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("PLATFORM_DATABASE_URL", "platform_database_url"),
+    )
+    platform_postgres_schema: str = Field(
+        default="platform",
+        validation_alias=AliasChoices(
+            "PLATFORM_POSTGRES_SCHEMA",
+            "PLATFORM_SCHEMA",
+            "platform_postgres_schema",
+        ),
+    )
+
+    @field_validator("platform_database_url")
+    @classmethod
+    def validate_platform_database_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        candidate = value.strip()
+        scheme = urlsplit(candidate).scheme
+        if not candidate or scheme not in {ASYNC_POSTGRES_SCHEME, "postgres+asyncpg"}:
+            raise ValueError(
+                "PLATFORM_DATABASE_URL must use asynchronous PostgreSQL; "
+                "SQLite and the agent-profile DATABASE_URL are not valid platform stores"
+            )
+        return candidate
+
+    @field_validator("platform_postgres_schema")
+    @classmethod
+    def validate_platform_postgres_schema(cls, value: str) -> str:
+        if (
+            not isinstance(value, str)
+            or not 1 <= len(value) <= 63
+            or not value.isascii()
+            or not (value[0].islower() or value[0] == "_")
+            or any(
+                not (character.islower() or character.isdigit() or character == "_")
+                for character in value
+            )
+        ):
+            raise ValueError("PLATFORM_POSTGRES_SCHEMA must be a lowercase PostgreSQL identifier")
+        return value
