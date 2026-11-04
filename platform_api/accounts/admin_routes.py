@@ -210,11 +210,9 @@ async def suspend_user(
     if target_user.role == "admin" and target_user.status == "active":
         admin_count_stmt = (
             select(func.count(User.id))
-            .join(AuthMfa, AuthMfa.user_id == User.id)
             .where(
                 User.role == "admin",
                 User.status == "active",
-                AuthMfa.enabled_at.is_not(None),
             )
         )
         admin_count = (await db.execute(admin_count_stmt)).scalar_one()

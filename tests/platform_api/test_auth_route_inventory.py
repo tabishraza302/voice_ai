@@ -34,9 +34,6 @@ EXPLICIT_PUBLIC_ALLOWLIST = {
     "/api/v1/auth/logout",
     "/api/v1/auth/password/reset-request",
     "/api/v1/auth/password/reset-confirm",
-    "/api/v1/auth/mfa/enroll",
-    "/api/v1/auth/mfa/confirm",
-    "/api/v1/auth/mfa/verify",
 }
 
 

@@ -32,19 +32,10 @@ from platform_api.auth.dependencies import (
 from platform_api.auth.errors import (
     ForbiddenError,
     InvalidCredentialsError,
-    MfaInvalidError,
-    MfaRequiredError,
-    MfaStateConflictError,
     NotFoundError,
     TokenInvalidError,
     UnauthenticatedError,
     ValidationError,
-)
-from platform_api.auth.mfa import (
-    confirm_mfa_enrollment,
-    get_or_create_mfa_record,
-    start_mfa_enrollment,
-    verify_mfa_login,
 )
 from platform_api.auth.passwords import get_password_hasher, validate_password_rules
 from platform_api.auth.rate_limits import (
@@ -55,10 +46,6 @@ from platform_api.auth.schemas import (
     Accepted,
     ChangePasswordRequest,
     LoginRequest,
-    MfaConfirmRequest,
-    MfaEnrollRequest,
-    MfaSetup,
-    MfaVerifyRequest,
     RegisterRequest,
     ResetPasswordConfirmRequest,
     ResetPasswordRequest,
@@ -80,7 +67,6 @@ from platform_api.auth.service import (
 from platform_api.auth.sessions import (
     create_anonymous_session,
     create_authenticated_session,
-    create_mfa_pending_session,
     delete_session_cookie,
     get_cookie_name,
     hash_session_secret,
@@ -91,7 +77,7 @@ from platform_api.auth.sessions import (
 from platform_api.auth.types import AuthSessionContext, Principal
 from platform_api.config import PlatformSettings
 from platform_api.db.session import get_db
-from platform_api.models.auth import AuthMfa, AuthSession, User
+from platform_api.models.auth import AuthSession, User
 
 async def enforce_global_auth_rate_limit(
     request: Request,
@@ -202,20 +188,7 @@ async def get_session(
                     and user.status == "active"
                     and session.auth_version == user.auth_version
                 ):
-                    mfa_stmt = select(AuthMfa).where(AuthMfa.user_id == user.id)
-                    mfa_res = await db.execute(mfa_stmt)
-                    mfa = mfa_res.scalar_one_or_none()
-                    mfa_enabled = bool(mfa and mfa.enabled_at is not None)
-
-                    if user.role == "admin" and session.state == "authenticated":
-                        if not mfa_enabled or session.mfa_verified_at is None:
-                            session.revoked_at = now
-                            await db.commit()
-                            session = None
-                        else:
-                            user_view = build_user_view(user, mfa_enabled=True)
-                    else:
-                        user_view = build_user_view(user, mfa_enabled=mfa_enabled)
+                    user_view = build_user_view(user)
                 else:
                     # User suspended or version invalid: revoke session
                     session.revoked_at = now
@@ -406,38 +379,19 @@ async def login(
         raise CsrfInvalidError("Session is expired or has already been rotated")
 
     old_session.revoked_at = now
-    # 7. Check MFA state for admin
-    mfa_stmt = select(AuthMfa).where(AuthMfa.user_id == user.id)
-    mfa_res = await db.execute(mfa_stmt)
-    mfa = mfa_res.scalar_one_or_none()
-    mfa_enabled = bool(mfa and mfa.enabled_at is not None)
-
-    if user.role == "admin":
-        state = "mfa_required" if mfa_enabled else "mfa_enrollment_required"
-        new_session, raw_secret = await create_mfa_pending_session(
-            db,
-            settings,
-            user=user,
-            state=state,
-            client_ip=client_ip,
-            user_agent=user_agent,
-            now=now,
-        )
-    else:
-        new_session, raw_secret = await create_authenticated_session(
-            db,
-            settings,
-            user=user,
-            client_ip=client_ip,
-            user_agent=user_agent,
-            now=now,
-            mfa_verified=False,
-        )
-        user.last_login_at = now
+    new_session, raw_secret = await create_authenticated_session(
+        db,
+        settings,
+        user=user,
+        client_ip=client_ip,
+        user_agent=user_agent,
+        now=now,
+    )
+    user.last_login_at = now
 
     await db.commit()
 
-    user_view = build_user_view(user, mfa_enabled=mfa_enabled)
+    user_view = build_user_view(user)
     return _build_session_response(
         settings, new_session, raw_secret, user_view, response, now
     )
@@ -573,7 +527,6 @@ async def change_password(
     await revoke_all_user_sessions(db, user.id, now)
 
     # Create fresh rotated session with new auth_version
-    mfa_verified = principal.role == "admin"
     new_session, raw_secret = await create_authenticated_session(
         db,
         settings,
@@ -581,7 +534,6 @@ async def change_password(
         client_ip=client_ip,
         user_agent=user_agent,
         now=now,
-        mfa_verified=mfa_verified,
     )
 
     await record_audit(
@@ -599,7 +551,7 @@ async def change_password(
 
     await db.commit()
 
-    user_view = build_user_view(user, mfa_enabled=bool(principal.mfa_verified_at))
+    user_view = build_user_view(user)
     return _build_session_response(
         settings, new_session, raw_secret, user_view, response, now
     )
@@ -711,277 +663,7 @@ async def logout_all(
     response.headers["Cache-Control"] = "no-store"
 
 
-# 12. POST /auth/mfa/enroll ----------------------------------------------------
-
-
-@router.post("/mfa/enroll", status_code=status.HTTP_201_CREATED, response_model=MfaSetup)
-async def mfa_enroll(
-    payload: MfaEnrollRequest,
-    request: Request,
-    response: Response,
-    ctx: AuthSessionContext = Depends(require_csrf),
-    db: AsyncSession = Depends(get_db),
-) -> MfaSetup:
-    """Generate pending TOTP enrollment secret for admin."""
-    settings = get_request_settings(request)
-    now = datetime.now(timezone.utc)
-    client_ip = get_client_ip(request, settings)
-
-    # Must be in mfa_enrollment_required state
-    if ctx.session.state != "mfa_enrollment_required" or ctx.user is None:
-        raise MfaStateConflictError("Only admin sessions requiring MFA enrollment can enroll")
-
-    # Rate limit MFA attempts
-    if client_ip:
-        await check_and_increment_rate_limit(
-            db,
-            settings,
-            scope="mfa_ip",
-            identifier=client_ip,
-            limit=settings.auth_rate_mfa_ip_per_15_minutes,
-            window_seconds=900,
-            now=now,
-        )
-    await check_and_increment_rate_limit(
-        db,
-        settings,
-        scope="mfa_session",
-        identifier=str(ctx.session.id),
-        limit=settings.auth_rate_mfa_session_per_5_minutes,
-        window_seconds=300,
-        now=now,
-    )
-
-    # Verify current password
-    hasher = get_password_hasher(settings.auth_hash_concurrency)
-    is_valid = await hasher.verify_password(payload.current_password, ctx.user.password_hash)
-    if not is_valid:
-        raise InvalidCredentialsError()
-
-    secret_b32, uri, expires_at = await start_mfa_enrollment(
-        db, settings, ctx.user, now
-    )
-    await db.commit()
-
-    response.headers["Cache-Control"] = "no-store"
-    return MfaSetup(
-        secret=secret_b32,
-        provisioning_uri=uri,
-        expires_at=expires_at,
-    )
-
-
-# 13. POST /auth/mfa/confirm ---------------------------------------------------
-
-
-@router.post("/mfa/confirm", response_model=SessionResponse)
-async def mfa_confirm(
-    payload: MfaConfirmRequest,
-    request: Request,
-    response: Response,
-    ctx: AuthSessionContext = Depends(require_csrf),
-    db: AsyncSession = Depends(get_db),
-) -> SessionResponse:
-    """Confirm pending TOTP enrollment and upgrade session to authenticated."""
-    settings = get_request_settings(request)
-    now = datetime.now(timezone.utc)
-    client_ip = get_client_ip(request, settings)
-    user_agent = request.headers.get("user-agent")
-
-    if ctx.session.state != "mfa_enrollment_required" or ctx.user is None:
-        raise MfaStateConflictError("Session is not in MFA enrollment state")
-
-    # Rate limit MFA attempts
-    if client_ip:
-        await check_and_increment_rate_limit(
-            db,
-            settings,
-            scope="mfa_ip",
-            identifier=client_ip,
-            limit=settings.auth_rate_mfa_ip_per_15_minutes,
-            window_seconds=900,
-            now=now,
-        )
-    # Enforce global per-session rate limit cap
-    await check_and_increment_rate_limit(
-        db,
-        settings,
-        scope="mfa_session",
-        identifier=str(ctx.session.id),
-        limit=settings.auth_rate_mfa_session_per_5_minutes,
-        window_seconds=300,
-        now=now,
-    )
-    try:
-        await confirm_mfa_enrollment(db, settings, ctx.user, payload.code, now)
-    except MfaInvalidError as exc:
-        fail_count = await record_rate_limit_failure(
-            db,
-            settings,
-            scope="mfa_failures_session",
-            identifier=str(ctx.session.id),
-            window_seconds=300,
-            now=now,
-        )
-        if fail_count >= 5:
-            bind = getattr(db, "bind", None) or db.get_bind()
-            async with AsyncSession(bind, expire_on_commit=False) as revoke_session:
-                sess_to_revoke = (
-                    await revoke_session.execute(
-                        select(AuthSession).where(AuthSession.id == ctx.session.id)
-                    )
-                ).scalar_one_or_none()
-                if sess_to_revoke is not None:
-                    sess_to_revoke.revoked_at = now
-                    await revoke_session.commit()
-            exc.expire_cookie = True
-        raise
-    # Revalidate and lock preceding session before rotation
-    sess_stmt = (
-        select(AuthSession)
-        .where(
-            AuthSession.id == ctx.session.id,
-            AuthSession.revoked_at.is_(None),
-            AuthSession.idle_expires_at > now,
-            AuthSession.absolute_expires_at > now,
-        )
-        .with_for_update()
-    )
-    old_session = (await db.execute(sess_stmt)).scalar_one_or_none()
-    if old_session is None:
-        raise CsrfInvalidError("Session is expired or has already been rotated")
-    old_session.revoked_at = now
-    new_session, raw_secret = await create_authenticated_session(
-        db,
-        settings,
-        user=ctx.user,
-        client_ip=client_ip,
-        user_agent=user_agent,
-        now=now,
-        mfa_verified=True,
-    )
-    ctx.user.last_login_at = now
-
-    await record_audit(
-        db,
-        actor_kind="user",
-        actor_id=ctx.user.id,
-        session_id=new_session.id,
-        action="mfa.enrolled",
-        target_type="user",
-        target_id=ctx.user.id,
-        source_ip=client_ip,
-        result="success",
-        created_at=now,
-    )
-
-    await db.commit()
-
-    user_view = build_user_view(ctx.user, mfa_enabled=True)
-    return _build_session_response(
-        settings, new_session, raw_secret, user_view, response, now
-    )
-
-
-# 14. POST /auth/mfa/verify ----------------------------------------------------
-
-
-@router.post("/mfa/verify", response_model=SessionResponse)
-async def mfa_verify(
-    payload: MfaVerifyRequest,
-    request: Request,
-    response: Response,
-    ctx: AuthSessionContext = Depends(require_csrf),
-    db: AsyncSession = Depends(get_db),
-) -> SessionResponse:
-    """Verify TOTP code for mfa_required session and rotate to authenticated."""
-    settings = get_request_settings(request)
-    now = datetime.now(timezone.utc)
-    client_ip = get_client_ip(request, settings)
-    user_agent = request.headers.get("user-agent")
-
-    if ctx.session.state != "mfa_required" or ctx.user is None:
-        raise MfaStateConflictError("Session is not awaiting MFA verification")
-
-    # Rate limit MFA attempts
-    if client_ip:
-        await check_and_increment_rate_limit(
-            db,
-            settings,
-            scope="mfa_ip",
-            identifier=client_ip,
-            limit=settings.auth_rate_mfa_ip_per_15_minutes,
-            window_seconds=900,
-            now=now,
-        )
-    # Enforce global per-session rate limit cap
-    await check_and_increment_rate_limit(
-        db,
-        settings,
-        scope="mfa_session",
-        identifier=str(ctx.session.id),
-        limit=settings.auth_rate_mfa_session_per_5_minutes,
-        window_seconds=300,
-        now=now,
-    )
-    try:
-        await verify_mfa_login(db, settings, ctx.user, payload.code, now)
-    except MfaInvalidError as exc:
-        fail_count = await record_rate_limit_failure(
-            db,
-            settings,
-            scope="mfa_failures_session",
-            identifier=str(ctx.session.id),
-            window_seconds=300,
-            now=now,
-        )
-        if fail_count >= 5:
-            bind = getattr(db, "bind", None) or db.get_bind()
-            async with AsyncSession(bind, expire_on_commit=False) as revoke_session:
-                sess_to_revoke = (
-                    await revoke_session.execute(
-                        select(AuthSession).where(AuthSession.id == ctx.session.id)
-                    )
-                ).scalar_one_or_none()
-                if sess_to_revoke is not None:
-                    sess_to_revoke.revoked_at = now
-                    await revoke_session.commit()
-            exc.expire_cookie = True
-        raise
-    sess_stmt = (
-        select(AuthSession)
-        .where(
-            AuthSession.id == ctx.session.id,
-            AuthSession.revoked_at.is_(None),
-            AuthSession.idle_expires_at > now,
-            AuthSession.absolute_expires_at > now,
-        )
-        .with_for_update()
-    )
-    old_session = (await db.execute(sess_stmt)).scalar_one_or_none()
-    if old_session is None:
-        raise CsrfInvalidError("Session is expired or has already been rotated")
-    old_session.revoked_at = now
-    new_session, raw_secret = await create_authenticated_session(
-        db,
-        settings,
-        user=ctx.user,
-        client_ip=client_ip,
-        user_agent=user_agent,
-        now=now,
-        mfa_verified=True,
-    )
-    ctx.user.last_login_at = now
-
-    await db.commit()
-
-    user_view = build_user_view(ctx.user, mfa_enabled=True)
-    return _build_session_response(
-        settings, new_session, raw_secret, user_view, response, now
-    )
-
-
-# 15. POST /auth/step-up -------------------------------------------------------
+# 12. POST /auth/step-up -------------------------------------------------------
 
 
 @router.post("/step-up", response_model=SessionResponse)
@@ -993,7 +675,7 @@ async def step_up(
     ctx: AuthSessionContext = Depends(require_csrf),
     db: AsyncSession = Depends(get_db),
 ) -> SessionResponse:
-    """Fresh step-up verification for privileged admin actions."""
+    """Fresh password step-up verification for privileged admin actions."""
     settings = get_request_settings(request)
     now = datetime.now(timezone.utc)
     client_ip = get_client_ip(request, settings)
@@ -1034,17 +716,11 @@ async def step_up(
     if not is_valid_pw:
         raise InvalidCredentialsError()
 
-    # 2. Verify TOTP code (must be unused)
-    try:
-        await verify_mfa_login(db, settings, user, payload.code, now)
-    except MfaInvalidError:
-        raise InvalidCredentialsError()
-
-    # 3. Update step_up_at on existing session
+    # 2. Update step_up_at on existing session
     ctx.session.step_up_at = now
     await db.commit()
 
-    user_view = build_user_view(user, mfa_enabled=True)
+    user_view = build_user_view(user)
     csrf_token = generate_csrf_token(settings.auth_csrf_key, ctx.session.id, ctx.session.token_digest)
     response.headers["Cache-Control"] = "no-store"
 

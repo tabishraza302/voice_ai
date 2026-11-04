@@ -9,7 +9,6 @@ export function StepUpDialog() {
   const { stepUpManager } = useAuth();
   const [isOpen, setIsOpen] = useState(stepUpManager.isStepUpOpen);
   const [password, setPassword] = useState("");
-  const [code, setCode] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -18,7 +17,6 @@ export function StepUpDialog() {
       setIsOpen(stepUpManager.isStepUpOpen);
       if (!stepUpManager.isStepUpOpen) {
         setPassword("");
-        setCode("");
         setError(null);
         setLoading(false);
       }
@@ -40,23 +38,18 @@ export function StepUpDialog() {
       setError("Password is required for step-up authentication");
       return;
     }
-    const cleanCode = code.replace(/\s+/g, "");
-    if (!/^\d{6}$/.test(cleanCode)) {
-      setError("Please enter a valid 6-digit verification code");
-      return;
-    }
 
     setLoading(true);
     setError(null);
 
     try {
       await stepUpManager.resolveStepUp(async () => {
-        return await platformApi.stepUp({ password, code: cleanCode });
+        return await platformApi.stepUp({ password });
       });
     } catch (err: unknown) {
       if (err instanceof PlatformApiError) {
         if (err.code === "INVALID_CREDENTIALS") {
-          setError("Invalid password or verification code");
+          setError("Invalid password");
         } else if (err.code === "RATE_LIMITED") {
           setError("Too many failed attempts. Please try again later.");
         } else {
@@ -65,8 +58,6 @@ export function StepUpDialog() {
       } else {
         setError(err instanceof Error ? err.message : "Authentication error");
       }
-      // Reset verification code on error to prevent accidental replay
-      setCode("");
       setLoading(false);
     }
   };
@@ -135,26 +126,6 @@ export function StepUpDialog() {
             />
           </div>
 
-          <div>
-            <label htmlFor="step-up-code" className="field-label">
-              6-Digit Authenticator Code
-            </label>
-            <input
-              id="step-up-code"
-              type="text"
-              inputMode="numeric"
-              pattern="[0-9]*"
-              maxLength={6}
-              required
-              autoComplete="one-time-code"
-              value={code}
-              onChange={(e) => setCode(e.target.value)}
-              disabled={loading}
-              placeholder="123456"
-              className="field-control text-center tracking-widest font-mono text-base"
-            />
-          </div>
-
           <div className="flex items-center justify-end gap-3 pt-2">
             <button
               type="button"
@@ -166,7 +137,7 @@ export function StepUpDialog() {
             </button>
             <button
               type="submit"
-              disabled={loading || !password || !code}
+              disabled={loading || !password}
               className="button-primary min-w-[120px]"
             >
               {loading ? (

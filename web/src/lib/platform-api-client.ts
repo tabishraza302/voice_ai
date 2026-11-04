@@ -6,10 +6,6 @@ import type {
   ApiFieldError,
   ChangePasswordRequest,
   LoginRequest,
-  MfaConfirmRequest,
-  MfaEnrollRequest,
-  MfaSetup,
-  MfaVerifyRequest,
   RegisterRequest,
   ResetPasswordConfirmRequest,
   ResetPasswordRequest,
@@ -31,6 +27,12 @@ import type {
   AdminAgentPage,
   AdminAuditPage,
   AdminOverview,
+  AdminProviderCatalog,
+  AdminOllamaModelCatalog,
+  AdminOllamaModelCreateRequest,
+  AdminOllamaModelItem,
+  AdminOllamaModelUpdateRequest,
+  AdminProviderSecretsRequest,
   AdminSessionFilters,
   AdminSessionDetail,
   AdminSessionPage,
@@ -438,28 +440,7 @@ export class PlatformApiClient {
     });
   }
 
-  // --- MFA and Step-Up ---
-
-  async enrollMfa(data: MfaEnrollRequest): Promise<MfaSetup> {
-    return this.request<MfaSetup>("/auth/mfa/enroll", {
-      method: "POST",
-      body: JSON.stringify(data),
-    });
-  }
-
-  async confirmMfa(data: MfaConfirmRequest): Promise<SessionResponse> {
-    return this.request<SessionResponse>("/auth/mfa/confirm", {
-      method: "POST",
-      body: JSON.stringify(data),
-    });
-  }
-
-  async verifyMfa(data: MfaVerifyRequest): Promise<SessionResponse> {
-    return this.request<SessionResponse>("/auth/mfa/verify", {
-      method: "POST",
-      body: JSON.stringify(data),
-    });
-  }
+  // --- Password-Based Step-Up ---
 
   async stepUp(data: StepUpRequest): Promise<SessionResponse> {
     return this.request<SessionResponse>("/auth/step-up", {
@@ -484,6 +465,61 @@ export class PlatformApiClient {
   }
 
   // --- Admin endpoints ---
+
+  async adminGetProviders(): Promise<AdminProviderCatalog> {
+    return this.request<AdminProviderCatalog>("/admin/providers", {
+      method: "GET",
+    });
+  }
+
+  async adminSetProviderSecrets(
+    providerId: string,
+    secrets: AdminProviderSecretsRequest["secrets"]
+  ): Promise<void> {
+    await this.request<unknown>(
+      `/admin/providers/${encodeURIComponent(providerId)}/secrets`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ secrets }),
+      }
+    );
+  }
+
+  async adminGetOllamaModels(providerId: string): Promise<AdminOllamaModelCatalog> {
+    return this.request<AdminOllamaModelCatalog>(
+      `/admin/providers/${encodeURIComponent(providerId)}/models`,
+      { method: "GET" }
+    );
+  }
+
+  async adminCreateOllamaModel(
+    providerId: string, model: AdminOllamaModelCreateRequest
+  ): Promise<AdminOllamaModelItem> {
+    return this.request<AdminOllamaModelItem>(`/admin/providers/${encodeURIComponent(providerId)}/models`, {
+      method: "POST",
+      body: JSON.stringify(model),
+    });
+  }
+
+  async adminUpdateOllamaModel(
+    providerId: string, modelId: string,
+    updates: AdminOllamaModelUpdateRequest
+  ): Promise<AdminOllamaModelItem> {
+    return this.request<AdminOllamaModelItem>(
+      `/admin/providers/${encodeURIComponent(providerId)}/models/${encodeURIComponent(modelId)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(updates),
+      }
+    );
+  }
+
+  async adminDeleteOllamaModel(providerId: string, modelId: string): Promise<void> {
+    await this.request<unknown>(
+      `/admin/providers/${encodeURIComponent(providerId)}/models/${encodeURIComponent(modelId)}`,
+      { method: "DELETE" }
+    );
+  }
 
   async adminGetUsers(params?: {
     limit?: number;

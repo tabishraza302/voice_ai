@@ -1,7 +1,6 @@
 import { test, expect } from "@playwright/test";
 import {
   createAdminUser,
-  generateTotpCode,
   getLatestMail,
   makeAdminSessionStepUpStale,
 } from "./fixtures/auth";
@@ -240,22 +239,20 @@ test.describe("TLS Production Ingress Real Authentication Journeys", () => {
     await page.waitForURL((url) => url.pathname === "/" || url.pathname === "/settings");
   });
 
-  // Test 5: Admin MFA Enrollment, Stale Step-Up Interception, and Privileged Mutation
-  test("Admin MFA Enrollment and Stale Step-Up Flow with Real TOTP Verification", async ({
+  // Test 5: Password-only admin sign-in, stale step-up interception, and privileged mutation
+  test("Password-only admin step-up intercepts a stale privileged mutation", async ({
     page,
   }) => {
     const adminEmail = `admin-tls-${Date.now()}@example.com`;
     const adminPassword = "AdminSecurePassword12345";
     const targetUserEmail = `target-user-${Date.now()}@example.com`;
 
-    // 1. Seed admin and a regular user directly in PostgreSQL
     createAdminUser({
       email: adminEmail,
       displayName: "TLS Admin Operator",
       password: adminPassword,
     });
 
-    // Fast-register a second user to suspend
     await page.goto("/register");
     await page.getByLabel("Email address").fill(targetUserEmail);
     await page.getByLabel("Display name").fill("Target Suspension User");
@@ -267,37 +264,13 @@ test.describe("TLS Production Ingress Real Authentication Journeys", () => {
     await page.getByRole("button", { name: "Create Account & Set Password" }).click();
     await expect(page.getByRole("heading", { name: "Account created!" })).toBeVisible();
 
-    // 2. Sign in as admin over HTTPS
     await page.goto("/login");
     await page.getByLabel("Email address").fill(adminEmail);
     await page.getByLabel("Password").fill(adminPassword);
     await page.getByRole("button", { name: "Sign in" }).click();
+    await page.waitForURL((url) => url.pathname === "/" || url.pathname === "/settings");
 
-    // Admin without active MFA is redirected to MFA enrollment
-    await page.waitForURL("**/admin/settings");
-    await expect(page.getByRole("heading", { name: "Administrator Security" })).toBeVisible();
-
-    // Begin enrollment
-    await page.getByLabel("Current admin password").fill(adminPassword);
-    await page.getByRole("button", { name: "Begin MFA Enrollment" }).click();
-
-    // Extract secret and generate real RFC 6238 TOTP code
-    const secretInput = page.getByLabel("TOTP Secret Key (Base32)");
-    await expect(secretInput).toBeVisible();
-    const secret = await secretInput.inputValue();
-    expect(secret).toBeTruthy();
-
-    const totpCode = generateTotpCode(secret);
-    await page.getByLabel("Step 3: Enter the generated 6-digit code").fill(totpCode);
-    await page.getByRole("button", { name: "Confirm & Enable MFA" }).click();
-
-    const mfaSection = page.locator('section[aria-labelledby="mfa-section-heading"]');
-    await expect(mfaSection.getByText("Active", { exact: true })).toBeVisible();
-
-    // 3. Force admin session step-up timestamp to be STALE immediately after enrollment
     makeAdminSessionStepUpStale({ email: adminEmail });
-
-    // 4. Navigate to User Management
     await page.goto("/admin/users");
     await expect(page.getByRole("heading", { name: "User Management" })).toBeVisible();
 
@@ -319,10 +292,8 @@ test.describe("TLS Production Ingress Real Authentication Journeys", () => {
     await expect(stepUpDialog).toBeVisible();
     await expect(page.getByText("Confirm your admin credentials to proceed with this sensitive action.")).toBeVisible();
 
-    // 7. Resolve step-up inside the dialog using admin password and valid next TOTP code (+1)
-    const stepUpTotp = generateTotpCode(secret, 1);
+    // 7. Resolve step-up inside the dialog with the admin password only
     await stepUpDialog.locator("#step-up-password").fill(adminPassword);
-    await stepUpDialog.locator("#step-up-code").fill(stepUpTotp);
     await stepUpDialog.getByRole("button", { name: "Verify & Proceed" }).click();
 
     // 8. After resolution, the pending suspension automatically completes and dialog closes

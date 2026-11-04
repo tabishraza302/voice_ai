@@ -23,8 +23,8 @@ class Principal:
     session_id: uuid.UUID
     email_verified_at: datetime
     password_verified_at: datetime
-    mfa_verified_at: datetime | None
-    step_up_at: datetime | None
+    step_up_at: datetime | None = None
+    mfa_verified_at: datetime | None = None
 
 
 @dataclass

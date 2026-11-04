@@ -199,9 +199,9 @@ describe("AuthState and security helpers", () => {
       expect(state.user).toBeNull();
     });
 
-    test("derives password-verified mfa_required state for admin login", () => {
+    test("derives authenticated state for an admin without MFA", () => {
       const session = {
-        state: "mfa_required",
+        state: "authenticated",
         user: {
           id: "00000000-0000-0000-0000-000000000002",
           email: "admin@example.com",
@@ -212,7 +212,6 @@ describe("AuthState and security helpers", () => {
           preferred_language: "en",
           timezone: "UTC",
           low_balance_notifications: true,
-          mfa_enabled: true,
           created_at: "2026-10-28T12:00:00Z",
           updated_at: "2026-10-28T12:00:00Z",
         },
@@ -223,36 +222,8 @@ describe("AuthState and security helpers", () => {
       };
 
       const state = deriveAuthState(session);
-      expect(state.status).toBe("mfa_required");
+      expect(state.status).toBe("authenticated");
       expect(state.user?.role).toBe("admin");
-    });
-
-    test("derives mfa_enrollment_required state for admin without factor", () => {
-      const session = {
-        state: "mfa_enrollment_required",
-        user: {
-          id: "00000000-0000-0000-0000-000000000004",
-          email: "bootstrap@example.com",
-          display_name: "Bootstrap Admin",
-          role: "admin",
-          status: "active",
-          email_verified_at: "2026-10-28T12:00:00Z",
-          preferred_language: "en",
-          timezone: "UTC",
-          low_balance_notifications: true,
-          mfa_enabled: false,
-          created_at: "2026-10-28T12:00:00Z",
-          updated_at: "2026-10-28T12:00:00Z",
-        },
-        session_id: "00000000-0000-0000-0000-000000000005",
-        expires_at: "2026-10-28T12:00:00Z",
-        csrf_token: "csrf",
-        step_up_expires_at: null,
-      };
-
-      const state = deriveAuthState(session);
-      expect(state.status).toBe("mfa_enrollment_required");
-      expect(state.user?.mfa_enabled).toBe(false);
     });
 
     test("derives authenticated state with full user view", () => {
@@ -268,7 +239,6 @@ describe("AuthState and security helpers", () => {
           preferred_language: "hi",
           timezone: "Asia/Kolkata",
           low_balance_notifications: true,
-          mfa_enabled: false,
           created_at: "2026-10-28T12:00:00Z",
           updated_at: "2026-10-28T12:00:00Z",
         },
