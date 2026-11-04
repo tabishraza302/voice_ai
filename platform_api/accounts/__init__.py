@@ -1,1 +1,0 @@
-"""Platform API accounts package."""
