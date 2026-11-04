@@ -152,6 +152,7 @@ class PlatformSettings(BaseSettings):
         env_prefix="PLATFORM_",
         env_file=None,
         extra="ignore",
+        hide_input_in_errors=True,
         case_sensitive=False,
         populate_by_name=True,
     )
@@ -285,6 +286,13 @@ class PlatformSettings(BaseSettings):
         ...,
         validation_alias=AliasChoices("PLATFORM_AUTH_MFA_KEY", "auth_mfa_key"),
         description="32-byte Fernet key for encrypting TOTP secrets",
+    )
+    provider_secret_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "PLATFORM_PROVIDER_SECRET_KEY", "provider_secret_key"
+        ),
+        description="Optional dedicated Fernet key for registered provider credentials",
     )
 
     # --- Auth Lifetime Policies (exact contract names) ------------------------
@@ -595,7 +603,7 @@ class PlatformSettings(BaseSettings):
 
     # --- Schema and Catalog ---------------------------------------------------
     schema_version: str = Field(
-        default="platform-v1",
+        default="platform-v3",
         validation_alias=AliasChoices("PLATFORM_SCHEMA_VERSION", "schema_version"),
     )
     catalog_path: str | None = Field(
@@ -1041,6 +1049,16 @@ class PlatformSettings(BaseSettings):
             raise ValueError("MFA key is required and cannot be empty.")
         return _validate_fernet_key(v)
 
+    @field_validator("provider_secret_key", mode="before")
+    @classmethod
+    def validate_provider_secret_key(cls, value: str | SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        raw = value.get_secret_value() if isinstance(value, SecretStr) else value
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        return SecretStr(raw.strip())
+
     @field_validator("auth_mail_mode")
     @classmethod
     def validate_mail_mode(cls, v: str) -> str:
@@ -1120,14 +1138,32 @@ class PlatformSettings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_key_separation(self) -> PlatformSettings:
-        if self.auth_csrf_key == self.auth_rate_key:
+        auth_keys = {
+            _decode_b64url_32(self.auth_csrf_key),
+            _decode_b64url_32(self.auth_rate_key),
+            _decode_b64url_32(self.auth_mfa_key),
+        }
+        if len(auth_keys) != 3:
             raise ValueError(
-                "PLATFORM_AUTH_CSRF_KEY and PLATFORM_AUTH_RATE_KEY must be distinct keys."
+                "PLATFORM_AUTH_CSRF_KEY, PLATFORM_AUTH_RATE_KEY, and "
+                "PLATFORM_AUTH_MFA_KEY must be distinct keys."
             )
-        if self.auth_csrf_key == self.auth_mfa_key or self.auth_rate_key == self.auth_mfa_key:
-            raise ValueError(
-                "All cryptographic keys (CSRF, rate limit, and MFA) must be distinct keys."
+        if self.provider_secret_key is not None:
+            provider_key = self.provider_secret_key.get_secret_value()
+            try:
+                normalized_key = _validate_fernet_key(provider_key)
+                provider_key_bytes = _decode_b64url_32(normalized_key)
+            except ValueError:
+                raise ValueError(
+                    "PLATFORM_PROVIDER_SECRET_KEY must be a valid Fernet key."
+                ) from None
+            self.provider_secret_key = SecretStr(
+                base64.urlsafe_b64encode(provider_key_bytes).decode("ascii")
             )
+            if provider_key_bytes in auth_keys:
+                raise ValueError(
+                    "PLATFORM_PROVIDER_SECRET_KEY must be distinct from all auth keys."
+                )
         return self
 
     @model_validator(mode="after")
@@ -1246,6 +1282,16 @@ class PlatformSettings(BaseSettings):
         if self.enable_chat_test and self.runtime_llm_base_url is None:
             raise ValueError(
                 "PLATFORM_RUNTIME_LLM_BASE_URL is required when chat testing is enabled."
+            )
+        if (
+            (self.enable_chat_test or self.enable_qa)
+            and self.runtime_llm_base_url is not None
+            and not _is_loopback_host(
+                urlsplit(self.runtime_llm_base_url).hostname or ""
+            )
+        ):
+            raise ValueError(
+                "PLATFORM_RUNTIME_LLM_BASE_URL must target a local Ollama endpoint."
             )
         if self.enable_generation and self.generation_llm_base_url is None:
             raise ValueError(

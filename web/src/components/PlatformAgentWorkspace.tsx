@@ -1,12 +1,18 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { ArrowLeft, Check, Clock3, RefreshCw, RotateCcw } from "lucide-react";
+import { ArrowLeft, Check, RefreshCw, MessageSquare, Activity, X } from "lucide-react";
 import { ChatTestPanel } from "@/components/ChatTestPanel";
 import { FlowQAPanel } from "@/components/FlowQAPanel";
-import { ConversationFlowEditor } from "@/components/ConversationFlowEditor";
+import { AgentBuilderTab } from "@/components/AgentBuilderTab";
+import { AgentRuntimeTab } from "@/components/AgentRuntimeTab";
+import { AgentPublishTab } from "@/components/AgentPublishTab";
+import {
+  type RuntimeSettingKey,
+  type WorkspaceTab,
+} from "@/lib/agent-workspace-constants";
 import {
   platformAgentApi,
   type AgentDiagnostic,
@@ -21,7 +27,6 @@ import { PlatformApiError } from "@/lib/platform-api-client";
 import {
   configWithFlow,
   getFlowFromConfig,
-  summarizeRuntimeSettings,
   type FlowDocument,
 } from "@/lib/platform-agent-model";
 
@@ -34,14 +39,6 @@ interface IdempotencyRecord {
   key: string;
 }
 
-const SETTINGS = [
-  { key: "llm_model", label: "Runtime model ID", maxLength: 64 },
-  { key: "stt_provider", label: "Speech recognition provider ID", maxLength: 32 },
-  { key: "tts_voice_en", label: "English voice ID", maxLength: 32 },
-  { key: "tts_voice_hi", label: "Hindi voice ID", maxLength: 32 },
-] as const;
-
-type RuntimeSettingKey = typeof SETTINGS[number]["key"];
 type MobileTab = "editor" | "test";
 type SaveStatus = "saved" | "unsaved" | "saving" | "error";
 
@@ -59,21 +56,16 @@ function idempotencyKeyFor(ref: { current: IdempotencyRecord | null }, fingerpri
   return key;
 }
 
-function formatDate(value: string): string {
-  const date = new Date(value);
-  return Number.isNaN(date.getTime())
-    ? "Date unavailable"
-    : new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date);
-}
-
-function getString(config: JsonObject, key: RuntimeSettingKey): string {
-  return typeof config[key] === "string" ? config[key] as string : "";
-}
 
 export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps) {
   const router = useRouter();
   const searchParams = useSearchParams();
   const [mobileTab, setMobileTab] = useState<MobileTab>(searchParams.get("tab") === "test" ? "test" : "editor");
+  const initialSection = searchParams.get("section");
+  const [workspaceTab, setWorkspaceTabState] = useState<WorkspaceTab>(
+    initialSection === "runtime" || initialSection === "publish" ? initialSection : "builder"
+  );
+  const [activeDrawer, setActiveDrawer] = useState<"none" | "chat" | "qa">("none");
   const [agent, setAgent] = useState<AgentView | null>(null);
   const [draft, setDraft] = useState<DraftView | null>(null);
   const [config, setConfig] = useState<JsonObject | null>(null);
@@ -341,15 +333,6 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
     if (config) updateConfig(configWithFlow(config, nextFlow));
   };
 
-  const saveDraftNow = () => {
-    if (!config || saveConflict) return;
-    if (saveTimerRef.current !== null) {
-      window.clearTimeout(saveTimerRef.current);
-      saveTimerRef.current = null;
-    }
-    setSaveError(null);
-    queueDraftSave(config);
-  };
 
   const discardLocalAndReload = async () => {
     if (saveStatus === "saving" || pendingSaveCountRef.current > 0) return;
@@ -407,6 +390,32 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
     setTextOnly(checked);
     updateConfig(next);
   };
+  const updateLlmSelection = (provider: string, model: string) => {
+    if (!config) return;
+    updateConfig({ ...config, llm_provider: provider, llm_model: model });
+  };
+  const updateSttSelection = (provider: string, model: string) => {
+    if (!config) return;
+    updateConfig({ ...config, stt_provider: provider, stt_model: model });
+  };
+
+  const updateVoiceSettings = (provider: string, model: string, en: string, hi: string, checked: boolean) => {
+    if (!config) return;
+    const next = { ...config };
+    if (provider) next.tts_provider = provider;
+    else delete next.tts_provider;
+    if (model) next.tts_model = model;
+    else delete next.tts_model;
+    if (checked) {
+      next.tts_voice_en = "";
+      next.tts_voice_hi = "";
+    } else {
+      next.tts_voice_en = en;
+      next.tts_voice_hi = hi;
+    }
+    setTextOnly(checked);
+    updateConfig(next);
+  };
 
   const refreshDraftSnapshot = async (identityAlreadySaved = false): Promise<boolean> => {
     const hasLocalIdentityChanges = Boolean(agent && (
@@ -459,8 +468,8 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
     }
   };
 
-  const handleSaveIdentity = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
+  const saveIdentity = async (): Promise<boolean> => {
+    if (!agent || !identityDirty) return true;
     const request: AgentUpdateRequest = {
       name: identityName.trim(),
       description: identityDescription.trim(),
@@ -474,20 +483,37 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
       setIdentityName(updated.name);
       setIdentityDescription(updated.description);
       setIdentityPersona(updated.persona_prompt);
-      if (updated.persona_prompt !== agent?.persona_prompt || snapshotRefreshNeeded) {
+      if (updated.persona_prompt !== agent.persona_prompt || snapshotRefreshNeeded) {
         setValidation(null);
         setValidationConfigKey(null);
         setValidationRevision(null);
         setAcknowledgedWarnings([]);
-        setDraft((current) => current ? { ...current, snapshot_hash: null } : current);
+        setDraft((current) => (current ? { ...current, snapshot_hash: null } : current));
         setSnapshotRefreshNeeded(true);
         await refreshDraftSnapshot(true);
       }
+      return true;
     } catch (error: unknown) {
       setIdentityError(errorMessage(error));
+      return false;
     } finally {
       setIdentitySaving(false);
     }
+  };
+
+  const saveDraftNow = async () => {
+    if (saveConflict) return;
+    if (identityDirty) {
+      const ok = await saveIdentity();
+      if (!ok) return;
+    }
+    if (!config || !dirty) return;
+    if (saveTimerRef.current !== null) {
+      window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    setSaveError(null);
+    queueDraftSave(config);
   };
 
   const handleEnabledChange = async () => {
@@ -589,7 +615,31 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
 
   const setMobileMode = (tab: MobileTab) => {
     setMobileTab(tab);
-    router.replace(tab === "test" ? `/agents/${agentId}?tab=test` : `/agents/${agentId}`, { scroll: false });
+    if (tab === "test") {
+      setActiveDrawer("chat");
+    } else {
+      setActiveDrawer("none");
+    }
+    const params = new URLSearchParams(searchParams.toString());
+    if (tab === "test") {
+      params.set("tab", "test");
+    } else {
+      params.delete("tab");
+    }
+    const query = params.toString();
+    router.replace(query ? `/agents/${agentId}?${query}` : `/agents/${agentId}`, { scroll: false });
+  };
+
+  const setWorkspaceTab = (tab: WorkspaceTab) => {
+    setWorkspaceTabState(tab);
+    const params = new URLSearchParams(searchParams.toString());
+    if (tab === "builder") {
+      params.delete("section");
+    } else {
+      params.set("section", tab);
+    }
+    const query = params.toString();
+    router.replace(query ? `/agents/${agentId}?${query}` : `/agents/${agentId}`, { scroll: false });
   };
 
 
@@ -611,7 +661,6 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
   }
 
   const latestVersion = versions.find((version) => version.version_id === agent.published_version_id) ?? null;
-  const runtimeSettings = summarizeRuntimeSettings(config);
   const draftStatusLabel = identitySaving
     ? "Saving agent details…"
     : identityDirty
@@ -629,26 +678,63 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
 
   return (
     <div className="mx-auto max-w-[1600px] space-y-5">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <Link href="/agents" className="inline-flex items-center gap-2 text-sm text-limestone-400 hover:text-limestone-100">
-          <ArrowLeft className="h-4 w-4" />Back to agents
+      <div className="flex items-center justify-between">
+        <Link href="/agents" className="inline-flex items-center gap-2 text-xs text-limestone-400 hover:text-limestone-100 transition-colors">
+          <ArrowLeft className="h-3.5 w-3.5" />Back to agents
         </Link>
-        <div className="flex flex-wrap items-center gap-2 text-xs">
-          <span className={`rounded-md border px-2 py-1 ${agent.enabled ? "border-moss-700 bg-moss-950 text-moss-200" : "border-ink-700 text-limestone-400"}`}>{agent.enabled ? "Enabled" : "Disabled"}</span>
-          <span className="rounded-md border border-ink-700 px-2 py-1 text-limestone-300">Draft r{draft.draft_revision}</span>
-          {latestVersion ? <span className="rounded-md border border-copper-800 px-2 py-1 text-copper-200">Published v{latestVersion.version}</span> : <span className="rounded-md border border-ink-700 px-2 py-1 text-limestone-400">Not published</span>}
-        </div>
       </div>
 
-      <header className="flex flex-col gap-4 border-b border-ink-800 pb-5 lg:flex-row lg:items-end lg:justify-between">
+      <header className="flex flex-col gap-4 border-b border-ink-800 pb-4 lg:flex-row lg:items-center lg:justify-between">
         <div className="min-w-0">
-          <p className="text-sm font-medium text-copper-300">Agent workspace</p>
-          <h1 className="mt-1 truncate text-3xl font-semibold tracking-tight text-limestone-100">{agent.name}</h1>
-          <p className="mt-2 max-w-3xl text-sm leading-6 text-limestone-400">Configure the saved flow, inspect validation, and test this exact draft or a published version.</p>
+          <div className="flex flex-wrap items-center gap-2.5">
+            <h1 className="truncate text-2xl font-bold tracking-tight text-limestone-100">{agent.name}</h1>
+            <span className={`rounded-md border px-2 py-0.5 text-xs font-mono ${agent.enabled ? "border-moss-700 bg-moss-950 text-moss-200" : "border-ink-700 text-limestone-400"}`}>
+              {agent.enabled ? "Enabled" : "Disabled"}
+            </span>
+            <span className="rounded-md border border-ink-700 px-2 py-0.5 text-xs font-mono text-limestone-300">
+              Draft r{draft.draft_revision}
+            </span>
+            {latestVersion ? (
+              <span className="rounded-md border border-copper-800 px-2 py-0.5 text-xs font-mono text-copper-200">
+                v{latestVersion.version}
+              </span>
+            ) : null}
+          </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <span role="status" aria-live="polite" className={`text-xs ${saveStatus === "error" ? "text-rust-300" : "text-limestone-400"}`}>{draftStatusLabel}</span>
-          <button type="button" className="button-secondary" onClick={saveDraftNow} disabled={!dirty || saveStatus === "saving" || saveConflict}>
+          {snapshotRefreshNeeded ? (
+            <button
+              type="button"
+              className="button-secondary"
+              onClick={() => void refreshDraftSnapshot()}
+              disabled={identitySaving || snapshotRefreshLoading || saveStatus === "saving"}
+            >
+              {snapshotRefreshLoading ? "Refreshing…" : "Refresh draft snapshot"}
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className={activeDrawer === "chat" ? "button-primary" : "button-secondary"}
+            onClick={() => setActiveDrawer((cur) => (cur === "chat" ? "none" : "chat"))}
+            title="Toggle Chat Test simulator"
+          >
+            <MessageSquare className="h-4 w-4" />Chat Test
+          </button>
+          <button
+            type="button"
+            className={activeDrawer === "qa" ? "button-primary" : "button-secondary"}
+            onClick={() => setActiveDrawer((cur) => (cur === "qa" ? "none" : "qa"))}
+            title="Toggle Flow QA test scenarios"
+          >
+            <Activity className="h-4 w-4" />Flow QA
+          </button>
+          <button
+            type="button"
+            className="button-secondary"
+            onClick={() => void saveDraftNow()}
+            disabled={(!dirty && !identityDirty) || saveStatus === "saving" || identitySaving || saveConflict}
+          >
             <Check className="h-4 w-4" />Save draft
           </button>
           <button type="button" className="button-secondary" onClick={handleEnabledChange} disabled={enabledSaving}>
@@ -663,7 +749,7 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
           <p>{saveConflict ? "This draft changed on the server. Your local edits are still here and were not overwritten." : `Draft save failed: ${saveError}`}</p>
           {saveConflict ? <p className="text-xs text-limestone-400">Copy or review your local flow before reloading the latest server revision.</p> : null}
           <div className="flex flex-wrap gap-2">
-            {!saveConflict ? <button type="button" className="button-secondary" onClick={saveDraftNow} disabled={saveStatus === "saving"}>Retry save</button> : null}
+            {!saveConflict ? <button type="button" className="button-secondary" onClick={() => void saveDraftNow()} disabled={saveStatus === "saving"}>Retry save</button> : null}
             <button type="button" className="button-secondary" onClick={() => void discardLocalAndReload()} disabled={saveStatus === "saving"}>Discard local changes and reload</button>
             <button type="button" className="button-secondary" onClick={() => setSaveError(null)}>Dismiss</button>
           </div>
@@ -675,213 +761,173 @@ export function PlatformAgentWorkspace({ agentId }: PlatformAgentWorkspaceProps)
         <button type="button" aria-pressed={mobileTab === "test"} className={mobileTab === "test" ? "button-primary flex-1" : "button-secondary flex-1"} onClick={() => setMobileMode("test")}>Test agent</button>
       </div>
 
-      <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(22rem,28rem)]">
-        <main className={`${mobileTab === "editor" ? "block" : "hidden"} space-y-6 lg:block`}>
-          <section className="surface p-5 sm:p-6">
-            <div className="mb-4 flex flex-wrap items-end justify-between gap-3 border-b border-ink-800 pb-4">
-              <div>
-                <h2 className="text-lg font-semibold text-limestone-100">Agent details</h2>
-                <p className="mt-1 text-sm text-limestone-400">Name, purpose, and persona instructions for this agent.</p>
-              </div>
-              <span className="text-xs text-limestone-500">Created <time dateTime={agent.created_at}>{formatDate(agent.created_at)}</time></span>
-            </div>
-            <form className="space-y-4" onSubmit={handleSaveIdentity}>
-              <div>
-                <label className="field-label" htmlFor="workspace-agent-name">Agent name</label>
-                <input id="workspace-agent-name" className="field-control" value={identityName} onChange={(event) => { setIdentityName(event.currentTarget.value); setIdentityError(null); }} required disabled={identitySaving || snapshotRefreshLoading || publishLoading} />
-              </div>
-              <div>
-                <label className="field-label" htmlFor="workspace-agent-description">Purpose</label>
-                <textarea id="workspace-agent-description" className="field-control min-h-20" value={identityDescription} onChange={(event) => { setIdentityDescription(event.currentTarget.value); setIdentityError(null); }} disabled={identitySaving || snapshotRefreshLoading || publishLoading} />
-              </div>
-              <div>
-                <label className="field-label" htmlFor="workspace-agent-persona">Persona instructions</label>
-                <textarea id="workspace-agent-persona" className="field-control min-h-32 font-mono text-sm" value={identityPersona} onChange={(event) => { setIdentityPersona(event.currentTarget.value); setIdentityError(null); }} disabled={identitySaving || snapshotRefreshLoading || publishLoading} />
-              </div>
-              {identityError ? <p role="alert" className="text-sm text-rust-200">{identityError}</p> : null}
-              {snapshotRefreshNeeded ? (
-                <button type="button" className="button-secondary" onClick={() => void refreshDraftSnapshot()} disabled={identitySaving || snapshotRefreshLoading}>
-                  {snapshotRefreshLoading ? "Refreshing…" : "Refresh draft snapshot"}
-                </button>
-              ) : null}
-              <button type="submit" className="button-secondary" disabled={identitySaving || snapshotRefreshLoading || publishLoading || !identityDirty}>
-                {identitySaving ? "Saving details…" : "Save agent details"}
+      <div className="w-full">
+        <main className={`${mobileTab === "editor" ? "block" : "hidden"} space-y-6 lg:block w-full`}>
+          <div role="tablist" aria-label="Workspace section" className="flex gap-2 border-b border-ink-800 pb-3">
+            {(["builder", "runtime", "publish"] as const).map((tab) => (
+              <button
+                key={tab}
+                type="button"
+                role="tab"
+                id={`tab-${tab}`}
+                aria-controls={`tabpanel-${tab}`}
+                aria-selected={workspaceTab === tab}
+                className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                  workspaceTab === tab
+                    ? "bg-ink-800 text-copper-200 border-b-2 border-copper-500 font-semibold"
+                    : "text-limestone-400 hover:text-limestone-200 hover:bg-ink-900"
+                }`}
+                onClick={() => setWorkspaceTab(tab)}
+              >
+                {tab === "builder" ? "Builder" : tab === "runtime" ? "Runtime Settings" : "Releases & History"}
               </button>
-            </form>
-          </section>
+            ))}
+          </div>
 
-          <section className="surface space-y-4 p-5 sm:p-6">
-            <div className="flex flex-wrap items-start justify-between gap-3 border-b border-ink-800 pb-4">
-              <div>
-                <h2 className="text-lg font-semibold text-limestone-100">Runtime settings</h2>
-                <p className="mt-1 text-sm text-limestone-400">Leave provider IDs blank to use platform defaults. The platform checks support before publishing.</p>
-              </div>
-              {runtimeSettings.llmModel || runtimeSettings.sttProvider || runtimeSettings.voices ? <span className="text-xs text-limestone-500">Explicit settings</span> : <span className="text-xs text-limestone-500">Platform defaults</span>}
-            </div>
-            <div className="grid gap-4 sm:grid-cols-2">
-              {SETTINGS.slice(0, 2).map((setting) => (
-                <div key={setting.key}>
-                  <label className="field-label" htmlFor={`setting-${setting.key}`}>{setting.label}</label>
-                  <input
-                    id={`setting-${setting.key}`}
-                    className="field-control font-mono text-sm"
-                    value={getString(config, setting.key)}
-                    onChange={(event) => updateRuntimeSetting(setting.key, event.currentTarget.value)}
-                    maxLength={setting.maxLength}
-                    autoComplete="off"
-                  />
-                  <p className="mt-1 text-xs text-limestone-500">Blank uses the platform default.</p>
-                </div>
-              ))}
-            </div>
-            <label className="flex min-h-11 items-center gap-3 rounded-lg border border-ink-800 p-3 text-sm text-limestone-200">
-              <input type="checkbox" className="h-4 w-4 accent-copper-500" checked={textOnly} onChange={(event) => updateTextOnly(event.currentTarget.checked)} />
-              Publish as text-only (no voice output)
-            </label>
-            <div className="grid gap-4 sm:grid-cols-2">
-              {SETTINGS.slice(2).map((setting) => (
-                <div key={setting.key}>
-                  <label className="field-label" htmlFor={`setting-${setting.key}`}>{setting.label}</label>
-                  <input
-                    id={`setting-${setting.key}`}
-                    className="field-control font-mono text-sm"
-                    value={getString(config, setting.key)}
-                    onChange={(event) => updateRuntimeSetting(setting.key, event.currentTarget.value)}
-                    maxLength={setting.maxLength}
-                    autoComplete="off"
-                    disabled={textOnly}
-                  />
-                </div>
-              ))}
-            </div>
-            <p className="text-xs leading-5 text-limestone-500">Configure both voice IDs, or leave both blank for platform defaults. The text-only switch explicitly stores empty voice IDs.</p>
-          </section>
+          <div hidden={workspaceTab !== "builder"}>
+            <AgentBuilderTab
+              identityDescription={identityDescription}
+              identityPersona={identityPersona}
+              onIdentityDescriptionChange={(val) => {
+                setIdentityDescription(val);
+                setIdentityError(null);
+              }}
+              onIdentityPersonaChange={(val) => {
+                setIdentityPersona(val);
+                setIdentityError(null);
+              }}
+              identityDisabled={identitySaving || snapshotRefreshLoading || publishLoading}
+              identityError={identityError}
+              config={config}
+              onLlmSelectionChange={updateLlmSelection}
+              onSttSelectionChange={updateSttSelection}
+              textOnly={textOnly}
+              onVoiceSettingsChange={updateVoiceSettings}
+              flow={flow}
+              flowError={flowError}
+              visibleDiagnostics={visibleDiagnostics}
+              onFlowChange={updateFlow}
+              onFlowJsonDirtyChange={setFlowJsonDirty}
+            />
+          </div>
 
-          {flow ? (
-            <ConversationFlowEditor flow={flow} diagnostics={visibleDiagnostics} onChange={updateFlow} onDirtyChange={setFlowJsonDirty} />
-          ) : (
-            <section className="surface space-y-3 p-5">
-              <h2 className="text-lg font-semibold text-limestone-100">Flow document unavailable</h2>
-              <p role="alert" className="text-sm text-rust-200">{flowError ?? "The draft has no flow configuration."}</p>
-              <p className="text-xs text-limestone-400">Your saved configuration has not been replaced. Correct its flow envelope through the platform draft contract.</p>
-            </section>
-          )}
+          {workspaceTab === "runtime" ? (
+            <AgentRuntimeTab
+              createdAt={agent.created_at}
+              config={config}
+              onRuntimeSettingChange={updateRuntimeSetting}
+              textOnly={textOnly}
+              onTextOnlyChange={updateTextOnly}
+              agentName={identityName}
+              onAgentNameChange={(val) => {
+                setIdentityName(val);
+                setIdentityError(null);
+              }}
+              nameDisabled={identitySaving || snapshotRefreshLoading || publishLoading}
+            />
+          ) : null}
 
-          <section className="surface space-y-4 p-5 sm:p-6">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <h2 className="text-lg font-semibold text-limestone-100">Validate and publish</h2>
-                <p className="mt-1 text-sm text-limestone-400">Validation uses the current schema. Publishing creates an immutable version; it never edits the saved source.</p>
-              </div>
-              <button type="button" className="button-secondary" onClick={() => void handleValidate()} disabled={validationLoading || identityDirty || identitySaving || snapshotRefreshNeeded || snapshotRefreshLoading || publishLoading || saveStatus === "saving"}>
-                {validationLoading ? "Validating…" : "Validate current draft"}
-              </button>
-            </div>
-            {currentValidation && validation ? (
-              <div role="status" className={`rounded-lg border p-3 text-sm ${validation.eligible_for_publish ? "border-moss-800 bg-moss-950/30 text-moss-200" : "border-rust-800 bg-rust-950/30 text-rust-200"}`}>
-                {validation.eligible_for_publish ? "This draft is eligible for publishing." : "This draft is not eligible for publishing. Review the diagnostics above."}
-                <span className="ml-2 text-xs text-limestone-400">Authoring hash {validation.authoring_hash.slice(0, 12)}…</span>
-              </div>
-            ) : null}
-            {currentValidation && warningCodes.length > 0 ? (
-              <fieldset className="space-y-2 rounded-lg border border-copper-900/70 p-4">
-                <legend className="px-1 text-sm font-semibold text-copper-200">Acknowledge publish warnings</legend>
-                {warningCodes.map((code) => (
-                  <label key={code} className="flex min-h-11 items-center gap-3 text-sm text-limestone-300">
-                    <input
-                      type="checkbox"
-                      className="h-4 w-4 accent-copper-500"
-                      checked={acknowledgedWarnings.includes(code)}
-                      onChange={(event) => setAcknowledgedWarnings((current) => event.currentTarget.checked
-                        ? [...current, code]
-                        : current.filter((item) => item !== code))}
-                    />
-                    <span>Confirm warning <code className="font-mono text-copper-200">{code}</code></span>
-                  </label>
-                ))}
-              </fieldset>
-            ) : null}
-            <div>
-              <label className="field-label" htmlFor="publish-changelog">Version notes</label>
-              <input id="publish-changelog" className="field-control" value={changelog} onChange={(event) => setChangelog(event.currentTarget.value)} placeholder="Summarize what this version changes" />
-            </div>
-            <div className="flex flex-wrap items-center gap-3">
-              <button type="button" className="button-primary" onClick={() => void handlePublish()} disabled={publishDisabled}>
-                {publishLoading ? "Publishing…" : "Publish version"}
-              </button>
-              {dirty ? <p className="text-xs text-limestone-500">Wait for the draft to save before publishing.</p> : null}
-            </div>
-          </section>
-
-          <section className="surface space-y-4 p-5 sm:p-6">
-            <div className="flex flex-wrap items-start justify-between gap-3 border-b border-ink-800 pb-4">
-              <div>
-                <h2 className="text-lg font-semibold text-limestone-100">Version history</h2>
-                <p className="mt-1 text-sm text-limestone-400">Restore a published version into the mutable draft without changing its original version.</p>
-              </div>
-              <span className="inline-flex items-center gap-1 text-xs text-limestone-500"><Clock3 className="h-3.5 w-3.5" />{versionsLoading ? "Loading…" : `${versions.length} versions`}</span>
-            </div>
-            {versionsError ? (
-              <div role="alert" className="flex flex-wrap items-center justify-between gap-3 text-sm text-rust-200">
-                <span>Could not load version history: {versionsError}</span>
-                <button type="button" className="button-secondary" onClick={() => void refreshVersions()} disabled={versionsLoading}>
-                  {versionsLoading ? "Retrying…" : "Retry version history"}
-                </button>
-              </div>
-            ) : versionsLoading ? (
-              <p role="status" className="text-sm text-limestone-400">Loading version history…</p>
-            ) : versions.length === 0 ? (
-              <p className="text-sm text-limestone-400">No published versions yet.</p>
-            ) : (
-              <ol className="divide-y divide-ink-800">
-                {versions.map((version) => (
-                  <li key={version.version_id} className="flex flex-col gap-3 py-4 sm:flex-row sm:items-start sm:justify-between">
-                    <div className="min-w-0">
-                      <h3 className="font-medium text-limestone-100">Version {version.version}</h3>
-                      <p className="mt-1 text-sm text-limestone-400">{version.changelog || "No version notes."}</p>
-                      <p className="mt-1 text-xs text-limestone-500"><time dateTime={version.created_at}>{formatDate(version.created_at)}</time> · compiler {version.compiler_version}</p>
-                      <p className="mt-1 break-all font-mono text-[10px] text-limestone-600">Artifact {version.artifact_hash}</p>
-                    </div>
-                    <button
-                      type="button"
-                      className="button-secondary shrink-0"
-                      onClick={() => void handleRestoreVersion(version)}
-                      disabled={restoringVersionId !== null || saveStatus === "saving" || pendingSaveCountRef.current > 0}
-                    >
-                      <RotateCcw className="h-4 w-4" />
-                      {restoringVersionId === version.version_id ? "Restoring…" : "Restore to draft"}
-                    </button>
-                  </li>
-                ))}
-              </ol>
-            )}
-          </section>
+          {workspaceTab === "publish" ? (
+            <AgentPublishTab
+              validation={validation}
+              currentValidation={currentValidation}
+              eligibleToPublish={eligibleToPublish}
+              validationLoading={validationLoading}
+              onValidate={() => void handleValidate()}
+              validateDisabled={
+                validationLoading ||
+                identityDirty ||
+                identitySaving ||
+                flowJsonDirty ||
+                snapshotRefreshNeeded ||
+                snapshotRefreshLoading ||
+                publishLoading ||
+                saveStatus === "saving"
+              }
+              warningCodes={warningCodes}
+              acknowledgedWarnings={acknowledgedWarnings}
+              onAcknowledgedWarningsChange={setAcknowledgedWarnings}
+              allWarningsAcknowledged={allWarningsAcknowledged}
+              changelog={changelog}
+              onChangelogChange={setChangelog}
+              publishDisabled={publishDisabled}
+              publishLoading={publishLoading}
+              onPublish={() => void handlePublish()}
+              dirty={dirty}
+              versions={versions}
+              versionsLoading={versionsLoading}
+              versionsError={versionsError}
+              onRetryVersions={() => void refreshVersions()}
+              restoringVersionId={restoringVersionId}
+              onRestoreVersion={(v) => void handleRestoreVersion(v)}
+              restoreDisabled={
+                restoringVersionId !== null || saveStatus === "saving" || pendingSaveCountRef.current > 0
+              }
+            />
+          ) : null}
         </main>
 
-        <aside className={`${mobileTab === "test" ? "block" : "hidden"} lg:sticky lg:top-4 lg:block`}>
-          <ChatTestPanel key={agentId} agentId={agentId} draft={draft} versions={versions} onRefreshDraftSnapshot={refreshDraftSnapshot} />
-          <FlowQAPanel
-            key={agentId}
-            agentId={agentId}
-            draft={draft}
-            versions={versions}
-            draftReady={
-              !identityDirty &&
-              !identitySaving &&
-              !flowJsonDirty &&
-              !dirty &&
-              !dirtyRef.current &&
-              pendingSaveCountRef.current === 0 &&
-              saveStatus === "saved" &&
-              !saveConflict &&
-              !snapshotRefreshNeeded &&
-              !snapshotRefreshLoading &&
-              !publishLoading &&
-              restoringVersionId === null
-            }
-            onRefreshDraftSnapshot={() => refreshDraftSnapshot(true)}
-          />
-        </aside>
+        {/* Right-side docked testing drawer (occupies complete right edge) */}
+        {activeDrawer !== "none" ? (
+          <aside
+            aria-label="Agent test rail"
+            className="fixed right-0 top-0 bottom-0 z-50 w-full sm:w-[440px] md:w-[460px] lg:w-[480px] bg-ink-950 border-l border-ink-800 shadow-2xl p-5 overflow-y-auto space-y-4"
+          >
+            <div className="flex items-center justify-between border-b border-ink-800 pb-3">
+              <div className="flex items-center gap-2">
+                {activeDrawer === "chat" ? (
+                  <MessageSquare className="h-4 w-4 text-copper-400" />
+                ) : (
+                  <Activity className="h-4 w-4 text-copper-400" />
+                )}
+                <span className="text-xs font-semibold uppercase tracking-wider text-limestone-200">
+                  {activeDrawer === "chat" ? "Interactive Chat Test" : "Flow QA Runner"}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setActiveDrawer("none")}
+                className="rounded-lg p-1.5 text-limestone-400 hover:bg-ink-800 hover:text-limestone-100 transition-colors"
+                aria-label="Close test rail"
+                title="Close"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            {activeDrawer === "chat" ? (
+              <ChatTestPanel
+                key={agentId}
+                agentId={agentId}
+                draft={draft}
+                versions={versions}
+                onRefreshDraftSnapshot={refreshDraftSnapshot}
+              />
+            ) : (
+              <FlowQAPanel
+                key={agentId}
+                agentId={agentId}
+                draft={draft}
+                versions={versions}
+                draftReady={
+                  !identityDirty &&
+                  !identitySaving &&
+                  !flowJsonDirty &&
+                  !dirty &&
+                  !dirtyRef.current &&
+                  pendingSaveCountRef.current === 0 &&
+                  saveStatus === "saved" &&
+                  !saveConflict &&
+                  !snapshotRefreshNeeded &&
+                  !snapshotRefreshLoading &&
+                  !publishLoading &&
+                  restoringVersionId === null
+                }
+                onRefreshDraftSnapshot={() => refreshDraftSnapshot(true)}
+              />
+            )}
+          </aside>
+        ) : null}
       </div>
     </div>
   );

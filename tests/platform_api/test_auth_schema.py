@@ -29,6 +29,10 @@ from platform_api.models import (
 from platform_api.config import PlatformSettings
 from platform_api.db.base import Base
 from platform_api.db.schema import (
+    CURRENT_SCHEMA_VERSION,
+    INTERMEDIATE_SCHEMA_VERSION,
+    LEGACY_SCHEMA_VERSION,
+    MODEL_ENTRY_TABLE,
     SchemaMismatch,
     compute_metadata_hash,
     initialize_schema,
@@ -261,7 +265,7 @@ async def test_schema_lifecycle_contract(fresh_pg: FreshPostgres):
     with pytest.raises(SchemaMismatch, match="explicit initial session rate"):
         await initialize_schema(
             fresh_pg.engine,
-            expected_version="platform-v1",
+            expected_version=CURRENT_SCHEMA_VERSION,
             metadata_hash=metadata_hash,
         )
     assert await check_schema_readiness(fresh_pg.engine) is False
@@ -269,7 +273,7 @@ async def test_schema_lifecycle_contract(fresh_pg: FreshPostgres):
     # 1. Fresh schema initialization uses an explicit persisted tariff.
     await initialize_schema(
         fresh_pg.engine,
-        expected_version="platform-v1",
+        expected_version=CURRENT_SCHEMA_VERSION,
         metadata_hash=metadata_hash,
         initial_tariff=TEST_INITIAL_TARIFF,
     )
@@ -277,7 +281,7 @@ async def test_schema_lifecycle_contract(fresh_pg: FreshPostgres):
     # 2. Verify readiness check passes
     ready = await check_schema_readiness(
         fresh_pg.engine,
-        expected_version="platform-v1",
+        expected_version=CURRENT_SCHEMA_VERSION,
         metadata_hash=metadata_hash,
     )
     async with fresh_pg.new_session() as db:
@@ -294,7 +298,7 @@ async def test_schema_lifecycle_contract(fresh_pg: FreshPostgres):
     # 3. Repeat initialization must be a safe no-op
     await initialize_schema(
         fresh_pg.engine,
-        expected_version="platform-v1",
+        expected_version=CURRENT_SCHEMA_VERSION,
         metadata_hash=metadata_hash,
     )
 
@@ -302,7 +306,7 @@ async def test_schema_lifecycle_contract(fresh_pg: FreshPostgres):
     with pytest.raises(SchemaMismatch):
         await initialize_schema(
             fresh_pg.engine,
-            expected_version="platform-v2",
+            expected_version=LEGACY_SCHEMA_VERSION,
             metadata_hash=metadata_hash,
         )
 
@@ -310,10 +314,157 @@ async def test_schema_lifecycle_contract(fresh_pg: FreshPostgres):
     with pytest.raises(SchemaMismatch):
         await initialize_schema(
             fresh_pg.engine,
-            expected_version="platform-v1",
+            expected_version=CURRENT_SCHEMA_VERSION,
             metadata_hash="deadbeef" * 8,
         )
 
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_platform_v1_migration_adds_provider_entries_without_losing_data(
+    fresh_pg: FreshPostgres,
+) -> None:
+    current_hash = compute_metadata_hash(Base.metadata)
+    legacy_hash = compute_metadata_hash(
+        exclude_tables={"platform.provider_secrets", f"platform.{MODEL_ENTRY_TABLE}"}
+    )
+    await initialize_schema(
+        fresh_pg.engine,
+        expected_version=CURRENT_SCHEMA_VERSION,
+        metadata_hash=current_hash,
+        initial_tariff=TEST_INITIAL_TARIFF,
+    )
+
+    async with fresh_pg.engine.begin() as conn:
+        await conn.execute(text(f"DROP TABLE platform.{MODEL_ENTRY_TABLE}"))
+        await conn.execute(text("DROP TABLE platform.provider_secrets"))
+        await conn.execute(
+            text(
+                "UPDATE platform.schema_info "
+                "SET version = :version, metadata_hash = :metadata_hash"
+            ),
+            {"version": LEGACY_SCHEMA_VERSION, "metadata_hash": legacy_hash},
+        )
+
+    assert await check_schema_readiness(fresh_pg.engine) is False
+
+    await initialize_schema(
+        fresh_pg.engine,
+        expected_version=CURRENT_SCHEMA_VERSION,
+        metadata_hash=current_hash,
+    )
+
+    assert await check_schema_readiness(fresh_pg.engine)
+    async with fresh_pg.new_session() as db:
+        pointer = await db.get(ActiveSessionTariff, 1)
+        assert pointer is not None
+        tariff = await db.get(SessionTariffRecord, pointer.current_tariff_id)
+        assert tariff is not None
+        assert tariff.rate_minor_per_minute == TEST_INITIAL_TARIFF.rate_minor_per_minute
+    async with fresh_pg.engine.connect() as conn:
+        assert await conn.scalar(
+            text("SELECT to_regclass('platform.provider_secrets')")
+        ) is not None
+        assert await conn.scalar(
+            text(f"SELECT to_regclass('platform.{MODEL_ENTRY_TABLE}')")
+        ) is not None
+        schema_row = (
+            await conn.execute(
+                text("SELECT version, metadata_hash FROM platform.schema_info")
+            )
+        ).one()
+        assert schema_row == (CURRENT_SCHEMA_VERSION, current_hash)
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_platform_v1_migration_rejects_unrecognized_legacy_hash(
+    fresh_pg: FreshPostgres,
+) -> None:
+    current_hash = compute_metadata_hash(Base.metadata)
+    await initialize_schema(
+        fresh_pg.engine,
+        expected_version=CURRENT_SCHEMA_VERSION,
+        metadata_hash=current_hash,
+        initial_tariff=TEST_INITIAL_TARIFF,
+    )
+    async with fresh_pg.engine.begin() as conn:
+        await conn.execute(text(f"DROP TABLE platform.{MODEL_ENTRY_TABLE}"))
+        await conn.execute(text("DROP TABLE platform.provider_secrets"))
+        await conn.execute(
+            text(
+                "UPDATE platform.schema_info "
+                "SET version = :version, metadata_hash = :metadata_hash"
+            ),
+            {"version": LEGACY_SCHEMA_VERSION, "metadata_hash": "f" * 64},
+        )
+
+    with pytest.raises(SchemaMismatch, match="supported historical schema"):
+        await initialize_schema(
+            fresh_pg.engine,
+            expected_version=CURRENT_SCHEMA_VERSION,
+            metadata_hash=current_hash,
+        )
+    async with fresh_pg.engine.connect() as conn:
+        assert await conn.scalar(
+            text("SELECT to_regclass('platform.provider_secrets')")
+        ) is None
+        assert await conn.scalar(
+            text(f"SELECT to_regclass('platform.{MODEL_ENTRY_TABLE}')")
+        ) is None
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_platform_v2_migration_adds_model_entries_without_losing_data(
+    fresh_pg: FreshPostgres,
+) -> None:
+    current_hash = compute_metadata_hash(Base.metadata)
+    v2_hash = compute_metadata_hash(exclude_tables={f"platform.{MODEL_ENTRY_TABLE}"})
+    await initialize_schema(
+        fresh_pg.engine,
+        expected_version=CURRENT_SCHEMA_VERSION,
+        metadata_hash=current_hash,
+        initial_tariff=TEST_INITIAL_TARIFF,
+    )
+
+    async with fresh_pg.engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO platform.provider_secrets "
+                "(provider_id, field_name, secret_ciphertext) "
+                "VALUES ('tts:kokoro', 'API_KEY', 'historical-ciphertext')"
+            )
+        )
+        await conn.execute(text(f"DROP TABLE platform.{MODEL_ENTRY_TABLE}"))
+        await conn.execute(
+            text(
+                "UPDATE platform.schema_info "
+                "SET version = :version, metadata_hash = :metadata_hash"
+            ),
+            {
+                "version": INTERMEDIATE_SCHEMA_VERSION,
+                "metadata_hash": v2_hash,
+            },
+        )
+
+    assert await check_schema_readiness(fresh_pg.engine) is False
+    await initialize_schema(
+        fresh_pg.engine,
+        expected_version=CURRENT_SCHEMA_VERSION,
+        metadata_hash=current_hash,
+    )
+    assert await check_schema_readiness(fresh_pg.engine)
+
+    async with fresh_pg.engine.connect() as conn:
+        assert await conn.scalar(
+            text(f"SELECT to_regclass('platform.{MODEL_ENTRY_TABLE}')")
+        ) is not None
+        assert await conn.scalar(
+            text(
+                "SELECT secret_ciphertext FROM platform.provider_secrets "
+                "WHERE provider_id = 'tts:kokoro' AND field_name = 'API_KEY'"
+            )
+        ) == "historical-ciphertext"
 
 @pytest.mark.postgres
 @pytest.mark.asyncio
@@ -330,13 +481,13 @@ async def test_schema_concurrent_initialization(fresh_pg: FreshPostgres):
         results = await asyncio.gather(
             initialize_schema(
                 fresh_pg.engine,
-                expected_version="platform-v1",
+                expected_version=CURRENT_SCHEMA_VERSION,
                 metadata_hash=metadata_hash,
                 initial_tariff=TEST_INITIAL_TARIFF,
             ),
             initialize_schema(
                 engine2,
-                expected_version="platform-v1",
+                expected_version=CURRENT_SCHEMA_VERSION,
                 metadata_hash=metadata_hash,
                 initial_tariff=TEST_INITIAL_TARIFF,
             ),

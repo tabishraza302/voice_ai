@@ -1274,7 +1274,7 @@ class VerificationHarness:
             return self.write_result(target_gates=["postgres_gate"])
         return 0 if postgres_passed else 1
 
-    def _run_browser_dev(self) -> GateCounts:
+    def _run_browser_dev(self, spec: str = "auth-journeys") -> GateCounts:
         admin_url, platform_url, legacy_url = self.provision_disposable_postgres()
         api_port = allocate_loopback_port(preferred_port=None)
         web_port = allocate_loopback_port(preferred_port=None)
@@ -1471,7 +1471,7 @@ class VerificationHarness:
             "bun",
             "run",
             "test:e2e",
-            "e2e/auth-journeys.spec.ts",
+            f"e2e/{spec}.spec.ts",
             "--project=chromium",
             "--reporter=json",
         ]
@@ -1820,11 +1820,15 @@ class VerificationHarness:
         finally:
             self.lifecycle.cleanup()
 
-    def browser(self, mode: str = "all", standalone: bool = True) -> int:
+    def browser(
+        self, mode: str = "all", standalone: bool = True, spec: str = "auth-journeys"
+    ) -> int:
         print(f"==> Running verify browser lane (mode={mode})...")
         self.write_manifest()
         if mode not in ("all", "tls", "dev"):
             raise ValueError(f"unknown browser verification mode: {mode}")
+        if spec != "auth-journeys" and mode != "dev":
+            raise ValueError("--spec selection is available only with --mode dev")
 
         dev_counts: GateCounts | None = None
         tls_counts: GateCounts | None = None
@@ -1832,7 +1836,7 @@ class VerificationHarness:
         try:
             if mode in ("all", "dev"):
                 print("--> Executing development split-port browser journey...")
-                dev_counts = self._run_browser_dev()
+                dev_counts = self._run_browser_dev(spec=spec)
                 require_gate(dev_counts)
 
             if mode in ("all", "tls"):
@@ -2157,6 +2161,12 @@ def main() -> None:
         default="all",
         help="Browser qualification mode: all (dev split-port + TLS production ingress), tls, dev",
     )
+    browser_parser.add_argument(
+        "--spec",
+        choices=["auth-journeys", "platform-agent-workspace"],
+        default="auth-journeys",
+        help="Development browser spec (requires --mode dev; default: auth-journeys)",
+    )
 
     # voice
     voice_parser = subparsers.add_parser("voice", help="Run voice qualification")
@@ -2199,7 +2209,7 @@ def main() -> None:
     elif args.subcommand == "postgres":
         sys.exit(harness.postgres())
     elif args.subcommand == "browser":
-        sys.exit(harness.browser(mode=args.mode))
+        sys.exit(harness.browser(mode=args.mode, spec=args.spec))
     elif args.subcommand == "voice":
         sys.exit(harness.voice(profile=args.profile, config=args.config))
     elif args.subcommand == "release":

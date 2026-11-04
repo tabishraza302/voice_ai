@@ -18,7 +18,7 @@ from platform_api.auth.errors import (
     RateLimitedError,
     ValidationError,
 )
-from platform_api.catalog import ModelCatalog
+from platform_api.catalog import ModelCatalog, catalog_with_managed_llms
 from platform_api.config import PlatformSettings
 from platform_api.qa.models import FlowQAJob
 from platform_api.qa.schemas import ExpectedEdge, QAJobCreate, QAScenario
@@ -352,6 +352,7 @@ async def preview_qa_scenarios(
         raise DependencyUnavailableError("Flow QA is not enabled")
     if not 1 <= scenario_count <= settings.qa_max_scenarios:
         raise ValidationError("Requested scenario count exceeds the Flow QA limit")
+    catalog = await catalog_with_managed_llms(catalog, db)
     _agent, snapshot = await _resolve_owner_snapshot(
         db,
         settings=settings,
@@ -393,8 +394,13 @@ async def enqueue_qa_job(
         raise ValidationError("Requested runtime exceeds the Flow QA limit")
     if settings.runtime_llm_base_url is None or settings.generation_llm_base_url is None:
         raise DependencyUnavailableError("Flow QA model endpoints are not configured")
+    catalog = await catalog_with_managed_llms(catalog, db)
     generation_ids = {item.id for item in catalog.generation_models}
-    runtime_ids = {item.id for item in catalog.llm_models}
+    runtime_identities = {
+        (item.provider_id, item.id)
+        for item in catalog.llm_models
+        if item.selectable
+    }
     if payload.utterance_model_id not in generation_ids:
         raise ValidationError(
             "The selected utterance model is not in the qualified model catalog",
@@ -425,10 +431,20 @@ async def enqueue_qa_job(
         snapshot_hash=payload.snapshot_hash,
     )
     compiled = _compiled_snapshot(snapshot)
-    runtime_model_id = snapshot.get("model_pins", {}).get("llm_model")
-    if not isinstance(runtime_model_id, str) or runtime_model_id not in runtime_ids:
+    model_pins = snapshot.get("model_pins")
+    runtime_provider_id = (
+        model_pins.get("llm_provider") if isinstance(model_pins, dict) else None
+    )
+    runtime_model_id = (
+        model_pins.get("llm_model") if isinstance(model_pins, dict) else None
+    )
+    if (
+        not isinstance(runtime_provider_id, str)
+        or not isinstance(runtime_model_id, str)
+        or (runtime_provider_id, runtime_model_id) not in runtime_identities
+    ):
         raise ValidationError(
-            "The pinned runtime model is not in the qualified model catalog",
+            "The pinned runtime provider/model is not in the qualified model catalog",
             fields=[{"field": "snapshot_hash", "code": "MODEL_UNAVAILABLE"}],
         )
 
@@ -515,6 +531,7 @@ async def enqueue_qa_job(
         runtime_model_id=runtime_model_id,
         judge_model_id=payload.judge_model_id,
         models_json={
+            "runtime_provider": runtime_provider_id,
             "runtime": runtime_model_id,
             "utterance": payload.utterance_model_id,
             "judge": payload.judge_model_id,

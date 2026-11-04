@@ -101,7 +101,7 @@ class FreshPostgres:
         self,
         *,
         schema: str = "platform",
-        expected_version: str = "platform-v1",
+        expected_version: str = "platform-v3",
         metadata_hash: str | None = None,
         initial_tariff=None,
     ) -> None:

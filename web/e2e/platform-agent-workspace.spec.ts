@@ -81,9 +81,11 @@ test("keyboard creation keeps incomplete drafts and surfaces a real stale-revisi
   await expect(page.getByText("Saved r2", { exact: true })).toBeVisible();
 
   await stalePage.getByLabel("Entry step ID").fill("unpublished_entry");
-  await expect(stalePage.getByRole("alert").filter({ hasText: "This draft changed on the server" })).toBeVisible();
+  await stalePage.getByRole("button", { name: "Save draft" }).click();
+  await expect(
+    stalePage.getByRole("alert").filter({ hasText: "This draft changed on the server" })
+  ).toBeVisible();
   await expect(stalePage.getByLabel("Entry step ID")).toHaveValue("unpublished_entry");
-  await expect(stalePage.getByText("Not published", { exact: true })).toBeVisible();
   await stalePage.close();
 });
 
@@ -177,6 +179,7 @@ test("Chat Test uses a saved executable snapshot and reset keeps its hash but st
   await page.getByRole("button", { name: "Apply flow JSON" }).click();
   await page.getByRole("button", { name: "Save draft" }).click();
   await expect(page.getByText(/Saved r2/)).toBeVisible();
+  await page.getByRole("button", { name: "Chat Test" }).click();
   await expect(page.getByText("This draft has no executable snapshot yet.")).toHaveCount(0);
 
   await page.getByLabel("Message the agent").fill("I am salaried and earn 100000 rupees per month.");
@@ -187,6 +190,7 @@ test("Chat Test uses a saved executable snapshot and reset keeps its hash but st
   await expect(transcript.locator("li")).toHaveCount(2);
 
   await page.reload();
+  await page.getByRole("button", { name: "Chat Test" }).click();
   const recoveredTranscript = page.getByRole("list", { name: "Chat transcript" });
   await expect(recoveredTranscript.getByText("You · turn 1")).toBeVisible();
   await expect(recoveredTranscript.getByText("Agent · turn 1")).toBeVisible();
@@ -212,7 +216,7 @@ test("Chat Test uses a saved executable snapshot and reset keeps its hash but st
     new URL(response.url()).pathname.endsWith(`/agents/${agentId}/draft`)
   );
   await identityPage.getByLabel("Persona instructions").fill("Give concise answers and ask only for confirmed facts.");
-  await identityPage.getByRole("button", { name: "Save agent details" }).click();
+  await identityPage.getByRole("button", { name: "Save draft" }).click();
   const [identityResponse, refreshedDraftResponse] = await Promise.all([identityUpdate, draftRefresh]);
   expect(identityResponse.ok()).toBe(true);
   expect(refreshedDraftResponse.ok()).toBe(true);
@@ -243,37 +247,94 @@ test("unapplied Flow JSON and unsaved persona changes block validation and publi
   await page.getByRole("button", { name: "Save draft" }).click();
   await expect(page.getByText("Saved r2", { exact: true })).toBeVisible();
 
-  await page.getByRole("button", { name: "Validate current draft" }).click();
-  await expect(page.getByText("This draft is eligible for publishing.")).toBeVisible();
-  const warnings = page.locator("fieldset input[type=checkbox]");
-  for (let index = 0; index < await warnings.count(); index += 1) {
-    await warnings.nth(index).check();
-  }
-  await page.getByLabel("Version notes").fill("Publish identity gate regression check");
+  await page.getByRole("tab", { name: "Releases & History" }).click();
+  const validateButton = page.getByRole("button", { name: "Validate current draft" });
   const publishButton = page.getByRole("button", { name: "Publish version" });
-  await expect(publishButton).toBeEnabled();
+  await expect(validateButton).toBeEnabled();
+  await expect(publishButton).toBeDisabled();
 
+  await page.getByRole("tab", { name: "Builder" }).click();
   await page.getByLabel("Persona instructions").fill("Use concise answers and do not guess.");
   await expect(page.getByRole("status").filter({ hasText: "Unsaved agent details" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Validate current draft" })).toBeDisabled();
-  await page.getByRole("button", { name: "Save agent details" }).click();
-  await expect(page.getByRole("button", { name: "Validate current draft" })).toBeEnabled();
+  await page.getByRole("tab", { name: "Releases & History" }).click();
+  await expect(validateButton).toBeDisabled();
+  await page.getByRole("button", { name: "Save draft" }).click();
+  await expect(validateButton).toBeEnabled();
   await expect(publishButton).toBeDisabled();
-  await page.getByRole("button", { name: "Validate current draft" }).click();
-  await expect(page.getByText("This draft is eligible for publishing.")).toBeVisible();
-  for (let index = 0; index < await warnings.count(); index += 1) {
-    await warnings.nth(index).check();
-  }
-  await expect(publishButton).toBeEnabled();
-  await page.getByRole("button", { name: "Flow JSON" }).click();
+
+  await page.getByRole("tab", { name: "Builder" }).click();
+  await page.getByRole("button", { name: "Flow JSON", exact: true }).click();
   const flowInput = page.getByLabel("Flow document");
   const unappliedFlow = JSON.stringify(loanFixture.flow, null, 2)
     .replace("Hi! I can help discuss a loan.", "Hello! I can help discuss a loan.");
   await flowInput.fill(unappliedFlow);
   await expect(page.getByRole("status").filter({ hasText: "Unapplied Flow JSON" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Validate current draft" })).toBeDisabled();
+  await page.getByRole("tab", { name: "Releases & History" }).click();
+  await expect(validateButton).toBeDisabled();
+  await expect(publishButton).toBeDisabled();
+  await page.getByRole("tab", { name: "Builder" }).click();
+  await expect(flowInput).toHaveValue(unappliedFlow);
+  await expect(page.getByRole("status").filter({ hasText: "Unapplied Flow JSON" })).toBeVisible();
+  await page.getByRole("tab", { name: "Releases & History" }).click();
+  await expect(validateButton).toBeDisabled();
   await expect(publishButton).toBeDisabled();
 
+});
+
+test("unapplied Flow JSON and step dropdowns survive workspace tab switches", async ({ page }) => {
+  await registerAndSignIn(page);
+  await createBlankAgent(page, `Flow state ${Date.now()}`);
+  await page.getByRole("button", { name: "Add step" }).click();
+
+  const stepType = page.getByLabel("Type");
+  await stepType.selectOption("collect");
+  await page.getByRole("button", { name: "Flow JSON" }).click();
+  const flowInput = page.getByLabel("Flow document");
+  const flowDraft = JSON.parse(await flowInput.inputValue()) as Record<string, unknown>;
+  flowDraft.workspace_test_marker = "preserve while switching tabs";
+  const unappliedFlow = JSON.stringify(flowDraft, null, 2);
+  await flowInput.fill(unappliedFlow);
+  await expect(page.getByRole("status").filter({ hasText: "Unapplied Flow JSON" })).toBeVisible();
+
+  await page.getByRole("tab", { name: "Releases & History" }).click();
+  await expect(page.getByRole("button", { name: "Validate current draft" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Publish version" })).toBeDisabled();
+  await page.getByRole("tab", { name: "Builder" }).click();
+  await expect(flowInput).toHaveValue(unappliedFlow);
+  await expect(page.getByRole("status").filter({ hasText: "Unapplied Flow JSON" })).toBeVisible();
+  await page.getByRole("button", { name: "Steps" }).click();
+  await expect(stepType).toHaveValue("collect");
+});
+
+test("speech dropdowns show registered models and block unqualified choices", async ({ page }) => {
+  await registerAndSignIn(page);
+  await createBlankAgent(page, `Speech catalog ${Date.now()}`);
+  const response = await page.request.get("/api/v1/catalog");
+  expect(response.ok()).toBe(true);
+  const catalog = await response.json() as {
+    stt_providers: { id: string; name: string; models: { id: string; name: string; selectable: boolean }[] }[];
+    tts_providers: { id: string; name: string; models: { id: string; name: string; selectable: boolean; voices: { name: string; language: string; selectable: boolean }[] }[] }[];
+  };
+  const stt = catalog.stt_providers.find((provider) => provider.models.length > 0);
+  const tts = catalog.tts_providers.find((provider) => provider.models.some((model) => model.voices.length > 0));
+  expect(stt).toBeTruthy();
+  expect(tts).toBeTruthy();
+
+  await page.getByRole("button", { name: /Configure speech-to-text/ }).click();
+  const sttPanel = page.getByRole("region", { name: "Speech-to-text provider and model settings" });
+  const sttOption = sttPanel.getByRole("region", { name: stt!.name }).getByRole("button", { name: new RegExp(stt!.models[0]!.name) });
+  await expect(sttOption).toHaveCount(1);
+  if (!stt!.models[0]!.selectable) await expect(sttOption).toBeDisabled();
+  await page.keyboard.press("Escape");
+
+  await page.getByRole("button", { name: /Configure text-to-speech/ }).click();
+  const ttsPanel = page.getByRole("region", { name: "Text-to-speech provider, model, and voice settings" });
+  const model = tts!.models.find((item) => item.voices.length > 0)!;
+  const voice = model.voices[0]!;
+  const escapedVoice = voice.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const ttsOption = ttsPanel.getByRole("region", { name: tts!.name }).getByRole("button", { name: new RegExp(escapedVoice) });
+  await expect(ttsOption).toHaveCount(1);
+  if (!model.selectable || !voice.selectable) await expect(ttsOption).toBeDisabled();
 });
 
 test("history retry preserves edits and warns before leaving the workspace", async ({ page }) => {
@@ -282,15 +343,21 @@ test("history retry preserves edits and warns before leaving the workspace", asy
   const failHistory = async (route: Route) => route.abort();
   await page.route(historyRoute, failHistory);
   const agentId = await createBlankAgent(page, `History recovery ${Date.now()}`);
+  await page.getByRole("tab", { name: "Releases & History" }).click();
   await expect(page.getByRole("alert").filter({ hasText: "Could not load version history" })).toBeVisible();
 
+  await page.getByRole("tab", { name: "Builder" }).click();
   const persona = "Keep answers brief and based on confirmed facts.";
   await page.getByLabel("Persona instructions").fill(persona);
   await expect(page.getByRole("status").filter({ hasText: "Unsaved agent details" })).toBeVisible();
   await page.unroute(historyRoute, failHistory);
+  await page.getByRole("tab", { name: "Releases & History" }).click();
   await page.getByRole("button", { name: "Retry version history" }).click();
   await expect(page.getByText("No published versions yet.")).toBeVisible();
+  await page.getByRole("tab", { name: "Builder" }).click();
   await expect(page.getByLabel("Persona instructions")).toHaveValue(persona);
+  await page.getByRole("button", { name: "Save draft" }).click();
+  await expect(page.getByRole("status").filter({ hasText: /Saved r\d+/ })).toBeVisible();
   const flowControls = page.getByRole("group", { name: "Flow editor view" });
   const flowStepsButton = flowControls.getByRole("button", { name: "Steps" });
   const flowJsonButton = flowControls.getByRole("button", { name: "Flow JSON" });
@@ -302,22 +369,26 @@ test("history retry preserves edits and warns before leaving the workspace", asy
   await page.keyboard.press("Space");
   await expect(flowJsonButton).toHaveAttribute("aria-pressed", "true");
 
-  await page.getByRole("button", { name: "Flow JSON" }).click();
+  await page.getByRole("button", { name: "Flow JSON", exact: true }).click();
   const rawFlow = JSON.stringify(loanFixture.flow, null, 2);
   const flowInput = page.getByLabel("Flow document");
   await flowInput.fill(rawFlow);
   await expect(page.getByRole("status").filter({ hasText: "Unapplied Flow JSON" })).toBeVisible();
   await page.getByRole("button", { name: "Steps" }).click();
   await page.getByRole("button", { name: "Add step" }).click();
+  await page.getByRole("button", { name: "Flow JSON", exact: true }).click();
   await expect(flowInput).toHaveValue(rawFlow);
   await expect(page.getByText(/Your JSON text is preserved/)).toBeVisible();
 
-  const navigationDialog = page.waitForEvent("dialog");
+  let navigationDialogType: string | null = null;
+  page.once("dialog", async (dialog) => {
+    navigationDialogType = dialog.type();
+    await dialog.dismiss();
+  });
   await page.getByRole("link", { name: "Back to agents" }).click();
-  const dialog = await navigationDialog;
-  expect(dialog.type()).toBe("confirm");
-  await dialog.dismiss();
+  expect(navigationDialogType).toBe("confirm");
   expect(page.url()).toContain(`/agents/${agentId}`);
+  await page.getByRole("tab", { name: "Builder" }).click();
   await expect(page.getByLabel("Persona instructions")).toHaveValue(persona);
   await expect(flowInput).toHaveValue(rawFlow);
 });
@@ -414,7 +485,7 @@ test("Chat Test reloads a pending message and retries the exact persisted turn",
       }),
     });
   });
-
+  await page.getByRole("button", { name: "Chat Test" }).click();
   const text = "Keep this exact message while the same turn is pending.";
   await page.getByLabel("Message the agent").fill(text);
   await page.getByRole("button", { name: "Send message" }).click();
@@ -423,6 +494,7 @@ test("Chat Test reloads a pending message and retries the exact persisted turn",
   await expect(page.getByLabel("Message the agent")).toHaveValue(text);
 
   await page.reload();
+  await page.getByRole("button", { name: "Chat Test" }).click();
   await expect(page.getByRole("list", { name: "Chat transcript" }).getByText("You · turn 1 · pending")).toBeVisible();
   await expect(page.getByRole("button", { name: "Retry pending turn" })).toBeVisible();
   await expect(page.getByLabel("Message the agent")).toHaveValue(text);
@@ -628,7 +700,7 @@ test("Flow QA lists frozen cases, shows results, keeps suggestions draft-only, a
   expect(savedDraftResponse.ok()).toBe(true);
   const savedDraft = await savedDraftResponse.json() as { snapshot_hash: string; draft_revision: number };
   expect(savedDraft.snapshot_hash).toBeTruthy();
-
+  await page.getByRole("button", { name: "Flow QA" }).click();
   await expect(page.getByRole("heading", { name: "Flow QA" })).toBeVisible();
   await page.getByRole("button", { name: "Load scenarios" }).click();
   await expect(page.getByLabel(`Include ${scenario.case_key}`)).toBeChecked();

@@ -14,6 +14,8 @@ from starlette.requests import Request
 from bot.flow.qualification import (
     REQUIRED_SCENARIO_CLASSES,
     CapabilityReport,
+    LegacyAgentQualificationSettings,
+    ProviderlessAgentQualificationSettings,
     ScenarioResult,
 )
 from bot.flow.schemas import AdapterCapabilities
@@ -23,24 +25,30 @@ from platform_api.app import create_app
 from platform_api.config import PlatformSettings
 from platform_api.qualification import (
     DeploymentIdentity,
+    has_qualified_voice_playback,
     load_deployment_capability_report,
+    is_trusted_deployment_report,
 )
 from tests.support.postgres import FreshPostgres
 
 
 def _unqualified_report() -> CapabilityReport:
     report = CapabilityReport(
-        protocol_version=2,
+        protocol_version=4,
         adapter_id="test-adapter",
         adapter_version="test-version",
         model_revision="test-model-revision",
+        metadata="none",
         agent_settings={
+            "llm_provider": "ollama",
             "llm_model": "qwen3.5:4b",
             "stt_provider": "mlx-audio",
+            "stt_model": "mlx-community/nemotron-3.5-asr-streaming-0.6b",
+            "tts_provider": "mlx-audio",
+            "tts_model": "mlx-community/Kokoro-82M-4bit",
             "tts_voice_en": "af_heart",
             "tts_voice_hi": "hf_alpha",
         },
-        metadata="none",
         speech_gating=False,
         cancel_generation=False,
         playback="unqualified",
@@ -87,12 +95,147 @@ def test_missing_deployment_report_does_not_create_capabilities() -> None:
     assert load_deployment_capability_report(None, None) is None
 
 
+def test_report_catalog_pins_require_matching_hash_and_deployment_identity() -> None:
+    report = _unqualified_report()
+    settings = _test_settings().model_copy(
+        update={
+            "adapter_capability_report_path": "/test/report.json",
+            "adapter_capability_report_hash": report.report_hash,
+            "deployment_adapter_id": report.adapter_id,
+            "deployment_adapter_version": report.adapter_version,
+            "deployment_model_revision": report.model_revision,
+            "deployment_profile_hash": report.profile_hash,
+            "deployment_source_revision": report.source_revision,
+        }
+    )
+
+    assert is_trusted_deployment_report(report, settings)
+    assert not is_trusted_deployment_report(
+        report,
+        settings.model_copy(update={"deployment_model_revision": "different-model"}),
+    )
+    assert not is_trusted_deployment_report(
+        report,
+        settings.model_copy(update={"adapter_capability_report_hash": "0" * 64}),
+    )
+
+
 def test_report_requires_a_pinned_hash(tmp_path) -> None:
     report = _unqualified_report()
     path = _write_report(tmp_path, report)
 
     with pytest.raises(ValueError):
         load_deployment_capability_report(str(path), None)
+
+
+def test_legacy_v2_report_remains_loadable_for_existing_snapshots(tmp_path) -> None:
+    current = _unqualified_report()
+    legacy_settings = LegacyAgentQualificationSettings.model_validate(
+        {
+            key: current.agent_settings.model_dump()[key]
+            for key in ("llm_model", "stt_provider", "tts_voice_en", "tts_voice_hi")
+        }
+    )
+    report = current.model_copy(
+        update={
+            "protocol_version": 2,
+            "agent_settings": legacy_settings,
+            "report_hash": "",
+        }
+    )
+    report = report.model_copy(update={"report_hash": report.compute_hash()})
+    path = _write_report(tmp_path, report)
+    loaded = load_deployment_capability_report(str(path), report.report_hash)
+
+    assert loaded is not None
+    assert loaded.protocol_version == 2
+    assert isinstance(loaded.agent_settings, LegacyAgentQualificationSettings)
+    assert loaded.report_hash == report.report_hash
+    assert not has_qualified_voice_playback(loaded)
+
+
+def test_protocol_v4_requires_the_llm_provider_binding() -> None:
+    report = _unqualified_report()
+    settings = report.agent_settings.model_dump(mode="json")
+    settings.pop("llm_provider")
+
+    with pytest.raises(PydanticValidationError):
+        CapabilityReport.model_validate(
+            {**report.model_dump(mode="json"), "agent_settings": settings}
+        )
+
+
+def test_legacy_v3_report_is_not_rewritten_and_cannot_qualify_playback(tmp_path) -> None:
+    current = _unqualified_report()
+    settings = ProviderlessAgentQualificationSettings.model_validate(
+        {
+            key: value
+            for key, value in current.agent_settings.model_dump().items()
+            if key != "llm_provider"
+        }
+    )
+    report = current.model_copy(
+        update={
+            "protocol_version": 3,
+            "agent_settings": settings,
+            "metadata": "separate_stream",
+            "speech_gating": True,
+            "cancel_generation": True,
+            "playback": "qualified_fragment_completion",
+            "locales": ["en", "hi"],
+            "budgets": {"fragment_latency_ms": 1},
+            "report_hash": "",
+        }
+    )
+    report = report.model_copy(update={"report_hash": report.compute_hash()})
+    original_data = report.model_dump(mode="json")
+    path = _write_report(tmp_path, report)
+
+    loaded = load_deployment_capability_report(str(path), report.report_hash)
+
+    assert loaded is not None
+    assert loaded.protocol_version == 3
+    assert isinstance(loaded.agent_settings, ProviderlessAgentQualificationSettings)
+    assert loaded.model_dump(mode="json") == original_data
+    assert not has_qualified_voice_playback(loaded)
+    assert not is_trusted_deployment_report(
+        loaded,
+        _test_settings().model_copy(
+            update={
+                "adapter_capability_report_hash": report.report_hash,
+                "deployment_adapter_id": report.adapter_id,
+                "deployment_adapter_version": report.adapter_version,
+                "deployment_model_revision": report.model_revision,
+                "deployment_profile_hash": report.profile_hash,
+                "deployment_source_revision": report.source_revision,
+            }
+        ),
+    )
+
+
+    capabilities = AdapterCapabilities(
+        adapter_id=loaded.adapter_id,
+        adapter_version=loaded.adapter_version,
+        model_revision=loaded.model_revision,
+        metadata=loaded.metadata,
+        speech_gating=loaded.speech_gating,
+        cancel_generation=loaded.cancel_generation,
+        playback=loaded.playback,
+        locales=list(loaded.locales),
+        report_hash=loaded.report_hash,
+    )
+    config = {
+        **loaded.agent_settings.model_dump(mode="json"),
+        "llm_provider": "ollama",
+        "schema_version": 1,
+        "steps": [],
+    }
+    diagnostics = validate_voice_capability(
+        config,
+        capabilities,
+        loaded.agent_settings,
+    )
+    assert [diagnostic.path for diagnostic in diagnostics] == ["/qualification"]
 
 
 def test_report_hash_pins_the_exact_capability_and_agent_settings_tuple(tmp_path) -> None:
@@ -109,6 +252,10 @@ def test_report_hash_pins_the_exact_capability_and_agent_settings_tuple(tmp_path
         ("model_revision", "other-model-revision"),
         ("profile_hash", "other-profile-hash"),
         ("source_revision", "other-source-revision"),
+        (
+            "agent_settings",
+            report.agent_settings.model_copy(update={"llm_provider": "other-provider"}),
+        ),
         ("metadata", "complete_tool"),
         ("speech_gating", True),
         ("cancel_generation", True),
@@ -121,6 +268,18 @@ def test_report_hash_pins_the_exact_capability_and_agent_settings_tuple(tmp_path
         (
             "agent_settings",
             report.agent_settings.model_copy(update={"stt_provider": "other-stt"}),
+        ),
+        (
+            "agent_settings",
+            report.agent_settings.model_copy(update={"stt_model": "other-stt-model"}),
+        ),
+        (
+            "agent_settings",
+            report.agent_settings.model_copy(update={"tts_provider": "other-tts"}),
+        ),
+        (
+            "agent_settings",
+            report.agent_settings.model_copy(update={"tts_model": "other-tts-model"}),
         ),
         (
             "agent_settings",
@@ -156,12 +315,15 @@ def test_voice_settings_must_match_the_pinned_report_tuple() -> None:
     config = {
         "schema_version": 1,
         "steps": [],
+        "llm_provider": "ollama",
         "llm_model": "qwen3.5:4b",
         "stt_provider": "mlx-audio",
+        "stt_model": "mlx-community/nemotron-3.5-asr-streaming-0.6b",
+        "tts_provider": "mlx-audio",
+        "tts_model": "mlx-community/Kokoro-82M-4bit",
         "tts_voice_en": "af_heart",
         "tts_voice_hi": "hf_alpha",
     }
-
     # Matching settings still fail closed because this report is unqualified.
     matching_errors = validate_voice_capability(
         config,
@@ -170,7 +332,15 @@ def test_voice_settings_must_match_the_pinned_report_tuple() -> None:
     )
     assert [diagnostic.path for diagnostic in matching_errors] == ["/capabilities"]
 
-    for key in ("llm_model", "stt_provider", "tts_voice_en", "tts_voice_hi"):
+    for key in (
+        "llm_model",
+        "stt_provider",
+        "stt_model",
+        "tts_provider",
+        "tts_model",
+        "tts_voice_en",
+        "tts_voice_hi",
+    ):
         mismatched = {**config, key: "not-pinned"}
         diagnostics = validate_voice_capability(
             mismatched,
@@ -182,6 +352,12 @@ def test_voice_settings_must_match_the_pinned_report_tuple() -> None:
             and diagnostic.code == "PLAYBACK_UNQUALIFIED"
             for diagnostic in diagnostics
         )
+
+    other_provider = report.agent_settings.model_copy(update={"llm_provider": "other"})
+    assert any(
+        diagnostic.path == "/llm_provider" and diagnostic.code == "PLAYBACK_UNQUALIFIED"
+        for diagnostic in validate_voice_capability(config, capabilities, other_provider)
+    )
 
 
 

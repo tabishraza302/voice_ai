@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync, execSync } from "node:child_process";
-import crypto from "node:crypto";
 
 // Resolve repository/worktree root
 export const WORKTREE_ROOT = path.resolve(__dirname, "../../..");
@@ -159,7 +158,7 @@ export function createAdminUser(options: {
     "from datetime import datetime, timezone",
     "from platform_api.config import PlatformSettings",
     "from platform_api.db.session import create_engine, get_session_factory",
-    "from platform_api.models.auth import User, AuthMfa",
+    "from platform_api.models.auth import User",
     "from platform_api.accounts.service import initialize_user_account",
     "from platform_api.auth.passwords import get_password_hasher",
     "",
@@ -188,16 +187,6 @@ export function createAdminUser(options: {
     "        )",
     "        session.add(user)",
     "        await session.flush()",
-    "        mfa_record = AuthMfa(",
-    "            user_id=user.id,",
-    "            secret_ciphertext=None,",
-    "            pending_secret_ciphertext=None,",
-    "            pending_expires_at=None,",
-    "            enabled_at=None,",
-    "            last_accepted_step=None,",
-    "        )",
-    "        session.add(mfa_record)",
-    "        await session.flush()",
     "        await initialize_user_account(session, user_id=user.id, now=now)",
     "        await session.commit()",
     "",
@@ -214,50 +203,6 @@ export function createAdminUser(options: {
   });
 }
 
-/**
- * Generate RFC 6238 compatible 6-digit TOTP code from base32 secret.
- * Supports optional offsetSteps for testing sequential valid timesteps
- * within the ±1 step window without wall-clock sleep delays.
- */
-export function generateTotpCode(
-  secretBase32: string,
-  offsetSteps: number = 0
-): string {
-  const cleanSecret = secretBase32.replace(/[\s=]/g, "").toUpperCase();
-  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-
-  let bits = "";
-  for (let i = 0; i < cleanSecret.length; i++) {
-    const val = alphabet.indexOf(cleanSecret[i]);
-    if (val === -1) continue;
-    bits += val.toString(2).padStart(5, "0");
-  }
-
-  const bytes: number[] = [];
-  for (let i = 0; i + 8 <= bits.length; i += 8) {
-    bytes.push(parseInt(bits.substring(i, i + 8), 2));
-  }
-  const key = Buffer.from(bytes);
-
-  // 30-second time window counter with optional offset steps
-  const epoch = Math.floor(Date.now() / 1000);
-  const timeStep = Math.floor(epoch / 30) + offsetSteps;
-  const timeBuffer = Buffer.alloc(8);
-  timeBuffer.writeBigInt64BE(BigInt(timeStep));
-
-  const hmac = crypto.createHmac("sha1", key);
-  hmac.update(timeBuffer);
-  const digest = hmac.digest();
-
-  const offset = digest[digest.length - 1] & 0x0f;
-  const codeNum =
-    ((digest[offset] & 0x7f) << 24) |
-    ((digest[offset + 1] & 0xff) << 16) |
-    ((digest[offset + 2] & 0xff) << 8) |
-    (digest[offset + 3] & 0xff);
-
-  return (codeNum % 1_000_000).toString().padStart(6, "0");
-}
 
 /**
  * Force the active session for an administrator to have a stale step-up timestamp

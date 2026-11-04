@@ -118,6 +118,7 @@ class AdminAuditItem(StrictModel):
     action: str
     target_type: str
     target_id: uuid.UUID | None
+    model_change: dict[str, Any] | None = None
     reason: str | None
     request_id: uuid.UUID | None
     source_ip: str | None

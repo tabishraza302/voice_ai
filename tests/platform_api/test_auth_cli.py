@@ -78,13 +78,13 @@ async def test_readiness_blocks_until_enrolled_admin_exists(
     test_platform_settings: PlatformSettings,
     initialized_pg: FreshPostgres,
 ):
-    """Readiness endpoint returns 503 until an administrator has enrolled and verified MFA."""
+    """Readiness endpoint returns 503 until an active administrator exists."""
     # 1. Initially (no admin), readiness returns 503
     res1 = await app_client.get("/api/v1/health/ready")
     assert res1.status_code == 503
     assert "No enrolled administrator" in res1.json()["error"]
 
-    # 2. Bootstrap admin (MFA not yet enabled)
+    # 2. Bootstrap admin
     await _bootstrap_admin_command(
         test_platform_settings,
         email_raw="unverified-admin@example.com",
@@ -93,24 +93,10 @@ async def test_readiness_blocks_until_enrolled_admin_exists(
         password_input="admin-secure-pw-12345",
     )
 
-    # Readiness still returns 503 because MFA is not yet enabled
+    # Readiness now returns 200 OK because admin exists
     res2 = await app_client.get("/api/v1/health/ready")
-    assert res2.status_code == 503
-    assert "No enrolled administrator" in res2.json()["error"]
-
-    # 3. Simulate admin completing MFA enrollment
-    async with initialized_pg.sessions() as session:
-        user = (await session.execute(select(User).where(User.role == "admin"))).scalar_one()
-        mfa = (await session.execute(select(AuthMfa).where(AuthMfa.user_id == user.id))).scalar_one()
-        mfa.enabled_at = datetime.now(timezone.utc)
-        mfa.secret_ciphertext = "encrypted-secret"
-        await session.commit()
-
-    # Readiness now returns 200 OK
-    res3 = await app_client.get("/api/v1/health/ready")
-    assert res3.status_code == 200
-    assert res3.json()["status"] == "ready"
-
+    assert res2.status_code == 200
+    assert res2.json()["status"] == "ready"
 
 @pytest.mark.postgres
 @pytest.mark.asyncio

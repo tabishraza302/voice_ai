@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from bot.provider_registry import MLX_KOKORO_MODEL, NEMOTRON_MODEL
 from tests.support import qualification
 
 pytestmark = pytest.mark.qualification
@@ -26,6 +27,9 @@ def _qualification_settings() -> dict:
         "agent_settings": {
             "llm_model": "llm-id",
             "stt_provider": "mlx-audio",
+            "stt_model": NEMOTRON_MODEL,
+            "tts_provider": "mlx-audio",
+            "tts_model": MLX_KOKORO_MODEL,
             "tts_voice_en": "af_heart",
             "tts_voice_hi": "hf_alpha",
         },
@@ -36,8 +40,18 @@ def _qualification_settings() -> dict:
 
 def _models() -> dict:
     return {
-        name: {"id": f"{name}-id", "revision": f"{name}-revision", "sha256": MODEL_HASH}
-        for name in ("llm", "stt", "tts_en", "tts_hi")
+        "llm": {"id": "llm-id", "revision": "llm-revision", "sha256": MODEL_HASH},
+        "stt": {"id": NEMOTRON_MODEL, "revision": "stt-revision", "sha256": MODEL_HASH},
+        "tts_en": {
+            "id": MLX_KOKORO_MODEL,
+            "revision": "tts-en-revision",
+            "sha256": MODEL_HASH,
+        },
+        "tts_hi": {
+            "id": MLX_KOKORO_MODEL,
+            "revision": "tts-hi-revision",
+            "sha256": MODEL_HASH,
+        },
     }
 
 

@@ -43,13 +43,12 @@ from platform_api.auth.schemas import (
 )
 from platform_api.auth.sessions import (
     create_authenticated_session,
-    create_mfa_pending_session,
     generate_session_secret,
     revoke_all_user_sessions,
     revoke_session,
 )
 from platform_api.config import PlatformSettings
-from platform_api.models.auth import AuthMfa, AuthSession, AuthToken, User
+from platform_api.models.auth import AuthSession, AuthToken, User
 
 
 def normalize_email_address(raw_email: str) -> tuple[str, str]:
@@ -108,7 +107,6 @@ def build_user_view(user: User, mfa_enabled: bool = False) -> UserView:
         preferred_language=user.preferred_language,  # type: ignore[arg-type]
         timezone=user.timezone,
         low_balance_notifications=user.low_balance_notifications,
-        mfa_enabled=mfa_enabled,
         created_at=user.created_at,
         updated_at=user.updated_at,
     )

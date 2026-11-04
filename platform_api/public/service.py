@@ -34,6 +34,7 @@ from platform_api.auth.errors import (
 from platform_api.auth.rate_limits import check_and_increment_rate_limit
 from platform_api.auth.types import Principal
 from platform_api.config import PlatformSettings
+from platform_api.catalog import ModelCatalog
 from platform_api.models.auth import User
 from platform_api.models.session import Session
 from platform_api.public.models import PublicDeployment, PublicGuestCapability
@@ -419,6 +420,7 @@ async def admit_guest_session(
     capabilities: Any,
     qualification_settings: Any,
     settings: PlatformSettings,
+    catalog: ModelCatalog | None = None,
 ) -> tuple[GuestAdmissionView, str]:
     """Check disclosure and abuse limits before reserving a funded guest call."""
     public_session_admission_config(settings)
@@ -477,6 +479,7 @@ async def admit_guest_session(
         operation_id=operation_id,
         capability_digest=digest,
         settings=settings,
+        catalog=catalog,
     )
     await db.commit()
     return (

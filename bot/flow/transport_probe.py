@@ -404,7 +404,7 @@ def probe_existing_webrtc_transport_behavior(
         evidence_hash = hashlib.sha256(raw_evidence_bytes).hexdigest()
 
         rep = CapabilityReport(
-            protocol_version=2,
+            protocol_version=4,
             adapter_id=adapter_id,
             adapter_version=adapter_version,
             model_revision=model_revision,

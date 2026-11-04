@@ -661,6 +661,23 @@ async def list_admin_audit_logs(
                 action=row.action,
                 target_type=row.target_type,
                 target_id=row.target_id,
+                model_change=(
+                    {
+                        "provider_id": row.change_summary.get("provider_id"),
+                        "model_id": row.change_summary.get("model_id"),
+                        "before": {
+                            key: row.change_summary["before"].get(key)
+                            for key in ("enabled", "qualified")
+                        } if isinstance(row.change_summary.get("before"), dict) else None,
+                        "after": {
+                            key: row.change_summary["after"].get(key)
+                            for key in ("enabled", "qualified")
+                        } if isinstance(row.change_summary.get("after"), dict) else None,
+                    }
+                    if row.target_type == "ollama_model"
+                    and isinstance(row.change_summary, dict)
+                    else None
+                ),
                 reason=row.reason,
                 request_id=row.request_id,
                 source_ip=str(row.source_ip) if row.source_ip is not None else None,

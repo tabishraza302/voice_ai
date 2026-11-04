@@ -9,6 +9,7 @@ import {
   LogIn,
   Mic2,
   ScrollText,
+  KeyRound,
   Settings,
   ShieldCheck,
   User,
@@ -32,6 +33,7 @@ const adminNavItems = [
   { href: "/admin/sessions", label: "Sessions", icon: Mic2 },
   { href: "/admin/tariffs", label: "Rates & pauses", icon: Settings },
   { href: "/admin/audit", label: "Audit log", icon: ScrollText },
+  { href: "/admin/providers", label: "Provider credentials", icon: KeyRound },
   { href: "/admin/settings", label: "Admin security", icon: ShieldCheck },
 ];
 

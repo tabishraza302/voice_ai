@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import uuid
 
+from bot.provider_registry import MLX_KOKORO_MODEL, NEMOTRON_MODEL
 import httpx
 import pytest
 import pytest_asyncio
@@ -38,6 +39,7 @@ from platform_api.model_client import (
 from platform_api.models.auth import User
 import platform_api.testing.chat as chat_service
 from platform_api.testing.models import ChatMessage, ChatTestSession
+from platform_api.catalog import load_catalog
 from tests.support.postgres import FreshPostgres
 
 
@@ -72,11 +74,13 @@ class FakeModelClient:
         temperature: float,
         reasoning_effort: str | None,
         max_tokens_parameter: str,
+        provider_id: str | None = None,
     ) -> ModelCompletion:
         self.calls.append(
             {
                 "endpoint": endpoint,
                 "model": model,
+                "provider_id": provider_id,
                 "messages": messages,
                 "max_tokens": max_tokens,
                 "temperature": temperature,
@@ -110,16 +114,35 @@ class FakeModelClient:
 
 def _catalog_file(tmp_path: Path) -> str:
     data = {
-        "llm_models": [
+        "stt_providers": [
             {
-                "id": "qwen3.5:4b",
-                "name": "Runtime Qwen",
-                "description": "runtime model",
-                "supports_reasoning": True,
+                "id": "mlx-audio",
+                "name": "Batch ASR",
+                "languages": ["en", "hi"],
+                "models": [
+                    {
+                        "id": NEMOTRON_MODEL,
+                        "name": "Nemotron 3.5 ASR Streaming 0.6B",
+                        "languages": ["en", "hi"],
+                    }
+                ],
             }
         ],
-        "stt_providers": [
-            {"id": "mlx-audio", "name": "Batch ASR", "languages": ["en", "hi"]}
+        "tts_providers": [
+            {
+                "id": "mlx-audio",
+                "name": "MLX Audio",
+                "models": [
+                    {
+                        "id": MLX_KOKORO_MODEL,
+                        "name": "Kokoro 82M (4-bit)",
+                        "voices": [
+                            {"id": "af_heart", "name": "English voice", "language": "en"},
+                            {"id": "hf_alpha", "name": "Hindi voice", "language": "hi"},
+                        ],
+                    }
+                ],
+            }
         ],
         "tts_voices": [
             {"id": "af_heart", "name": "English voice", "language": "en"},
@@ -143,6 +166,7 @@ def _catalog_file(tmp_path: Path) -> str:
 async def task4_app_client(
     test_platform_settings: PlatformSettings,
     initialized_pg: FreshPostgres,
+    qualified_test_llm,
     tmp_path: Path,
 ):
     """Run the platform app with a fake provider and a real isolated PostgreSQL schema."""
@@ -245,6 +269,8 @@ async def _create_template_agent(
     draft_body = draft.json()
     text_only_config = {
         **draft_body["config"],
+        "llm_provider": "ollama",
+        "llm_model": "qwen3.5:4b",
         "tts_voice_en": "",
         "tts_voice_hi": "",
     }
@@ -271,6 +297,7 @@ def _generated_proposal() -> dict[str, object]:
         "persona_prompt": "Be precise and do not invent product terms.",
         "config": {
             "flow": template["flow"],
+            "llm_provider": "ollama",
             "llm_model": "qwen3.5:4b",
             "stt_provider": "mlx-audio",
             "tts_voice_en": "af_heart",
@@ -781,6 +808,32 @@ async def test_chat_ignores_voice_qualification_required_for_publish(
     initialized_pg: FreshPostgres,
 ):
     client, app, model_client = task4_app_client
+    report = app.state.adapter_capability_report
+    unqualified_report = report.model_copy(
+        update={
+            "metadata": "none",
+            "speech_gating": False,
+            "cancel_generation": False,
+            "playback": "unqualified",
+            "report_hash": "",
+        }
+    )
+    unqualified_report = unqualified_report.model_copy(
+        update={"report_hash": unqualified_report.compute_hash()}
+    )
+    app.state.adapter_capability_report = unqualified_report
+    app.state.settings = app.state.settings.model_copy(
+        update={"adapter_capability_report_hash": unqualified_report.report_hash}
+    )
+    app.state.qualified_settings = unqualified_report.agent_settings
+    app.state.catalog = load_catalog(
+        app.state.settings.catalog_path,
+        qualified_settings=unqualified_report.agent_settings.model_dump(
+            mode="python",
+            exclude_none=True,
+        ),
+        tts_playback_qualified=False,
+    )
     _, headers = await _create_user_session(
         initialized_pg, app.state.settings, client, "chat_voice_mode@example.com"
     )
@@ -800,7 +853,8 @@ async def test_chat_ignores_voice_qualification_required_for_publish(
     assert configured.status_code == 200
     draft = configured.json()
     assert any(
-        error["code"] == "PLAYBACK_UNQUALIFIED"
+        error["code"] == "MODEL_UNQUALIFIED"
+        and error["path"] in {"/tts_model", "/tts_voice_en", "/tts_voice_hi"}
         for error in draft["validation"]["errors"]
     )
     assert isinstance(draft["snapshot_hash"], str)
@@ -816,7 +870,8 @@ async def test_chat_ignores_voice_qualification_required_for_publish(
     )
     assert blocked_publish.status_code == 422
     assert any(
-        field["code"] == "PLAYBACK_UNQUALIFIED"
+        field["code"] == "MODEL_UNQUALIFIED"
+        and field["field"] in {"/tts_model", "/tts_voice_en", "/tts_voice_hi"}
         for field in blocked_publish.json()["error"]["fields"]
     )
 
@@ -836,6 +891,7 @@ async def test_chat_ignores_voice_qualification_required_for_publish(
     assert chat.json()["reply"] == "I can help with that."
     assert len(model_client.calls) == 1
     assert model_client.calls[0]["endpoint"] == "runtime"
+    assert model_client.calls[0]["provider_id"] == "ollama"
 
 
 @pytest.mark.postgres
@@ -1195,6 +1251,7 @@ async def test_model_client_omits_unsupported_structured_output_option(monkeypat
         completion = await model_client.complete(
             "runtime",
             model="qwen3.5:4b",
+            provider_id="ollama",
             messages=[
                 {"role": "system", "content": "Return JSON only."},
                 {"role": "user", "content": "Say hello."},
@@ -1236,6 +1293,7 @@ async def test_model_client_exposes_safe_upstream_http_status(monkeypatch):
             await model_client.complete(
                 "runtime",
                 model="qwen3.5:4b",
+                provider_id="ollama",
                 messages=[{"role": "user", "content": "Say hello."}],
                 max_tokens=64,
                 temperature=0.2,
@@ -1250,6 +1308,35 @@ async def test_model_client_exposes_safe_upstream_http_status(monkeypatch):
         "The configured model endpoint returned HTTP 501."
     )
     assert "private provider details" not in error.value.public_message
+
+async def test_model_client_refuses_runtime_provider_mismatch_and_remote_endpoint():
+    async def complete(settings: PlatformSettings, provider_id: str) -> None:
+        client = OpenAICompatibleModelClient(settings)
+        await client.complete(
+            "runtime",
+            model="qwen3.5:4b",
+            provider_id=provider_id,
+            messages=[{"role": "user", "content": "Say hello."}],
+            max_tokens=64,
+            temperature=0.2,
+            reasoning_effort=None,
+            max_tokens_parameter="max_tokens",
+        )
+
+    base_settings = _model_client_settings()
+    remote_settings = base_settings.model_copy(
+        update={"runtime_llm_base_url": "https://runtime.example/v1"}
+    )
+    with pytest.raises(ModelClientError) as remote_error:
+        await complete(remote_settings, "ollama")
+    assert remote_error.value.code == "RUNTIME_ENDPOINT_NOT_LOCAL"
+
+    local_settings = base_settings.model_copy(
+        update={"runtime_llm_base_url": "http://127.0.0.1:11434/v1"}
+    )
+    with pytest.raises(ModelClientError) as provider_error:
+        await complete(local_settings, "openai-compatible")
+    assert provider_error.value.code == "RUNTIME_PROVIDER_MISMATCH"
 
 @pytest.mark.postgres
 @pytest.mark.asyncio
@@ -1298,3 +1385,37 @@ async def test_chat_model_failure_commits_only_user_turn_without_fallback(
             "message": "The configured model request failed unexpectedly.",
         }
     ]
+
+
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_existing_chat_stops_after_model_is_disabled(task4_app_client, initialized_pg):
+    from platform_api.models.provider_model_entry import ProviderModelEntry
+
+    client, app, model_client = task4_app_client
+    _, headers = await _create_user_session(
+        initialized_pg, app.state.settings, client, "chat_revoked@example.com"
+    )
+    agent_id, draft = await _create_template_agent(client, headers)
+    test_id = str(uuid.uuid4())
+    payload = {
+        "snapshot_hash": draft["snapshot_hash"],
+        "test_id": test_id,
+        "expected_turn_sequence": 1,
+        "text": "I am salaried.",
+    }
+    first = await client.post(f"/api/v1/agents/{agent_id}/test/chat", headers=headers, json=payload)
+    assert first.status_code == 200
+    assert len(model_client.calls) == 1
+    async with initialized_pg.sessions() as db:
+        model = await db.get(ProviderModelEntry, ("ollama", "qwen3.5:4b"))
+        assert model is not None
+        model.enabled = False
+        await db.commit()
+    second = await client.post(
+        f"/api/v1/agents/{agent_id}/test/chat",
+        headers=headers,
+        json={**payload, "expected_turn_sequence": 2, "text": "Another turn."},
+    )
+    assert second.status_code == 409
+    assert len(model_client.calls) == 1

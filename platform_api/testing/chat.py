@@ -37,10 +37,18 @@ from bot.flow.schemas import (
     UserTurnAcceptedEvent,
 )
 from platform_api.agents.config import (
+    LEGACY_AGENT_SETTING_KEYS,
+    V2_AGENT_SETTING_KEYS,
     AgentConfigError,
+    compute_legacy_model_hash,
+    compute_legacy_settings_hash,
+    compute_legacy_voice_hash,
     compute_model_hash,
+    compute_model_hash_v3,
     compute_settings_hash,
+    compute_settings_hash_v3,
     compute_voice_hash,
+    compute_voice_hash_v3,
     extract_flow,
     extract_settings,
 )
@@ -172,6 +180,14 @@ async def post_chat_turn(
     else:
         if chat_session.snapshot_hash != payload.snapshot_hash:
             raise RevisionConflictError("Chat Test snapshot does not match the pinned session")
+        runtime = chat_session.snapshot_json.get("runtime_profile", {})
+        if not isinstance(runtime, dict) or not any(
+            model.selectable
+            and model.provider_id == runtime.get("provider_id")
+            and model.id == runtime.get("model_id")
+            for model in catalog.llm_models
+        ):
+            raise RevisionConflictError("The pinned runtime model is no longer available")
         if chat_session.pending_turn_sequence is not None:
             turn_sequence = chat_session.pending_turn_sequence
             if payload.expected_turn_sequence != turn_sequence:
@@ -315,6 +331,7 @@ async def post_chat_turn(
             completion = await model_client.complete(
                 "runtime",
                 model=runtime["model_id"],
+                provider_id=runtime["provider_id"],
                 messages=_model_messages(
                     snapshot=snapshot,
                     compiled=compiled,
@@ -542,8 +559,11 @@ async def _resolve_new_snapshot(
             "The saved draft cannot be compiled for Chat Test",
             fields=[{"field": "config", "code": "SNAPSHOT_INVALID"}],
         ) from exc
-
-    runtime_profile = _runtime_profile(settings, model_pins["llm_model"])
+    runtime_profile = _runtime_profile(
+        settings,
+        model_pins["llm_provider"],
+        model_pins["llm_model"],
+    )
     snapshot = {
         "kind": "draft",
         "snapshot_hash": draft_view.snapshot_hash,
@@ -568,6 +588,9 @@ async def _published_snapshot(
 ) -> dict[str, Any]:
     immutable = version.immutable_config_json
     if not isinstance(immutable, dict):
+        raise _invalid_published_snapshot()
+    schema_version = immutable.get("schema_version")
+    if type(schema_version) is not int or schema_version not in {1, 2, 3}:
         raise _invalid_published_snapshot()
     try:
         authoring_config = immutable["authoring_config"]
@@ -601,16 +624,49 @@ async def _published_snapshot(
             raise ValueError("immutable authoring config contains forbidden secrets")
 
         settings_pins = extract_settings(authoring_config)
+        if schema_version == 1:
+            settings_pins = {
+                key: settings_pins[key] for key in LEGACY_AGENT_SETTING_KEYS
+            }
+            expected_model_hash = compute_legacy_model_hash(settings_pins)
+            expected_voice_hash = compute_legacy_voice_hash(settings_pins)
+            expected_settings_hash = compute_legacy_settings_hash(settings_pins)
+        elif schema_version == 2:
+            settings_pins = {
+                key: settings_pins[key] for key in V2_AGENT_SETTING_KEYS
+            }
+            expected_model_hash = compute_model_hash(settings_pins)
+            expected_voice_hash = compute_voice_hash(settings_pins)
+            expected_settings_hash = compute_settings_hash(settings_pins)
+        else:
+            expected_model_hash = compute_model_hash_v3(settings_pins)
+            expected_voice_hash = compute_voice_hash_v3(settings_pins)
+            expected_settings_hash = compute_settings_hash_v3(settings_pins)
+        if set(model_pins) != set(settings_pins) | {
+            "model_hash",
+            "voice_hash",
+            "settings_hash",
+        }:
+            raise ValueError("model pins have an unsupported shape")
         if any(model_pins.get(key) != value for key, value in settings_pins.items()):
             raise ValueError("model pins do not match immutable authoring config")
-        if model_pins.get("model_hash") != compute_model_hash(settings_pins):
+        if model_pins.get("model_hash") != expected_model_hash:
             raise ValueError("model pin hash mismatch")
-        if model_pins.get("voice_hash") != compute_voice_hash(settings_pins):
+        if model_pins.get("voice_hash") != expected_voice_hash:
             raise ValueError("voice pin hash mismatch")
-        if model_pins.get("settings_hash") != compute_settings_hash(settings_pins):
+        if model_pins.get("settings_hash") != expected_settings_hash:
             raise ValueError("settings pin hash mismatch")
-        if not any(item.id == settings_pins["llm_model"] for item in catalog.llm_models):
-            raise ValueError("published runtime model is no longer qualified")
+        if schema_version < 3:
+            raise ValueError("published runtime version does not pin an LLM provider")
+        llm_provider = settings_pins["llm_provider"]
+        llm_model = settings_pins["llm_model"]
+        if not any(
+            item.provider_id == llm_provider
+            and item.id == llm_model
+            and item.selectable
+            for item in catalog.llm_models
+        ):
+            raise ValueError("published runtime provider/model is no longer qualified")
 
         policy_result = await db.execute(
             select(PlatformPromptVersion).where(
@@ -665,7 +721,11 @@ async def _published_snapshot(
         },
         "system_prompt": system_prompt + CHAT_RUNTIME_INSTRUCTIONS,
         "model_pins": settings_pins,
-        "runtime_profile": _runtime_profile(settings, settings_pins["llm_model"]),
+        "runtime_profile": _runtime_profile(
+            settings,
+            settings_pins["llm_provider"],
+            settings_pins["llm_model"],
+        ),
         "compiled_flow": compiled.model_dump(mode="json"),
     }
 
@@ -677,8 +737,11 @@ def _invalid_published_snapshot() -> ValidationError:
     )
 
 
-def _runtime_profile(settings: PlatformSettings, model_id: str) -> dict[str, Any]:
+def _runtime_profile(
+    settings: PlatformSettings, provider_id: str, model_id: str
+) -> dict[str, Any]:
     return {
+        "provider_id": provider_id,
         "model_id": model_id,
         "max_tokens": settings.runtime_llm_max_tokens,
         "temperature": settings.runtime_llm_temperature,

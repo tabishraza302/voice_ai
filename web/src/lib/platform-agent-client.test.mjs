@@ -161,6 +161,44 @@ describe("PlatformAgentClient", () => {
     expect(new URL(calls[1].url).searchParams.get("cursor")).toBe("next-page");
   });
 
+
+
+
+  test("rejects catalog API errors instead of returning an empty catalog", async () => {
+    mockFetch(async () => jsonResponse({
+      error: {
+        code: "CATALOG_UNAVAILABLE",
+        message: "Qualified catalog is unavailable.",
+      },
+    }, 503));
+
+    await expect(client.getCatalog()).rejects.toMatchObject({
+      status: 503,
+      code: "CATALOG_UNAVAILABLE",
+    });
+  });
+
+  test("rejects malformed catalog responses instead of dropping catalog entries", async () => {
+    mockFetch(async () => jsonResponse({ llm_models: [] }));
+
+    await expect(client.getCatalog()).rejects.toThrow(
+      "Invalid platform response: catalog.stt_providers must be an array."
+    );
+  });
+
+  test("rejects catalog providers with malformed model lists", async () => {
+    mockFetch(async () => jsonResponse({
+      llm_models: [],
+      stt_providers: [{ id: "stt", name: "Speech", models: null }],
+      tts_voices: [],
+      tts_providers: [],
+    }));
+
+    await expect(client.getCatalog()).rejects.toThrow(
+      "Invalid platform response: catalog.stt_provider.models must be an array."
+    );
+  });
+
   test("submits a generation job, loads the typed proposal, and does not create an agent", async () => {
     const proposal = {
       name: "Loan guide",

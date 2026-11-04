@@ -25,6 +25,7 @@ from sqlalchemy import (
     inspect,
     select,
     text,
+    update,
 )
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sqlalchemy.orm import Mapped, mapped_column
@@ -35,6 +36,11 @@ if TYPE_CHECKING:
 
 
 # Unique 64-bit advisory lock ID for serializing platform schema operations
+CURRENT_SCHEMA_VERSION = "platform-v3"
+INTERMEDIATE_SCHEMA_VERSION = "platform-v2"
+LEGACY_SCHEMA_VERSION = "platform-v1"
+PROVIDER_SECRET_TABLE = "provider_secrets"
+MODEL_ENTRY_TABLE = "provider_model_entries"
 PLATFORM_SCHEMA_ADVISORY_LOCK_ID = 8100984920448107368
 
 
@@ -75,17 +81,32 @@ def _canonicalize_default_value(arg: Any) -> str | None:
     return str(arg)
 
 
-def compute_metadata_hash(metadata: MetaData | None = None) -> str:
-    """Compute deterministic SHA-256 hash of all tables, columns, constraints, and defaults."""
+def compute_metadata_hash(
+    metadata: MetaData | None = None,
+    *,
+    exclude_tables: set[str] | frozenset[str] = frozenset(),
+) -> str:
+    """Compute deterministic SHA-256 hash of schema metadata.
+
+    ``exclude_tables`` exists for compatibility checks against explicitly
+    supported historical schemas before applying a narrow migration.
+    """
     import platform_api.models  # Ensure all platform models are registered
 
     if metadata is None:
         metadata = Base.metadata
 
+    excluded = set(exclude_tables)
     structure: dict[str, Any] = {}
 
     for table_name in sorted(metadata.tables.keys()):
         table = metadata.tables[table_name]
+        if (
+            table_name in excluded
+            or table.name in excluded
+            or table.fullname in excluded
+        ):
+            continue
 
         columns = []
         for col in sorted(table.columns, key=lambda c: c.name):
@@ -343,7 +364,7 @@ async def initialize_schema(
     engine: AsyncEngine,
     *,
     schema: str = DEFAULT_PLATFORM_SCHEMA,
-    expected_version: str = "platform-v1",
+    expected_version: str = CURRENT_SCHEMA_VERSION,
     metadata_hash: str | None = None,
     initial_tariff: InitialSessionTariff | None = None,
     allow_unseeded_restore: bool = False,
@@ -354,6 +375,10 @@ async def initialize_schema(
     - Non-PostgreSQL dialect: raises SchemaMismatch.
     - Missing or empty platform schema creates tables and records the schema only after an
       explicit tariff seed; only backup restore may set `allow_unseeded_restore=True` to import the archived tariff.
+    - An exact platform-v1 inventory migrates to platform-v3 by adding provider_secrets
+      and provider_model_entries; an exact platform-v2 inventory migrates by adding only
+      provider_model_entries. Each migration preserves existing rows and records schema_info
+      in the same transaction; unknown drift is refused.
     - Non-empty unknown platform schema (lacks schema_info or has unexpected objects): raises SchemaMismatch.
     - Matching schema_info with missing/extra tables, missing generated sequences, or unexpected objects: raises SchemaMismatch.
     - Identical recorded schema and tables: safe no-op; initial tariff values are ignored.
@@ -430,6 +455,87 @@ async def initialize_schema(
             )
 
         rec_version, rec_hash = rows[0]
+        expected_tables = {t.name for t in Base.metadata.tables.values()}
+        migration_additions = {
+            LEGACY_SCHEMA_VERSION: (
+                {PROVIDER_SECRET_TABLE, MODEL_ENTRY_TABLE},
+                (PROVIDER_SECRET_TABLE, MODEL_ENTRY_TABLE),
+            ),
+            INTERMEDIATE_SCHEMA_VERSION: (
+                {MODEL_ENTRY_TABLE},
+                (MODEL_ENTRY_TABLE,),
+            ),
+        }
+        migration = (
+            migration_additions.get(rec_version)
+            if expected_version == CURRENT_SCHEMA_VERSION
+            else None
+        )
+        if migration is not None:
+            excluded_tables, tables_to_add = migration
+            expected_current_hash = compute_metadata_hash()
+            expected_previous_hash = compute_metadata_hash(
+                exclude_tables=excluded_tables
+            )
+            expected_previous_tables = expected_tables - set(tables_to_add)
+            tables_by_name = {
+                table.name: table
+                for table in Base.metadata.tables.values()
+                if table.name in tables_to_add
+            }
+            if (
+                set(tables_by_name) != set(tables_to_add)
+                or metadata_hash != expected_current_hash
+                or rec_hash != expected_previous_hash
+            ):
+                raise SchemaMismatch(
+                    f"SCHEMA_MISMATCH: Cannot safely migrate schema '{schema}' from "
+                    f"{rec_version}; recorded metadata does not match the supported "
+                    "historical schema."
+                )
+            if inventory.tables != expected_previous_tables:
+                raise SchemaMismatch(
+                    f"SCHEMA_MISMATCH: Cannot safely migrate schema '{schema}'; "
+                    f"expected historical tables {sorted(expected_previous_tables)}, "
+                    f"found {sorted(inventory.tables)}."
+                )
+            if inventory.views or inventory.custom_types or inventory.user_functions:
+                raise SchemaMismatch(
+                    f"SCHEMA_MISMATCH: Cannot safely migrate schema '{schema}' with "
+                    "unexpected views, types, or functions."
+                )
+            unexpected_sequences, missing_sequence_owners = _sequence_mismatches(
+                inventory, schema=schema
+            )
+            if unexpected_sequences or missing_sequence_owners:
+                raise SchemaMismatch(
+                    f"SCHEMA_MISMATCH: Cannot safely migrate schema '{schema}' with "
+                    "unexpected or missing generated sequences."
+                )
+
+            await conn.run_sync(
+                lambda sync_conn: [
+                    tables_by_name[name].create(sync_conn, checkfirst=False)
+                    for name in tables_to_add
+                ]
+            )
+            update_result = await conn.execute(
+                update(SchemaInfo)
+                .where(SchemaInfo.version == rec_version)
+                .values(
+                    version=expected_version,
+                    metadata_hash=metadata_hash,
+                    applied_at=datetime.now(timezone.utc),
+                )
+            )
+            if update_result.rowcount != 1:
+                raise SchemaMismatch(
+                    f"SCHEMA_MISMATCH: Could not atomically record schema migration "
+                    f"to {expected_version}."
+                )
+            inventory = await _inspect_catalog_inventory(conn, schema=schema)
+            rec_version, rec_hash = expected_version, metadata_hash
+
         if rec_version != expected_version or rec_hash != metadata_hash:
             raise SchemaMismatch(
                 f"SCHEMA_MISMATCH: Expected version={expected_version}, hash={metadata_hash}; "
@@ -478,7 +584,7 @@ async def check_schema_readiness(
     engine: AsyncEngine,
     *,
     schema: str = DEFAULT_PLATFORM_SCHEMA,
-    expected_version: str = "platform-v1",
+    expected_version: str = CURRENT_SCHEMA_VERSION,
     metadata_hash: str | None = None,
 ) -> bool:
     """Read-only check if the platform schema has the expected schema version, hash, and tables."""
