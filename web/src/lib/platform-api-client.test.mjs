@@ -52,7 +52,6 @@ describe("PlatformApiClient", () => {
               preferred_language: "en",
               timezone: "UTC",
               low_balance_notifications: true,
-              mfa_enabled: false,
               created_at: "2026-10-28T12:00:00Z",
               updated_at: "2026-10-28T12:00:00Z",
             },
@@ -227,7 +226,6 @@ describe("PlatformApiClient", () => {
             preferred_language: "en",
             timezone: "UTC",
             low_balance_notifications: true,
-            mfa_enabled: true,
             created_at: "2026-10-28T12:00:00Z",
             updated_at: "2026-10-28T12:00:00Z",
           },
@@ -510,6 +508,76 @@ describe("PlatformApiClient", () => {
       expect(init.headers.get("X-CSRF-Token")).toBe("csrf-platform-policy");
       expect(init.headers.get("Idempotency-Key")).toBe(idempotencyKeys[index]);
     }
+  });
+  test("provider metadata is loaded from the admin registry", async () => {
+    const providers = [
+      {
+        id: "mlx-audio",
+        kind: "stt",
+        name: "Batch Nemotron 3.5 (Metal GPU)",
+        secret_fields: [],
+      },
+    ];
+    mockFetch(async () =>
+      new Response(JSON.stringify({ providers }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    );
+
+    const result = await client.adminGetProviders();
+
+    expect(result).toEqual({ providers });
+    expect(new URL(calls[0].url).pathname).toBe("/api/v1/admin/providers");
+    expect(calls[0].init.method).toBe("GET");
+    expect(calls[0].init.headers.get("X-CSRF-Token")).toBeNull();
+  });
+
+  test("provider secret updates send values by field and discard the response", async () => {
+    client.setCsrfToken("csrf-provider-secret");
+    mockFetch(async () =>
+      new Response(
+        JSON.stringify({
+          provider_id: "mlx-audio",
+          configured_secret_fields: [],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      )
+    );
+
+    const result = await client.adminSetProviderSecrets("mlx-audio", {
+      api_key: "test-provider-secret",
+    });
+
+    expect(result).toBeUndefined();
+    expect(new URL(calls[0].url).pathname).toBe(
+      "/api/v1/admin/providers/mlx-audio/secrets"
+    );
+    expect(calls[0].init.method).toBe("PUT");
+    expect(calls[0].init.headers.get("X-CSRF-Token")).toBe(
+      "csrf-provider-secret"
+    );
+    expect(JSON.parse(calls[0].init.body)).toEqual({
+      secrets: { api_key: "test-provider-secret" },
+    });
+  });
+  test("step-up sends only the password", async () => {
+    client.setCsrfToken("csrf-step-up");
+    mockFetch(async () =>
+      new Response(JSON.stringify({ status: "ok" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    );
+
+    await client.stepUp({ password: "AdminPassword12345" });
+
+    expect(new URL(calls[0].url).pathname).toBe("/api/v1/auth/step-up");
+    expect(calls[0].init.method).toBe("POST");
+    expect(calls[0].init.headers.get("X-CSRF-Token")).toBe("csrf-step-up");
+    expect(JSON.parse(calls[0].init.body)).toEqual({
+      password: "AdminPassword12345",
+    });
   });
 });
 

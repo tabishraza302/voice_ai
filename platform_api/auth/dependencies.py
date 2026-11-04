@@ -205,27 +205,14 @@ async def require_user(
 
     if session.auth_version != user.auth_version:
         raise UnauthenticatedError("Session has been superseded by password or security change")
-    # 5. For admin users, verify enrolled MFA and session verification
-    if user.role == "admin":
-        if session.mfa_verified_at is None:
-            raise MfaRequiredError("Administrator session requires verified MFA")
-
-        mfa_stmt = select(AuthMfa).where(AuthMfa.user_id == user.id)
-        mfa_res = await db.execute(mfa_stmt)
-        mfa = mfa_res.scalar_one_or_none()
-        if mfa is None or mfa.enabled_at is None:
-            raise MfaRequiredError("Administrator account requires enrolled MFA factor")
-
-    # 6. Touch session activity conditionally
+    # 5. Touch session activity conditionally
     await touch_session_activity(db, settings, session, now)
-
     return Principal(
         user_id=user.id,
         role=user.role,  # type: ignore[arg-type]
         session_id=session.id,
         email_verified_at=user.email_verified_at,
         password_verified_at=session.password_verified_at,
-        mfa_verified_at=session.mfa_verified_at,
         step_up_at=session.step_up_at,
     )
 
@@ -236,8 +223,6 @@ async def require_admin(
     """Enforce administrator role on top of verified require_user."""
     if principal.role != "admin":
         raise ForbiddenError("Administrator access required")
-    if principal.mfa_verified_at is None:
-        raise MfaRequiredError("Admin operations require verified MFA")
     return principal
 
 

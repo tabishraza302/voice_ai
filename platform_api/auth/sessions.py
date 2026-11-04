@@ -14,7 +14,6 @@ import base64
 from datetime import datetime, timedelta, timezone
 import hashlib
 import secrets
-from typing import Literal
 import uuid
 
 from fastapi import Request, Response
@@ -139,41 +138,6 @@ async def create_anonymous_session(
     return session, raw_secret
 
 
-async def create_mfa_pending_session(
-    db: AsyncSession,
-    settings: PlatformSettings,
-    *,
-    user: User,
-    state: Literal["mfa_required", "mfa_enrollment_required"],
-    client_ip: str | None,
-    user_agent: str | None,
-    now: datetime,
-) -> tuple[AuthSession, str]:
-    """Create restricted session for MFA verification or enrollment."""
-    raw_secret, token_digest = generate_session_secret()
-    ttl = timedelta(seconds=settings.auth_mfa_ttl_seconds)
-
-    session = AuthSession(
-        id=uuid.uuid4(),
-        token_digest=token_digest,
-        user_id=user.id,
-        auth_version=user.auth_version,
-        state=state,
-        user_agent_label=sanitize_user_agent(user_agent),
-        created_ip=client_ip,
-        created_at=now,
-        last_seen_at=now,
-        idle_expires_at=now + ttl,
-        absolute_expires_at=now + ttl,
-        password_verified_at=now,
-        mfa_verified_at=None,
-        step_up_at=None,
-        revoked_at=None,
-    )
-    db.add(session)
-    await db.flush()
-    return session, raw_secret
-
 
 async def create_authenticated_session(
     db: AsyncSession,
@@ -217,7 +181,6 @@ async def create_authenticated_session(
     idle_ttl = timedelta(seconds=settings.auth_idle_ttl_seconds)
     abs_ttl = timedelta(seconds=settings.auth_session_ttl_seconds)
 
-    mfa_time = now if mfa_verified else None
 
     session = AuthSession(
         id=uuid.uuid4(),
@@ -232,8 +195,8 @@ async def create_authenticated_session(
         idle_expires_at=now + idle_ttl,
         absolute_expires_at=now + abs_ttl,
         password_verified_at=now,
-        mfa_verified_at=mfa_time,
-        step_up_at=mfa_time,
+        mfa_verified_at=None,
+        step_up_at=None,
         revoked_at=None,
     )
     db.add(session)

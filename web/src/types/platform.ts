@@ -149,6 +149,49 @@ export interface AdminAgentPage {
   items: AdminAgentItem[];
   next_cursor: string | null;
 }
+export interface AdminProviderSecretField {
+  name: string;
+  required: boolean;
+  configured: boolean;
+}
+
+export interface AdminProviderItem {
+  id: string;
+  kind: "stt" | "tts";
+  name: string;
+  secret_fields: AdminProviderSecretField[];
+}
+
+export interface AdminProviderCatalog {
+  providers: AdminProviderItem[];
+  model_providers: { id: string; name: string }[];
+}
+
+export interface AdminProviderSecretsRequest {
+  secrets: Record<string, string>;
+}
+export interface AdminOllamaModelItem {
+  provider_id: string;
+  model_id: string;
+  name: string;
+  enabled: boolean;
+  qualified: boolean;
+}
+
+export interface AdminOllamaModelCatalog {
+  models: AdminOllamaModelItem[];
+}
+
+export interface AdminOllamaModelCreateRequest {
+  model_id: string;
+  name: string;
+  enabled?: boolean;
+  qualified?: boolean;
+}
+
+export type AdminOllamaModelUpdateRequest = Partial<
+  Pick<AdminOllamaModelItem, "name" | "enabled" | "qualified">
+>;
 
 export interface AdminTariffVersionItem {
   id: string;
@@ -216,6 +259,12 @@ export interface AdminAuditItem {
   action: string;
   target_type: string;
   target_id: string | null;
+  model_change?: {
+    provider_id: string;
+    model_id: string;
+    before: { enabled: boolean; qualified: boolean } | null;
+    after: { enabled: boolean; qualified: boolean } | null;
+  } | null;
   reason: string | null;
   request_id: string | null;
   source_ip: string | null;

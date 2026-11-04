@@ -15,16 +15,12 @@ export type AuthStatus =
   | "loading"
   | "error"
   | "anonymous"
-  | "mfa_required"
-  | "mfa_enrollment_required"
   | "authenticated";
 
 export type AuthState =
   | { status: "loading"; session: null; user: null }
   | { status: "error"; session: null; user: null; message: string }
   | { status: "anonymous"; session: SessionResponse; user: null }
-  | { status: "mfa_required"; session: SessionResponse; user: UserView | null }
-  | { status: "mfa_enrollment_required"; session: SessionResponse; user: UserView | null }
   | { status: "authenticated"; session: SessionResponse; user: UserView };
 
 export function deriveAuthState(
@@ -39,10 +35,6 @@ export function deriveAuthState(
   switch (session.state) {
     case "anonymous":
       return { status: "anonymous", session, user: null };
-    case "mfa_required":
-      return { status: "mfa_required", session, user: session.user };
-    case "mfa_enrollment_required":
-      return { status: "mfa_enrollment_required", session, user: session.user };
     case "authenticated":
       if (!session.user) {
         return { status: "anonymous", session, user: null };

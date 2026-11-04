@@ -7,7 +7,7 @@ import { platformApi, PlatformApiError } from "@/lib/platform-api-client";
 import { sanitizeReturnPath, useAuth } from "@/lib/auth-state";
 import { validatePassword } from "@/types/auth";
 import devAccounts from "@/lib/dev-accounts.json";
-import { KeyRound, Loader2, LogIn, ShieldAlert } from "lucide-react";
+import { Loader2, LogIn, ShieldAlert } from "lucide-react";
 
 function LoginForm() {
   const router = useRouter();
@@ -19,8 +19,6 @@ function LoginForm() {
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [mfaCode, setMfaCode] = useState("");
-  const [isMfaStep, setIsMfaStep] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showDevAccounts, setShowDevAccounts] = useState(false);
@@ -53,16 +51,13 @@ function LoginForm() {
         password: loginPassword,
       });
 
-      if (response.state === "authenticated") {
-        await refreshSession();
-        router.push(returnPath);
-      } else if (response.state === "mfa_required") {
-        setIsMfaStep(true);
+      if (response.state !== "authenticated") {
+        setError("Login failed");
         setLoading(false);
-      } else if (response.state === "mfa_enrollment_required") {
-        await refreshSession();
-        router.push("/admin/settings");
+        return;
       }
+      await refreshSession();
+      router.push(returnPath);
     } catch (err: unknown) {
       if (err instanceof PlatformApiError) {
         if (err.code === "INVALID_CREDENTIALS") {
@@ -86,55 +81,18 @@ function LoginForm() {
     void signIn(email, password);
   };
 
-  const handleMfaVerify = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (loading) return;
-
-    const cleanCode = mfaCode.replace(/\s+/g, "");
-    if (!/^\d{6}$/.test(cleanCode)) {
-      setError("Please enter a valid 6-digit authenticator code");
-      return;
-    }
-
-    setLoading(true);
-    setError(null);
-
-    try {
-      const response = await platformApi.verifyMfa({ code: cleanCode });
-      if (response.state === "authenticated") {
-        await refreshSession();
-        router.push(returnPath);
-      }
-    } catch (err: unknown) {
-      if (err instanceof PlatformApiError) {
-        if (err.code === "MFA_INVALID") {
-          setError("Invalid or expired verification code");
-        } else if (err.code === "RATE_LIMITED") {
-          setError("Too many attempts. Please try again later.");
-        } else {
-          setError(err.message || "MFA verification failed");
-        }
-      } else {
-        setError(err instanceof Error ? err.message : "Verification error");
-      }
-      setMfaCode("");
-      setLoading(false);
-    }
-  };
 
   return (
     <div className="surface max-w-md w-full mx-auto p-6 sm:p-8 space-y-6">
       <div className="text-center space-y-2">
         <div className="inline-flex w-12 h-12 rounded-xl bg-copper-950 border border-copper-800 items-center justify-center text-copper-300 mb-2">
-          {isMfaStep ? <KeyRound className="w-6 h-6" /> : <LogIn className="w-6 h-6" />}
+          <LogIn className="w-6 h-6" />
         </div>
         <h1 className="text-xl sm:text-2xl font-bold text-white">
-          {isMfaStep ? "Two-factor verification" : "Sign in to Voice AI"}
+          Sign in to Voice AI
         </h1>
         <p className="text-xs sm:text-sm text-limestone-400">
-          {isMfaStep
-            ? "Enter the 6-digit code from your authenticator app"
-            : "Enter your credentials to access your workspace"}
+          Enter your credentials to access your workspace
         </p>
       </div>
 
@@ -148,60 +106,7 @@ function LoginForm() {
         </div>
       )}
 
-      {isMfaStep ? (
-        <form onSubmit={handleMfaVerify} className="space-y-4">
-          <div>
-            <label htmlFor="mfa-code" className="field-label">
-              Authenticator Code
-            </label>
-            <input
-              id="mfa-code"
-              type="text"
-              inputMode="numeric"
-              pattern="[0-9]*"
-              maxLength={6}
-              required
-              autoFocus
-              autoComplete="one-time-code"
-              value={mfaCode}
-              onChange={(e) => setMfaCode(e.target.value)}
-              disabled={loading}
-              placeholder="123456"
-              className="field-control text-center tracking-widest font-mono text-lg"
-            />
-          </div>
-
-          <button
-            type="submit"
-            disabled={loading || !mfaCode}
-            className="button-primary w-full"
-          >
-            {loading ? (
-              <>
-                <Loader2 className="w-4 h-4 animate-spin" />
-                Verifying...
-              </>
-            ) : (
-              "Confirm & Sign in"
-            )}
-          </button>
-
-          <div className="text-center pt-2">
-            <button
-              type="button"
-              onClick={() => {
-                setIsMfaStep(false);
-                setMfaCode("");
-                setError(null);
-              }}
-              className="text-xs text-limestone-400 hover:text-white transition-colors"
-            >
-              Back to password sign in
-            </button>
-          </div>
-        </form>
-      ) : (
-        <form onSubmit={handlePasswordLogin} className="space-y-4">
+      <form onSubmit={handlePasswordLogin} className="space-y-4">
           <div>
             <label htmlFor="login-email" className="field-label">
               Email address
@@ -260,12 +165,11 @@ function LoginForm() {
             )}
           </button>
         </form>
-      )}
 
-      {!isMfaStep && showDevAccounts && (
+      {showDevAccounts && (
         <section className="border-t border-ink-800 pt-4 space-y-3" aria-label="Local development accounts">
           <h2 className="text-sm font-semibold text-white">Local development accounts</h2>
-          <p className="text-xs text-limestone-400">Administrator access requires authenticator setup.</p>
+          <p className="text-xs text-limestone-400">Use a local development account to sign in.</p>
           {devAccounts.map((account) => (
             <div key={account.email} className="rounded-lg border border-ink-800 p-3 space-y-2">
               <p className="text-sm text-white">{account.label}</p>
@@ -279,8 +183,7 @@ function LoginForm() {
         </section>
       )}
 
-      {!isMfaStep && (
-        <div className="border-t border-ink-800 pt-4 text-center text-xs text-limestone-400">
+      <div className="border-t border-ink-800 pt-4 text-center text-xs text-limestone-400">
           Don&apos;t have an account?{" "}
           <Link
             href="/register"
@@ -289,7 +192,6 @@ function LoginForm() {
             Create account
           </Link>
         </div>
-      )}
     </div>
   );
 }

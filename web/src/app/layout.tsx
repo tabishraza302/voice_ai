@@ -22,7 +22,7 @@ export default function RootLayout({
         <AuthProvider>
           <Sidebar />
           <main className="min-w-0 flex-1 overflow-y-auto md:h-screen">
-            <div className="mx-auto w-full max-w-7xl p-4 sm:p-8">
+            <div className="mx-auto w-full max-w-[1700px] p-4 sm:p-6 lg:p-8">
               <ModeGuard>{children}</ModeGuard>
             </div>
           </main>
