@@ -1,4 +1,0 @@
-[
-  {"label":"Customer", "email":"customer@example.com", "password":"LocalCustomer12345!", "role":"user"},
-  {"label":"Administrator", "email":"admin@example.com", "password":"LocalAdmin12345!", "role":"admin"}
-]
