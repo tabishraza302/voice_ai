@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Header, Request, Response, status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from platform_api.agents.routes import _publication_context
+from platform_api.agents.routes import _publication_context, _request_catalog
 from platform_api.auth.dependencies import (
     get_request_settings,
     require_csrf,
@@ -85,6 +85,7 @@ async def post_test_voice_session(
         qualification_settings=qualification_settings,
         operation_id=idempotency_key,
         settings=get_request_settings(request),
+        catalog=await _request_catalog(request, db),
     )
 
 
@@ -185,6 +186,7 @@ async def get_registered_runtime_config(
         session_id=session_id,
         runtime_principal=runtime_principal,
         settings=get_request_settings(request),
+        catalog=await _request_catalog(request, db),
     )
 
 

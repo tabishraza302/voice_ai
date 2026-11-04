@@ -29,10 +29,11 @@ from bot.flow.schemas import AdapterCapabilities, FlowLimits
 from bot.flow.validation import normalize_executable
 from bot.agents.compiler import compile_system_prompt
 from platform_api.agents.config import (
+    IMMUTABLE_CONFIG_SCHEMA_VERSION,
     AgentConfigError,
-    compute_model_hash,
-    compute_settings_hash,
-    compute_voice_hash,
+    compute_model_hash_v3,
+    compute_settings_hash_v3,
+    compute_voice_hash_v3,
     extract_flow,
     extract_settings,
     validate_config_bounds,
@@ -67,7 +68,12 @@ from platform_api.auth.errors import (
     RevisionConflictError,
     ValidationError,
 )
-from platform_api.catalog import ModelCatalog, load_catalog
+from platform_api.catalog import (
+    ModelCatalog,
+    catalog_with_managed_llms,
+    load_catalog,
+)
+from platform_api.models.provider_model_entry import ProviderModelEntry
 
 __all__ = [
     "DEFAULT_BASE_PROMPT",
@@ -75,6 +81,16 @@ __all__ = [
     "ensure_default_policy_version",
     "publish_agent_version",
 ]
+
+
+async def _lock_managed_model_entries(db: AsyncSession) -> None:
+    result = await db.execute(
+        select(ProviderModelEntry)
+        .order_by(ProviderModelEntry.provider_id, ProviderModelEntry.model_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    result.scalars().all()
 
 
 async def ensure_default_policy_version(
@@ -229,6 +245,9 @@ async def publish_agent_version(
             fields=[{"field": d.path, "code": d.code} for d in structural_errors],
         )
 
+    # Re-read eligibility after locking the rows that administrator changes.
+    await _lock_managed_model_entries(db)
+    cat = await catalog_with_managed_llms(cat, db)
     # 7. Catalog qualification check.
     catalog_diagnostics = validate_catalog_eligibility(draft.authoring_json, cat)
     if catalog_diagnostics:
@@ -306,16 +325,17 @@ async def publish_agent_version(
         raise _validation_error_from_compiler(exc) from exc
 
     # 12. Compute the pinned model/voice/settings hashes.
-    model_hash = compute_model_hash(settings)
-    voice_hash = compute_voice_hash(settings)
-    settings_hash = compute_settings_hash(settings)
+    model_hash = compute_model_hash_v3(settings)
+    voice_hash = compute_voice_hash_v3(settings)
+    settings_hash = compute_settings_hash_v3(settings)
+    compiler_version = compiled.manifest["compiler_version"]
 
     # 13. Construct the immutable configuration snapshot. The original source,
     # normalized graph and manifest are retained byte-for-byte; model/voice
     # selections are pinned both by ID and by deterministic hash.
     raw_config: dict[str, Any] = {
-        "schema_version": 1,
-        "compiler_version": "flow-compiler/1",
+        "schema_version": IMMUTABLE_CONFIG_SCHEMA_VERSION,
+        "compiler_version": compiler_version,
         "authoring_config": draft.authoring_json,
         "authoring_flow": flow,
         "normalized_flow": normalized,
@@ -390,7 +410,7 @@ async def publish_agent_version(
         flow_hash=compiled.flow_hash,
         artifact_hash=compiled.artifact_hash,
         policy_version_id=prompt_version.id,
-        compiler_version="flow-compiler/1",
+        compiler_version=compiler_version,
         changelog=changelog,
         created_at=now,
     )

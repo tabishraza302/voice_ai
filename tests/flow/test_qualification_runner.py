@@ -106,8 +106,12 @@ async def test_run_qualification_composes_real_model_and_transport_probe_observa
         adapter_version="1.0.0",
         model_revision="qwen3.5:4b@sha256:abc123def456",
         agent_settings={
+            "llm_provider": "ollama",
             "llm_model": "qwen3.5:4b",
             "stt_provider": "mlx-audio",
+            "stt_model": "mlx-community/nemotron-3.5-asr-streaming-0.6b",
+            "tts_provider": "mlx-audio",
+            "tts_model": "mlx-community/Kokoro-82M-4bit",
             "tts_voice_en": "af_heart",
             "tts_voice_hi": "hf_alpha",
         },

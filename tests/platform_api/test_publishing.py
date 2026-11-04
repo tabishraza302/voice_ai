@@ -25,7 +25,9 @@ import pytest_asyncio
 import platform_api.app as platform_app
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError
 from bot.flow.schemas import AdapterCapabilities
+from platform_api.agents import routes as agent_routes
 from platform_api.agents.defaults import compute_policy_hash
 from platform_api.agents.publishing import publish_agent_version
 from platform_api.auth.errors import ValidationError
@@ -37,6 +39,7 @@ from platform_api.auth.sessions import create_authenticated_session
 from platform_api.config import PlatformSettings
 from platform_api.db.session import create_engine as create_platform_engine
 from platform_api.models.auth import User
+from platform_api.models.provider_model_entry import ProviderModelEntry
 from tests.support.postgres import FreshPostgres
 
 
@@ -51,6 +54,8 @@ def load_text_only_flow(filename: str) -> dict[str, Any]:
     """Load a flow with both TTS voices explicitly disabled."""
     return {
         **load_fixture(filename),
+        "llm_provider": "ollama",
+        "llm_model": "qwen3.5:4b",
         "tts_voice_en": "",
         "tts_voice_hi": "",
     }
@@ -129,6 +134,7 @@ async def test_cannot_publish_invalid_drafts(
     app_client: httpx.AsyncClient,
     test_platform_settings: PlatformSettings,
     initialized_pg: FreshPostgres,
+    qualified_test_llm,
 ):
     """Publishing incomplete drafts or unqualified models is rejected with 422 VALIDATION."""
     user, headers = await create_test_user_session(
@@ -179,6 +185,7 @@ async def test_warning_acknowledgment_enforcement(
     app_client: httpx.AsyncClient,
     test_platform_settings: PlatformSettings,
     initialized_pg: FreshPostgres,
+    qualified_test_llm,
 ):
     """Publishing flows with warnings requires explicit acknowledgment codes."""
     user, headers = await create_test_user_session(
@@ -230,6 +237,7 @@ async def test_publish_cas_revision_conflict(
     app_client: httpx.AsyncClient,
     test_platform_settings: PlatformSettings,
     initialized_pg: FreshPostgres,
+    qualified_test_llm,
 ):
     """Publishing with stale revision returns 409 REVISION_CONFLICT."""
     user, headers = await create_test_user_session(
@@ -266,6 +274,7 @@ async def test_publish_detects_stale_stored_authoring_hash(
     app_client: httpx.AsyncClient,
     test_platform_settings: PlatformSettings,
     initialized_pg: FreshPostgres,
+    qualified_test_llm,
 ):
     """A draft whose stored bytes no longer match its hash cannot be published."""
     user, headers = await create_test_user_session(
@@ -317,6 +326,7 @@ async def test_lost_response_publish_idempotency(
     app_client: httpx.AsyncClient,
     test_platform_settings: PlatformSettings,
     initialized_pg: FreshPostgres,
+    qualified_test_llm,
 ):
     """Idempotency-Key on publish replays exact outcome without creating new versions."""
     user, headers = await create_test_user_session(
@@ -380,10 +390,90 @@ async def test_lost_response_publish_idempotency(
 
 
 
+@pytest.mark.postgres
+@pytest.mark.asyncio
+async def test_publish_holds_provider_model_lock_until_transaction_commit(
+    app_client: httpx.AsyncClient,
+    test_platform_settings: PlatformSettings,
+    initialized_pg: FreshPostgres,
+    qualified_test_llm,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _user, headers = await create_test_user_session(
+        initialized_pg,
+        test_platform_settings,
+        app_client,
+        "publish-model-lock@example.com",
+    )
+    created = await app_client.post(
+        "/api/v1/agents",
+        headers=headers,
+        json={"name": "Model lock publication agent"},
+    )
+    assert created.status_code == 201, created.text
+    agent_id = created.json()["id"]
+
+    patched = await app_client.patch(
+        f"/api/v1/agents/{agent_id}/draft",
+        headers=headers,
+        json={
+            "expected_revision": 1,
+            "config": load_text_only_flow("valid-loan-en-hi.json"),
+        },
+    )
+    assert patched.status_code == 200, patched.text
+
+    original_publish = agent_routes.publish_agent
+    publication_ready = asyncio.Event()
+    allow_commit = asyncio.Event()
+
+    async def pause_before_route_commit(*args, **kwargs):
+        result = await original_publish(*args, **kwargs)
+        publication_ready.set()
+        await allow_commit.wait()
+        return result
+
+    monkeypatch.setattr(agent_routes, "publish_agent", pause_before_route_commit)
+    publication = asyncio.create_task(
+        app_client.post(
+            f"/api/v1/agents/{agent_id}/publish",
+            headers={**headers, "Idempotency-Key": "publish-model-lock"},
+            json={"expected_revision": 2},
+        )
+    )
+    try:
+        await asyncio.wait_for(publication_ready.wait(), timeout=10)
+        async with initialized_pg.sessions() as db:
+            with pytest.raises(DBAPIError):
+                await db.execute(
+                    select(ProviderModelEntry)
+                    .where(
+                        ProviderModelEntry.provider_id == qualified_test_llm.provider_id,
+                        ProviderModelEntry.model_id == qualified_test_llm.model_id,
+                    )
+                    .with_for_update(nowait=True)
+                )
+            await db.rollback()
+    finally:
+        allow_commit.set()
+        published = await publication
+
+    assert published.status_code == 201, published.text
+    async with initialized_pg.sessions() as db:
+        model = await db.get(
+            ProviderModelEntry,
+            (qualified_test_llm.provider_id, qualified_test_llm.model_id),
+        )
+        assert model is not None
+        model.enabled = False
+        await db.commit()
+
+
 @pytest_asyncio.fixture
 async def repeatable_read_app_client(
     test_platform_settings: PlatformSettings,
     initialized_pg: FreshPostgres,
+    qualified_test_llm,
     monkeypatch: pytest.MonkeyPatch,
 ):
     """Run routes with a PostgreSQL connection default of REPEATABLE READ."""
@@ -463,6 +553,7 @@ async def test_publish_requires_idempotency_key(
     app_client: httpx.AsyncClient,
     test_platform_settings: PlatformSettings,
     initialized_pg: FreshPostgres,
+    qualified_test_llm,
 ):
     """A publish without its required key is rejected without creating a version."""
     user, headers = await create_test_user_session(
@@ -504,12 +595,18 @@ async def test_publish_requires_idempotency_key(
 @pytest.mark.asyncio
 async def test_voice_publish_without_capabilities_is_rejected(
     initialized_pg: FreshPostgres,
+    qualified_test_catalog,
 ):
     """Voice-enabled drafts cannot publish without deployment qualification."""
+    catalog = qualified_test_catalog
     user_id = uuid.uuid4()
     agent_id = uuid.uuid4()
     now = datetime.now(timezone.utc)
-    flow = load_fixture("valid-credit-card-en-hi.json")
+    flow = {
+        **load_fixture("valid-credit-card-en-hi.json"),
+        "llm_provider": "ollama",
+        "llm_model": "qwen3.5:4b",
+    }
 
     async with initialized_pg.sessions() as session:
         from platform_api.agents.models import Agent, AgentDraft
@@ -557,6 +654,7 @@ async def test_voice_publish_without_capabilities_is_rejected(
                 owner_user_id=user_id,
                 expected_revision=1,
                 capabilities=None,
+                catalog=catalog,
             )
         assert any(f.get("code") == "PLAYBACK_UNQUALIFIED" for f in exc_info.value.fields)
 
@@ -580,6 +678,7 @@ async def test_voice_publish_without_capabilities_is_rejected(
                 owner_user_id=user_id,
                 expected_revision=1,
                 capabilities=unqualified_caps,
+                catalog=catalog,
             )
         assert any(f.get("code") == "PLAYBACK_UNQUALIFIED" for f in exc_info.value.fields)
 
@@ -589,9 +688,11 @@ async def test_voice_publish_without_capabilities_is_rejected(
 async def test_changing_persona_prompt_changes_base_prompt_hash_and_artifact_hash(
     app_client: httpx.AsyncClient,
     test_platform_settings: PlatformSettings,
+    qualified_test_catalog,
     initialized_pg: FreshPostgres,
 ):
     """Changing only persona_prompt changes base_prompt_hash and artifact_hash; policy_hash and flow_hash are unchanged."""
+    catalog = qualified_test_catalog
     user, headers = await create_test_user_session(
         initialized_pg, test_platform_settings, app_client, "persona_hash@example.com"
     )
@@ -624,6 +725,7 @@ async def test_changing_persona_prompt_changes_base_prompt_hash_and_artifact_has
             owner_user_id=user.id,
             expected_revision=2,
             capabilities=None,
+            catalog=catalog,
         )
         await session.commit()
 
@@ -651,6 +753,7 @@ async def test_changing_persona_prompt_changes_base_prompt_hash_and_artifact_has
             owner_user_id=user.id,
             expected_revision=2,
             capabilities=None,
+            catalog=catalog,
         )
         await session.commit()
 
@@ -674,9 +777,11 @@ async def test_changing_persona_prompt_changes_base_prompt_hash_and_artifact_has
 async def test_changing_policy_revision_changes_policy_hash_and_base_prompt_hash(
     app_client: httpx.AsyncClient,
     test_platform_settings: PlatformSettings,
+    qualified_test_catalog,
     initialized_pg: FreshPostgres,
 ):
     """Changing only the platform policy revision changes policy_hash and compiled base_prompt_hash."""
+    catalog = qualified_test_catalog
     user, headers = await create_test_user_session(
         initialized_pg, test_platform_settings, app_client, "policy_rev@example.com"
     )
@@ -707,6 +812,7 @@ async def test_changing_policy_revision_changes_policy_hash_and_base_prompt_hash
             owner_user_id=user.id,
             expected_revision=2,
             capabilities=None,
+            catalog=catalog,
         )
         await session.commit()
 
@@ -739,6 +845,7 @@ async def test_changing_policy_revision_changes_policy_hash_and_base_prompt_hash
             owner_user_id=user.id,
             expected_revision=2,
             capabilities=None,
+            catalog=catalog,
         )
         await session.commit()
 
@@ -761,9 +868,11 @@ async def test_changing_policy_revision_changes_policy_hash_and_base_prompt_hash
 async def test_published_version_persona_and_hashes_immutable_after_draft_and_agent_edits(
     app_client: httpx.AsyncClient,
     test_platform_settings: PlatformSettings,
+    qualified_test_catalog,
     initialized_pg: FreshPostgres,
 ):
     """A published version's persona and hashes do not change when the draft or agent is edited afterwards."""
+    catalog = qualified_test_catalog
     user, headers = await create_test_user_session(
         initialized_pg, test_platform_settings, app_client, "immutable_edits@example.com"
     )
@@ -793,6 +902,7 @@ async def test_published_version_persona_and_hashes_immutable_after_draft_and_ag
             owner_user_id=user.id,
             expected_revision=2,
             capabilities=None,
+            catalog=catalog,
         )
         await session.commit()
 
