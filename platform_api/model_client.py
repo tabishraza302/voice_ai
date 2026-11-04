@@ -5,10 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from typing import Literal
+from urllib.parse import urlsplit
 
 import httpx
 
-from platform_api.config import PlatformSettings
+from platform_api.config import PlatformSettings, _is_loopback_host
 
 
 class ModelClientError(RuntimeError):
@@ -70,7 +71,14 @@ class OpenAICompatibleModelClient:
         temperature: float,
         reasoning_effort: str | None,
         max_tokens_parameter: str,
+        provider_id: str | None = None,
     ) -> ModelCompletion:
+        if endpoint == "runtime" and provider_id != "ollama":
+            raise ModelClientError(
+                "runtime model provider does not match the pinned Ollama provider",
+                code="RUNTIME_PROVIDER_MISMATCH",
+                public_message="The configured runtime provider does not match this model.",
+            )
         base_url, api_key, timeout_seconds = self._endpoint_settings(endpoint)
         body: dict[str, object] = {
             "model": model,
@@ -169,6 +177,14 @@ class OpenAICompatibleModelClient:
             raise ModelClientError("unknown configured model endpoint")
         if base_url is None:
             raise ModelClientError("configured model endpoint is unavailable")
+        if endpoint == "runtime":
+            hostname = urlsplit(base_url).hostname or ""
+            if not _is_loopback_host(hostname):
+                raise ModelClientError(
+                    "runtime model endpoint is not a local Ollama endpoint",
+                    code="RUNTIME_ENDPOINT_NOT_LOCAL",
+                    public_message="The configured runtime model endpoint is unavailable.",
+                )
         return base_url.rstrip("/"), api_key, timeout
 
     def _client(self, endpoint: str, timeout_seconds: int) -> httpx.AsyncClient:
@@ -177,6 +193,7 @@ class OpenAICompatibleModelClient:
             client = httpx.AsyncClient(
                 timeout=httpx.Timeout(timeout_seconds),
                 limits=httpx.Limits(max_connections=16, max_keepalive_connections=8),
+                trust_env=endpoint != "runtime",
                 follow_redirects=False,
             )
             self._clients[endpoint] = client
