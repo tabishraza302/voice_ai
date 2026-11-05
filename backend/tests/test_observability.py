@@ -10,6 +10,7 @@ os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://voice:voice@127.0.0.
 os.environ.setdefault("SESSION_SECRET", "test-only-secret-with-at-least-32-bytes")
 os.environ.setdefault("APP_ORIGIN", "http://localhost:3000")
 
+from app import observability
 from app.agents import Agent
 from app.db import Base, Session, engine
 from app.main import app
@@ -90,6 +91,67 @@ def test_redacting_exporter_removes_private_payloads_and_derives_session_id() ->
     }
     assert exported.status.status_code == StatusCode.ERROR
     assert exported.status.description is None
+
+
+def test_redacting_exporter_removes_exception_stacktraces() -> None:
+    capture = _Capture()
+    provider = TracerProvider()
+    provider.add_span_processor(capture)
+    span = provider.get_tracer("test").start_span("conversation")
+    span.set_attribute("exception.stacktrace", "Traceback with private LLM context")
+    span.add_event(
+        "exception",
+        {
+            "exception.type": "ValueError",
+            "exception.stacktrace": "Traceback with private LLM context",
+        },
+    )
+    span.end()
+
+    delegate = _Delegate()
+    RedactingExporter(delegate).export([capture.spans[0]])
+    exported = delegate.exported[0]
+
+    assert "exception.stacktrace" not in exported.attributes
+    assert [dict(event.attributes) for event in exported.events] == [{"exception.type": "ValueError"}]
+
+
+@pytest.mark.anyio
+async def test_pipecat_does_not_log_private_system_instruction() -> None:
+    from loguru import logger
+    from pipecat.services.openai.llm import OpenAILLMService
+
+    messages = []
+    sink = logger.add(lambda message: messages.append(str(message)), level="DEBUG")
+    try:
+        observability.configure_tracing(env={})
+        OpenAILLMService(
+            api_key="test-only",
+            settings=OpenAILLMService.Settings(system_instruction="private system prompt"),
+        )
+    finally:
+        logger.remove(sink)
+
+    assert any("Using system instruction: [redacted]" in message for message in messages)
+    assert all("private system prompt" not in message for message in messages)
+
+
+def test_pipecat_does_not_log_private_tool_arguments() -> None:
+    from loguru import logger
+
+    messages = []
+    sink = logger.add(lambda message: messages.append(str(message)), level="WARNING")
+    try:
+        observability.configure_tracing(env={})
+        exec(
+            "logger.warning('Failed to parse function call arguments: private answer')",
+            {"__name__": "pipecat.services.openai.base_llm", "logger": logger},
+        )
+    finally:
+        logger.remove(sink)
+
+    assert any("Failed to parse function call arguments: [redacted]" in message for message in messages)
+    assert all("private answer" not in message for message in messages)
 
 
 def test_public_trace_span_exposes_only_timing_status_and_error_type() -> None:
