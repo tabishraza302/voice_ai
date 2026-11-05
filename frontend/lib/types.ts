@@ -41,7 +41,6 @@ export type AgentPatch = Partial<
   Pick<
     Agent,
     | "name"
-    | "slug"
     | "description"
     | "instructions"
     | "languages"

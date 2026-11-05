@@ -307,3 +307,27 @@ async def test_publish_and_unpublish_persist_agent_state(client, monkeypatch):
     unpublished = await client.post(f"/agents/{agent['id']}/unpublish", headers=headers)
     assert unpublished.status_code == 200
     assert unpublished.json()["status"] == "draft"
+
+@pytest.mark.anyio
+async def test_slug_is_auto_generated_and_not_editable(client):
+    token = await login(client, f"{uuid.uuid4()}@example.com")
+    headers = mutation_headers(token)
+
+    # Create without providing a slug
+    create_resp = await client.post(
+        "/agents",
+        json={"name": "Auto Slug Support Bot"},
+        headers=headers,
+    )
+    assert create_resp.status_code == 201
+    data = create_resp.json()
+    assert data["slug"].startswith("auto-slug-support-bot-")
+    assert len(data["slug"]) > len("auto-slug-support-bot-")
+
+    # Attempt to patch slug should fail (extra fields forbidden)
+    patch_resp = await client.patch(
+        f"/agents/{data['id']}",
+        json={"slug": "hacked-slug"},
+        headers=headers,
+    )
+    assert patch_resp.status_code == 422
