@@ -8,11 +8,12 @@ import {
   AdminLoading,
   AdminNotice,
   errorDetails,
-  inputClassName,
   type LoadState,
   type Notice,
-  primaryButtonClassName,
 } from "./admin-ui";
+import { Button } from "../ui/button";
+import { Input } from "../ui/input";
+import { Label } from "../ui/label";
 
 type PolicyDraft = {
   max_call_duration_seconds: string;
@@ -117,7 +118,7 @@ export function PolicyEditor() {
   return (
     <form
       onSubmit={savePolicy}
-      className="rounded-lg border border-border bg-card p-5 sm:p-7"
+      className="rounded-2xl border border-border bg-card p-5 sm:p-7"
       aria-busy={saving}
     >
       <div className="max-w-3xl">
@@ -129,14 +130,12 @@ export function PolicyEditor() {
       <fieldset className="mt-6 max-w-3xl space-y-6" disabled={saving}>
         <legend className="text-base font-semibold">Call limits</legend>
         <div>
-          <label htmlFor="max-call-duration" className="block text-sm font-medium">
-            Maximum call duration
-          </label>
+          <Label htmlFor="max-call-duration">Maximum call duration</Label>
           <p id="max-call-duration-help" className="mt-1 text-sm text-muted-foreground">
             From 60 to 3,600 seconds.
           </p>
           <div className="mt-2 flex max-w-sm items-center gap-3">
-            <input
+            <Input
               id="max-call-duration"
               type="number"
               min={60}
@@ -149,7 +148,6 @@ export function PolicyEditor() {
                 setDraft((current) => ({ ...current, max_call_duration_seconds: event.currentTarget.value }));
                 setNotice(null);
               }}
-              className={inputClassName}
               aria-describedby="max-call-duration-help"
             />
             <span className="shrink-0 text-sm text-muted-foreground">seconds</span>
@@ -157,13 +155,11 @@ export function PolicyEditor() {
         </div>
 
         <div>
-          <label htmlFor="max-agent-calls" className="block text-sm font-medium">
-            Maximum concurrent calls per agent
-          </label>
+          <Label htmlFor="max-agent-calls">Maximum concurrent calls per agent</Label>
           <p id="max-agent-calls-help" className="mt-1 text-sm text-muted-foreground">
             From 1 to 10 calls, and no higher than the overall limit.
           </p>
-          <input
+          <Input
             id="max-agent-calls"
             type="number"
             min={1}
@@ -176,19 +172,17 @@ export function PolicyEditor() {
               setDraft((current) => ({ ...current, max_concurrent_calls_per_agent: event.currentTarget.value }));
               setNotice(null);
             }}
-            className={`${inputClassName} mt-2 max-w-sm`}
+            className="mt-2 max-w-sm"
             aria-describedby="max-agent-calls-help"
           />
         </div>
 
         <div>
-          <label htmlFor="max-overall-calls" className="block text-sm font-medium">
-            Maximum concurrent calls overall
-          </label>
+          <Label htmlFor="max-overall-calls">Maximum concurrent calls overall</Label>
           <p id="max-overall-calls-help" className="mt-1 text-sm text-muted-foreground">
             From 1 to 50 calls. This limit must be at least the per-agent limit.
           </p>
-          <input
+          <Input
             id="max-overall-calls"
             type="number"
             min={1}
@@ -201,7 +195,7 @@ export function PolicyEditor() {
               setDraft((current) => ({ ...current, max_concurrent_calls_overall: event.currentTarget.value }));
               setNotice(null);
             }}
-            className={`${inputClassName} mt-2 max-w-sm`}
+            className="mt-2 max-w-sm"
             aria-describedby="max-overall-calls-help"
           />
         </div>
@@ -211,9 +205,9 @@ export function PolicyEditor() {
         <div className="sm:max-w-xl">
           <AdminNotice notice={notice} />
         </div>
-        <button type="submit" className={primaryButtonClassName} disabled={saving || !hasChanges}>
+        <Button type="submit" disabled={saving || !hasChanges}>
           {saving ? "Saving…" : "Save policy"}
-        </button>
+        </Button>
       </div>
     </form>
   );

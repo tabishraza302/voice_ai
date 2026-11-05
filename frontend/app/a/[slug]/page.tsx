@@ -3,6 +3,9 @@
 import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import { CallPanel, type CallSessionGrant } from "../../../components/call-panel";
+import { Button } from "@/components/ui/button";
+import { Label } from "@/components/ui/label";
+import { Select } from "@/components/ui/select";
 import { api } from "../../../lib/api";
 
 type PublicAgent = {
@@ -125,69 +128,67 @@ export default function PublicCallPage() {
   }
 
   return (
-    <main className="min-h-screen bg-[#f7f6f0] px-4 py-10 text-stone-900 sm:px-6 sm:py-16">
+    <main className="min-h-dvh bg-background px-4 py-10 text-foreground sm:px-6 sm:py-16">
       <div className="mx-auto w-full max-w-3xl">
         {state.kind === "loading" ? (
-          <div className="rounded-3xl border border-stone-200 bg-white p-8 text-stone-700" role="status" aria-live="polite">
-            <span className="mr-3 inline-block h-3 w-3 animate-pulse rounded-full bg-emerald-700" aria-hidden="true" />
+          <div className="rounded-2xl border bg-card p-8 text-muted-foreground" role="status" aria-live="polite">
+            <span className="mr-3 inline-block h-3 w-3 animate-pulse rounded-full bg-primary" aria-hidden="true" />
             Loading this agent…
           </div>
         ) : null}
 
         {state.kind === "unavailable" ? (
-          <section className="rounded-3xl border border-stone-200 bg-white p-7 shadow-[0_16px_40px_-28px_rgba(24,39,34,0.35)] sm:p-9" aria-labelledby="unavailable-title">
-            <h1 id="unavailable-title" className="text-2xl font-semibold tracking-[-0.03em] sm:text-3xl">
+          <section className="rounded-2xl border bg-card p-7 sm:p-9" aria-labelledby="unavailable-title">
+            <h1 id="unavailable-title" className="text-2xl font-semibold tracking-tight sm:text-3xl">
               This call isn’t available
             </h1>
-            <p className="mt-3 max-w-prose text-sm leading-6 text-stone-600" role="alert">
+            <p className="mt-3 max-w-prose text-sm leading-6 text-muted-foreground" role="alert">
               {state.message}
             </p>
-            <button
-              type="button"
-              onClick={() => setReloadKey((value) => value + 1)}
-              className="mt-6 inline-flex min-h-11 items-center justify-center rounded-full bg-emerald-800 px-5 text-sm font-semibold text-white transition-colors hover:bg-emerald-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-700 focus-visible:ring-offset-2"
-            >
+            <Button className="mt-6" onClick={() => setReloadKey((value) => value + 1)}>
               Try again
-            </button>
+            </Button>
           </section>
         ) : null}
 
         {agent ? (
           <>
             <header className="mb-8 sm:mb-10">
-              <p className="text-sm font-medium text-emerald-900">Voice call</p>
-              <h1 className="mt-2 text-4xl font-semibold tracking-[-0.04em] sm:text-5xl">{agent.name}</h1>
+              <h1 className="text-4xl font-semibold tracking-tight sm:text-5xl">{agent.name}</h1>
               {agent.description ? (
-                <p className="mt-4 max-w-2xl text-base leading-7 text-stone-700">{agent.description}</p>
+                <p className="mt-4 max-w-2xl text-base leading-7 text-muted-foreground">{agent.description}</p>
               ) : null}
             </header>
 
             {agent.languages.length > 0 ? (
               <>
-                <div className="mb-4 rounded-2xl border border-stone-200 bg-white px-4 py-4 sm:px-5">
-                  <label htmlFor="call-language" className="block text-sm font-semibold text-stone-800">
-                    Language for this call
-                  </label>
+                <div className="mb-4 rounded-2xl border bg-card px-4 py-4 sm:px-5">
                   {agent.languages.length === 1 ? (
-                    <p className="mt-2 text-sm text-stone-600">{languageLabel(agent.languages[0])}</p>
+                    <>
+                      <p className="text-sm font-medium text-foreground">Language for this call</p>
+                      <p className="mt-2 text-sm text-muted-foreground">{languageLabel(agent.languages[0])}</p>
+                    </>
                   ) : (
-                    <select
-                      id="call-language"
-                      value={language}
-                      onChange={(event) => setSelectedLanguage(event.target.value)}
-                      className="mt-2 min-h-11 w-full rounded-xl border border-stone-300 bg-white px-3 text-sm text-stone-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-700 sm:max-w-xs"
-                    >
+                    <>
+                      <Label htmlFor="call-language">Language for this call</Label>
+                      <Select
+                        id="call-language"
+                        value={language}
+                        onChange={(event) => setSelectedLanguage(event.target.value)}
+                        className="mt-2 sm:max-w-xs"
+                      >
                       {agent.languages.map((option) => (
                         <option key={option} value={option}>{languageLabel(option)}</option>
                       ))}
-                    </select>
+                      </Select>
+                    </>
                   )}
-                  <p className="mt-2 text-xs leading-5 text-stone-500">The language is set when the call starts.</p>
+                  <p className="mt-2 text-xs leading-5 text-muted-foreground">The language is set when the call starts.</p>
                 </div>
                 <CallPanel title={`Talk with ${agent.name}`} createCall={createPublicCall} />
               </>
             ) : (
-              <p className="rounded-2xl border border-stone-200 bg-white p-5 text-sm leading-6 text-stone-700" role="alert">
+              <p className="rounded-2xl border bg-card p-5 text-sm leading-6 text-muted-foreground" role="alert">
                 Voice calling is not available for this agent right now.
               </p>
             )}

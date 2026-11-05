@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { ApiError, api } from "@/lib/api";
+import { api, apiErrorText } from "@/lib/api";
 import type { AgentStep, AnswerType, JsonValue, StepBranch, StepInput, ValidationOperator, ValidationRule } from "@/lib/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -63,11 +63,6 @@ function valueForType(type: AnswerType | null): JsonValue {
   if (type === "number") return 0;
   if (type === "enum") return "";
   return "";
-}
-
-function failureText(reason: unknown, fallback: string): string {
-  if (!(reason instanceof ApiError)) return fallback;
-  return reason.status > 0 ? `${reason.message} (HTTP ${reason.status})` : reason.message;
 }
 
 function OperandInput({
@@ -293,7 +288,7 @@ export function QuestionsEditor({
       onStepsChange([...steps, created]);
       setSelectedId(created.id);
     } catch (reason) {
-      setError(failureText(reason, "Could not add this question. Try again."));
+      setError(apiErrorText(reason, "Could not add this question. Try again."));
     } finally {
       setSaving(false);
     }
@@ -313,7 +308,7 @@ export function QuestionsEditor({
       setDraft(inputFromStep(updated));
       setSavedMessage("Question saved.");
     } catch (reason) {
-      setError(failureText(reason, "Could not save this question. Try again."));
+      setError(apiErrorText(reason, "Could not save this question. Try again."));
     } finally {
       setSaving(false);
     }
@@ -330,7 +325,7 @@ export function QuestionsEditor({
       setSelectedId(remaining[0]?.id ?? null);
       setDeleteOpen(false);
     } catch (reason) {
-      setError(failureText(reason, "Could not delete this question. Try again."));
+      setError(apiErrorText(reason, "Could not delete this question. Try again."));
     } finally {
       setDeleting(false);
     }
@@ -351,7 +346,7 @@ export function QuestionsEditor({
       });
       onStepsChange(result);
     } catch (reason) {
-      setError(failureText(reason, "Could not reorder the questions. Try again."));
+      setError(apiErrorText(reason, "Could not reorder the questions. Try again."));
     } finally {
       setReordering(false);
     }
@@ -369,7 +364,7 @@ export function QuestionsEditor({
   }
 
   return (
-    <div className="grid gap-6 lg:grid-cols-[15rem_minmax(0,1fr)]">
+    <div className="grid grid-cols-1 gap-6 lg:grid-cols-[15rem_minmax(0,1fr)]">
       <aside className="space-y-4">
         <div className="flex items-center justify-between gap-3">
           <h3 className="text-sm font-semibold">Question order</h3>
@@ -386,7 +381,7 @@ export function QuestionsEditor({
               <li key={step.id} className="rounded-xl border bg-card p-3">
                 <button
                   type="button"
-                  className="w-full rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  className="w-full rounded-xl text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   aria-current={activeStep?.id === step.id ? "step" : undefined}
                   onClick={() => setSelectedId(step.id)}
                 >
@@ -418,7 +413,7 @@ export function QuestionsEditor({
           </div>
 
           <Card className="space-y-5 p-4 sm:p-5">
-            <div className="grid gap-4 sm:grid-cols-2">
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <div className="space-y-1.5">
                 <Label htmlFor="step-title">Question title</Label>
                 <Input id="step-title" maxLength={255} value={draft.title} onChange={(event) => updateDraft("title", event.currentTarget.value)} />
@@ -434,7 +429,7 @@ export function QuestionsEditor({
               <Textarea id="step-objective" value={draft.objective} onChange={(event) => updateDraft("objective", event.currentTarget.value)} />
               <p className="text-xs text-muted-foreground">Explain what this step needs to collect or communicate.</p>
             </div>
-            <div className="grid gap-4 sm:grid-cols-2">
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <div className="space-y-1.5">
                 <Label htmlFor="step-answer-type">Answer type</Label>
                 <Select
@@ -530,7 +525,7 @@ export function QuestionsEditor({
               {draft.validation_rules.length === 0 ? <p className="text-sm text-muted-foreground">No validation rules configured.</p> : null}
               <div className="space-y-4">
                 {draft.validation_rules.map((rule, index) => (
-                  <div key={`rule-${index}`} className="grid gap-3 rounded-xl border p-3 sm:grid-cols-[minmax(8rem,0.65fr)_minmax(10rem,1fr)_auto] sm:items-end">
+                  <div key={`rule-${index}`} className="grid grid-cols-1 gap-3 rounded-xl border p-3 sm:grid-cols-[minmax(8rem,0.65fr)_minmax(10rem,1fr)_auto] sm:items-end">
                     <div className="space-y-1.5">
                       <Label htmlFor={`rule-op-${index}`}>Operator</Label>
                       <Select
@@ -606,7 +601,7 @@ export function QuestionsEditor({
                       const referencedType = referenced?.answer_type ?? null;
                       const operators = referencedType === "boolean" || referencedType === "text" || referencedType === "enum" ? setOperators : allOperators;
                       return (
-                        <div key={`condition-${conditionIndex}`} className="grid gap-3 rounded-lg bg-muted/40 p-3 sm:grid-cols-2">
+                        <div key={`condition-${conditionIndex}`} className="grid grid-cols-1 gap-3 rounded-xl bg-muted/40 p-3 sm:grid-cols-2">
                           <div className="space-y-1.5">
                             <Label htmlFor={`branch-${branchIndex}-field-${conditionIndex}`}>When field</Label>
                             <Select

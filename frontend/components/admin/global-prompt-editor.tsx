@@ -8,11 +8,12 @@ import {
   AdminLoading,
   AdminNotice,
   errorDetails,
-  inputClassName,
   type LoadState,
   type Notice,
-  primaryButtonClassName,
 } from "./admin-ui";
+import { Button } from "../ui/button";
+import { Label } from "../ui/label";
+import { Textarea } from "../ui/textarea";
 
 export function GlobalPromptEditor() {
   const [load, setLoad] = useState<LoadState<GlobalPrompt>>({ kind: "loading" });
@@ -80,7 +81,7 @@ export function GlobalPromptEditor() {
   return (
     <form
       onSubmit={savePrompt}
-      className="rounded-lg border border-border bg-card p-5 sm:p-7"
+      className="rounded-2xl border border-border bg-card p-5 sm:p-7"
       aria-busy={saving}
     >
       <div className="flex flex-col gap-1 border-b border-border pb-5 sm:flex-row sm:items-baseline sm:justify-between">
@@ -89,13 +90,11 @@ export function GlobalPromptEditor() {
       </div>
 
       <div className="mt-5 max-w-4xl">
-        <label htmlFor="global-prompt" className="block text-sm font-medium">
-          Global prompt
-        </label>
+        <Label htmlFor="global-prompt">Global prompt</Label>
         <p id="global-prompt-help" className="mt-1 text-sm leading-6 text-muted-foreground">
           This instruction applies to new calls. Calls already in progress keep the prompt saved in their session.
         </p>
-        <textarea
+        <Textarea
           id="global-prompt"
           name="prompt_text"
           value={draft}
@@ -103,7 +102,7 @@ export function GlobalPromptEditor() {
             setDraft(event.currentTarget.value);
             setNotice(null);
           }}
-          className={`${inputClassName} mt-3 min-h-72 resize-y leading-6`}
+          className="mt-3 min-h-72 leading-6"
           rows={14}
           maxLength={20000}
           required
@@ -119,9 +118,9 @@ export function GlobalPromptEditor() {
         <div className="sm:max-w-xl">
           <AdminNotice notice={notice} />
         </div>
-        <button type="submit" className={primaryButtonClassName} disabled={saving || !hasChanges || !draft.trim()}>
+        <Button type="submit" disabled={saving || !hasChanges || !draft.trim()}>
           {saving ? "Saving…" : "Save prompt"}
-        </button>
+        </Button>
       </div>
     </form>
   );

@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api } from "../../lib/api";
+import { Badge } from "../ui/badge";
 import type { AdminUser } from "./admin-types";
 import {
   AdminLoadError,
@@ -36,7 +37,7 @@ export function UsersDirectory() {
   }
 
   return (
-    <div className="rounded-lg border border-border bg-card px-5 sm:px-7">
+    <div className="rounded-2xl border border-border bg-card px-5 sm:px-7">
       <div className="flex items-baseline justify-between gap-4 border-b border-border py-4">
         <p className="text-sm font-medium">Registered accounts</p>
         <p className="text-sm tabular-nums text-muted-foreground">
@@ -59,9 +60,7 @@ export function UsersDirectory() {
               <div className="col-span-2 min-w-0 md:col-span-1">
                 <p className="text-xs font-medium text-muted-foreground">Account</p>
                 <p className="mt-1 break-words font-medium">{user.email}</p>
-                <span className="mt-2 inline-flex rounded-full bg-muted px-2.5 py-1 text-xs font-medium text-muted-foreground">
-                  {user.role}
-                </span>
+                <Badge className="mt-2 capitalize">{user.role}</Badge>
               </div>
               <div>
                 <p className="text-xs font-medium text-muted-foreground">Joined</p>

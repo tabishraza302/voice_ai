@@ -2,6 +2,8 @@
 
 import { useEffect, useState } from "react";
 import { api } from "../../lib/api";
+import { Badge } from "../ui/badge";
+import { Button } from "../ui/button";
 import type { AdminAgent, AdminAgentStatus, AdminAgentSuspension } from "./admin-types";
 import {
   AdminLoadError,
@@ -14,10 +16,10 @@ import {
   type Notice,
 } from "./admin-ui";
 
-const statusStyles: Record<AdminAgentStatus, string> = {
-  draft: "bg-muted text-muted-foreground",
-  published: "bg-primary/10 text-primary",
-  suspended: "bg-destructive/10 text-destructive",
+const statusVariants: Record<AdminAgentStatus, "muted" | "success" | "danger"> = {
+  draft: "muted",
+  published: "success",
+  suspended: "danger",
 };
 
 export function AgentsDirectory() {
@@ -83,7 +85,7 @@ export function AgentsDirectory() {
   }
 
   return (
-    <div className="rounded-lg border border-border bg-card px-5 sm:px-7">
+    <div className="rounded-2xl border border-border bg-card px-5 sm:px-7">
       <div className="flex flex-col gap-3 border-b border-border py-4 sm:flex-row sm:items-center sm:justify-between">
         <p className="text-sm font-medium">All agents</p>
         <p className="text-sm tabular-nums text-muted-foreground">
@@ -119,9 +121,9 @@ export function AgentsDirectory() {
                 </div>
                 <div>
                   <p className="text-xs font-medium text-muted-foreground">Status</p>
-                  <span className={`mt-1 inline-flex rounded-full px-2.5 py-1 text-xs font-medium ${statusStyles[agent.status]}`}>
+                  <Badge variant={statusVariants[agent.status]} className="mt-1 capitalize">
                     {agent.status}
-                  </span>
+                  </Badge>
                 </div>
                 <div>
                   <p className="text-xs font-medium text-muted-foreground">Updated</p>
@@ -142,19 +144,15 @@ export function AgentsDirectory() {
                   <p className="mt-1 text-sm tabular-nums">{formatCount(agent.active_session_count)}</p>
                 </div>
                 <div className="col-span-2 md:col-span-1">
-                  <button
-                    type="button"
+                  <Button
+                    variant={canSuspend ? "destructive" : "secondary"}
+                    className="w-full"
                     onClick={() => void suspendAgent(agent)}
                     disabled={!canSuspend || suspendingId !== null}
-                    className={`inline-flex min-h-11 w-full items-center justify-center rounded-md px-4 py-2 text-sm font-medium shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60 ${
-                      canSuspend
-                        ? "bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                        : "bg-muted text-muted-foreground"
-                    }`}
                     aria-label={canSuspend ? `Suspend ${agent.name} (${agent.slug})` : `${agent.name} is suspended`}
                   >
                     {isSuspending ? "Suspending…" : canSuspend ? "Suspend agent" : "Suspended"}
-                  </button>
+                  </Button>
                 </div>
               </li>
             );

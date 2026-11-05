@@ -3,10 +3,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { ApiError, api, apiFieldErrors } from "@/lib/api";
+import { ApiError, api, apiFieldErrors, apiErrorText } from "@/lib/api";
+import { statusLabels, statusVariant } from "@/lib/agent-status";
 import type { Agent, AgentStep, CurrentUser, ProviderCatalog } from "@/lib/types";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
+import { Button, buttonClassName } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { TabPanel, TabsBar } from "@/components/ui/tabs";
@@ -28,12 +29,6 @@ const editorTabs: Array<{ value: EditorTab; label: string }> = [
   { value: "publishing", label: "Publishing" },
 ];
 
-function statusVariant(status: Agent["status"]): "muted" | "success" | "warning" {
-  if (status === "published") return "success";
-  if (status === "suspended") return "warning";
-  return "muted";
-}
-
 function tabForField(field: string): EditorTab {
   if (field.startsWith("steps.")) return "questions";
   if (field.includes("language")) return "languages";
@@ -41,11 +36,6 @@ function tabForField(field: string): EditorTab {
   if (field.includes("instruction")) return "instructions";
   if (field.includes("slug") || field.includes("name") || field.includes("description")) return "overview";
   return "publishing";
-}
-
-function errorText(reason: unknown, fallback: string): string {
-  if (!(reason instanceof ApiError)) return fallback;
-  return reason.status > 0 ? `${reason.message} (HTTP ${reason.status})` : reason.message;
 }
 
 export default function AgentEditorPage() {
@@ -92,7 +82,7 @@ export default function AgentEditorPage() {
         return;
       }
       setCatalog(null);
-      setCatalogError(errorText(reason, "Verified provider choices could not be loaded."));
+      setCatalogError(apiErrorText(reason, "Verified provider choices could not be loaded."));
     } finally {
       if (!signal?.aborted) setCatalogLoading(false);
     }
@@ -133,7 +123,7 @@ export default function AgentEditorPage() {
           router.replace("/login");
           return;
         }
-        setPageError(errorText(reason, "This agent could not be loaded."));
+        setPageError(apiErrorText(reason, "This agent could not be loaded."));
       } finally {
         if (current) setLoading(false);
       }
@@ -166,7 +156,7 @@ export default function AgentEditorPage() {
       setDraft(agentDraftFromAgent(updated));
       setSaveMessage("Changes saved.");
     } catch (reason) {
-      setSaveError(errorText(reason, "Could not save this agent."));
+      setSaveError(apiErrorText(reason, "Could not save this agent."));
     } finally {
       setSaving(false);
     }
@@ -184,7 +174,7 @@ export default function AgentEditorPage() {
     } catch (reason) {
       if (reason instanceof ApiError) {
         setPublishErrors(apiFieldErrors(reason));
-        setPublishMessage(reason.status > 0 ? `${reason.message} (HTTP ${reason.status})` : reason.message);
+        setPublishMessage(apiErrorText(reason, "Could not update publishing status. Try again."));
       } else {
         setPublishMessage("Could not update publishing status. Try again.");
       }
@@ -200,7 +190,7 @@ export default function AgentEditorPage() {
       await api<void>(`/agents/${agentId}`, { method: "DELETE" });
       router.replace("/dashboard");
     } catch (reason) {
-      setDeleteError(errorText(reason, "Could not delete this agent."));
+      setDeleteError(apiErrorText(reason, "Could not delete this agent."));
       setDeleting(false);
     }
   }
@@ -222,7 +212,7 @@ export default function AgentEditorPage() {
             </div>
             <div className="flex flex-wrap gap-3">
               <Button variant="outline" onClick={() => setReload((value) => value + 1)}>Try again</Button>
-              <Link href="/dashboard" className="inline-flex min-h-11 items-center justify-center rounded-xl border px-4 py-2.5 text-sm font-medium hover:bg-muted">Back to dashboard</Link>
+              <Link href="/dashboard" className={buttonClassName("outline")}>Back to dashboard</Link>
             </div>
           </Card>
         ) : agent && draft ? (
@@ -230,10 +220,9 @@ export default function AgentEditorPage() {
             <Link href="/dashboard" className="rounded-xl text-sm font-medium text-muted-foreground underline-offset-4 hover:text-foreground hover:underline">Back to dashboard</Link>
             <div className="mt-6 flex flex-col gap-4 border-b pb-6 sm:flex-row sm:items-end sm:justify-between">
               <div className="min-w-0">
-                <p className="text-sm font-medium text-primary">Agent editor</p>
-                <div className="mt-1 flex flex-wrap items-center gap-3">
+                <div className="flex flex-wrap items-center gap-3">
                   <h1 className="max-w-full break-words text-3xl font-semibold tracking-tight">{agent.name}</h1>
-                  <Badge variant={statusVariant(agent.status)}>{agent.status}</Badge>
+                  <Badge variant={statusVariant(agent.status)}>{statusLabels[agent.status]}</Badge>
                 </div>
                 <p className="mt-2 break-all text-sm text-muted-foreground">/a/{agent.slug}</p>
               </div>
@@ -283,7 +272,7 @@ export default function AgentEditorPage() {
                     <Card className="space-y-4 p-5 sm:p-6">
                       <div className="flex flex-wrap items-center gap-3">
                         <span className="text-sm font-medium">Current status</span>
-                        <Badge variant={statusVariant(agent.status)}>{agent.status}</Badge>
+                        <Badge variant={statusVariant(agent.status)}>{statusLabels[agent.status]}</Badge>
                       </div>
                       {agent.status === "suspended" ? (
                         <p className="text-sm leading-6 text-muted-foreground">This agent is suspended by an administrator. Owners cannot publish or unsuspend it.</p>

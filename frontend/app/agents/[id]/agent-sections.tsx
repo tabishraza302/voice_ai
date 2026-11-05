@@ -64,7 +64,7 @@ export function AgentOverview({ draft, onPatch }: { draft: AgentDraft; onPatch: 
         <h3 className="text-lg font-semibold">Agent overview</h3>
         <p className="mt-1 text-sm leading-6 text-muted-foreground">Set a clear name, public URL, and short description.</p>
       </div>
-      <div className="grid gap-4 sm:grid-cols-2">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         <div className="space-y-1.5">
           <Label htmlFor="agent-name">Name</Label>
           <Input id="agent-name" maxLength={120} value={draft.name} onChange={(event) => onPatch({ name: event.currentTarget.value })} />
@@ -145,7 +145,7 @@ export function AgentVoice({
           <h4 id="stt-heading" className="font-semibold">Speech recognition</h4>
           <p className="mt-1 text-sm text-muted-foreground">Only Deepgram Nova-3 is configured by this runtime.</p>
         </div>
-        <div className="grid gap-4 sm:grid-cols-2">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div className="space-y-1.5">
             <Label htmlFor="stt-provider">Provider</Label>
             <Select
@@ -174,7 +174,7 @@ export function AgentVoice({
           <h4 id="llm-heading" className="font-semibold">Language model</h4>
           <p className="mt-1 text-sm text-muted-foreground">The model list contains verified choices only.</p>
         </div>
-        <div className="grid gap-4 sm:grid-cols-2">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div className="space-y-1.5">
             <Label htmlFor="llm-provider">Provider</Label>
             <Select
@@ -207,7 +207,7 @@ export function AgentVoice({
           <h4 id="tts-heading" className="font-semibold">Voice output</h4>
           <p className="mt-1 text-sm text-muted-foreground">Choose an available provider, model, and voice. Voice language support is shown in the Languages tab.</p>
         </div>
-        <div className="grid gap-4 sm:grid-cols-2">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div className="space-y-1.5">
             <Label htmlFor="tts-provider">Provider</Label>
             <Select

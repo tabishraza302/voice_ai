@@ -48,10 +48,12 @@ docker compose exec frontend npm run build
 
 | Variable | Purpose |
 | --- | --- |
-| `ENVIRONMENT` | `development` for local HTTP; `production` makes session cookies `Secure` (requires HTTPS). |
-| `APP_ORIGIN` | Exact frontend origin checked on state-changing requests, e.g. `http://localhost:3000` or `https://voice.example.com`. |
+| `ENVIRONMENT` | Use exactly `development` for local HTTP; `production` makes session cookies `Secure` (requires HTTPS). |
+| `APP_ORIGIN` | Exact frontend origin checked on state-changing requests and dev login, e.g. `http://localhost:3000` or `https://voice.example.com`. |
 | `SESSION_SECRET` | At least 32 characters; signs session cookies. Rotating it signs everyone out. |
-| `ADMIN_EMAIL`, `ADMIN_PASSWORD` | Used only by `python -m app.bootstrap`; password must be at least 12 characters. Existing non-admin emails are never promoted. |
+| `ADMIN_EMAIL`, `ADMIN_PASSWORD` | Used by `python -m app.bootstrap`; password must be at least 12 characters. Existing non-admin emails are never promoted. These credentials also identify the admin development login when enabled. |
+| `ALLOW_DEV_LOGIN` | Set to `true` only for local development to show passwordless login buttons. The endpoint also requires `ENVIRONMENT=development` and an exact matching `Origin`. Default: disabled. |
+| `DEV_USER_EMAIL`, `DEV_USER_PASSWORD` | Optional development-user button credentials. Must match an existing `user` account; dev login never creates or changes accounts. |
 | `DATABASE_URL` | Async PostgreSQL URL, `postgresql+asyncpg://...`. Compose supplies the service host and password. |
 | `TEST_DATABASE_URL` | Disposable database used by pytest. Compose supplies it; without Compose, set it to a local disposable database. |
 | `DEEPGRAM_API_KEY` | Deepgram `nova-3` speech recognition. |
@@ -139,7 +141,9 @@ The frontend rewrites `/api/*` to `BACKEND_URL`; there is no CORS configuration 
 
 ## Login
 
-Development and production use the same email/password login. There is no development session shortcut because request Origin headers do not authenticate callers.
+Passwordless User and Admin buttons are available only when `ALLOW_DEV_LOGIN=true` and `ENVIRONMENT=development`. They use `DEV_USER_EMAIL`/`DEV_USER_PASSWORD` and `ADMIN_EMAIL`/`ADMIN_PASSWORD`, which must match existing accounts with the corresponding roles; they never create accounts or promote an existing user. Browser requests must include an exact `Origin` matching `APP_ORIGIN`.
+
+This option grants a session without asking for a password. Keep it disabled unless developing locally. It is not safe on shared or untrusted networks—even when the configured Origin check is enabled, non-browser clients can send that header. The default Compose ingress listens on all interfaces, so a machine reachable by other people must not enable this option. Production always disables the endpoints.
 
 ## Roles and data boundaries
 
