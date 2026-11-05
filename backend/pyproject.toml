@@ -1,0 +1,25 @@
+[project]
+name = "voice-agent-builder"
+version = "0.1.0"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.34,<1",
+  "sqlalchemy[asyncio]>=2.0,<3",
+  "asyncpg>=0.30,<1",
+  "alembic>=1.15,<2",
+  "argon2-cffi>=23,<26",
+  "aiortc==1.15.0",
+  "pyjwt>=2.8,<3",
+  "pipecat-ai[cartesia,deepgram,elevenlabs,openai,webrtc]==1.13.0",
+  "opentelemetry-sdk>=1.30,<2",
+  "opentelemetry-exporter-otlp-proto-http>=1.30,<2",
+  "httpx>=0.28,<1",
+]
+
+[dependency-groups]
+test = ["pytest>=8,<10", "httpx>=0.28,<1", "anyio>=4,<5"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
