@@ -81,7 +81,7 @@ Supported combinations in this build: Deepgram `nova-3`, OpenAI models from the 
 
 ### HTTPS and cookies
 
-Terminate TLS at a reverse proxy (Caddy, nginx, a cloud load balancer) and proxy to the frontend on port 3000. Keep the browser on one origin so `/api/*` is same-origin and cookie/CSRF handling works. Then set:
+Terminate TLS at a reverse proxy (Caddy, nginx, a cloud load balancer) and proxy to the Compose ingress on port 3000. Keep the browser on one origin so `/api/*` is same-origin and cookie/CSRF handling works. Then set:
 
 ```dotenv
 ENVIRONMENT=production
@@ -89,6 +89,8 @@ APP_ORIGIN=https://voice.example.com
 ```
 
 With `ENVIRONMENT=production` over plain HTTP the browser will not store the `Secure` session cookie, so local HTTP must use `ENVIRONMENT=development`.
+
+Compose's ingress replaces caller-supplied `X-Forwarded-For` headers, and the backend trusts forwarded addresses only from the frontend's isolated backend-network address. If a TLS proxy or load balancer sits in front of the ingress, the ingress sees that proxy's address and clients share its rate-limit bucket. Configure nginx's real-IP module with only the actual trusted proxy addresses before relying on per-client limits; never trust forwarded headers from arbitrary clients. If the default backend proxy subnet conflicts with another network, set both `BACKEND_PROXY_SUBNET` and a matching `FRONTEND_PROXY_IP` in `.env`.
 
 ### Phoenix access and privacy
 
@@ -135,9 +137,9 @@ BACKEND_URL=http://127.0.0.1:8000 npm run dev
 
 The frontend rewrites `/api/*` to `BACKEND_URL`; there is no CORS configuration because the browser should stay on one origin.
 
-## Dev login buttons
+## Login
 
-For local development only, set `ALLOW_DEV_LOGIN=true` and keep `ENVIRONMENT=development`. The login page then shows “Sign in as User” and “Sign in as Admin” buttons that issue sessions for the seeded `DEV_USER_EMAIL`/`DEV_USER_PASSWORD` and `ADMIN_EMAIL`/`ADMIN_PASSWORD` accounts. The buttons and endpoints are disabled (404) when either condition is false.
+Development and production use the same email/password login. There is no development session shortcut because request Origin headers do not authenticate callers.
 
 ## Roles and data boundaries
 
