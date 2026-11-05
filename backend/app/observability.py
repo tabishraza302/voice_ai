@@ -16,6 +16,7 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
+from loguru import logger as _logger
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource
@@ -48,6 +49,7 @@ _SENSITIVE_PARTS = (
     "prompt",
     "transcript",
     "message",
+    "stacktrace",
     "answer",
     "completion",
     "arguments",
@@ -62,7 +64,24 @@ _SENSITIVE_PARTS = (
 )
 _SAFE_ERROR_TYPES = ("error.type", "exception.type", "error_type")
 
+_PRIVATE_LLM_LOG_MODULE = "pipecat.services.openai.base_llm"
+_PRIVATE_LLM_LOG_MARKERS = {
+    "DEBUG": "Using system instruction:",
+    "WARNING": "Failed to parse function call arguments:",
+}
+_log_privacy_configured = False
 _configured = False
+
+
+def _redact_pipecat_record(record: dict[str, Any]) -> None:
+    if record.get("name") != _PRIVATE_LLM_LOG_MODULE:
+        return
+    marker = _PRIVATE_LLM_LOG_MARKERS.get(getattr(record.get("level"), "name", None))
+    message = record.get("message")
+    if marker and isinstance(message, str):
+        prefix, found, _ = message.partition(marker)
+        if found:
+            record["message"] = f"{prefix}{found} [redacted]"
 
 
 def _is_sensitive(key: str) -> bool:
@@ -142,13 +161,16 @@ def _environment(env: dict[str, str] | None) -> dict[str, str]:
 
 
 def configure_tracing(env: dict[str, str] | None = None) -> bool:
-    """Install the global tracer provider when a Phoenix endpoint is set.
+    """Configure privacy-safe Pipecat logging and Phoenix tracing when enabled.
 
     Returns True when tracing is active. Calling this more than once is a
     no-op, which keeps FastAPI startup and tests predictable.
     """
 
-    global _configured
+    global _configured, _log_privacy_configured
+    if not _log_privacy_configured:
+        _logger.configure(patcher=_redact_pipecat_record)
+        _log_privacy_configured = True
     if _configured:
         return True
     settings = _environment(env)
