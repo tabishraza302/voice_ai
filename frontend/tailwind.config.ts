@@ -24,9 +24,6 @@ const config: Config = {
         xl: "var(--radius)",
         "2xl": "calc(var(--radius) + 0.25rem)",
       },
-      boxShadow: {
-        panel: "0 8px 24px hsl(35 20% 20% / 0.06)",
-      },
     },
   },
   plugins: [],

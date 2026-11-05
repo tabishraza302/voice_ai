@@ -2,8 +2,8 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useState, type FormEvent } from "react";
-import { ApiError, api } from "@/lib/api";
+import { useEffect, useState, type FormEvent } from "react";
+import { api, apiErrorText } from "@/lib/api";
 import type { CurrentUser } from "@/lib/types";
 import { AuthFrame } from "@/components/ui/auth-frame";
 import { Button } from "@/components/ui/button";
@@ -16,6 +16,31 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+  const [devLoginAvailable, setDevLoginAvailable] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    api<{ enabled: boolean }>("/auth/dev-login/available")
+      .then((value) => { if (!cancelled && value.enabled) setDevLoginAvailable(true); })
+      .catch(() => { if (!cancelled) setDevLoginAvailable(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  async function devSignIn(role: "user" | "admin") {
+    setError(null);
+    setPending(true);
+    try {
+      const user = await api<CurrentUser>("/auth/dev-login", {
+        method: "POST",
+        body: JSON.stringify({ role }),
+      });
+      router.replace(user.role === "admin" ? "/admin" : "/dashboard");
+      router.refresh();
+    } catch (reason) {
+      setError(apiErrorText(reason, "Could not sign in as the dev account. Try again."));
+      setPending(false);
+    }
+  }
 
   async function signIn(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -29,9 +54,7 @@ export default function LoginPage() {
       router.replace(user.role === "admin" ? "/admin" : "/dashboard");
       router.refresh();
     } catch (reason) {
-      setError(reason instanceof ApiError
-        ? reason.status > 0 ? `${reason.message} (HTTP ${reason.status})` : reason.message
-        : "Could not sign in. Try again.");
+      setError(apiErrorText(reason, "Could not sign in. Try again."));
       setPending(false);
     }
   }
@@ -77,6 +100,23 @@ export default function LoginPage() {
           {pending ? "Signing in..." : "Sign in"}
         </Button>
       </form>
+      {devLoginAvailable ? (
+        <div className="mt-5 space-y-3">
+          <div className="relative flex items-center">
+            <span aria-hidden="true" className="absolute inset-x-0 h-px bg-border" />
+            <span className="relative mx-auto bg-background px-3 text-xs uppercase tracking-wide text-muted-foreground">Development</span>
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <Button variant="outline" type="button" disabled={pending} onClick={() => void devSignIn("user")}>
+              Sign in as User
+            </Button>
+            <Button variant="outline" type="button" disabled={pending} onClick={() => void devSignIn("admin")}>
+              Sign in as Admin
+            </Button>
+          </div>
+          <p className="text-center text-[11px] leading-4 text-muted-foreground">Local development only. Seeded dev accounts — not for production.</p>
+        </div>
+      ) : null}
       <p className="mt-6 text-center text-sm text-muted-foreground">
         <Link href="/" className="rounded-xl underline-offset-4 hover:text-foreground hover:underline">Return to home</Link>
       </p>

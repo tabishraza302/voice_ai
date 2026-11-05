@@ -104,9 +104,8 @@ export default function SessionTracePage() {
           </Link>
         )}
         <div className="mt-7 space-y-2">
-          <p className="text-sm font-medium text-primary">Session diagnostics</p>
           <h1 className="text-3xl font-semibold tracking-tight">Trace details</h1>
-          <p className="text-sm leading-6 text-muted-foreground">Only timing and error type fields for this session are shown.</p>
+          <p className="mt-1 text-sm leading-6 text-muted-foreground">Only timing and error type fields for this session are shown.</p>
         </div>
 
         {loading ? (
@@ -132,7 +131,7 @@ export default function SessionTracePage() {
                   {session.status}
                 </Badge>
               </CardHeader>
-              <CardContent className="grid gap-4 sm:grid-cols-3">
+              <CardContent className="grid grid-cols-1 gap-4 sm:grid-cols-3">
                 <div><p className="text-xs font-medium text-muted-foreground">Call type</p><p className="mt-1 text-sm">{session.call_type}</p></div>
                 <div><p className="text-xs font-medium text-muted-foreground">Started</p><p className="mt-1 text-sm">{formatTime(session.started_at)}</p></div>
                 <div><p className="text-xs font-medium text-muted-foreground">Ended</p><p className="mt-1 text-sm">{formatTime(session.ended_at)}</p></div>
@@ -155,7 +154,7 @@ export default function SessionTracePage() {
                 ) : (
                   <ul className="divide-y">
                     {trace.spans.map((span, index) => (
-                      <li key={`${span.name}-${span.started_at ?? "none"}-${index}`} className="grid gap-3 py-5 md:grid-cols-[minmax(0,1fr)_11rem_9rem] md:items-start">
+                      <li key={`${span.name}-${span.started_at ?? "none"}-${index}`} className="grid grid-cols-1 gap-3 py-5 md:grid-cols-[minmax(0,1fr)_11rem_9rem] md:items-start">
                         <div className="min-w-0">
                           <h3 className="break-words text-sm font-semibold">{span.name}</h3>
                           <p className="mt-1 text-sm text-muted-foreground">{span.status}</p>

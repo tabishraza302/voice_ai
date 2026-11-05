@@ -1,10 +1,9 @@
 import type { HTMLAttributes } from "react";
 import { cn } from "./utils";
 
-type BadgeVariant = "default" | "muted" | "success" | "warning" | "danger";
+type BadgeVariant = "muted" | "success" | "warning" | "danger";
 
 const badgeClasses: Record<BadgeVariant, string> = {
-  default: "border-primary/25 bg-primary/10 text-primary",
   muted: "border-border bg-muted text-muted-foreground",
   success: "border-primary/25 bg-primary/10 text-primary",
   warning: "border-amber-700/25 bg-amber-700/10 text-amber-900 dark:text-amber-200",

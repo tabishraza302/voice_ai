@@ -3,9 +3,9 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState, type FormEvent } from "react";
-import { ApiError, api } from "@/lib/api";
+import { ApiError, api, apiErrorText } from "@/lib/api";
 import type { Agent, CurrentUser } from "@/lib/types";
-import { Button } from "@/components/ui/button";
+import { Button, buttonClassName } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -59,9 +59,7 @@ export default function NewAgentPage() {
       });
       router.replace(`/agents/${agent.id}`);
     } catch (reason) {
-      setError(reason instanceof ApiError
-        ? reason.status > 0 ? `${reason.message} (HTTP ${reason.status})` : reason.message
-        : "Could not save this draft. Try again.");
+      setError(apiErrorText(reason, "Could not save this draft. Try again."));
       setSaving(false);
     }
   }
@@ -73,7 +71,6 @@ export default function NewAgentPage() {
           Back to dashboard
         </Link>
         <div className="mt-7 space-y-2">
-          <p className="text-sm font-medium text-primary">New agent</p>
           <h1 className="text-3xl font-semibold tracking-tight">Start with a draft</h1>
           <p className="max-w-2xl text-sm leading-6 text-muted-foreground">
             Save a name and a unique URL slug now. Voice settings and questions can be added later.
@@ -142,7 +139,7 @@ export default function NewAgentPage() {
                   />
                 </div>
                 <div className="flex flex-col-reverse gap-3 border-t pt-5 sm:flex-row sm:justify-end">
-                  <Link href="/dashboard" className="inline-flex min-h-11 items-center justify-center rounded-xl border px-4 py-2.5 text-sm font-medium hover:bg-muted">Cancel</Link>
+                  <Link href="/dashboard" className={buttonClassName("outline")}>Cancel</Link>
                   <Button type="submit" disabled={saving || !name.trim() || !slug.trim()}>
                     {saving ? "Saving draft..." : "Create draft"}
                   </Button>

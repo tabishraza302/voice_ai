@@ -4,9 +4,10 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ApiError, api } from "@/lib/api";
+import { statusLabels, statusVariant } from "@/lib/agent-status";
 import type { Agent, CallSession, CurrentUser } from "@/lib/types";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
+import { Button, buttonClassName } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -20,20 +21,7 @@ interface AgentActivity {
 
 type StatusFilter = "all" | Agent["status"];
 
-const statusLabels: Record<Agent["status"], string> = {
-  draft: "Draft",
-  published: "Published",
-  suspended: "Suspended",
-};
-
-function statusVariant(status: Agent["status"]): "muted" | "success" | "warning" {
-  if (status === "published") return "success";
-  if (status === "suspended") return "warning";
-  return "muted";
-}
-
-function formatDate(value: string | null): string {
-  if (!value) return "No sessions yet";
+function formatDate(value: string): string {
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(value));
 }
 
@@ -108,23 +96,19 @@ export default function DashboardPage() {
       <main className="mx-auto max-w-7xl px-4 py-8 sm:px-6 sm:py-10 lg:px-8">
         <div className="flex flex-col gap-5 sm:flex-row sm:items-end sm:justify-between">
           <div className="space-y-2">
-            <p className="text-sm font-medium text-primary">Workspace</p>
             <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">Your voice agents</h1>
             <p className="max-w-2xl text-sm leading-6 text-muted-foreground">
               Manage your agents, test a call, and review session activity.
             </p>
           </div>
-          <Link
-            href="/agents/new"
-            className="inline-flex min-h-11 items-center justify-center rounded-xl bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-          >
+          <Link href="/agents/new" className={buttonClassName("primary", "default", "whitespace-nowrap")}>
             Create agent
           </Link>
         </div>
 
         {loading ? (
           <section className="mt-8 space-y-5" aria-label="Loading workspace" aria-busy="true">
-            <div className="grid gap-3 sm:grid-cols-3">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
               {["agents", "published", "sessions"].map((item) => (
                 <div key={item} className="h-24 animate-pulse rounded-2xl border bg-card" />
               ))}
@@ -139,9 +123,9 @@ export default function DashboardPage() {
               <Button variant="outline" onClick={() => setReload((value) => value + 1)}>Try again</Button>
             </div>
           </Card>
-        ) : (
+        ) : user ? (
           <>
-            <section className="mt-8 grid gap-px overflow-hidden rounded-2xl border bg-border sm:grid-cols-3" aria-label="Workspace counts">
+            <section className="mt-8 grid grid-cols-1 gap-px overflow-hidden rounded-2xl border bg-border sm:grid-cols-3" aria-label="Workspace counts">
               <div className="bg-card p-5 sm:p-6">
                 <p className="text-sm text-muted-foreground">Agents</p>
                 <p className="mt-2 text-3xl font-semibold tabular-nums">{activity.length}</p>
@@ -164,7 +148,7 @@ export default function DashboardPage() {
                     {filtered.length} of {activity.length} agents
                   </p>
                 </div>
-                <div className="grid gap-3 sm:grid-cols-[minmax(14rem,1fr)_10rem]">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-[minmax(14rem,1fr)_10rem]">
                   <div className="space-y-1.5">
                     <Label htmlFor="agent-search">Search agents</Label>
                     <Input id="agent-search" type="search" value={query} onChange={(event) => setQuery(event.currentTarget.value)} />
@@ -190,7 +174,7 @@ export default function DashboardPage() {
                   <p className="mx-auto mt-2 max-w-md text-sm leading-6 text-muted-foreground">
                     Create a draft to start configuring its voice, questions, and call flow.
                   </p>
-                  <Link href="/agents/new" className="mt-5 inline-flex min-h-11 items-center justify-center rounded-xl bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground hover:bg-primary/90">
+                  <Link href="/agents/new" className={buttonClassName("primary", "default", "mt-5")}>
                     Create your first agent
                   </Link>
                 </div>
@@ -209,7 +193,7 @@ export default function DashboardPage() {
                     const activeCalls = sessions.filter((session) => session.status === "created" || session.status === "active").length;
                     return (
                       <li key={agent.id}>
-                        <article className="grid gap-3 py-5 sm:grid-cols-[minmax(0,1fr)_9rem_10rem_auto] sm:items-center sm:gap-6">
+                        <article className="grid grid-cols-1 gap-3 py-5 sm:grid-cols-[minmax(0,1fr)_9rem_10rem_auto] sm:items-center sm:gap-6">
                           <div className="min-w-0">
                             <Link href={`/agents/${agent.id}`} className="rounded-sm text-base font-semibold tracking-tight underline-offset-4 hover:text-primary hover:underline">
                               {agent.name}
@@ -221,9 +205,9 @@ export default function DashboardPage() {
                             <Badge variant={statusVariant(agent.status)}>{statusLabels[agent.status]}</Badge>
                             {activeCalls > 0 ? <p className="mt-2 text-xs text-muted-foreground">{activeCalls} active call{activeCalls === 1 ? "" : "s"}</p> : null}
                           </div>
-                          <div className="text-sm text-muted-foreground">
-                            <p className="font-medium text-foreground">{sessions.length} session{sessions.length === 1 ? "" : "s"}</p>
-                            <p className="mt-1">Last activity {formatDate(latest)}</p>
+                          <div className="min-w-0 text-sm">
+                            <p className="font-medium tabular-nums text-foreground">{sessions.length} session{sessions.length === 1 ? "" : "s"}</p>
+                            <p className="mt-1 text-xs text-muted-foreground">{latest ? `Last activity ${formatDate(latest)}` : "No sessions yet"}</p>
                           </div>
                           <Link href={`/agents/${agent.id}`} className="rounded-xl px-3 py-2 text-sm font-semibold text-primary underline-offset-4 hover:underline sm:justify-self-end">
                             Edit agent
@@ -236,7 +220,7 @@ export default function DashboardPage() {
               )}
             </section>
           </>
-        )}
+        ) : null}
       </main>
     </OwnerShell>
   );

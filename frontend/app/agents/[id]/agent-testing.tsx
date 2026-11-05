@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { CallPanel } from "@/components/call-panel";
-import { ApiError, api } from "@/lib/api";
+import { ApiError, api, apiErrorText } from "@/lib/api";
 import type { CallAnswer, CallMessage, CallSession, CallSessionGrant } from "@/lib/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -13,11 +13,6 @@ import { Select } from "@/components/ui/select";
 
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
-}
-
-function errorText(reason: unknown, fallback: string): string {
-  if (!(reason instanceof ApiError)) return fallback;
-  return reason.status > 0 ? `${reason.message} (HTTP ${reason.status})` : reason.message;
 }
 
 export function AgentTesting({
@@ -59,7 +54,7 @@ export function AgentTesting({
         router.replace("/login");
         return;
       }
-      setHistoryError(errorText(reason, "Could not load session history."));
+      setHistoryError(apiErrorText(reason, "Could not load session history."));
     } finally {
       setLoadingHistory(false);
     }
@@ -99,7 +94,7 @@ export function AgentTesting({
       setSession(null);
       setMessages([]);
       setAnswers([]);
-      setDetailError(errorText(reason, "Could not load this session."));
+      setDetailError(apiErrorText(reason, "Could not load this session."));
     }).finally(() => {
       if (current) setLoadingDetail(false);
     });
@@ -121,7 +116,7 @@ export function AgentTesting({
       void loadSessions();
       return grant;
     } catch (reason) {
-      setCallError(errorText(reason, "Could not start a test call."));
+      setCallError(apiErrorText(reason, "Could not start a test call."));
       throw reason;
     }
   }
@@ -181,7 +176,7 @@ export function AgentTesting({
         ) : sessions.length === 0 ? (
           <p className="rounded-xl border border-dashed p-5 text-sm leading-6 text-muted-foreground">No sessions are recorded for this agent yet.</p>
         ) : (
-          <div className="grid gap-5 lg:grid-cols-[minmax(14rem,0.7fr)_minmax(0,1.3fr)]">
+          <div className="grid grid-cols-1 gap-5 lg:grid-cols-[minmax(14rem,0.7fr)_minmax(0,1.3fr)]">
             <ul className="space-y-2" aria-label="Agent sessions">
               {sessions.map((item) => (
                 <li key={item.id}>
@@ -215,7 +210,7 @@ export function AgentTesting({
                 {detailError ? <p role="alert" className="text-sm text-destructive">{detailError}</p> : null}
                 {session ? (
                   <>
-                    <dl className="grid gap-3 text-sm sm:grid-cols-2">
+                    <dl className="grid grid-cols-1 gap-3 text-sm sm:grid-cols-2">
                       <div><dt className="text-xs text-muted-foreground">Created</dt><dd className="mt-1">{formatDate(session.created_at)}</dd></div>
                       <div><dt className="text-xs text-muted-foreground">Outcome</dt><dd className="mt-1">{session.outcome ?? "Not set"}</dd></div>
                       <div><dt className="text-xs text-muted-foreground">Started</dt><dd className="mt-1">{session.started_at ? formatDate(session.started_at) : "Not started"}</dd></div>
@@ -229,7 +224,7 @@ export function AgentTesting({
                       {messages.length === 0 ? <p className="mt-2 text-sm text-muted-foreground">No transcript messages have been saved.</p> : (
                         <ol className="mt-3 max-h-96 space-y-3 overflow-y-auto rounded-xl border bg-muted/30 p-3" aria-label="Session transcript">
                           {messages.map((message) => (
-                            <li key={message.id} className="rounded-lg bg-card p-3 text-sm">
+                            <li key={message.id} className="rounded-xl bg-card p-3 text-sm">
                               <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">{message.role === "assistant" ? "Agent" : "Caller"}</p>
                               <p className="whitespace-pre-wrap break-words leading-6">{message.content}</p>
                             </li>

@@ -34,7 +34,10 @@ async def admin_client(client):
 
 
 @pytest.fixture
-async def client():
+async def client(monkeypatch):
+    monkeypatch.setenv("ALLOW_DEV_LOGIN", "false")
+    monkeypatch.setenv("APP_ORIGIN", "http://localhost:3000")
+    monkeypatch.setenv("ENVIRONMENT", "development")
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.drop_all)
         await connection.run_sync(Base.metadata.create_all)
@@ -117,34 +120,101 @@ async def test_login_rejects_unknown_wrong_and_corrupt_credentials(client):
 
 
 @pytest.mark.anyio
-async def test_dev_login_shortcut_is_removed_even_when_enabled(client, monkeypatch):
+async def test_dev_login_requires_development_and_explicit_opt_in(client, monkeypatch):
     monkeypatch.setenv("ENVIRONMENT", "development")
-    monkeypatch.setenv("ALLOW_DEV_LOGIN", "true")
-    dev_email = f"{uuid.uuid4()}@example.com"
-    dev_password = "correct horse battery staple"
-    admin_email = f"{uuid.uuid4()}@example.com"
-    admin_password = "another correct horse battery staple"
-    monkeypatch.setenv("DEV_USER_EMAIL", dev_email)
-    monkeypatch.setenv("DEV_USER_PASSWORD", dev_password)
-    monkeypatch.setenv("ADMIN_EMAIL", admin_email)
-    monkeypatch.setenv("ADMIN_PASSWORD", admin_password)
-
-    assert (await client.post("/auth/register", json={"email": dev_email, "password": dev_password})).status_code == 201
-    assert (await client.post("/auth/register", json={"email": admin_email, "password": admin_password})).status_code == 201
-    async with Session() as db:
-        admin = await db.scalar(select(User).where(User.email == admin_email))
-        assert admin is not None
-        admin.role = "admin"
-        await db.commit()
-
     assert (await client.get("/auth/dev-login/available")).status_code == 404
-    for role in ("user", "admin"):
-        for headers in (None, {"Origin": "http://localhost:3000"}, {"Origin": "https://attacker.example"}):
-            response = await client.post("/auth/dev-login", json={"role": role}, headers=headers)
+    disabled = await client.post(
+        "/auth/dev-login", json={"role": "user"}, headers={"Origin": "http://localhost:3000"}
+    )
+    assert disabled.status_code == 404
+    monkeypatch.setenv("ALLOW_DEV_LOGIN", "true")
+    for environment in ("", "production", "test"):
+        monkeypatch.setenv("ENVIRONMENT", environment)
+        assert (await client.get("/auth/dev-login/available")).status_code == 404
+        for role in ("user", "admin"):
+            response = await client.post(
+                "/auth/dev-login", json={"role": role}, headers={"Origin": "http://localhost:3000"}
+            )
             assert response.status_code == 404
             assert "set-cookie" not in response.headers
     assert client.cookies.get(COOKIE) is None
 
+
+@pytest.mark.anyio
+async def test_dev_login_requires_exact_origin_and_issues_cookie_and_csrf(client, monkeypatch):
+    monkeypatch.setenv("ALLOW_DEV_LOGIN", "true")
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    accounts = {
+        "user": (f"{uuid.uuid4()}@example.com", "correct horse battery staple"),
+        "admin": (f"{uuid.uuid4()}@example.com", "another correct horse battery staple"),
+    }
+    async with Session() as db:
+        for role, (email, password) in accounts.items():
+            db.add(User(email=email, password_hash=PasswordHasher().hash(password), role=role))
+        await db.commit()
+    monkeypatch.setenv("DEV_USER_EMAIL", accounts["user"][0])
+    monkeypatch.setenv("DEV_USER_PASSWORD", accounts["user"][1])
+    monkeypatch.setenv("ADMIN_EMAIL", accounts["admin"][0])
+    monkeypatch.setenv("ADMIN_PASSWORD", accounts["admin"][1])
+
+    assert (await client.get("/auth/dev-login/available")).json() == {"enabled": True}
+    for origin in (None, "http://localhost:3000.evil", "http://localhost:3000/"):
+        headers = {} if origin is None else {"Origin": origin}
+        response = await client.post("/auth/dev-login", json={"role": "admin"}, headers=headers)
+        assert response.status_code == 403
+        assert "set-cookie" not in response.headers
+    monkeypatch.setenv("DEV_USER_PASSWORD", "wrong seeded password")
+    wrong_password = await client.post(
+        "/auth/dev-login", json={"role": "user"}, headers={"Origin": "http://localhost:3000"}
+    )
+    assert wrong_password.status_code == 401
+    assert "set-cookie" not in wrong_password.headers
+    monkeypatch.setenv("DEV_USER_PASSWORD", accounts["user"][1])
+
+
+    for role, (email, _) in accounts.items():
+        response = await client.post(
+            "/auth/dev-login", json={"role": role}, headers={"Origin": "http://localhost:3000"}
+        )
+        assert response.status_code == 200
+        assert response.json()["role"] == role
+        assert response.json()["email"] == email
+        assert response.json()["csrf_token"]
+        cookie = response.headers["set-cookie"].lower()
+        assert cookie.startswith(f"{COOKIE}=")
+        assert "max-age=43200" in cookie
+
+        assert "httponly" in cookie and "samesite=lax" in cookie
+        assert "secure" not in cookie
+        assert (await client.get("/auth/me")).json()["email"] == email
+        logout = await client.post(
+            "/auth/logout",
+            headers={"Origin": "http://localhost:3000", "X-CSRF-Token": response.json()["csrf_token"]},
+        )
+        assert logout.status_code == 204
+        assert (await client.get("/auth/me")).status_code == 401
+
+
+@pytest.mark.anyio
+async def test_dev_admin_login_does_not_promote_existing_user(client, monkeypatch):
+    monkeypatch.setenv("ALLOW_DEV_LOGIN", "true")
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    email = f"{uuid.uuid4()}@example.com"
+    password = "correct horse battery staple"
+    async with Session() as db:
+        user = User(email=email, password_hash=PasswordHasher().hash(password), role="user")
+        db.add(user)
+        await db.commit()
+    monkeypatch.setenv("ADMIN_EMAIL", email)
+    monkeypatch.setenv("ADMIN_PASSWORD", password)
+
+    response = await client.post(
+        "/auth/dev-login", json={"role": "admin"}, headers={"Origin": "http://localhost:3000"}
+    )
+    assert response.status_code == 401
+    async with Session() as db:
+        user = await db.scalar(select(User).where(User.email == email))
+        assert user is not None and user.role == "user"
 
 @pytest.mark.anyio
 async def test_session_cookie_rejects_tampering_and_expiry(client, monkeypatch):

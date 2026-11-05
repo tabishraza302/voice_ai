@@ -15,8 +15,8 @@ const SAFE_METHODS: Record<string, true> = { GET: true, HEAD: true, OPTIONS: tru
 
 function requiresCsrf(route: string, method: string): boolean {
   if (SAFE_METHODS[method]) return false;
-  // Login/registration establish the session; they cannot present a token.
-  if (route === "/auth/login" || route === "/auth/register") return false;
+  // Session-establishing routes cannot present a CSRF token beforehand.
+  if (route === "/auth/login" || route === "/auth/register" || route === "/auth/dev-login") return false;
   // Public calls and signaling are authorized by single-use grants and
   // renegotiation tokens, not by the owner's cookie. Requiring /auth/me here
   // would make anonymous callers fail before WebRTC starts.
@@ -120,6 +120,11 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const payload = await responsePayload(response);
   if (!response.ok) throwResponseError(response, payload);
   return payload as T;
+}
+
+export function apiErrorText(reason: unknown, fallback: string): string {
+  if (!(reason instanceof ApiError)) return fallback;
+  return reason.status > 0 ? `${reason.message} (HTTP ${reason.status})` : reason.message;
 }
 
 export function apiFieldErrors(error: ApiError): Record<string, string[]> {

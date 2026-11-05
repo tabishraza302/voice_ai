@@ -4,7 +4,7 @@ import { cn } from "./utils";
 type CardProps = HTMLAttributes<HTMLDivElement>;
 
 export function Card({ className, ...props }: CardProps) {
-  return <section className={cn("rounded-2xl border bg-card text-card-foreground shadow-panel", className)} {...props} />;
+  return <section className={cn("rounded-2xl border bg-card text-card-foreground", className)} {...props} />;
 }
 
 export function CardHeader({ className, ...props }: CardProps) {

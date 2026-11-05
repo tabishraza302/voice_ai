@@ -2,7 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useState, type FormEvent } from "react";
-import { ApiError, api } from "@/lib/api";
+import { api, apiErrorText } from "@/lib/api";
 import type { CurrentUser } from "@/lib/types";
 import { AuthFrame } from "@/components/ui/auth-frame";
 import { Button } from "@/components/ui/button";
@@ -34,11 +34,9 @@ export default function RegisterPage() {
       router.replace(user.role === "admin" ? "/admin" : "/dashboard");
       router.refresh();
     } catch (reason) {
-      setError(reason instanceof ApiError
-        ? reason.status > 0 ? `${reason.message} (HTTP ${reason.status})` : reason.message
-        : created
-          ? "Your account was created, but sign-in could not finish. Sign in with your new account."
-          : "Could not create your account. Try again.");
+      setError(apiErrorText(reason, created
+        ? "Your account was created, but sign-in could not finish. Sign in with your new account."
+        : "Could not create your account. Try again."));
       setPending(false);
     }
   }

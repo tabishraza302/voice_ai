@@ -12,6 +12,7 @@ import {
   type CallTransportEvent,
   type SmallWebRtcCall,
 } from "../lib/webrtc";
+import { Button } from "./ui/button";
 
 export type { CallSessionGrant } from "../lib/webrtc";
 
@@ -352,15 +353,15 @@ export function CallPanel({ createCall, title, onEnded }: CallPanelProps) {
     (state.kind === "connecting" || state.kind === "active") && state.audioBlocked;
 
   return (
-    <section className="w-full rounded-3xl border border-stone-200 bg-white p-5 text-stone-900 shadow-[0_16px_40px_-28px_rgba(24,39,34,0.35)] sm:p-7" aria-label={`Call with ${title}`}>
+    <section className="w-full rounded-2xl border bg-card p-5 text-card-foreground sm:p-7" aria-label={`Call with ${title}`}>
       <audio ref={audioRef} autoPlay playsInline className="sr-only" aria-label="Call audio" />
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
-          <h2 className="text-xl font-semibold tracking-[-0.02em]">{title}</h2>
-          <p className="mt-1 text-sm text-stone-600">A voice conversation with captions.</p>
+          <h2 className="text-xl font-semibold tracking-tight">{title}</h2>
+          <p className="mt-1 text-sm text-muted-foreground">A voice conversation with captions.</p>
         </div>
         {active ? (
-          <time className="rounded-full bg-stone-100 px-3 py-1.5 font-mono text-sm tabular-nums text-stone-700" aria-label={`Call time ${formatDuration(elapsedSeconds)}`}>
+          <time className="rounded-xl bg-muted px-3 py-1.5 text-sm tabular-nums text-muted-foreground" aria-label={`Call time ${formatDuration(elapsedSeconds)}`}>
             {formatDuration(elapsedSeconds)}
           </time>
         ) : null}
@@ -368,22 +369,22 @@ export function CallPanel({ createCall, title, onEnded }: CallPanelProps) {
 
       <div className="mt-6 flex items-center gap-3" role="status" aria-live="polite" aria-atomic="true">
         <span
-          className={`h-2.5 w-2.5 rounded-full ${state.kind === "active" && state.speech === "speaking" ? "bg-emerald-600" : isBusy(state) ? "bg-emerald-500" : "bg-stone-400"}`}
+          className={`h-2.5 w-2.5 rounded-full ${state.kind === "active" && state.speech === "speaking" ? "bg-primary" : isBusy(state) ? "bg-primary/60" : "bg-muted-foreground/40"}`}
           aria-hidden="true"
         />
-        <span className="text-sm font-medium text-stone-700">{statusLabel}</span>
+        <span className="text-sm font-medium text-foreground">{statusLabel}</span>
       </div>
 
-      <div className="mt-5 min-h-40 max-h-72 space-y-3 overflow-y-auto rounded-2xl bg-stone-50 p-4" aria-label="Live captions" aria-live="polite" aria-relevant="additions text">
+      <div className="mt-5 min-h-40 max-h-72 space-y-3 overflow-y-auto rounded-2xl bg-muted/40 p-4" aria-label="Live captions" aria-live="polite" aria-relevant="additions text">
         {currentCaptions.length > 0 ? (
           currentCaptions.map((caption) => (
-            <p key={caption.id} className="text-sm leading-6 text-stone-700">
-              <span className="mr-2 font-semibold text-emerald-800">{caption.role === "assistant" ? "Agent" : "You"}</span>
+            <p key={caption.id} className="text-sm leading-6 text-foreground">
+              <span className="mr-2 font-semibold text-primary">{caption.role === "assistant" ? "Agent" : "You"}</span>
               {caption.text}
             </p>
           ))
         ) : (
-          <p className="text-sm leading-6 text-stone-500">
+          <p className="text-sm leading-6 text-muted-foreground">
             {state.kind === "ended"
               ? "No captions were received during this call."
               : state.kind === "failed"
@@ -394,10 +395,10 @@ export function CallPanel({ createCall, title, onEnded }: CallPanelProps) {
       </div>
 
       {state.kind === "error" || state.kind === "failed" ? (
-        <p className="mt-4 text-sm text-rose-800" role="alert">{state.message}</p>
+        <p className="mt-4 text-sm text-destructive" role="alert">{state.message}</p>
       ) : null}
       {state.kind === "ended" ? (
-        <p className="mt-4 text-sm text-stone-600" role="status">
+        <p className="mt-4 text-sm text-muted-foreground" role="status">
           {state.reason === "caller"
             ? "You ended this call."
             : state.reason === "completed"
@@ -408,41 +409,24 @@ export function CallPanel({ createCall, title, onEnded }: CallPanelProps) {
 
       <div className="mt-5 flex flex-wrap gap-3">
         {!isBusy(state) ? (
-          <button
-            type="button"
-            onClick={() => void startCall()}
-            className="inline-flex min-h-11 items-center justify-center rounded-full bg-emerald-800 px-5 text-sm font-semibold text-white transition-colors hover:bg-emerald-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-700 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60"
-          >
+          <Button onClick={() => void startCall()}>
             {state.kind === "ready" ? "Start call" : "Start another call"}
-          </button>
+          </Button>
         ) : null}
         {active ? (
-          <button
-            type="button"
-            onClick={toggleMute}
-            aria-pressed={state.muted}
-            className="inline-flex min-h-11 items-center justify-center rounded-full border border-stone-300 px-5 text-sm font-semibold text-stone-800 transition-colors hover:bg-stone-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-700 focus-visible:ring-offset-2"
-          >
+          <Button variant="outline" onClick={toggleMute} aria-pressed={state.muted}>
             {state.muted ? "Unmute microphone" : "Mute microphone"}
-          </button>
+          </Button>
         ) : null}
         {canEnd ? (
-          <button
-            type="button"
-            onClick={() => void endCall()}
-            className="inline-flex min-h-11 items-center justify-center rounded-full border border-rose-300 px-5 text-sm font-semibold text-rose-800 transition-colors hover:bg-rose-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-700 focus-visible:ring-offset-2"
-          >
+          <Button variant="outline" className="border-destructive/40 text-destructive hover:bg-destructive/10" onClick={() => void endCall()}>
             {state.kind === "connecting" ? "Cancel connection" : "End call"}
-          </button>
+          </Button>
         ) : null}
         {canEnableAudio ? (
-          <button
-            type="button"
-            onClick={() => void connectionRef.current?.enableAudio()}
-            className="inline-flex min-h-11 items-center justify-center rounded-full border border-stone-300 px-5 text-sm font-semibold text-stone-800 transition-colors hover:bg-stone-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-700 focus-visible:ring-offset-2"
-          >
+          <Button variant="outline" onClick={() => void connectionRef.current?.enableAudio()}>
             Enable call audio
-          </button>
+          </Button>
         ) : null}
       </div>
     </section>

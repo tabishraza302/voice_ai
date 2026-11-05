@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { Button } from "../ui/button";
 
 export type LoadState<T> =
   | { kind: "loading" }
@@ -48,7 +49,7 @@ export function AdminPage({
 
 export function AdminLoading({ label }: { label: string }) {
   return (
-    <div className="rounded-lg border border-border bg-card p-5" aria-busy="true" aria-live="polite">
+    <div className="rounded-2xl border border-border bg-card p-5" aria-busy="true" aria-live="polite">
       <p className="text-sm text-muted-foreground">{label}</p>
       <div className="mt-5 space-y-3" aria-hidden="true">
         <div className="h-4 w-2/3 animate-pulse rounded bg-muted motion-reduce:animate-none" />
@@ -67,15 +68,11 @@ export function AdminLoadError({
   onRetry: () => void;
 }) {
   return (
-    <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-5" role="alert">
+    <div className="rounded-2xl border border-destructive/30 bg-destructive/5 p-5" role="alert">
       <p className="font-medium text-destructive">{message}</p>
-      <button
-        type="button"
-        onClick={onRetry}
-        className="mt-4 inline-flex min-h-10 items-center justify-center rounded-md border border-border bg-background px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60"
-      >
+      <Button variant="outline" className="mt-4" onClick={onRetry}>
         Try again
-      </button>
+      </Button>
     </div>
   );
 }
@@ -90,7 +87,7 @@ export function AdminNotice({ notice }: { notice: Notice }) {
 
   return (
     <p
-      className={`rounded-md border px-4 py-3 text-sm ${style}`}
+      className={`rounded-xl border px-4 py-3 text-sm ${style}`}
       role={notice.kind === "error" ? "alert" : "status"}
       aria-live={notice.kind === "error" ? "assertive" : "polite"}
     >
@@ -112,9 +109,3 @@ export function formatDateTime(value: string) {
 export function formatCount(value: number) {
   return new Intl.NumberFormat().format(value);
 }
-
-export const inputClassName =
-  "min-h-11 w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60";
-
-export const primaryButtonClassName =
-  "inline-flex min-h-11 items-center justify-center rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground shadow-sm transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60";
