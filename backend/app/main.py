@@ -8,6 +8,7 @@ from . import admin, agents, auth, observability, provider_catalog, sessions, si
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     observability.configure_tracing()
+    await sessions.recover_interrupted_sessions()
     yield
 
 

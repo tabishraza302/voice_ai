@@ -17,8 +17,10 @@ from sqlalchemy import (
     UniqueConstraint,
     and_,
     func,
+    inspect,
     or_,
     select,
+    update,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -305,6 +307,29 @@ async def _frozen_call_snapshot(
         "agent": _agent_snapshot(agent),
         "steps": [_step_snapshot(step) for step in steps],
     }
+
+
+async def recover_interrupted_sessions() -> None:
+    async with DbSession() as db:
+        # The backend starts before migrations on fresh installs.
+        connection = await db.connection()
+        has_sessions_table = await connection.run_sync(
+            lambda sync_connection: inspect(sync_connection).has_table(CallSession.__tablename__)
+        )
+        if not has_sessions_table:
+            return
+
+        for status, terminal_status in (("active", "failed"), ("created", "expired")):
+            await db.execute(
+                update(CallSession)
+                .where(CallSession.status == status)
+                .values(
+                    status=terminal_status,
+                    ended_at=func.coalesce(CallSession.ended_at, func.now()),
+                    updated_at=func.now(),
+                )
+            )
+        await db.commit()
 
 
 def _open_call_predicate(now: datetime):

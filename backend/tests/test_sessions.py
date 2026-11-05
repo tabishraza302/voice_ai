@@ -20,6 +20,7 @@ from app.sessions import (
     CallSession,
     SessionUnavailableError,
     SessionWriter,
+    _open_call_count,
     load_session_snapshot,
     load_signaling_context,
     set_session_status,
@@ -289,6 +290,60 @@ async def test_expired_signaling_cannot_activate_a_call(client):
         assert stored.status == "expired"
     with pytest.raises(SessionUnavailableError, match="expired to active"):
         await set_session_status(session_id, "active")
+
+
+@pytest.mark.anyio
+async def test_app_startup_expires_unusable_created_sessions_and_fails_active_sessions(client):
+    token = await login(client, f"{uuid.uuid4()}@example.com")
+    agent = await create_agent(client, token, f"restart-{uuid.uuid4().hex[:12]}")
+    session_ids = []
+    for _ in range(3):
+        response = await client.post(f"/agents/{agent['id']}/test-calls", headers=mutation_headers(token))
+        assert response.status_code == 201
+        session_ids.append(uuid.UUID(response.json()["session_id"]))
+    created_session_id, active_session_id, completed_session_id = session_ids
+    await set_session_status(active_session_id, "active")
+    await set_session_status(completed_session_id, "active")
+    await set_session_status(completed_session_id, "completed")
+
+    async with Session() as db:
+        assert await _open_call_count(db, datetime.now(timezone.utc)) == 2
+        created = await db.get(CallSession, created_session_id)
+        completed = await db.get(CallSession, completed_session_id)
+        assert created is not None
+        assert created.signaling_expires_at > datetime.now(timezone.utc)
+        assert completed is not None
+        completed_ended_at = completed.ended_at
+        assert completed_ended_at is not None
+
+    async with app.router.lifespan_context(app):
+        pass
+
+    async with Session() as db:
+        created = await db.get(CallSession, created_session_id)
+        active = await db.get(CallSession, active_session_id)
+        completed = await db.get(CallSession, completed_session_id)
+        assert created is not None
+        assert created.status == "expired"
+        assert created.ended_at is not None
+        assert active is not None
+        assert active.status == "failed"
+        assert active.ended_at is not None
+        assert completed is not None
+        assert completed.status == "completed"
+        assert completed.ended_at == completed_ended_at
+        assert await _open_call_count(db, datetime.now(timezone.utc)) == 0
+
+
+@pytest.mark.anyio
+async def test_app_startup_does_not_require_session_schema(client):
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.drop_all)
+
+    async with app.router.lifespan_context(app):
+        pass
+
+
 
 
 
