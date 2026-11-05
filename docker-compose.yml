@@ -1,0 +1,78 @@
+name: voice-agent-builder
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-voice}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-voice}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./backend/docker/postgres-init.sql:/docker-entrypoint-initdb.d/10-test-db.sql:ro
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  phoenix:
+    image: arizephoenix/phoenix:version-20.23.0
+    restart: unless-stopped
+    environment:
+      PHOENIX_WORKING_DIR: /data
+    volumes:
+      - phoenix-data:/data
+    # Phoenix stays on the host loopback. Do not publish it publicly; owners
+    # use the authenticated /sessions/{id}/trace route instead.
+    ports:
+      - "127.0.0.1:${PHOENIX_PORT:-6006}:6006"
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-voice}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-voice}
+      # pytest always overrides DATABASE_URL with this disposable database.
+      TEST_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-voice}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/voice_test
+      APP_ORIGIN: ${APP_ORIGIN:-http://localhost:3000}
+      # Use defaults only when unset; an explicit empty value disables tracing
+      # without changing the compose file.
+      PHOENIX_OTLP_ENDPOINT: ${PHOENIX_OTLP_ENDPOINT-http://phoenix:6006/v1/traces}
+      PHOENIX_URL: ${PHOENIX_URL-http://phoenix:6006}
+      PHOENIX_PROJECT_NAME: ${PHOENIX_PROJECT_NAME:-voice-agent}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      phoenix:
+        condition: service_started
+    ports:
+      - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/openapi.json', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        BACKEND_URL: http://backend:8000
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+
+volumes:
+  postgres-data:
+  phoenix-data:

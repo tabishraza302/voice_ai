@@ -1,12 +1,20 @@
 # Local secrets and tooling — never committed
 .env
 .env.*
+!.env.example
 .omp/
+.superpowers/
+.omp_*
 
 # Generated state
 .venv/
 __pycache__/
 *.py[cod]
+.pytest_cache/
 .cache/
 data/
 logs/
+frontend/.next/
+frontend/node_modules/
+frontend/tsconfig.tsbuildinfo
+.DS_Store
