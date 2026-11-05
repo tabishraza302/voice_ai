@@ -1,8 +1,0 @@
-# Project-local uv cache.
-#
-# The shared cache at ~/.cache/uv on this host contains a root-owned
-# subdirectory (wheels-v6/pypi/sounddevice) that uv cannot write to, so any
-# command that needs to build a wheel there fails with "Permission denied".
-# A project-local cache sidesteps it and keeps the whole environment
-# reproducible inside the repo.
-cache-dir = ".cache/uv"
