@@ -9,21 +9,13 @@ import { Button, buttonClassName } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
 import { OwnerShell } from "@/app/dashboard/owner-shell";
-
-function toSlug(value: string): string {
-  return value.toLocaleLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-}
 
 export default function NewAgentPage() {
   const router = useRouter();
   const [user, setUser] = useState<CurrentUser | null>(null);
   const [checking, setChecking] = useState(true);
   const [name, setName] = useState("");
-  const [slug, setSlug] = useState("");
-  const [slugEdited, setSlugEdited] = useState(false);
-  const [description, setDescription] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
@@ -55,7 +47,7 @@ export default function NewAgentPage() {
     try {
       const agent = await api<Agent>("/agents", {
         method: "POST",
-        body: JSON.stringify({ name: name.trim(), slug: slug.trim(), description: description.trim() || null }),
+        body: JSON.stringify({ name: name.trim() }),
       });
       router.replace(`/agents/${agent.id}`);
     } catch (reason) {
@@ -73,7 +65,7 @@ export default function NewAgentPage() {
         <div className="mt-7 space-y-2">
           <h1 className="text-3xl font-semibold tracking-tight">Start with a draft</h1>
           <p className="max-w-2xl text-sm leading-6 text-muted-foreground">
-            Save a name and a unique URL slug now. Voice settings and questions can be added later.
+            Name your agent to start configuring its voice, instructions, and questions.
           </p>
         </div>
         <Card className="mt-7">
@@ -97,50 +89,12 @@ export default function NewAgentPage() {
                     maxLength={120}
                     required
                     value={name}
-                    onChange={(event) => {
-                      const next = event.currentTarget.value;
-                      setName(next);
-                      if (!slugEdited) setSlug(toSlug(next));
-                    }}
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="agent-slug">Public URL slug</Label>
-                  <div className="flex min-h-11 items-center gap-2 rounded-xl border bg-background px-3.5 focus-within:ring-2 focus-within:ring-ring">
-                    <span className="shrink-0 text-sm text-muted-foreground">/a/</span>
-                    <input
-                      id="agent-slug"
-                      name="slug"
-                      className="min-w-0 flex-1 bg-transparent py-2 text-sm outline-none"
-                      autoComplete="off"
-                      maxLength={80}
-                      pattern="[a-z0-9]+(-[a-z0-9]+)*"
-                      required
-                      value={slug}
-                      onChange={(event) => {
-                        setSlugEdited(true);
-                        setSlug(event.currentTarget.value.toLocaleLowerCase().replace(/[^a-z0-9-]/g, ""));
-                      }}
-                      aria-describedby="agent-slug-help"
-                    />
-                  </div>
-                  <p id="agent-slug-help" className="text-sm leading-5 text-muted-foreground">
-                    Use lowercase letters, numbers, and single hyphens. Slugs are unique.
-                  </p>
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="agent-description">Description <span className="font-normal text-muted-foreground">(optional)</span></Label>
-                  <Textarea
-                    id="agent-description"
-                    name="description"
-                    maxLength={500}
-                    value={description}
-                    onChange={(event) => setDescription(event.currentTarget.value)}
+                    onChange={(event) => setName(event.currentTarget.value)}
                   />
                 </div>
                 <div className="flex flex-col-reverse gap-3 border-t pt-5 sm:flex-row sm:justify-end">
                   <Link href="/dashboard" className={buttonClassName("outline")}>Cancel</Link>
-                  <Button type="submit" disabled={saving || !name.trim() || !slug.trim()}>
+                  <Button type="submit" disabled={saving || !name.trim()}>
                     {saving ? "Saving draft..." : "Create draft"}
                   </Button>
                 </div>

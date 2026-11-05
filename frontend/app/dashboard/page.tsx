@@ -3,23 +3,20 @@
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ApiError, api } from "@/lib/api";
-import { statusLabels, statusVariant } from "@/lib/agent-status";
+import { ApiError, api, apiErrorText } from "@/lib/api";
 import type { Agent, CallSession, CurrentUser } from "@/lib/types";
-import { Badge } from "@/components/ui/badge";
 import { Button, buttonClassName } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Select } from "@/components/ui/select";
 import { OwnerShell } from "./owner-shell";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 
 interface AgentActivity {
   agent: Agent;
   sessions: CallSession[];
 }
 
-type StatusFilter = "all" | Agent["status"];
 
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(value));
@@ -30,10 +27,27 @@ export default function DashboardPage() {
   const [user, setUser] = useState<CurrentUser | null>(null);
   const [activity, setActivity] = useState<AgentActivity[]>([]);
   const [query, setQuery] = useState("");
-  const [status, setStatus] = useState<StatusFilter>("all");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [reload, setReload] = useState(0);
+  const [agentToDelete, setAgentToDelete] = useState<Agent | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  async function deleteAgent() {
+    if (!agentToDelete) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await api<void>(`/agents/${agentToDelete.id}`, { method: "DELETE" });
+      setAgentToDelete(null);
+      setReload((val) => val + 1);
+    } catch (reason) {
+      setDeleteError(apiErrorText(reason, "Could not delete this agent. Active calls prevent deletion."));
+    } finally {
+      setDeleting(false);
+    }
+  }
 
   useEffect(() => {
     const controller = new AbortController();
@@ -82,14 +96,12 @@ export default function DashboardPage() {
   const filtered = useMemo(() => {
     const search = query.trim().toLocaleLowerCase();
     return activity.filter(({ agent }) => {
-      const matchesStatus = status === "all" || agent.status === status;
-      const searchable = `${agent.name} ${agent.slug} ${agent.description ?? ""}`.toLocaleLowerCase();
-      return matchesStatus && (!search || searchable.includes(search));
+      const searchable = agent.name.toLocaleLowerCase();
+      return !search || searchable.includes(search);
     });
-  }, [activity, query, status]);
+  }, [activity, query]);
 
   const totalSessions = activity.reduce((total, item) => total + item.sessions.length, 0);
-  const publishedCount = activity.filter(({ agent }) => agent.status === "published").length;
 
   return (
     <OwnerShell active="dashboard" email={user?.email}>
@@ -108,8 +120,8 @@ export default function DashboardPage() {
 
         {loading ? (
           <section className="mt-8 space-y-5" aria-label="Loading workspace" aria-busy="true">
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-              {["agents", "published", "sessions"].map((item) => (
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              {["agents", "sessions"].map((item) => (
                 <div key={item} className="h-24 animate-pulse rounded-2xl border bg-card" />
               ))}
             </div>
@@ -125,14 +137,10 @@ export default function DashboardPage() {
           </Card>
         ) : user ? (
           <>
-            <section className="mt-8 grid grid-cols-1 gap-px overflow-hidden rounded-2xl border bg-border sm:grid-cols-3" aria-label="Workspace counts">
+            <section className="mt-8 grid grid-cols-1 gap-px overflow-hidden rounded-2xl border bg-border sm:grid-cols-2" aria-label="Workspace counts">
               <div className="bg-card p-5 sm:p-6">
                 <p className="text-sm text-muted-foreground">Agents</p>
                 <p className="mt-2 text-3xl font-semibold tabular-nums">{activity.length}</p>
-              </div>
-              <div className="bg-card p-5 sm:p-6">
-                <p className="text-sm text-muted-foreground">Published</p>
-                <p className="mt-2 text-3xl font-semibold tabular-nums">{publishedCount}</p>
               </div>
               <div className="bg-card p-5 sm:p-6">
                 <p className="text-sm text-muted-foreground">Sessions</p>
@@ -148,23 +156,9 @@ export default function DashboardPage() {
                     {filtered.length} of {activity.length} agents
                   </p>
                 </div>
-                <div className="grid grid-cols-1 gap-3 sm:grid-cols-[minmax(14rem,1fr)_10rem]">
-                  <div className="space-y-1.5">
-                    <Label htmlFor="agent-search">Search agents</Label>
-                    <Input id="agent-search" type="search" value={query} onChange={(event) => setQuery(event.currentTarget.value)} />
-                  </div>
-                  <div className="space-y-1.5">
-                    <Label htmlFor="agent-status">Status</Label>
-                    <Select id="agent-status" value={status} onChange={(event) => {
-                      const value = event.currentTarget.value;
-                      setStatus(value === "draft" || value === "published" || value === "suspended" ? value : "all");
-                    }}>
-                      <option value="all">All statuses</option>
-                      <option value="draft">Draft</option>
-                      <option value="published">Published</option>
-                      <option value="suspended">Suspended</option>
-                    </Select>
-                  </div>
+                <div className="w-full max-w-xs space-y-1.5">
+                  <Label htmlFor="agent-search">Search agents</Label>
+                  <Input id="agent-search" type="search" value={query} onChange={(event) => setQuery(event.currentTarget.value)} />
                 </div>
               </div>
 
@@ -181,9 +175,9 @@ export default function DashboardPage() {
               ) : filtered.length === 0 ? (
                 <div className="py-14 text-center">
                   <h3 className="text-lg font-semibold">No matching agents</h3>
-                  <p className="mt-2 text-sm text-muted-foreground">Change the search or status filter.</p>
-                  <Button className="mt-4" variant="outline" onClick={() => { setQuery(""); setStatus("all"); }}>
-                    Clear filters
+                  <p className="mt-2 text-sm text-muted-foreground">Try a different search term.</p>
+                  <Button className="mt-4" variant="outline" onClick={() => setQuery("")}>
+                    Clear search
                   </Button>
                 </div>
               ) : (
@@ -193,25 +187,33 @@ export default function DashboardPage() {
                     const activeCalls = sessions.filter((session) => session.status === "created" || session.status === "active").length;
                     return (
                       <li key={agent.id}>
-                        <article className="grid grid-cols-1 gap-3 py-5 sm:grid-cols-[minmax(0,1fr)_9rem_10rem_auto] sm:items-center sm:gap-6">
+                        <article className="grid grid-cols-1 gap-3 py-5 sm:grid-cols-[minmax(0,1fr)_12rem_auto] sm:items-center sm:gap-6">
                           <div className="min-w-0">
                             <Link href={`/agents/${agent.id}`} className="rounded-sm text-base font-semibold tracking-tight underline-offset-4 hover:text-primary hover:underline">
                               {agent.name}
                             </Link>
-                            <p className="mt-1 truncate text-sm text-muted-foreground">/{agent.slug}</p>
-                            {agent.description ? <p className="mt-2 line-clamp-2 text-sm leading-5 text-muted-foreground">{agent.description}</p> : null}
-                          </div>
-                          <div>
-                            <Badge variant={statusVariant(agent.status)}>{statusLabels[agent.status]}</Badge>
-                            {activeCalls > 0 ? <p className="mt-2 text-xs text-muted-foreground">{activeCalls} active call{activeCalls === 1 ? "" : "s"}</p> : null}
+                            {activeCalls > 0 ? <p className="mt-1 text-xs text-muted-foreground">{activeCalls} active call{activeCalls === 1 ? "" : "s"}</p> : null}
                           </div>
                           <div className="min-w-0 text-sm">
                             <p className="font-medium tabular-nums text-foreground">{sessions.length} session{sessions.length === 1 ? "" : "s"}</p>
                             <p className="mt-1 text-xs text-muted-foreground">{latest ? `Last activity ${formatDate(latest)}` : "No sessions yet"}</p>
                           </div>
-                          <Link href={`/agents/${agent.id}`} className="rounded-xl px-3 py-2 text-sm font-semibold text-primary underline-offset-4 hover:underline sm:justify-self-end">
-                            Edit agent
-                          </Link>
+                          <div className="flex flex-wrap items-center gap-2 sm:justify-self-end">
+                            <Link href={`/agents/${agent.id}`} className={buttonClassName("outline", "sm")}>
+                              Edit agent
+                            </Link>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                              onClick={() => {
+                                setDeleteError(null);
+                                setAgentToDelete(agent);
+                              }}
+                            >
+                              Delete agent
+                            </Button>
+                          </div>
                         </article>
                       </li>
                     );
@@ -222,6 +224,24 @@ export default function DashboardPage() {
           </>
         ) : null}
       </main>
+            <ConfirmDialog
+              open={agentToDelete !== null}
+              title={agentToDelete ? `Delete "${agentToDelete.name}"?` : "Delete agent?"}
+              description={
+                deleteError
+                  ? deleteError
+                  : "Deleting permanently removes this agent and its saved sessions and answers. Active calls prevent deletion."
+              }
+              confirmLabel="Delete agent"
+              pending={deleting}
+              onConfirm={() => void deleteAgent()}
+              onOpenChange={(open) => {
+                if (!deleting && !open) {
+                  setAgentToDelete(null);
+                  setDeleteError(null);
+                }
+              }}
+            />
     </OwnerShell>
   );
 }

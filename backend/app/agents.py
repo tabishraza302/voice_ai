@@ -71,7 +71,6 @@ class AgentPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str | None = Field(default=None, min_length=1, max_length=120)
-    slug: str | None = Field(default=None, min_length=1, max_length=80)
     description: str | None = Field(default=None, max_length=500)
     instructions: str | None = Field(default=None, max_length=8000)
     languages: list[str] | None = Field(default=None, max_length=12)
@@ -94,15 +93,6 @@ class AgentPatch(BaseModel):
             raise ValueError("Name cannot be blank")
         return value
 
-    @field_validator("slug")
-    @classmethod
-    def validate_slug(cls, value: str | None) -> str | None:
-        if value is None:
-            raise ValueError("Slug cannot be null")
-        value = value.strip().casefold()
-        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", value):
-            raise ValueError("Slug must contain lowercase letters, numbers, and single hyphens")
-        return value
 
     @field_validator(
         "description",
@@ -146,10 +136,29 @@ class AgentPatch(BaseModel):
         return value
 
 
+def generate_slug(name: str) -> str:
+    base = re.sub(r"[^a-z0-9]+", "-", name.lower().strip()).strip("-")
+    if not base:
+        base = "agent"
+    base = base[:68].rstrip("-")
+    suffix = uuid.uuid4().hex[:8]
+    return f"{base}-{suffix}"
+
+
 class AgentCreate(AgentPatch):
     name: str = Field(min_length=1, max_length=120)
-    slug: str = Field(min_length=1, max_length=80)
+    slug: str | None = Field(default=None, min_length=1, max_length=80)
     languages: list[str] = Field(default_factory=list, max_length=12)
+
+    @field_validator("slug")
+    @classmethod
+    def validate_slug(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip().casefold()
+        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", value):
+            raise ValueError("Slug must contain lowercase letters, numbers, and single hyphens")
+        return value
 
 
 class AgentRead(BaseModel):
@@ -256,7 +265,10 @@ async def create_agent(
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(csrf)],
 ):
-    agent = Agent(id=uuid.uuid4(), owner_id=user.id, **data.model_dump())
+    payload = data.model_dump()
+    if not payload.get("slug"):
+        payload["slug"] = generate_slug(data.name)
+    agent = Agent(id=uuid.uuid4(), owner_id=user.id, **payload)
     db.add(agent)
     await _commit_agent(db, agent)
     await db.refresh(agent)
