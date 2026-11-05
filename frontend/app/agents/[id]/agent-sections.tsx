@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { TtsVoiceSelect, formatProviderName, type TtsProviderOption } from "@/components/ui/tts-voice-select";
 
 export type AgentDraft = Pick<Agent,
   | "name"
@@ -68,23 +69,35 @@ export function AgentPipelineToolbar({
   onRetryCatalog: () => void;
 }) {
   const openAiAvailableModels = catalog?.openai.models.filter((model) => model.available) ?? [];
-  const availableTtsProviders = catalog?.tts_providers.filter((provider) => provider.available) ?? [];
+  const allCatalogTtsProviders = catalog?.tts_providers ?? [];
 
-  const allVoices = useMemo(() => {
-    return availableTtsProviders.flatMap((provider) =>
-      provider.models.flatMap((model) =>
+  const ttsProviders: TtsProviderOption[] = useMemo(() => {
+    return allCatalogTtsProviders.map((provider) => ({
+      provider: provider.provider,
+      label: formatProviderName(provider.provider),
+      available: provider.available,
+      error: provider.error,
+      sampleUrl: provider.sample_url,
+      voices: provider.models.flatMap((model) =>
         model.voices
           .filter((voice) => voice.available)
           .map((voice) => ({
             provider: provider.provider,
+            providerLabel: formatProviderName(provider.provider),
             modelId: model.id,
             voiceId: voice.id,
+            name: voice.name,
             languages: voice.languages,
-            label: `${provider.provider === "cartesia" ? "Cartesia" : "ElevenLabs"} - ${voice.id}`,
+            sampleUrl: voice.sample_url ?? provider.sample_url,
+            label: `${formatProviderName(provider.provider)} - ${voice.name ? `${voice.name} (${voice.id})` : voice.id}`,
           }))
-      )
-    );
-  }, [availableTtsProviders]);
+      ),
+    }));
+  }, [allCatalogTtsProviders]);
+
+  const allVoices = useMemo(() => {
+    return ttsProviders.flatMap((p) => p.voices);
+  }, [ttsProviders]);
 
   const currentVoice = allVoices.find((v) => v.voiceId === draft.voice_id);
   const supportedLanguages = useMemo(() => {
@@ -95,17 +108,14 @@ export function AgentPipelineToolbar({
 
   return (
     <div className="rounded-2xl border bg-card/75 p-4 sm:p-5">
-      <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h3 className="text-sm font-semibold tracking-tight text-foreground">AI Pipeline & Voice</h3>
-          <p className="text-xs text-muted-foreground">Select speech recognition, language model, voice, and call language.</p>
-        </div>
-        {catalogError ? (
+      {catalogError ? (
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <span className="text-xs text-amber-600">Could not load provider catalog</span>
           <Button variant="outline" size="sm" onClick={onRetryCatalog} className="text-xs text-amber-600">
             Retry Catalog
           </Button>
-        ) : null}
-      </div>
+        </div>
+      ) : null}
 
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <div className="space-y-1.5">
@@ -149,13 +159,13 @@ export function AgentPipelineToolbar({
 
         <div className="space-y-1.5">
           <Label htmlFor="toolbar-tts" className="text-xs font-medium text-muted-foreground">TTS & Voice</Label>
-          <Select
+          <TtsVoiceSelect
             id="toolbar-tts"
-            value={draft.voice_id ?? ""}
-            disabled={catalogLoading || allVoices.length === 0}
-            onChange={(e) => {
-              const val = e.currentTarget.value;
-              const found = allVoices.find((v) => v.voiceId === val);
+            value={draft.voice_id ?? null}
+            selectedProvider={draft.tts_provider}
+            providers={ttsProviders}
+            disabled={catalogLoading || ttsProviders.length === 0}
+            onSelect={(found) => {
               if (found) {
                 const nextLang =
                   draft.default_language && found.languages.includes(draft.default_language)
@@ -172,16 +182,8 @@ export function AgentPipelineToolbar({
                 onPatch({ tts_provider: null, tts_model: null, voice_id: null });
               }
             }}
-          >
-            <option value="">Select Voice</option>
-            {allVoices.map((v) => (
-              <option key={`${v.provider}-${v.voiceId}`} value={v.voiceId}>
-                {v.label}
-              </option>
-            ))}
-          </Select>
+          />
         </div>
-
         <div className="space-y-1.5">
           <Label htmlFor="toolbar-lang" className="text-xs font-medium text-muted-foreground">Language</Label>
           <Select
@@ -211,7 +213,7 @@ export function AgentPipelineToolbar({
 
 export function AgentInstructions({ draft, onPatch }: { draft: AgentDraft; onPatch: (patch: Partial<AgentDraft>) => void }) {
   return (
-    <div className="max-w-3xl space-y-5">
+    <div className="max-w-5xl space-y-5">
       <div>
         <h3 className="text-lg font-semibold">Agent instructions</h3>
         <p className="mt-1 text-sm leading-6 text-muted-foreground">Add agent-specific guidance. Global administrator policy has higher priority.</p>

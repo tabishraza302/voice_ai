@@ -70,15 +70,14 @@ def test_publishing_accepts_only_configured_provider_models_and_voice() -> None:
     assert provider_publish_errors(provider_agent(), verified_environment()) == {}
 
 
-def test_publishing_rejects_arbitrary_model_and_voice_ids() -> None:
+def test_publishing_rejects_arbitrary_model_ids() -> None:
     env = verified_environment()
-    agent = provider_agent(llm_model="model-from-user", voice_id="voice-from-user")
+    agent = provider_agent(llm_model="model-from-user", tts_model="invalid-tts-model")
 
     errors = provider_publish_errors(agent, env)
 
     assert "llm_model" in errors
-    assert "voice_id" in errors
-
+    assert "tts_model" in errors
 
 def test_publishing_fails_closed_without_provider_credentials() -> None:
     env = verified_environment()
@@ -91,14 +90,14 @@ def test_publishing_fails_closed_without_provider_credentials() -> None:
     assert "voice_id" in errors
 
 
-def test_publishing_fails_closed_without_catalog_when_credentials_are_present() -> None:
+def test_publishing_fails_closed_without_voice_id_when_credentials_are_present() -> None:
     env = verified_environment()
-    env.pop("VERIFIED_TTS_VOICE_CATALOG")
+    agent = provider_agent()
+    agent["voice_id"] = ""
 
-    errors = provider_publish_errors(provider_agent(), env)
+    errors = provider_publish_errors(agent, env)
 
     assert "voice_id" in errors
-
 
 def test_multilingual_runtime_is_not_published_until_tts_switching_is_verified() -> None:
     errors = provider_publish_errors(provider_agent(languages=["en", "hi"]), verified_environment())
@@ -106,31 +105,37 @@ def test_multilingual_runtime_is_not_published_until_tts_switching_is_verified()
     assert "languages" in errors
 
 
-def test_voice_catalog_is_scoped_to_provider_model_and_language() -> None:
+def test_voice_selection_validates_provider_model_and_language() -> None:
     env = verified_environment()
 
     assert validate_tts_voice_selection(
         provider="cartesia",
         model="sonic-3.6",
-        voice_id="cartesia-hi",
-        language="hi",
+        voice_id="any-voice",
+        language="en",
         env=env,
     ) is None
     assert validate_tts_voice_selection(
         provider="cartesia",
+        model="invalid-model",
+        voice_id="any-voice",
+        language="en",
+        env=env,
+    ) is not None
+    assert validate_tts_voice_selection(
+        provider="cartesia",
         model="sonic-3.6",
-        voice_id="cartesia-hi",
+        voice_id="",
         language="en",
         env=env,
     ) is not None
     assert validate_tts_voice_selection(
         provider="elevenlabs",
         model="sonic-3.6",
-        voice_id="cartesia-en",
+        voice_id="any-voice",
         language="en",
         env=env,
     ) is not None
-
 
 def test_call_definition_copies_frozen_snapshot_and_provider_keys() -> None:
     snapshot = {

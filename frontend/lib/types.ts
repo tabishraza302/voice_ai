@@ -29,7 +29,7 @@ export interface Agent {
   stt_model: string | null;
   llm_provider: string | null;
   llm_model: string | null;
-  tts_provider: "cartesia" | "elevenlabs" | null;
+  tts_provider: string | null;
   tts_model: string | null;
   voice_id: string | null;
   status: AgentStatus;
@@ -168,10 +168,11 @@ export interface ProviderCatalogModel {
 
 export interface ProviderCatalogVoice {
   id: string;
+  name?: string | null;
   languages: string[];
   available: boolean;
+  sample_url?: string | null;
 }
-
 export interface ProviderCatalog {
   openai: {
     available: boolean;
@@ -179,9 +180,10 @@ export interface ProviderCatalog {
     models: ProviderCatalogModel[];
   };
   tts_providers: Array<{
-    provider: "cartesia" | "elevenlabs";
+    provider: string;
     available: boolean;
     error: string | null;
+    sample_url?: string | null;
     models: Array<{
       id: string;
       available: boolean;

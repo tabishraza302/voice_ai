@@ -96,19 +96,6 @@ def _agent_value(agent: Any, name: str) -> Any:
     return getattr(agent, name, None)
 
 
-def _voice_catalog(env: Mapping[str, str]) -> tuple[dict[str, Any] | None, str | None]:
-    raw = env.get("VERIFIED_TTS_VOICE_CATALOG", "").strip()
-    if not raw:
-        return None, "The server has no verified TTS voice catalog configured."
-    try:
-        parsed = json.loads(raw)
-    except (TypeError, json.JSONDecodeError):
-        return None, "The server's verified TTS voice catalog is invalid."
-    if not isinstance(parsed, dict):
-        return None, "The server's verified TTS voice catalog is invalid."
-    return parsed, None
-
-
 def validate_tts_voice_selection(
     *,
     provider: str | None,
@@ -117,7 +104,7 @@ def validate_tts_voice_selection(
     language: str,
     env: Mapping[str, str] | None = None,
 ) -> str | None:
-    """Return a publish error unless the server has approved this exact voice choice."""
+    """Return a publish error if the voice selection is invalid."""
     settings = os.environ if env is None else env
     if provider not in SUPPORTED_TTS_MODELS:
         return "Choose a supported TTS provider: Cartesia or ElevenLabs."
@@ -131,19 +118,6 @@ def validate_tts_voice_selection(
         return f"TTS is unavailable because {key_name} is not configured on the server."
     if not isinstance(voice_id, str) or not voice_id.strip():
         return "A provider voice ID is required."
-    catalog, catalog_error = _voice_catalog(settings)
-    if catalog_error is not None:
-        return catalog_error
-    assert catalog is not None
-    provider_catalog = catalog.get(provider)
-    model_catalog = provider_catalog.get(model) if isinstance(provider_catalog, dict) else None
-    language_catalog = model_catalog.get(voice_id) if isinstance(model_catalog, dict) else None
-    if (
-        not isinstance(language_catalog, list)
-        or any(not isinstance(item, str) for item in language_catalog)
-        or language not in language_catalog
-    ):
-        return "This voice is not approved for the selected provider, model, and language."
     return None
 
 
@@ -219,7 +193,7 @@ def provider_publish_errors(
         if voice_error is not None:
             add("voice_id", voice_error)
     elif not selected_languages:
-        add("voice_id", "A verified voice cannot be selected until a supported call language is configured.")
+        add("voice_id", "A voice cannot be selected until a supported call language is configured.")
 
     return errors
 

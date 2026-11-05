@@ -135,7 +135,7 @@ export function OwnerShell({
 
         <div className="flex min-w-0 flex-1 flex-col">
           {signOutError ? (
-            <p role="alert" className="mx-auto mt-4 w-full max-w-7xl px-4 text-sm text-destructive sm:px-6 lg:px-8">
+            <p role="alert" className="mt-4 w-full px-6 text-sm text-destructive sm:px-8 lg:px-12">
               {signOutError}
             </p>
           ) : null}

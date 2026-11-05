@@ -150,7 +150,7 @@ export default function AgentEditorPage() {
 
   return (
     <OwnerShell active="agents" email={user?.email}>
-      <main className="mx-auto max-w-7xl px-4 py-8 sm:px-6 sm:py-10 lg:px-8">
+      <main className="w-full px-6 py-8 sm:px-8 sm:py-10 lg:px-12">
         {loading ? (
           <div className="space-y-5" aria-busy="true" aria-label="Loading agent editor">
             <div className="h-12 w-1/2 animate-pulse rounded-xl bg-muted" />

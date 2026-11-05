@@ -1,15 +1,21 @@
 import json
+import logging
 import os
 import re
+import time
 from collections.abc import Mapping
-from typing import Annotated
+from typing import Annotated, Any
 
+import httpx
+import redis.asyncio as aioredis
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict
 
 from .auth import current_user
 from .models import User
 from .voice import SUPPORTED_LANGUAGES, SUPPORTED_TTS_MODELS
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["providers"])
 
@@ -18,6 +24,8 @@ _PROVIDER_KEY_NAMES = {
     "elevenlabs": "ELEVENLABS_API_KEY",
 }
 _OPENAI_MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+CACHE_TTL_SECONDS = 300
+_IN_MEMORY_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
 
 class OpenAIModelRead(BaseModel):
@@ -39,8 +47,10 @@ class TTSVoiceRead(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str
+    name: str | None = None
     languages: list[str]
     available: bool
+    sample_url: str | None = None
 
 
 class TTSModelRead(BaseModel):
@@ -57,6 +67,7 @@ class TTSProviderRead(BaseModel):
     provider: str
     available: bool
     error: str | None
+    sample_url: str | None = None
     models: list[TTSModelRead]
 
 
@@ -83,50 +94,6 @@ def _openai_models(env: Mapping[str, str]) -> tuple[list[str], str | None]:
     return values, None
 
 
-def _tts_voice_catalog(env: Mapping[str, str]) -> tuple[dict[str, dict[str, dict[str, list[str]]]] | None, str | None]:
-    raw = env.get("VERIFIED_TTS_VOICE_CATALOG")
-    if not isinstance(raw, str) or not raw.strip():
-        return None, "The server has no verified TTS voice catalog configured."
-    try:
-        parsed = json.loads(raw)
-    except (TypeError, json.JSONDecodeError):
-        return None, "The server's verified TTS voice catalog is invalid."
-    if not isinstance(parsed, dict):
-        return None, "The server's verified TTS voice catalog is invalid."
-
-    verified: dict[str, dict[str, dict[str, list[str]]]] = {}
-    for provider, model_id in SUPPORTED_TTS_MODELS.items():
-        if provider not in parsed:
-            continue
-        provider_catalog = parsed[provider]
-        if not isinstance(provider_catalog, dict):
-            return None, "The server's verified TTS voice catalog is invalid."
-        if model_id not in provider_catalog:
-            continue
-        model_catalog = provider_catalog[model_id]
-        if not isinstance(model_catalog, dict):
-            return None, "The server's verified TTS voice catalog is invalid."
-
-        voices: dict[str, list[str]] = {}
-        for voice_id, raw_languages in model_catalog.items():
-            if (
-                not isinstance(voice_id, str)
-                or not voice_id
-                or len(voice_id) > 256
-                or voice_id != voice_id.strip()
-                or not voice_id.isprintable()
-                or not isinstance(raw_languages, list)
-                or any(not isinstance(language, str) for language in raw_languages)
-            ):
-                return None, "The server's verified TTS voice catalog is invalid."
-            voices[voice_id] = list(
-                dict.fromkeys(language for language in raw_languages if language in SUPPORTED_LANGUAGES)
-            )
-        verified.setdefault(provider, {})[model_id] = voices
-
-    return verified, None
-
-
 def _openai_catalog(env: Mapping[str, str]) -> OpenAIProviderRead:
     models, list_error = _openai_models(env)
     key_available = _has_key(env, "OPENAI_API_KEY")
@@ -145,60 +112,188 @@ def _openai_catalog(env: Mapping[str, str]) -> OpenAIProviderRead:
     )
 
 
-def _tts_provider_catalog(
+async def _get_cached_voices(provider: str, redis_url: str | None) -> list[TTSVoiceRead] | None:
+    if redis_url:
+        try:
+            client = aioredis.from_url(redis_url, decode_responses=True, socket_timeout=1.0)
+            async with client:
+                cached_json = await client.get(f"tts:voices:{provider}")
+                if cached_json:
+                    raw_list = json.loads(cached_json)
+                    return [TTSVoiceRead(**item) for item in raw_list]
+        except Exception as exc:
+            logger.debug("Redis cache get error for %s: %s", provider, exc)
+
+    mem = _IN_MEMORY_CACHE.get(provider)
+    if mem:
+        expiry, raw_list = mem
+        if time.monotonic() < expiry:
+            return [TTSVoiceRead(**item) for item in raw_list]
+
+    return None
+
+
+async def _set_cached_voices(provider: str, voices: list[TTSVoiceRead], redis_url: str | None) -> None:
+    raw_list = [v.model_dump() for v in voices]
+    _IN_MEMORY_CACHE[provider] = (time.monotonic() + CACHE_TTL_SECONDS, raw_list)
+
+    if redis_url:
+        try:
+            client = aioredis.from_url(redis_url, decode_responses=True, socket_timeout=1.0)
+            async with client:
+                await client.set(f"tts:voices:{provider}", json.dumps(raw_list), ex=CACHE_TTL_SECONDS)
+        except Exception as exc:
+            logger.debug("Redis cache set error for %s: %s", provider, exc)
+
+
+async def _fetch_cartesia_voices(api_key: str) -> list[TTSVoiceRead]:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(
+            "https://api.cartesia.ai/voices",
+            headers={
+                "X-API-Key": api_key,
+                "Cartesia-Version": "2024-06-10",
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+        voices: list[TTSVoiceRead] = []
+        for item in data:
+            voice_id = item.get("id")
+            if not voice_id:
+                continue
+            raw_lang = item.get("language")
+            langs = [raw_lang] if raw_lang and raw_lang in SUPPORTED_LANGUAGES else ["en"]
+            voices.append(
+                TTSVoiceRead(
+                    id=str(voice_id),
+                    name=item.get("name"),
+                    languages=langs,
+                    available=True,
+                    sample_url=None,
+                )
+            )
+        return voices
+
+
+async def _fetch_elevenlabs_voices(api_key: str) -> list[TTSVoiceRead]:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.get(
+            "https://api.elevenlabs.io/v1/voices",
+            headers={"xi-api-key": api_key},
+        )
+        response.raise_for_status()
+        data = response.json()
+        voices: list[TTSVoiceRead] = []
+        for item in data.get("voices", []):
+            voice_id = item.get("voice_id")
+            if not voice_id:
+                continue
+            langs: list[str] = []
+            labels = item.get("labels") or {}
+            lang_label = labels.get("language")
+            if lang_label and lang_label in SUPPORTED_LANGUAGES:
+                langs.append(lang_label)
+            for vl in item.get("verified_languages") or []:
+                l = vl.get("language")
+                if l and l in SUPPORTED_LANGUAGES and l not in langs:
+                    langs.append(l)
+            if not langs:
+                langs = ["en"]
+            preview_url = item.get("preview_url")
+            voices.append(
+                TTSVoiceRead(
+                    id=str(voice_id),
+                    name=item.get("name"),
+                    languages=langs,
+                    available=True,
+                    sample_url=preview_url if preview_url else None,
+                )
+            )
+        return voices
+
+
+async def _tts_provider_catalog(
     env: Mapping[str, str],
-    catalog: dict[str, dict[str, dict[str, list[str]]]] | None,
-    catalog_error: str | None,
     provider: str,
     model_id: str,
 ) -> TTSProviderRead:
-    if catalog_error is not None:
-        return TTSProviderRead(provider=provider, available=False, error=catalog_error, models=[])
-
-    provider_catalog = catalog.get(provider) if catalog is not None else None
-    model_catalog = provider_catalog.get(model_id) if provider_catalog is not None else None
-    if model_catalog is None:
+    key_name = _PROVIDER_KEY_NAMES[provider]
+    api_key = env.get(key_name, "").strip()
+    if not api_key:
         return TTSProviderRead(
             provider=provider,
             available=False,
-            error=f"No verified {provider} voices are configured on the server.",
+            error=f"{key_name} is not configured on the server.",
+            sample_url=None,
             models=[],
         )
 
-    key_name = _PROVIDER_KEY_NAMES[provider]
-    key_available = _has_key(env, key_name)
-    voices = [
-        TTSVoiceRead(id=voice_id, languages=languages, available=key_available and bool(languages))
-        for voice_id, languages in model_catalog.items()
-    ]
-    model_available = key_available and any(voice.available for voice in voices)
-    model = TTSModelRead(id=model_id, available=model_available, voices=voices)
-
-    if not key_available:
-        error = f"{key_name} is not configured on the server."
-    elif not model_available:
-        error = f"No verified {provider} voices support the configured call languages."
+    redis_url = env.get("REDIS_URL")
+    cached_voices = await _get_cached_voices(provider, redis_url)
+    if cached_voices is not None:
+        voices = cached_voices
     else:
-        error = None
+        try:
+            if provider == "cartesia":
+                voices = await _fetch_cartesia_voices(api_key)
+            elif provider == "elevenlabs":
+                voices = await _fetch_elevenlabs_voices(api_key)
+            else:
+                voices = []
+            await _set_cached_voices(provider, voices, redis_url)
+        except httpx.HTTPStatusError as exc:
+            error_detail = exc.response.text[:200]
+            try:
+                parsed = exc.response.json()
+                if isinstance(parsed, dict) and "detail" in parsed:
+                    detail = parsed["detail"]
+                    if isinstance(detail, dict) and "message" in detail:
+                        error_detail = detail["message"]
+                    elif isinstance(detail, str):
+                        error_detail = detail
+            except Exception:
+                pass
+            return TTSProviderRead(
+                provider=provider,
+                available=False,
+                error=f"{provider.capitalize()} API error: {error_detail}",
+                sample_url=None,
+                models=[],
+            )
+        except Exception as exc:
+            return TTSProviderRead(
+                provider=provider,
+                available=False,
+                error=f"Failed to fetch {provider} voices: {exc}",
+                sample_url=None,
+                models=[],
+            )
+
+    model_available = bool(voices)
+    model = TTSModelRead(id=model_id, available=model_available, voices=voices)
+    raw_sample = env.get(f"{provider.upper()}_SAMPLE_AUDIO_URL") or env.get(f"{provider.upper()}_SAMPLE_URL")
+    sample_url = raw_sample.strip() if isinstance(raw_sample, str) and raw_sample.strip() else None
     return TTSProviderRead(
         provider=provider,
         available=model_available,
-        error=error,
+        error=None if model_available else f"No voices returned by {provider}.",
+        sample_url=sample_url,
         models=[model],
     )
 
 
-def _build_provider_catalog(env: Mapping[str, str]) -> ProviderCatalogRead:
-    tts_catalog, catalog_error = _tts_voice_catalog(env)
+async def _build_provider_catalog(env: Mapping[str, str]) -> ProviderCatalogRead:
+    tts_providers: list[TTSProviderRead] = []
+    for provider, model_id in SUPPORTED_TTS_MODELS.items():
+        tts_providers.append(await _tts_provider_catalog(env, provider, model_id))
+
     return ProviderCatalogRead(
         openai=_openai_catalog(env),
-        tts_providers=[
-            _tts_provider_catalog(env, tts_catalog, catalog_error, provider, model_id)
-            for provider, model_id in SUPPORTED_TTS_MODELS.items()
-        ],
+        tts_providers=tts_providers,
     )
 
 
 @router.get("/provider-catalog", response_model=ProviderCatalogRead)
 async def get_provider_catalog(user: Annotated[User, Depends(current_user)]):
-    return _build_provider_catalog(os.environ)
+    return await _build_provider_catalog(os.environ)
