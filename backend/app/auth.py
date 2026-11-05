@@ -2,7 +2,7 @@ import os
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Literal
+from typing import Annotated
 
 import jwt
 from argon2 import PasswordHasher
@@ -96,28 +96,6 @@ async def csrf(request: Request, user: Annotated[User, Depends(current_user)]) -
     return user
 
 
-def dev_login_enabled() -> bool:
-    return (
-        os.environ.get("ENVIRONMENT", "").casefold() == "development"
-        and os.environ.get("ALLOW_DEV_LOGIN", "").casefold() == "true"
-    )
-
-
-def _dev_credentials(role: str) -> tuple[str, str]:
-    if role == "user":
-        return os.environ.get("DEV_USER_EMAIL", ""), os.environ.get("DEV_USER_PASSWORD", "")
-    if role == "admin":
-        return os.environ.get("ADMIN_EMAIL", ""), os.environ.get("ADMIN_PASSWORD", "")
-    return "", ""
-
-
-def _check_dev_origin(request: Request) -> None:
-    origin = os.environ.get("APP_ORIGIN", "http://localhost:3000").rstrip("/")
-    supplied = request.headers.get("origin")
-    if supplied is not None and supplied.rstrip("/") != origin:
-        raise HTTPException(403, "Dev login must use the configured frontend origin")
-
-
 async def admin_user(user: Annotated[User, Depends(current_user)]):
     if user.role != "admin":
         raise HTTPException(403, "Administrator access required")
@@ -148,42 +126,6 @@ async def login(credentials: Credentials, response: Response, db: Annotated[Asyn
         valid = False
     if not valid:
         raise HTTPException(401, "Invalid credentials")
-    token = secrets.token_urlsafe(32)
-    value = create_session_token(user.id, token)
-    response.set_cookie(COOKIE, value, max_age=MAX_AGE, httponly=True, secure=secure_cookie(), samesite="lax", path="/")
-    return {**public_user(user), "csrf_token": token}
-
-
-class DevLoginInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    role: Literal["user", "admin"]
-
-
-@router.get("/dev-login/available")
-async def dev_login_available():
-    if not dev_login_enabled():
-        raise HTTPException(404, "Not found")
-    return {"enabled": True}
-
-
-@router.post("/dev-login")
-async def dev_login(payload: DevLoginInput, request: Request, response: Response, db: Annotated[AsyncSession, Depends(get_db)]):
-    if not dev_login_enabled():
-        raise HTTPException(404, "Not found")
-    _check_dev_origin(request)
-    email, password = _dev_credentials(payload.role)
-    if not email.strip() or len(password) < 12:
-        raise HTTPException(404, "Not found")
-    user = await db.scalar(select(User).where(User.email == email.strip().casefold()))
-    try:
-        valid = user is not None and hasher.verify(user.password_hash, password)
-    except (VerifyMismatchError, VerificationError, InvalidHashError):
-        valid = False
-    if not valid or user is None:
-        raise HTTPException(401, "Invalid seeded credentials")
-    if payload.role == "admin" and user.role != "admin":
-        raise HTTPException(401, "Invalid seeded credentials")
     token = secrets.token_urlsafe(32)
     value = create_session_token(user.id, token)
     response.set_cookie(COOKIE, value, max_age=MAX_AGE, httponly=True, secure=secure_cookie(), samesite="lax", path="/")

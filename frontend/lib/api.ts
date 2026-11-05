@@ -17,8 +17,6 @@ function requiresCsrf(route: string, method: string): boolean {
   if (SAFE_METHODS[method]) return false;
   // Login/registration establish the session; they cannot present a token.
   if (route === "/auth/login" || route === "/auth/register") return false;
-  // Dev shortcut logins issue a session directly, like login/register.
-  if (route === "/auth/dev-login") return false;
   // Public calls and signaling are authorized by single-use grants and
   // renegotiation tokens, not by the owner's cookie. Requiring /auth/me here
   // would make anonymous callers fail before WebRTC starts.

@@ -117,6 +117,36 @@ async def test_login_rejects_unknown_wrong_and_corrupt_credentials(client):
 
 
 @pytest.mark.anyio
+async def test_dev_login_shortcut_is_removed_even_when_enabled(client, monkeypatch):
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.setenv("ALLOW_DEV_LOGIN", "true")
+    dev_email = f"{uuid.uuid4()}@example.com"
+    dev_password = "correct horse battery staple"
+    admin_email = f"{uuid.uuid4()}@example.com"
+    admin_password = "another correct horse battery staple"
+    monkeypatch.setenv("DEV_USER_EMAIL", dev_email)
+    monkeypatch.setenv("DEV_USER_PASSWORD", dev_password)
+    monkeypatch.setenv("ADMIN_EMAIL", admin_email)
+    monkeypatch.setenv("ADMIN_PASSWORD", admin_password)
+
+    assert (await client.post("/auth/register", json={"email": dev_email, "password": dev_password})).status_code == 201
+    assert (await client.post("/auth/register", json={"email": admin_email, "password": admin_password})).status_code == 201
+    async with Session() as db:
+        admin = await db.scalar(select(User).where(User.email == admin_email))
+        assert admin is not None
+        admin.role = "admin"
+        await db.commit()
+
+    assert (await client.get("/auth/dev-login/available")).status_code == 404
+    for role in ("user", "admin"):
+        for headers in (None, {"Origin": "http://localhost:3000"}, {"Origin": "https://attacker.example"}):
+            response = await client.post("/auth/dev-login", json={"role": role}, headers=headers)
+            assert response.status_code == 404
+            assert "set-cookie" not in response.headers
+    assert client.cookies.get(COOKIE) is None
+
+
+@pytest.mark.anyio
 async def test_session_cookie_rejects_tampering_and_expiry(client, monkeypatch):
     monkeypatch.setenv("ENVIRONMENT", "development")
     email = f"{uuid.uuid4()}@example.com"
