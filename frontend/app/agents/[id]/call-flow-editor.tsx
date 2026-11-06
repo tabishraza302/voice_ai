@@ -14,7 +14,6 @@ import type { AgentStep } from "@/lib/types";
 import {
   agentStepsToCallFlow,
   callFlowToStepInput,
-  getSampleHearingScript,
   resolveCallFlowRoute,
 } from "./call-flow-adapter";
 import type { CallFlowAnswer, CallFlowStep } from "./call-flow-adapter";
@@ -201,9 +200,6 @@ export function CallFlowEditor({
   flushToken?: number;
 }) {
   const [flowSteps, setFlowSteps] = useState<CallFlowStep[]>(() => agentStepsToCallFlow(steps).flowSteps);
-  const [showExport, setShowExport] = useState(false);
-  const [copyNote, setCopyNote] = useState("");
-  const [sampleArmed, setSampleArmed] = useState(false);
   const [armedDeleteId, setArmedDeleteId] = useState<string | null>(null);
   const [saveState, setSaveState] = useState<CallFlowSaveState>({ status: "idle" });
 
@@ -211,8 +207,6 @@ export function CallFlowEditor({
   const stepsRef = useRef<HTMLDivElement | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const liveRef = useRef<HTMLParagraphElement | null>(null);
-  const jsonRef = useRef<HTMLTextAreaElement | null>(null);
-
   const flowStepsRef = useRef(flowSteps);
   const prevFlowStepsRef = useRef(flowSteps);
   const serverStepsRef = useRef(steps);
@@ -348,11 +342,6 @@ export function CallFlowEditor({
     };
   }, [armedDeleteId]);
 
-  useEffect(() => {
-    if (!sampleArmed) return;
-    const timer = window.setTimeout(() => setSampleArmed(false), 3200);
-    return () => window.clearTimeout(timer);
-  }, [sampleArmed]);
 
 
   useEffect(() => {
@@ -489,9 +478,13 @@ export function CallFlowEditor({
     const answerId = pendingFocusAnswerRef.current;
     if (answerId) {
       pendingFocusAnswerRef.current = null;
-      stepsRef.current
-        ?.querySelector<HTMLInputElement>(`.answer[data-ans-id="${answerId}"] .ans-input`)
-        ?.focus();
+      const input = stepsRef.current
+        ?.querySelector<HTMLInputElement>(`.answer[data-ans-id="${answerId}"] .ans-input`);
+      if (input) {
+        input.focus();
+        const len = input.value.length;
+        input.setSelectionRange(len, len);
+      }
     }
     const answerGripId = pendingFocusAnswerGripRef.current;
     if (answerGripId) {
@@ -807,12 +800,29 @@ export function CallFlowEditor({
     );
   }
 
-  function addAnswer(stepId: string) {
-    const answer: CallFlowAnswer = { id: uid("a"), label: "", to: "next" };
-    pendingFocusAnswerRef.current = answer.id;
-    setFlowSteps((current) =>
-      current.map((step) => (step.id === stepId ? { ...step, answers: [...step.answers, answer] } : step))
+  function handleElseInputChange(stepId: string, text: string) {
+    if (!text) return;
+    const current = flowStepsRef.current;
+    const stepIndex = current.findIndex((step) => step.id === stepId);
+    if (stepIndex < 0) return;
+    const step = current[stepIndex];
+    const newAnswerId = uid("a");
+    const newAnswer: CallFlowAnswer = {
+      id: newAnswerId,
+      label: text,
+      to: step.other || "next",
+    };
+    pendingFocusAnswerRef.current = newAnswerId;
+    const next = current.map((candidate, index) =>
+      index === stepIndex
+        ? {
+            ...candidate,
+            answers: [...candidate.answers, newAnswer],
+            other: "next",
+          }
+        : candidate
     );
+    setFlowSteps(next);
   }
 
   function removeAnswer(stepId: string, answerId: string) {
@@ -1259,66 +1269,6 @@ export function CallFlowEditor({
     }
   }
 
-  /* ---------- Export and sample ---------- */
-
-  function toExport() {
-    const name = (target: string, index: number): string => {
-      const resolved = resolveCallFlowRoute(target, index, flowSteps);
-      if (resolved === "end") return resolved;
-      return `step_${flowSteps.findIndex((step) => step.id === resolved) + 1}`;
-    };
-    return {
-      name: agentName || "Voice call script",
-      start: flowSteps.length ? "step_1" : null,
-      steps: flowSteps.map((step, index) => ({
-        id: `step_${index + 1}`,
-        title: step.title,
-        say: step.say,
-        routes: step.answers
-          .map((answer) => ({ when: answer.label, go: name(answer.to, index) }))
-          .concat([{ when: "*", go: name(step.other, index) }]),
-      })),
-    };
-  }
-
-  function toggleExport() {
-    const next = !showExport;
-    setShowExport(next);
-    if (next) {
-      setCopyNote('"when" is what the caller says; "*" is the anything-else route.');
-    }
-  }
-
-  function handleCopy() {
-    const json = JSON.stringify(toExport(), null, 2);
-    const fail = () => {
-      jsonRef.current?.focus();
-      jsonRef.current?.select();
-      setCopyNote("Copy was blocked here. The text is selected, press Ctrl+C or Cmd+C.");
-    };
-    try {
-      if (navigator.clipboard?.writeText) {
-        navigator.clipboard.writeText(json).then(() => {
-          setCopyNote("Copied to clipboard.");
-        }, fail);
-      } else {
-        fail();
-      }
-    } catch {
-      fail();
-    }
-  }
-
-  function handleLoadSample() {
-    if (!sampleArmed) {
-      setSampleArmed(true);
-      return;
-    }
-    setSampleArmed(false);
-    setFlowSteps(getSampleHearingScript());
-    announce("Sample script loaded");
-  }
-
   /* ---------- Auto-save ---------- */
 
   function clearTimer(ref: { current: number }) {
@@ -1471,77 +1421,8 @@ export function CallFlowEditor({
     );
   }
 
-  const exportJson = JSON.stringify(toExport(), null, 2);
-
   return (
     <div className="call-flow-app">
-      <div className="top">
-        <div className="top-main">
-          <p className="stats" aria-live="polite">
-            <span>
-              <b>{flowSteps.length}</b> {flowSteps.length === 1 ? "step" : "steps"}
-            </span>
-            <span>
-              <b>{stats.totalRoutes}</b> routes
-            </span>
-            {stats.unreachedIds.size > 0 ? (
-              <span className="warn">
-                {plural(stats.unreachedIds.size, "step has", "steps have")} no route leading to{" "}
-                {stats.unreachedIds.size === 1 ? "it" : "them"}
-              </span>
-            ) : null}
-          </p>
-        </div>
-        <div className="top-actions">
-          <button
-            type="button"
-            className="flow-btn"
-            aria-expanded={showExport}
-            aria-controls="exportPanel"
-            onClick={toggleExport}
-          >
-            Export JSON
-          </button>
-          <button
-            type="button"
-            className={`flow-btn${sampleArmed ? " armed" : ""}`}
-            onClick={handleLoadSample}
-          >
-            {sampleArmed ? "Replace script?" : "Load sample"}
-          </button>
-        </div>
-      </div>
-
-      <div className="guide">
-        <ul className="legend" aria-label="Line key">
-          <li>
-            <svg width="34" height="10" viewBox="0 0 34 10" aria-hidden="true">
-              <path className="lg-line" d="M2 5H25" />
-              <path className="lg-arrow" d="M31 5l-6 -3v6z" />
-            </svg>
-            Goes to another step
-          </li>
-          <li>
-            <svg width="34" height="10" viewBox="0 0 34 10" aria-hidden="true">
-              <path className="lg-line lg-dash" d="M2 5H25" />
-              <path className="lg-arrow" d="M31 5l-6 -3v6z" />
-            </svg>
-            Ends the call
-          </li>
-        </ul>
-        <p className="hint">Drag the handle to reorder. Hover an answer or a line to trace it. Sample content, edit freely.</p>
-      </div>
-
-      <section className="export-panel" id="exportPanel" hidden={!showExport} aria-label="Script as JSON">
-        <div className="export-head">
-          <strong>Script as JSON</strong>
-          <button type="button" className="flow-btn" onClick={handleCopy}>
-            Copy
-          </button>
-        </div>
-        <textarea ref={jsonRef} value={exportJson} readOnly spellCheck={false} aria-label="Script JSON" />
-        <p className="export-note">{copyNote}</p>
-      </section>
       {saveState.status === "error" ? (
         <div role="alert" className="mb-4 flex items-center justify-between rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-2.5 text-sm text-destructive">
           <span>{saveState.message}</span>
@@ -1645,6 +1526,15 @@ export function CallFlowEditor({
                           aria-label="When the caller says"
                           autoComplete="off"
                           onChange={(event) => updateAnswerLabel(flowStep.id, answer.id, event.currentTarget.value)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") {
+                              event.preventDefault();
+                              const row = event.currentTarget.closest(".answer");
+                              const nextRow = row?.nextElementSibling;
+                              const nextInput = nextRow?.querySelector<HTMLInputElement>(".ans-input");
+                              nextInput?.focus();
+                            }
+                          }}
                         />
                         <span className="to" aria-hidden="true">
                           {ICONS.arrow}
@@ -1675,7 +1565,15 @@ export function CallFlowEditor({
                       data-route-key={`${flowStep.id}:else`}
                     >
                       <span className="answer-grip-spacer" aria-hidden="true" />
-                      <span className="ans-fixed">Anything else</span>
+                      <input
+                        className="ans-input ans-else-input"
+                        type="text"
+                        value=""
+                        placeholder="Anything else"
+                        aria-label="When the caller says anything else, or type rule"
+                        autoComplete="off"
+                        onChange={(event) => handleElseInputChange(flowStep.id, event.currentTarget.value)}
+                      />
                       <span className="to" aria-hidden="true">
                         {ICONS.arrow}
                       </span>
@@ -1690,9 +1588,6 @@ export function CallFlowEditor({
                       </span>
                       <span className="icon-spacer"></span>
                     </div>
-                    <button type="button" className="add-answer" onClick={() => addAnswer(flowStep.id)}>
-                      {ICONS.plus} Add answer
-                    </button>
                   </div>
                 </div>
               </article>
