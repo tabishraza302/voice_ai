@@ -14,7 +14,7 @@ from app.agents import Agent
 from app.db import Base, Session, engine
 from app.main import app
 from app.models import User
-from app.steps import Step, ValidationFailureTarget, validate_publish
+from app.steps import Step, validate_publish
 
 
 @pytest.fixture
@@ -53,20 +53,12 @@ def mutation_headers(csrf_token):
     return {"Origin": "http://localhost:3000", "X-CSRF-Token": csrf_token}
 
 
-def question(field_key, *, title="Question", answer_type="text", wording_mode="flexible"):
+def question(field_key, *, title="Question", branches=None):
     return {
         "field_key": field_key,
         "title": title,
         "objective": "Collect the caller's answer.",
-        "required": True,
-        "enabled": True,
-        "answer_type": answer_type,
-        "wording_mode": wording_mode,
-        "localized_phrases": {},
-        "extraction_instructions": "Extract the value from the caller.",
-        "clarification_instructions": "Ask for a clearer answer.",
-        "validation_rules": [],
-        "branches": [],
+        "branches": branches or [],
     }
 
 
@@ -159,9 +151,6 @@ async def test_incomplete_draft_step_can_be_saved(client):
     csrf_token = await registered_client(client, email)
     agent_id = await create_agent(email)
     draft = question("draft", title="")
-    draft["answer_type"] = None
-    draft["wording_mode"] = None
-
     response = await client.post(
         f"/agents/{agent_id}/steps",
         json=draft,
@@ -170,88 +159,54 @@ async def test_incomplete_draft_step_can_be_saved(client):
 
     assert response.status_code == 201
     assert response.json()["title"] == ""
-    assert response.json()["answer_type"] is None
+    assert response.json()["branches"] == []
 
 
 def make_step(
     agent_id,
     field_key,
     *,
-    answer_type="text",
-    rules=None,
     branches=None,
-    enum_values=None,
-    validation_failure_target=None,
-    enabled=True,
-    wording_mode="flexible",
-    phrases=None,
     sort_order=0,
+    title=None,
+    objective=None,
 ):
     return Step(
         id=uuid.uuid4(),
         agent_id=agent_id,
         field_key=field_key,
         sort_order=sort_order,
-        title=field_key.title(),
-        objective="Collect the caller's answer.",
-        required=True,
-        enabled=enabled,
-        answer_type=answer_type,
-        wording_mode=wording_mode,
-        localized_phrases=phrases or {},
-        extraction_instructions="Extract the value from the caller.",
-        clarification_instructions="Ask for a clearer answer.",
-        validation_rules=rules or [],
+        title=field_key.title() if title is None else title,
+        objective="Collect the caller's answer." if objective is None else objective,
         branches=branches or [],
-        enum_values=enum_values or [],
-        validation_failure_target=validation_failure_target,
     )
 
-
-def test_publish_validation_reports_missing_exact_phrases_and_invalid_typed_rules():
+def test_publish_validation_requires_title_and_objective():
     agent_id = uuid.uuid4()
-    agent = SimpleNamespace(languages=["en", "hi"])
-    step = make_step(
-        agent_id,
-        "is_employed",
-        answer_type="boolean",
-        wording_mode="exact",
-        phrases={"en": "Are you employed?"},
-        rules=[
-            {"operator": "contains", "operand": "yes"},
-            {"operator": "eq", "operand": "true"},
-        ],
-    )
+    agent = SimpleNamespace(languages=["en"])
+    step = make_step(agent_id, "test_step", title="", objective="")
 
     errors = validate_publish(agent, [step])
 
-    assert f"steps.{step.id}.localized_phrases" in errors
-    assert f"steps.{step.id}.validation_rules" in errors
-    assert errors[f"steps.{step.id}.validation_rules"]
-
-
-def test_publish_validation_reports_missing_and_disabled_branch_targets():
+    assert f"steps.{step.id}.title" in errors
+    assert f"steps.{step.id}.objective" in errors
+def test_publish_validation_reports_missing_branch_targets():
     agent_id = uuid.uuid4()
     agent = SimpleNamespace(languages=["en"])
     source = make_step(agent_id, "source", sort_order=0)
     missing_id = uuid.uuid4()
-    disabled = make_step(agent_id, "disabled", enabled=False, sort_order=2)
     router = make_step(
         agent_id,
         "router",
         sort_order=1,
         branches=[
             {"conditions": [{"field_key": "source", "operator": "eq", "operand": "yes"}], "target_step_id": str(missing_id)},
-            {"conditions": [{"field_key": "source", "operator": "eq", "operand": "no"}], "target_step_id": str(disabled.id)},
         ],
     )
 
-    errors = validate_publish(agent, [source, router, disabled])
+    errors = validate_publish(agent, [source, router])
 
     assert f"steps.{router.id}.branches" in errors
-    assert len(errors[f"steps.{router.id}.branches"]) >= 2
-
-
 def test_publish_validation_rejects_cycles_in_ordered_branch_graph():
     agent_id = uuid.uuid4()
     agent = SimpleNamespace(languages=["en"])
@@ -269,6 +224,71 @@ def test_publish_validation_rejects_cycles_in_ordered_branch_graph():
     errors = validate_publish(agent, [first, second])
 
     assert any(path.endswith(".branches") for path in errors)
+def test_publish_validation_rejects_cycles_from_conditions_after_fallback():
+    agent_id = uuid.uuid4()
+    agent = SimpleNamespace(languages=["en"])
+    answer = make_step(agent_id, "answer", sort_order=0)
+    answer.branches = [
+        {"conditions": [], "outcome": "end"},
+        {
+            "conditions": [{"field_key": "answer", "operator": "eq", "operand": "yes"}],
+            "target_step_id": str(answer.id),
+        },
+    ]
+    errors = validate_publish(agent, [answer])
+
+    assert any(
+        "cycle" in message
+        for path, messages in errors.items()
+        if path.endswith(".branches")
+        for message in messages
+    )
+
+
+@pytest.mark.parametrize(
+    ("operator", "operand"),
+    [
+        ("eq", "yes"),
+        ("ne", "no"),
+        ("gt", 1),
+        ("gte", 1),
+        ("lt", 1),
+        ("lte", 1),
+        ("in", ["yes", "no"]),
+    ],
+)
+def test_publish_validation_accepts_supported_branch_operators(operator, operand):
+    agent_id = uuid.uuid4()
+    agent = SimpleNamespace(languages=["en"])
+    answer = make_step(
+        agent_id,
+        "answer",
+        branches=[{
+            "conditions": [{"field_key": "answer", "operator": operator, "operand": operand}],
+            "outcome": "end",
+        }],
+    )
+
+    assert validate_publish(agent, [answer]) == {}
+
+
+def test_publish_validation_rejects_unknown_branch_operator():
+    agent_id = uuid.uuid4()
+    agent = SimpleNamespace(languages=["en"])
+    answer = make_step(
+        agent_id,
+        "answer",
+        branches=[{
+            "conditions": [{"field_key": "answer", "operator": "bogus", "operand": "yes"}],
+            "outcome": "end",
+        }],
+    )
+
+    errors = validate_publish(agent, [answer])
+
+    branch_errors = errors[f"steps.{answer.id}.branches"]
+    assert any("operator" in message.lower() for message in branch_errors)
+
 
 
 @pytest.mark.anyio
@@ -299,8 +319,6 @@ async def test_publish_route_returns_step_field_errors(client):
     csrf_token = await registered_client(client, email)
     agent_id = await create_agent(email)
     draft = question("draft", title="")
-    draft["answer_type"] = None
-    draft["wording_mode"] = None
     created = await client.post(
         f"/agents/{agent_id}/steps",
         json=draft,
@@ -316,171 +334,20 @@ async def test_publish_route_returns_step_field_errors(client):
     assert f"steps.{created.json()['id']}.title" in response.json()["detail"]
 
 
-def test_publish_validation_accepts_a_configured_outcome_branch():
+def test_publish_validation_accepts_an_outcome_branch():
     agent_id = uuid.uuid4()
     agent = SimpleNamespace(languages=["en"])
     answer = make_step(
         agent_id,
         "answer",
         sort_order=0,
-        wording_mode="exact",
-        phrases={"en": "Do you agree?"},
         branches=[{
             "conditions": [{"field_key": "answer", "operator": "eq", "operand": "yes"}],
-            "outcome": "accepted",
+            "outcome": "end",
         }],
     )
-    outcome = make_step(agent_id, "accepted", answer_type="outcome", sort_order=1)
 
-    assert validate_publish(agent, [answer, outcome]) == {}
-
-
-def test_publish_requires_and_validates_validation_failure_targets():
-    agent_id = uuid.uuid4()
-    agent = SimpleNamespace(languages=["en"])
-    rules = [{"operator": "gt", "operand": 24}]
-    missing = make_step(agent_id, "missing", answer_type="number", rules=rules, sort_order=0)
-    invalid_id = make_step(
-        agent_id,
-        "invalid_id",
-        answer_type="number",
-        rules=rules,
-        validation_failure_target={"target_step_id": str(uuid.uuid4()), "outcome": None},
-        sort_order=1,
-    )
-    disabled = make_step(
-        agent_id,
-        "disabled",
-        enabled=False,
-        sort_order=2,
-    )
-    disabled_target = make_step(
-        agent_id,
-        "disabled_target",
-        answer_type="number",
-        rules=rules,
-        validation_failure_target={"target_step_id": str(disabled.id), "outcome": None},
-        sort_order=3,
-    )
-    valid = make_step(
-        agent_id,
-        "valid",
-        answer_type="number",
-        rules=rules,
-        validation_failure_target={"target_step_id": None, "outcome": "rejected"},
-        sort_order=4,
-    )
-    rejection = make_step(agent_id, "rejected", answer_type="outcome", sort_order=5)
-
-    errors = validate_publish(agent, [missing, invalid_id, disabled, disabled_target, valid, rejection])
-
-    assert f"steps.{missing.id}.validation_failure_target" in errors
-    assert f"steps.{invalid_id.id}.validation_failure_target" in errors
-    assert f"steps.{disabled_target.id}.validation_failure_target" in errors
-    assert f"steps.{valid.id}.validation_failure_target" not in errors
-
-
-def test_publish_validation_includes_failure_step_targets_in_cycle_detection():
-    agent_id = uuid.uuid4()
-    first = make_step(
-        agent_id,
-        "first",
-        answer_type="number",
-        rules=[{"operator": "gt", "operand": 0}],
-        branches=[{"conditions": [], "target_step_id": None, "outcome": "accepted"}],
-        validation_failure_target={"target_step_id": None, "outcome": None},
-        sort_order=0,
-    )
-    second = make_step(
-        agent_id,
-        "second",
-        answer_type="number",
-        rules=[{"operator": "gt", "operand": 0}],
-        branches=[{"conditions": [], "target_step_id": None, "outcome": "accepted"}],
-        validation_failure_target={"target_step_id": str(first.id), "outcome": None},
-        sort_order=1,
-    )
-    first.validation_failure_target = {"target_step_id": str(second.id), "outcome": None}
-    agent = SimpleNamespace(languages=["en"])
-    accepted = make_step(agent_id, "accepted", answer_type="outcome", sort_order=2)
-
-    errors = validate_publish(agent, [first, second, accepted])
-
-    assert f"steps.{first.id}.branches" in errors
-
-
-def test_validation_failure_target_requires_exactly_one_destination():
-    with pytest.raises(ValueError):
-        ValidationFailureTarget(target_step_id=None, outcome=None)
-    with pytest.raises(ValueError):
-        ValidationFailureTarget(target_step_id=uuid.uuid4(), outcome="rejected")
-
-
-
-def test_publish_validation_requires_nonempty_unique_enum_values():
-    agent_id = uuid.uuid4()
-    agent = SimpleNamespace(languages=["en"])
-    empty = make_step(agent_id, "empty", answer_type="enum", sort_order=0)
-    duplicate = make_step(
-        agent_id,
-        "duplicate",
-        answer_type="enum",
-        enum_values=["red", "red"],
-        rules=[{"operator": "eq", "operand": "blue"}],
-        sort_order=1,
-    )
-
-    errors = validate_publish(agent, [empty, duplicate])
-
-    assert f"steps.{empty.id}.enum_values" in errors
-    assert f"steps.{duplicate.id}.enum_values" in errors
-    assert f"steps.{duplicate.id}.validation_rules" in errors
-
-
-def test_publish_validation_accepts_configured_enum_rule_and_branch_values():
-    agent_id = uuid.uuid4()
-    agent = SimpleNamespace(languages=["en"])
-    choice = make_step(
-        agent_id,
-        "choice",
-        answer_type="enum",
-        enum_values=["yes", "no"],
-        rules=[{"operator": "in", "operand": ["yes", "no"]}],
-        branches=[{
-            "conditions": [{"field_key": "choice", "operator": "eq", "operand": "yes"}],
-            "outcome": "accepted",
-        }],
-        sort_order=0,
-        validation_failure_target={"target_step_id": None, "outcome": "accepted"},
-    )
-    accepted = make_step(agent_id, "accepted", answer_type="outcome", sort_order=1)
-
-    assert validate_publish(agent, [choice, accepted]) == {}
-
-def test_publish_validation_rejects_unknown_types_and_non_finite_or_wrong_currency_operands():
-    agent_id = uuid.uuid4()
-    agent = SimpleNamespace(languages=["en"])
-    invalid_type = make_step(agent_id, "unsupported", answer_type="other", sort_order=0)
-    number = make_step(
-        agent_id,
-        "number",
-        answer_type="number",
-        rules=[{"operator": "gt", "operand": float("inf")}],
-        sort_order=1,
-    )
-    currency = make_step(
-        agent_id,
-        "currency",
-        answer_type="currency",
-        rules=[{"operator": "gt", "operand": 100}],
-        sort_order=2,
-    )
-
-    errors = validate_publish(agent, [invalid_type, number, currency])
-
-    assert f"steps.{invalid_type.id}.answer_type" in errors
-    assert f"steps.{number.id}.validation_rules" in errors
-    assert f"steps.{currency.id}.validation_rules" in errors
+    assert validate_publish(agent, [answer]) == {}
 
 
 async def published_agent_with_step(client, monkeypatch):
@@ -530,69 +397,20 @@ async def test_published_agent_rejects_invalid_step_create_patch_and_delete(clie
 
     patched = await client.patch(
         f"/agents/{agent_id}/steps/{step_id}",
-        json={"wording_mode": "exact", "localized_phrases": {}},
+        json={"title": " "},
         headers=headers,
     )
     assert patched.status_code == 422
-    assert f"steps.{step_id}.localized_phrases" in patched.json()["detail"]
-    steps = (await client.get(f"/agents/{agent_id}/steps")).json()
-    assert [(step["id"], step["wording_mode"]) for step in steps] == [(step_id, "flexible")]
+    assert f"steps.{step_id}.title" in patched.json()["detail"]
 
-    invalid = question("number_question", answer_type="number")
-    invalid["extraction_instructions"] = ""
+    invalid = question("empty_objective")
+    invalid["objective"] = ""
     created = await client.post(f"/agents/{agent_id}/steps", json=invalid, headers=headers)
     assert created.status_code == 422
-    assert any(path.endswith(".extraction_instructions") for path in created.json()["detail"])
-    assert [step["id"] for step in (await client.get(f"/agents/{agent_id}/steps")).json()] == [step_id]
-
+    assert any(path.endswith(".objective") for path in created.json()["detail"])
     deleted = await client.delete(f"/agents/{agent_id}/steps/{step_id}", headers=headers)
     assert deleted.status_code == 422
     assert [step["id"] for step in (await client.get(f"/agents/{agent_id}/steps")).json()] == [step_id]
-
-
-@pytest.mark.anyio
-async def test_published_agent_accepts_a_disabled_question_until_it_is_enabled(client, monkeypatch):
-    agent_id, first_id, headers = await published_agent_with_step(client, monkeypatch)
-    payload = question("later")
-    payload.update(
-        title="New question",
-        objective="",
-        extraction_instructions="",
-        clarification_instructions="",
-        enabled=False,
-    )
-
-    created = await client.post(f"/agents/{agent_id}/steps", json=payload, headers=headers)
-
-    assert created.status_code == 201
-    assert created.json()["enabled"] is False
-    assert created.json()["sort_order"] == 1
-    step_id = created.json()["id"]
-
-    invalid = await client.patch(
-        f"/agents/{agent_id}/steps/{step_id}",
-        json={"enabled": True},
-        headers=headers,
-    )
-    assert invalid.status_code == 422
-    assert f"steps.{step_id}.objective" in invalid.json()["detail"]
-    assert [step["id"] for step in (await client.get(f"/agents/{agent_id}/steps")).json()] == [
-        first_id,
-        step_id,
-    ]
-
-    valid = await client.patch(
-        f"/agents/{agent_id}/steps/{step_id}",
-        json={
-            "enabled": True,
-            "objective": "Collect the caller's follow-up answer.",
-            "extraction_instructions": "Extract the follow-up answer.",
-            "clarification_instructions": "Ask the caller to clarify.",
-        },
-        headers=headers,
-    )
-    assert valid.status_code == 200
-    assert valid.json()["enabled"] is True
 
 
 @pytest.mark.anyio

@@ -273,17 +273,7 @@ def _step_snapshot(step: Step) -> dict[str, Any]:
         "sort_order": step.sort_order,
         "title": step.title,
         "objective": step.objective,
-        "required": step.required,
-        "enabled": step.enabled,
-        "answer_type": step.answer_type,
-        "enum_values": step.enum_values,
-        "wording_mode": step.wording_mode,
-        "localized_phrases": step.localized_phrases,
-        "extraction_instructions": step.extraction_instructions,
-        "clarification_instructions": step.clarification_instructions,
-        "validation_rules": step.validation_rules,
         "branches": step.branches,
-        "validation_failure_target": step.validation_failure_target,
     }
 
 
@@ -296,7 +286,7 @@ async def _frozen_call_snapshot(
     steps = list(
         await db.scalars(
             select(Step)
-            .where(Step.agent_id == agent.id, Step.enabled.is_(True))
+            .where(Step.agent_id == agent.id)
             .order_by(Step.sort_order, Step.id)
         )
     )
