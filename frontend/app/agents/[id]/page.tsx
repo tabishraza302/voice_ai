@@ -244,14 +244,15 @@ export default function AgentEditorPage() {
                         Detailed Form
                       </Button>
                     </div>
-                    {workflowView === "flow" ? (
+                    <div className={cn(workflowView !== "flow" && "hidden")}>
                       <CallFlowEditor
                         agentId={agentId}
                         agentName={draft.name || agent.name}
                         steps={steps}
                         onStepsChange={setSteps}
                       />
-                    ) : (
+                    </div>
+                    <div className={cn(workflowView !== "form" && "hidden")}>
                       <QuestionsEditor
                         agentId={agentId}
                         languages={draft.languages}
@@ -259,7 +260,7 @@ export default function AgentEditorPage() {
                         published={false}
                         onStepsChange={setSteps}
                       />
-                    )}
+                    </div>
                   </div>
                 ) : null}
                 {activeTab === "instructions" ? <AgentInstructions draft={draft} onPatch={patchDraft} /> : null}

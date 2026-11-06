@@ -168,28 +168,46 @@
   color: var(--flow-danger);
 }
 
-.call-flow-app .flow-btn-save {
-  background: var(--flow-accent);
-  border-color: var(--flow-accent);
-  color: var(--flow-accent-ink);
-}
-.call-flow-app .flow-btn-save:hover:not(:disabled) {
-  opacity: .92;
-}
-.call-flow-app .flow-btn-save:disabled {
-  opacity: .5;
-  cursor: not-allowed;
-}
 .call-flow-app .save-status {
   align-self: center;
+  max-width: 22rem;
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--flow-ink-3);
+  font: inherit;
   font-size: 13px;
   font-weight: 500;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
+  text-align: right;
+  cursor: pointer;
+  transition: color .2s ease;
+}
+.call-flow-app .save-status:hover {
+  color: var(--flow-ink);
+}
+.call-flow-app .save-status.saving,
+.call-flow-app .save-status.saved {
+  color: var(--flow-accent);
+}
+.call-flow-app .save-status.saved {
+  animation: flow-save-fade 2.5s ease forwards;
 }
 .call-flow-app .save-status.error {
   color: var(--flow-danger);
+}
+.call-flow-app .save-status .retry {
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+@keyframes flow-save-fade {
+  0%, 60% { opacity: 1; }
+  100% { opacity: .35; }
 }
 
 .call-flow-app .guide {

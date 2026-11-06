@@ -1,5 +1,5 @@
-import { api } from "@/lib/api";
-import type { AgentStep, BranchCondition, StepBranch, StepInput } from "@/lib/types";
+import { ApiError, api } from "@/lib/api";
+import type { AgentStep, AnswerType, BranchCondition, JsonValue, StepBranch, StepInput } from "@/lib/types";
 
 export interface CallFlowAnswer {
   id: string;
@@ -79,6 +79,33 @@ export function agentStepsToCallFlow(steps: AgentStep[]): {
   return { flowSteps, outcomes };
 }
 
+export function resolveCallFlowRoute(target: string, index: number, steps: CallFlowStep[]): string {
+  return target === "next" ? steps[index + 1]?.id ?? "end" : target;
+}
+
+/** Raw branch index encoded in an answer id (`ans_${step.id}_${branchIndex}`), if any. */
+function answerBranchIndex(stepId: string, answerId: string): number | null {
+  const prefix = `ans_${stepId}_`;
+  if (!answerId.startsWith(prefix)) return null;
+  const suffix = answerId.slice(prefix.length);
+  if (!/^\d+$/.test(suffix)) return null;
+  return Number(suffix);
+}
+
+/** Synthesized condition operands follow the step's answer type. */
+function coerceOperand(label: string, answerType: AnswerType | null): JsonValue {
+  if (answerType === "boolean") {
+    if (label === "true") return true;
+    if (label === "false") return false;
+    return label;
+  }
+  if (answerType === "number") {
+    const value = Number(label);
+    return label !== "" && Number.isFinite(value) ? value : label;
+  }
+  return label;
+}
+
 export function callFlowToStepInput(
   flowStep: CallFlowStep,
   allFlowSteps: CallFlowStep[],
@@ -88,6 +115,7 @@ export function callFlowToStepInput(
   const raw = flowStep.rawStep;
   const fieldKey = raw?.field_key || generateFieldKey(flowStep.title, index);
   const endKey = outcomeFieldKeys.end || "end_call";
+  const answerType = raw?.answer_type || (flowStep.answers.length > 0 ? "enum" : "text");
 
   const nextStep = allFlowSteps[index + 1];
 
@@ -95,13 +123,29 @@ export function callFlowToStepInput(
 
   // Conditional answers
   for (const a of flowStep.answers) {
-    const conditions: BranchCondition[] = [
-      {
-        field_key: fieldKey,
-        operator: "eq",
-        operand: a.label.trim(),
-      },
-    ];
+    const branchIndex = answerBranchIndex(flowStep.id, a.id);
+    const rawBranch = branchIndex !== null ? raw?.branches[branchIndex] : undefined;
+    let conditions: BranchCondition[];
+
+    if (rawBranch && rawBranch.conditions.length > 1) {
+      // Multi-condition branches are reused verbatim; only the target may change.
+      conditions = rawBranch.conditions;
+    } else if (
+      rawBranch &&
+      rawBranch.conditions.length === 1 &&
+      String(rawBranch.conditions[0].operand) === a.label
+    ) {
+      // Label untouched: keep the original operator and operand type.
+      conditions = [rawBranch.conditions[0]];
+    } else {
+      conditions = [
+        {
+          field_key: fieldKey,
+          operator: "eq",
+          operand: coerceOperand(a.label.trim(), answerType),
+        },
+      ];
+    }
 
     if (a.to === "next") {
       if (nextStep) {
@@ -125,17 +169,19 @@ export function callFlowToStepInput(
     }
   }
 
+  const answerLabels = flowStep.answers.map((a) => a.label.trim()).filter(Boolean);
+
   return {
     title: flowStep.title.trim() || `Step ${index + 1}`,
     objective: flowStep.say.trim() || "Follow conversation flow.",
     field_key: fieldKey,
-    answer_type: raw?.answer_type || (flowStep.answers.length > 0 ? "enum" : "text"),
+    answer_type: answerType,
     required: raw?.required ?? true,
     enabled: raw?.enabled ?? true,
     enum_values:
-      flowStep.answers.length > 0
-        ? flowStep.answers.map((a) => a.label.trim()).filter(Boolean)
-        : raw?.enum_values || [],
+      answerType === "enum"
+        ? [...new Set([...(raw?.enum_values ?? []), ...answerLabels])]
+        : raw?.enum_values ?? [],
     wording_mode: raw?.wording_mode || "flexible",
     localized_phrases: raw?.localized_phrases || {},
     extraction_instructions:
@@ -193,8 +239,14 @@ export async function ensureOutcomeSteps(
       });
       updatedSteps.push(endStep);
       outcomeKeys.end = endStep.field_key || "end_call";
-    } catch {
-      // Step may already exist on server
+    } catch (reason) {
+      if (!(reason instanceof ApiError) || reason.status !== 409) throw reason;
+      // A previous or concurrent save already created the outcome; adopt it.
+      const serverSteps = await api<AgentStep[]>(`/agents/${agentId}/steps`);
+      const serverEnd = serverSteps.find(
+        (step) => step.answer_type === "outcome" && step.field_key === "end_call"
+      );
+      if (serverEnd) updatedSteps.push(serverEnd);
       outcomeKeys.end = "end_call";
     }
   }
