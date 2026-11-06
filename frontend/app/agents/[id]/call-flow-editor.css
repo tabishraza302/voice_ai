@@ -1,0 +1,796 @@
+/* Call Flow Editor Stylesheet
+   Derived from /Users/artist/Downloads/Call Flow Editor.html
+   One column of step cards with SVG routes in a right-hand gutter.
+*/
+
+.call-flow-app {
+  --flow-bg: #ECF1F0;
+  --flow-surface: #FFFFFF;
+  --flow-field: #F3F7F6;
+  --flow-ink: #10201F;
+  --flow-ink-2: #4A5D5B;
+  --flow-ink-3: #6C7F7D;
+  --flow-line: #D3DEDC;
+  --flow-line-strong: #B3C4C2;
+  --flow-accent: #0B7A75;
+  --flow-accent-ink: #FFFFFF;
+  --flow-accent-wash: #DCF0ED;
+  --flow-wire: #8EA5A3;
+  --flow-warn: #8A4E05;
+  --flow-warn-wash: #FAEBD0;
+  --flow-danger: #B02E1C;
+  --flow-danger-wash: #FBE4E0;
+  --flow-exit-bg: #1B2C2E;
+  --flow-exit-ink: #E7F1F0;
+  --flow-shadow: 0 1px 2px rgba(16,32,31,.06), 0 8px 18px -10px rgba(16,32,31,.14);
+  --flow-shadow-lift: 0 16px 34px -10px rgba(16,32,31,.38), 0 2px 6px rgba(16,32,31,.14);
+  --gutter: 96px;
+
+  color: var(--flow-ink);
+  max-width: 860px;
+  margin-inline: auto;
+  padding-block: 16px 48px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .call-flow-app,
+  .dark .call-flow-app {
+    --flow-bg: #0B1211;
+    --flow-surface: #142120;
+    --flow-field: #0E1918;
+    --flow-ink: #E4EEED;
+    --flow-ink-2: #9CB1AE;
+    --flow-ink-3: #7C9491;
+    --flow-line: #233332;
+    --flow-line-strong: #38504E;
+    --flow-accent: #3FC4B7;
+    --flow-accent-ink: #04201E;
+    --flow-accent-wash: #123330;
+    --flow-wire: #527370;
+    --flow-warn: #EDB763;
+    --flow-warn-wash: #34270F;
+    --flow-danger: #F29683;
+    --flow-danger-wash: #3A1914;
+    --flow-exit-bg: #050A0A;
+    --flow-exit-ink: #CFE0DE;
+    --flow-shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 18px -10px rgba(0,0,0,.6);
+    --flow-shadow-lift: 0 16px 34px -10px rgba(0,0,0,.8), 0 2px 6px rgba(0,0,0,.5);
+  }
+}
+
+.dark .call-flow-app {
+  --flow-bg: #0B1211;
+  --flow-surface: #142120;
+  --flow-field: #0E1918;
+  --flow-ink: #E4EEED;
+  --flow-ink-2: #9CB1AE;
+  --flow-ink-3: #7C9491;
+  --flow-line: #233332;
+  --flow-line-strong: #38504E;
+  --flow-accent: #3FC4B7;
+  --flow-accent-ink: #04201E;
+  --flow-accent-wash: #123330;
+  --flow-wire: #527370;
+  --flow-warn: #EDB763;
+  --flow-warn-wash: #34270F;
+  --flow-danger: #F29683;
+  --flow-danger-wash: #3A1914;
+  --flow-exit-bg: #050A0A;
+  --flow-exit-ink: #CFE0DE;
+  --flow-shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 18px -10px rgba(0,0,0,.6);
+  --flow-shadow-lift: 0 16px 34px -10px rgba(0,0,0,.8), 0 2px 6px rgba(0,0,0,.5);
+}
+
+/* Header */
+.call-flow-app .top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px 24px;
+}
+.call-flow-app .top-main {
+  flex: 1 1 320px;
+  min-width: 0;
+}
+.call-flow-app .eyebrow {
+  display: block;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: .09em;
+  text-transform: uppercase;
+  color: var(--flow-ink-2);
+  margin-bottom: 6px;
+}
+.call-flow-app .script-name {
+  width: 100%;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 4px 8px;
+  margin-left: -8px;
+  font-size: 24px;
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--flow-ink);
+}
+.call-flow-app .script-name:hover {
+  border-color: var(--flow-line);
+}
+.call-flow-app .script-name:focus {
+  outline: none;
+  border-color: var(--flow-accent);
+  background: var(--flow-surface);
+}
+.call-flow-app .stats {
+  margin: 6px 0 0;
+  color: var(--flow-ink-2);
+  font-size: 13.5px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+}
+.call-flow-app .stats b {
+  font-weight: 600;
+  color: var(--flow-ink);
+  font-variant-numeric: tabular-nums;
+}
+.call-flow-app .stats .warn {
+  color: var(--flow-warn);
+  font-weight: 600;
+}
+.call-flow-app .top-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.call-flow-app .flow-btn {
+  height: 34px;
+  padding: 0 13px;
+  border-radius: 8px;
+  border: 1px solid var(--flow-line-strong);
+  background: var(--flow-surface);
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+  color: var(--flow-ink);
+  transition: border-color .15s ease, background-color .15s ease;
+}
+.call-flow-app .flow-btn:hover {
+  border-color: var(--flow-ink-3);
+}
+.call-flow-app .flow-btn.armed {
+  background: var(--flow-danger-wash);
+  border-color: var(--flow-danger);
+  color: var(--flow-danger);
+}
+
+.call-flow-app .flow-btn-save {
+  background: var(--flow-accent);
+  border-color: var(--flow-accent);
+  color: var(--flow-accent-ink);
+}
+.call-flow-app .flow-btn-save:hover:not(:disabled) {
+  opacity: .92;
+}
+.call-flow-app .flow-btn-save:disabled {
+  opacity: .5;
+  cursor: not-allowed;
+}
+.call-flow-app .save-status {
+  align-self: center;
+  font-size: 13px;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.call-flow-app .save-status.success {
+  color: var(--flow-accent);
+}
+.call-flow-app .save-status.error {
+  color: var(--flow-danger);
+}
+
+.call-flow-app .guide {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 24px;
+  margin: 16px 0 20px;
+  color: var(--flow-ink-2);
+  font-size: 13px;
+}
+.call-flow-app .legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.call-flow-app .legend li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.call-flow-app .lg-line {
+  fill: none;
+  stroke: var(--flow-wire);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+}
+.call-flow-app .lg-dash {
+  stroke-dasharray: 4 3;
+}
+.call-flow-app .lg-arrow {
+  fill: var(--flow-wire);
+}
+.call-flow-app .hint {
+  margin: 0;
+  min-width: 0;
+}
+
+/* Export JSON Panel */
+.call-flow-app .export-panel {
+  background: var(--flow-surface);
+  border: 1px solid var(--flow-line);
+  border-radius: 10px;
+  padding: 14px;
+  margin: 0 0 22px;
+  box-shadow: var(--flow-shadow);
+}
+.call-flow-app .export-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.call-flow-app .export-panel textarea {
+  width: 100%;
+  min-height: 180px;
+  resize: vertical;
+  background: var(--flow-field);
+  border: 1px solid var(--flow-line);
+  border-radius: 8px;
+  padding: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--flow-ink);
+}
+.call-flow-app .export-note {
+  margin: 8px 0 0;
+  font-size: 12.5px;
+  color: var(--flow-ink-2);
+  min-height: 1.4em;
+}
+
+/* Flow Container and Wires */
+.call-flow-app .flow {
+  position: relative;
+  padding-right: var(--gutter);
+}
+.call-flow-app .wires {
+  position: absolute;
+  left: 0;
+  top: 0;
+  overflow: visible;
+  pointer-events: none;
+  z-index: 3;
+}
+.call-flow-app #steps {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* Step Card */
+.call-flow-app .node {
+  position: relative;
+  container-type: inline-size;
+  container-name: node;
+  background: var(--flow-surface);
+  border: 1px solid var(--flow-line);
+  border-radius: 10px;
+  box-shadow: var(--flow-shadow);
+  transition: transform .17s ease, box-shadow .15s ease;
+}
+.call-flow-app .node.hl-to {
+  box-shadow: 0 0 0 2px var(--flow-accent), var(--flow-shadow);
+}
+.call-flow-app .node.dragging {
+  transition: none;
+  z-index: 6;
+  box-shadow: var(--flow-shadow-lift);
+  cursor: grabbing;
+}
+.call-flow-app .node.settling {
+  transition: transform .17s ease;
+}
+.call-flow-app .node.flash {
+  animation: flow-flash 1.1s ease-out;
+}
+@keyframes flow-flash {
+  from { box-shadow: 0 0 0 3px var(--flow-accent), var(--flow-shadow); }
+  to { box-shadow: 0 0 0 3px transparent, var(--flow-shadow); }
+}
+.call-flow-app .flow.is-dragging {
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: grabbing;
+}
+
+/* Card Header */
+.call-flow-app .node-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 50px;
+  padding: 0 10px 0 6px;
+  border-bottom: 1px solid var(--flow-line);
+}
+.call-flow-app .grip {
+  flex: none;
+  width: 28px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  background: transparent;
+  color: var(--flow-ink-3);
+  border-radius: 6px;
+  cursor: grab;
+  touch-action: none;
+}
+.call-flow-app .grip:hover {
+  color: var(--flow-ink);
+  background: var(--flow-field);
+}
+.call-flow-app .num {
+  flex: none;
+  min-width: 24px;
+  height: 24px;
+  padding: 0 6px;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  background: var(--flow-accent-wash);
+  color: var(--flow-accent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12.5px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.call-flow-app .title {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  padding: 5px 8px;
+  margin-left: -4px;
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--flow-ink);
+  text-overflow: ellipsis;
+}
+.call-flow-app .title:hover {
+  border-color: var(--flow-line);
+}
+.call-flow-app .title:focus {
+  outline: none;
+  border-color: var(--flow-accent);
+  background: var(--flow-field);
+}
+.call-flow-app .flag {
+  flex: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  padding: 4px 6px;
+  border-radius: 5px;
+}
+.call-flow-app .flag-start {
+  background: var(--flow-accent-wash);
+  color: var(--flow-accent);
+}
+.call-flow-app .flag-warn {
+  background: var(--flow-warn-wash);
+  color: var(--flow-warn);
+}
+
+.call-flow-app .icon-btn {
+  flex: none;
+  min-width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  color: var(--flow-ink-3);
+  border-radius: 7px;
+  cursor: pointer;
+  padding: 0 5px;
+  transition: background .12s ease, color .12s ease;
+}
+.call-flow-app .icon-btn:hover {
+  background: var(--flow-field);
+  color: var(--flow-ink);
+}
+.call-flow-app .del-text {
+  display: none;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+.call-flow-app .icon-btn.armed {
+  background: var(--flow-danger-wash);
+  color: var(--flow-danger);
+  padding: 0 9px;
+}
+.call-flow-app .icon-btn.armed .del-text {
+  display: inline;
+}
+.call-flow-app .icon-btn:disabled {
+  opacity: .35;
+  cursor: not-allowed;
+}
+
+/* Card Body */
+.call-flow-app .node-body {
+  padding: 14px 16px 12px;
+}
+.call-flow-app .field-label {
+  display: block;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--flow-ink-2);
+  margin-bottom: 7px;
+}
+.call-flow-app .say {
+  display: block;
+  width: 100%;
+  min-height: 58px;
+  resize: none;
+  overflow: hidden;
+  background: var(--flow-field);
+  border: 1px solid var(--flow-line);
+  border-radius: 8px;
+  padding: 9px 11px;
+  font-size: 14.5px;
+  line-height: 1.5;
+  color: var(--flow-ink);
+}
+.call-flow-app .say:focus,
+.call-flow-app .ans-input:focus {
+  outline: none;
+  border-color: var(--flow-accent);
+  background: var(--flow-surface);
+}
+
+/* Answer Rows */
+.call-flow-app .answers {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--flow-line);
+  margin-right: -6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.call-flow-app .answers-head,
+.call-flow-app .answer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 16px minmax(0, 13.5rem) 28px;
+  column-gap: 8px;
+  align-items: center;
+}
+.call-flow-app .answers-head {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--flow-ink-2);
+  padding: 0 4px 8px;
+}
+.call-flow-app .answers-head span:nth-child(3) {
+  padding-left: 2px;
+}
+.call-flow-app .answer {
+  padding: 3px 4px;
+  margin: 0 -4px;
+  border-radius: 9px;
+  transition: background .12s ease;
+}
+.call-flow-app .answer.hl {
+  background: var(--flow-accent-wash);
+}
+.call-flow-app .ans-input {
+  width: 100%;
+  height: 36px;
+  background: var(--flow-field);
+  border: 1px solid var(--flow-line);
+  border-radius: 7px;
+  padding: 0 10px;
+  font-size: 14px;
+  color: var(--flow-ink);
+}
+.call-flow-app .ans-input::placeholder {
+  color: var(--flow-ink-3);
+}
+.call-flow-app .ans-fixed {
+  height: 36px;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  border: 1px dashed var(--flow-line-strong);
+  border-radius: 7px;
+  color: var(--flow-ink-2);
+  font-style: italic;
+  font-size: 14px;
+}
+.call-flow-app .to {
+  display: grid;
+  place-items: center;
+  color: var(--flow-ink-3);
+}
+.call-flow-app .route {
+  position: relative;
+  display: block;
+  min-width: 0;
+}
+.call-flow-app .route::after {
+  content: "";
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  width: 6px;
+  height: 6px;
+  pointer-events: none;
+  border-right: 1.6px solid var(--flow-ink-2);
+  border-bottom: 1.6px solid var(--flow-ink-2);
+  transform: translateY(-70%) rotate(45deg);
+}
+.call-flow-app .route select {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 100%;
+  height: 36px;
+  padding: 0 30px 0 11px;
+  background: var(--flow-surface);
+  border: 1px solid var(--flow-line-strong);
+  border-radius: 7px;
+  font-weight: 500;
+  font-size: 13.5px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  overflow: hidden;
+  cursor: pointer;
+  color: var(--flow-ink);
+}
+.call-flow-app .route select:hover {
+  border-color: var(--flow-ink-3);
+}
+.call-flow-app .route select:focus {
+  outline: none;
+  border-color: var(--flow-accent);
+  box-shadow: 0 0 0 2px var(--flow-accent-wash);
+}
+.call-flow-app .icon-spacer {
+  width: 28px;
+  height: 28px;
+}
+.call-flow-app .add-answer {
+  align-self: flex-start;
+  margin: 6px 0 0;
+  height: 30px;
+  padding: 0 10px 0 6px;
+  border: 0;
+  background: transparent;
+  color: var(--flow-accent);
+  font-weight: 600;
+  font-size: 13px;
+  border-radius: 7px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.call-flow-app .add-answer:hover {
+  background: var(--flow-accent-wash);
+}
+
+/* Narrow Cards */
+@container node (max-width: 470px) {
+  .call-flow-app .answers-head {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .call-flow-app .answers-head span:nth-child(n+2) {
+    display: none;
+  }
+  .call-flow-app .answer {
+    grid-template-columns: minmax(0, 1fr) 28px;
+    row-gap: 6px;
+    padding-block: 7px;
+  }
+  .call-flow-app .answer + .answer {
+    border-top: 1px solid var(--flow-line);
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+  }
+  .call-flow-app .answer .to {
+    display: none;
+  }
+  .call-flow-app .answer .ans-input,
+  .call-flow-app .answer .ans-fixed {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  .call-flow-app .answer .route {
+    grid-column: 1;
+    grid-row: 2;
+  }
+  .call-flow-app .answer .icon-btn,
+  .call-flow-app .answer .icon-spacer {
+    grid-column: 2;
+    grid-row: 1;
+  }
+  .call-flow-app .node-body {
+    padding: 12px 12px 10px;
+  }
+}
+
+/* Add Step Button */
+.call-flow-app .add-row {
+  margin-top: 14px;
+}
+.call-flow-app .add-step {
+  width: 100%;
+  height: 46px;
+  border: 1.5px dashed var(--flow-line-strong);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--flow-ink-2);
+  font-weight: 600;
+  font-size: 14px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: border-color .15s ease, color .15s ease, background-color .15s ease;
+}
+.call-flow-app .add-step:hover {
+  border-color: var(--flow-accent);
+  color: var(--flow-accent);
+  background: var(--flow-accent-wash);
+}
+
+/* Exits Section */
+.call-flow-app .exits-label {
+  margin: 30px 0 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--flow-ink-2);
+}
+.call-flow-app .exits {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.call-flow-app .term {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 54px;
+  padding: 8px 16px;
+  border-radius: 10px;
+  transition: box-shadow .15s ease;
+}
+.call-flow-app .term svg {
+  flex: none;
+}
+.call-flow-app .term-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.call-flow-app .term-title {
+  font-weight: 600;
+  font-size: 15px;
+}
+.call-flow-app .term-sub {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.3;
+  opacity: .75;
+  font-variant-numeric: tabular-nums;
+}
+.call-flow-app .term-end {
+  background: var(--flow-exit-bg);
+  color: var(--flow-exit-ink);
+  border: 1px solid var(--flow-exit-bg);
+}
+.call-flow-app .term-transfer {
+  background: var(--flow-surface);
+  border: 1.5px dashed var(--flow-line-strong);
+  color: var(--flow-ink);
+}
+.call-flow-app .term.hl-to {
+  box-shadow: 0 0 0 2px var(--flow-accent);
+}
+
+/* SVG Wires and Highlighting */
+.call-flow-app .wire .line {
+  fill: none;
+  stroke: var(--flow-wire);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  transition: stroke .12s ease, opacity .12s ease;
+}
+.call-flow-app .wire.exit .line {
+  stroke-dasharray: 4 3;
+}
+.call-flow-app .wire .arrow {
+  fill: var(--flow-wire);
+  transition: fill .12s ease;
+}
+.call-flow-app .wire .dot {
+  fill: var(--flow-surface);
+  stroke: var(--flow-wire);
+  stroke-width: 1.5;
+  transition: stroke .12s ease, fill .12s ease;
+}
+.call-flow-app .wire .hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 12;
+  pointer-events: stroke;
+  cursor: default;
+}
+
+.call-flow-app .wires.has-hl .wire {
+  opacity: .2;
+}
+.call-flow-app .wires.has-hl .wire.hl {
+  opacity: 1;
+}
+.call-flow-app .wire.hl .line {
+  stroke: var(--flow-accent);
+  stroke-width: 2.25;
+}
+.call-flow-app .wire.hl .arrow {
+  fill: var(--flow-accent);
+}
+.call-flow-app .wire.hl .dot {
+  stroke: var(--flow-accent);
+  fill: var(--flow-accent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .call-flow-app .node,
+  .call-flow-app .node.settling,
+  .call-flow-app .answer,
+  .call-flow-app .wire .line {
+    transition: none !important;
+  }
+  .call-flow-app .node.flash {
+    animation: none !important;
+  }
+}
