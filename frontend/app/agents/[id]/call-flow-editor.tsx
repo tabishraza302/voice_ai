@@ -21,6 +21,7 @@ import type { CallFlowAnswer, CallFlowStep } from "./call-flow-adapter";
 import { assignLanes, computeReachability, gutterFor, pathD } from "./call-flow-geometry";
 import type { GutterConfig, LaneAssignment, MeasuredNode, RouteSpan } from "./call-flow-geometry";
 import { saveCallFlow } from "./call-flow-save";
+import type { CallFlowSaveState } from "./call-flow-save";
 import "./call-flow-editor.css";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -99,17 +100,31 @@ interface DragState {
   controller: AbortController;
 }
 
+interface AnswerDragState {
+  stepId: string;
+  el: HTMLElement;
+  grip: HTMLButtonElement;
+  els: HTMLElement[];
+  idx: number;
+  target: number;
+  tops: number[];
+  hs: number[];
+  gap: number;
+  startY: number;
+  startScroll: number;
+  y: number;
+  settling: boolean;
+  raf: number;
+  lanes: LaneAssignment;
+  controller: AbortController;
+}
+
 interface HighlightState {
   wire: string | null;
   row: string | null;
   node: string | null;
   focusRow: string | null;
   focusNode: string | null;
-}
-
-interface SaveState {
-  status: "idle" | "saving" | "saved" | "error";
-  message?: string;
 }
 
 function uid(prefix: string): string {
@@ -175,19 +190,22 @@ export function CallFlowEditor({
   agentName,
   steps,
   onStepsChange,
+  onSaveStateChange,
+  flushToken,
 }: {
   agentId: string;
-  agentName: string;
+  agentName?: string;
   steps: AgentStep[];
   onStepsChange: (steps: AgentStep[]) => void;
+  onSaveStateChange?: (state: CallFlowSaveState) => void;
+  flushToken?: number;
 }) {
   const [flowSteps, setFlowSteps] = useState<CallFlowStep[]>(() => agentStepsToCallFlow(steps).flowSteps);
-  const [title, setTitle] = useState(agentName);
   const [showExport, setShowExport] = useState(false);
   const [copyNote, setCopyNote] = useState("");
   const [sampleArmed, setSampleArmed] = useState(false);
   const [armedDeleteId, setArmedDeleteId] = useState<string | null>(null);
-  const [saveState, setSaveState] = useState<SaveState>({ status: "idle" });
+  const [saveState, setSaveState] = useState<CallFlowSaveState>({ status: "idle" });
 
   const flowRef = useRef<HTMLElement | null>(null);
   const stepsRef = useRef<HTMLDivElement | null>(null);
@@ -228,10 +246,13 @@ export function CallFlowEditor({
   const pendingFocusGripRef = useRef<string | null>(null);
   const pendingAddStepRef = useRef<string | null>(null);
   const pendingFlashRef = useRef<string | null>(null);
+  const answerDragRef = useRef<AnswerDragState | null>(null);
+  const answerSettleTimerRef = useRef(0);
+  const pendingFocusAnswerGripRef = useRef<string | null>(null);
+  const pendingFlashAnswerRef = useRef<string | null>(null);
+  const onSaveStateChangeRef = useRef(onSaveStateChange);
+  const flushTokenRef = useRef(flushToken);
 
-  useEffect(() => {
-    setTitle(agentName);
-  }, [agentName]);
 
   // External reloads replace the server snapshot; the working model is only
   // re-derived from the prop when no local edit or save is in flight. A clean
@@ -333,6 +354,7 @@ export function CallFlowEditor({
     return () => window.clearTimeout(timer);
   }, [sampleArmed]);
 
+
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -350,6 +372,13 @@ export function CallFlowEditor({
         drag.controller.abort();
         cancelAnimationFrame(drag.raf);
         dragRef.current = null;
+      }
+      if (answerSettleTimerRef.current) window.clearTimeout(answerSettleTimerRef.current);
+      const answerDrag = answerDragRef.current;
+      if (answerDrag) {
+        answerDrag.controller.abort();
+        cancelAnimationFrame(answerDrag.raf);
+        answerDragRef.current = null;
       }
       // SPA navigation before the debounce fires: hand the pending model to
       // the save module fire-and-forget. Refs only — no component state and no
@@ -369,6 +398,26 @@ export function CallFlowEditor({
       }
     };
   }, []);
+
+  // The page chip owns status display: every save-state transition is
+  // reported through the latest callback, read from a ref so parent callback
+  // identity churn can never retrigger saves or duplicate reports.
+  useEffect(() => {
+    onSaveStateChangeRef.current = onSaveStateChange;
+  });
+
+  useEffect(() => {
+    onSaveStateChangeRef.current?.(saveState);
+  }, [saveState]);
+
+  // The page chip flushes the flow by bumping flushToken; the mount value is
+  // ignored so a plain render (or StrictMode replay) never saves on its own.
+  useEffect(() => {
+    if (flushTokenRef.current === flushToken) return;
+    flushTokenRef.current = flushToken;
+    flush();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [flushToken]);
 
   const stats = useMemo(() => {
     const ids = flowSteps.map((step) => step.id);
@@ -428,12 +477,27 @@ export function CallFlowEditor({
     el.classList.add("flash");
   }
 
+  function flashAnswer(id: string) {
+    const el = stepsRef.current?.querySelector<HTMLElement>(`.answer[data-ans-id="${id}"]`);
+    if (!el) return;
+    el.classList.remove("flash");
+    void el.offsetWidth;
+    el.classList.add("flash");
+  }
+
   function processPendingActions() {
     const answerId = pendingFocusAnswerRef.current;
     if (answerId) {
       pendingFocusAnswerRef.current = null;
       stepsRef.current
         ?.querySelector<HTMLInputElement>(`.answer[data-ans-id="${answerId}"] .ans-input`)
+        ?.focus();
+    }
+    const answerGripId = pendingFocusAnswerGripRef.current;
+    if (answerGripId) {
+      pendingFocusAnswerGripRef.current = null;
+      stepsRef.current
+        ?.querySelector<HTMLButtonElement>(`.answer[data-ans-id="${answerGripId}"] .answer-grip`)
         ?.focus();
     }
     const gripId = pendingFocusGripRef.current;
@@ -457,6 +521,11 @@ export function CallFlowEditor({
     if (flashId) {
       pendingFlashRef.current = null;
       flashNode(flashId);
+    }
+    const flashAnswerId = pendingFlashAnswerRef.current;
+    if (flashAnswerId) {
+      pendingFlashAnswerRef.current = null;
+      flashAnswer(flashAnswerId);
     }
   }
 
@@ -583,7 +652,7 @@ export function CallFlowEditor({
   }
 
   function layout() {
-    if (dragRef.current) return;
+    if (dragRef.current || answerDragRef.current) return;
     let m = measure();
     let lanes = assignLanes(m.routes);
     for (let pass = 0; pass < 3; pass++) {
@@ -658,7 +727,7 @@ export function CallFlowEditor({
   }
 
   function handleMouseOver(event: ReactMouseEvent<HTMLElement>) {
-    if (dragRef.current) return;
+    if (dragRef.current || answerDragRef.current) return;
     const target = event.target instanceof Element ? event.target : null;
     clearHover();
     if (target) {
@@ -814,6 +883,37 @@ export function CallFlowEditor({
     moveStep(stepId, event.key === "ArrowUp" ? index - 1 : index + 1);
   }
 
+  function moveAnswer(stepId: string, from: number, to: number) {
+    const current = flowStepsRef.current;
+    const stepIndex = current.findIndex((step) => step.id === stepId);
+    if (stepIndex < 0) return;
+    const answers = current[stepIndex].answers;
+    if (from < 0 || to < 0 || to >= answers.length || to === from) return;
+    const moved = answers[from];
+    if (!moved) return;
+    const next = [...answers];
+    next.splice(from, 1);
+    next.splice(to, 0, moved);
+    const steps = current.map((step, index) => (index === stepIndex ? { ...step, answers: next } : step));
+    pendingFocusAnswerGripRef.current = moved.id;
+    setFlowSteps(steps);
+    announce(`Rule moved to position ${to + 1} of ${next.length}`);
+  }
+
+  function handleAnswerGripKeyDown(
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+    stepId: string,
+    answerId: string
+  ) {
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+    event.preventDefault();
+    const step = flowStepsRef.current.find((candidate) => candidate.id === stepId);
+    if (!step) return;
+    const index = step.answers.findIndex((answer) => answer.id === answerId);
+    if (index < 0) return;
+    moveAnswer(stepId, index, event.key === "ArrowUp" ? index - 1 : index + 1);
+  }
+
   /* ---------- Drag to reorder ---------- */
 
   function handleGripPointerDown(event: ReactPointerEvent<HTMLButtonElement>) {
@@ -827,7 +927,7 @@ export function CallFlowEditor({
     if (event.button !== 0) return;
     event.preventDefault();
     const stepsEl = stepsRef.current;
-    if (!stepsEl || dragRef.current) return;
+    if (!stepsEl || dragRef.current || answerDragRef.current) return;
     const els = Array.from(stepsEl.querySelectorAll<HTMLElement>(":scope > .node"));
     const scrollY = window.pageYOffset || document.documentElement.scrollTop || 0;
     const controller = new AbortController();
@@ -976,6 +1076,189 @@ export function CallFlowEditor({
     }
   }
 
+  /* ---------- Answer drag to reorder ---------- */
+
+  function handleAnswerGripPointerDown(
+    event: ReactPointerEvent<HTMLButtonElement>,
+    stepId: string
+  ) {
+    const grip = event.currentTarget;
+    const row = grip.closest<HTMLElement>(".answer");
+    if (!row) return;
+    startAnswerDrag(event, grip, row, stepId);
+  }
+
+  function startAnswerDrag(
+    event: ReactPointerEvent<HTMLButtonElement>,
+    grip: HTMLButtonElement,
+    row: HTMLElement,
+    stepId: string
+  ) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    if (dragRef.current || answerDragRef.current) return;
+    const container = row.parentElement;
+    if (!container) return;
+    const els = Array.from(container.querySelectorAll<HTMLElement>(":scope > .answer:not(.is-else)"));
+    const idx = els.indexOf(row);
+    if (idx < 0) return;
+    const scrollY = window.pageYOffset || document.documentElement.scrollTop || 0;
+    const tops = els.map((el) => el.getBoundingClientRect().top + scrollY);
+    const hs = els.map((el) => el.offsetHeight);
+    const gap = els.length > 1 ? Math.max(0, tops[1] - tops[0] - hs[0]) : 0;
+    const controller = new AbortController();
+    answerDragRef.current = {
+      stepId,
+      el: row,
+      grip,
+      els,
+      idx,
+      target: idx,
+      tops,
+      hs,
+      gap,
+      startY: event.clientY,
+      startScroll: scrollY,
+      y: event.clientY,
+      settling: false,
+      raf: 0,
+      lanes: assignLanes(measure().routes),
+      controller,
+    };
+    try {
+      grip.setPointerCapture(event.pointerId);
+    } catch {
+      // Pointer capture can be unavailable; drag still works through the listeners.
+    }
+    row.classList.add("dragging");
+    flowRef.current?.classList.add("is-dragging");
+    clearHover();
+    hlRef.current.focusRow = null;
+    hlRef.current.focusNode = null;
+    applyHighlight();
+    const { signal } = controller;
+    grip.addEventListener("pointermove", onAnswerDragMove, { signal });
+    grip.addEventListener("pointerup", onAnswerDragUp, { signal });
+    grip.addEventListener("pointercancel", onAnswerDragCancel, { signal });
+    document.addEventListener("keydown", onAnswerDragKey, { signal });
+    answerTick();
+  }
+
+  function onAnswerDragMove(event: PointerEvent) {
+    const drag = answerDragRef.current;
+    if (drag) drag.y = event.clientY;
+  }
+
+  function onAnswerDragUp() {
+    endAnswerDrag(true);
+  }
+
+  function onAnswerDragCancel() {
+    endAnswerDrag(false);
+  }
+
+  function onAnswerDragKey(event: KeyboardEvent) {
+    if (event.key === "Escape") endAnswerDrag(false);
+  }
+
+  function answerTick() {
+    const drag = answerDragRef.current;
+    if (!drag) return;
+    if (!drag.settling) {
+      const viewportHeight = window.innerHeight;
+      if (drag.y < 64) window.scrollBy(0, -14);
+      else if (drag.y > viewportHeight - 64) window.scrollBy(0, 14);
+      updateAnswerDrag();
+    } else {
+      drawFrozen(drag.lanes);
+    }
+    drag.raf = requestAnimationFrame(answerTick);
+  }
+
+  function updateAnswerDrag() {
+    const drag = answerDragRef.current;
+    if (!drag) return;
+    const scrollY = window.pageYOffset || document.documentElement.scrollTop || 0;
+    let dy = drag.y - drag.startY + (scrollY - drag.startScroll);
+    const last = drag.els.length - 1;
+    const minDy = drag.tops[0] - drag.tops[drag.idx];
+    const maxDy = drag.tops[last] + drag.hs[last] - (drag.tops[drag.idx] + drag.hs[drag.idx]);
+    dy = Math.max(minDy, Math.min(maxDy, dy));
+    drag.el.style.transform = `translateY(${dy}px)`;
+    const center = drag.tops[drag.idx] + drag.hs[drag.idx] / 2 + dy;
+    let target = 0;
+    drag.els.forEach((_, index) => {
+      if (index === drag.idx) return;
+      if (drag.tops[index] + drag.hs[index] / 2 < center) target += 1;
+    });
+    drag.target = target;
+    const shift = drag.hs[drag.idx] + drag.gap;
+    drag.els.forEach((node, index) => {
+      if (index === drag.idx) return;
+      let offset = 0;
+      if (index < drag.idx && index >= target) offset = shift;
+      else if (index > drag.idx && index <= target) offset = -shift;
+      node.style.transform = offset ? `translateY(${offset}px)` : "";
+    });
+    drawFrozen(drag.lanes);
+  }
+
+  function endAnswerDrag(commit: boolean) {
+    const drag = answerDragRef.current;
+    if (!drag || drag.settling) return;
+    drag.controller.abort();
+    const reorder = commit && drag.target !== drag.idx;
+    drag.settling = true;
+    drag.el.classList.add("settling");
+    if (reorder) {
+      const order = drag.els.map((_, index) => index);
+      order.splice(drag.idx, 1);
+      order.splice(drag.target, 0, drag.idx);
+      let y = drag.tops[0];
+      let finalTop = drag.tops[drag.idx];
+      order.forEach((index) => {
+        if (index === drag.idx) finalTop = y;
+        y += drag.hs[index] + drag.gap;
+      });
+      drag.el.style.transform = `translateY(${finalTop - drag.tops[drag.idx]}px)`;
+    } else {
+      drag.el.style.transform = "";
+      drag.els.forEach((node) => {
+        if (node !== drag.el) node.style.transform = "";
+      });
+    }
+    answerSettleTimerRef.current = window.setTimeout(() => finishAnswerDrag(drag, reorder), 190);
+  }
+
+  function finishAnswerDrag(drag: AnswerDragState, reorder: boolean) {
+    cancelAnimationFrame(drag.raf);
+    drag.els.forEach((node) => {
+      node.style.transform = "";
+      node.classList.remove("dragging", "settling");
+    });
+    flowRef.current?.classList.remove("is-dragging");
+    answerDragRef.current = null;
+    if (reorder) {
+      const current = flowStepsRef.current;
+      const stepIndex = current.findIndex((step) => step.id === drag.stepId);
+      const step = stepIndex >= 0 ? current[stepIndex] : undefined;
+      const moved = step?.answers[drag.idx];
+      if (step && moved) {
+        const answers = [...step.answers];
+        answers.splice(drag.idx, 1);
+        answers.splice(drag.target, 0, moved);
+        const steps = current.map((candidate, index) =>
+          index === stepIndex ? { ...candidate, answers } : candidate
+        );
+        pendingFlashAnswerRef.current = moved.id;
+        setFlowSteps(steps);
+        announce(`Rule moved to position ${drag.target + 1} of ${answers.length}`);
+      }
+    } else {
+      layoutSoon();
+    }
+  }
+
   /* ---------- Export and sample ---------- */
 
   function toExport() {
@@ -985,7 +1268,7 @@ export function CallFlowEditor({
       return `step_${flowSteps.findIndex((step) => step.id === resolved) + 1}`;
     };
     return {
-      name: title,
+      name: agentName || "Voice call script",
       start: flowSteps.length ? "step_1" : null,
       steps: flowSteps.map((step, index) => ({
         id: `step_${index + 1}`,
@@ -1192,21 +1475,8 @@ export function CallFlowEditor({
 
   return (
     <div className="call-flow-app">
-      <header className="top">
+      <div className="top">
         <div className="top-main">
-          <label className="eyebrow" htmlFor="scriptName">
-            Voice call script
-          </label>
-          <input
-            id="scriptName"
-            className="script-name"
-            type="text"
-            autoComplete="off"
-            spellCheck={false}
-            aria-label="Script name"
-            value={title}
-            onChange={(event) => setTitle(event.currentTarget.value)}
-          />
           <p className="stats" aria-live="polite">
             <span>
               <b>{flowSteps.length}</b> {flowSteps.length === 1 ? "step" : "steps"}
@@ -1239,23 +1509,8 @@ export function CallFlowEditor({
           >
             {sampleArmed ? "Replace script?" : "Load sample"}
           </button>
-          <button
-            type="button"
-            className={`save-status ${saveState.status}`}
-            onClick={flush}
-          >
-            {saveState.status === "idle" ? "Auto-saves as you edit" : null}
-            {saveState.status === "saving" ? "Saving…" : null}
-            {saveState.status === "saved" ? "Saved" : null}
-            {saveState.status === "error" ? (
-              <>
-                {saveState.message}
-                <span className="retry">Retry</span>
-              </>
-            ) : null}
-          </button>
         </div>
-      </header>
+      </div>
 
       <div className="guide">
         <ul className="legend" aria-label="Line key">
@@ -1287,6 +1542,12 @@ export function CallFlowEditor({
         <textarea ref={jsonRef} value={exportJson} readOnly spellCheck={false} aria-label="Script JSON" />
         <p className="export-note">{copyNote}</p>
       </section>
+      {saveState.status === "error" ? (
+        <div role="alert" className="mb-4 flex items-center justify-between rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-2.5 text-sm text-destructive">
+          <span>{saveState.message}</span>
+          <button type="button" onClick={flush} className="font-semibold underline">Retry</button>
+        </div>
+      ) : null}
 
       <main
         className="flow"
@@ -1353,12 +1614,13 @@ export function CallFlowEditor({
                   />
                   <div className="answers">
                     <div className="answers-head" aria-hidden="true">
+                      <span></span>
                       <span>If the caller says</span>
                       <span></span>
                       <span>Go to</span>
                       <span></span>
                     </div>
-                    {flowStep.answers.map((answer) => (
+                    {flowStep.answers.map((answer, answerIndex) => (
                       <div
                         key={answer.id}
                         className="answer"
@@ -1366,6 +1628,15 @@ export function CallFlowEditor({
                         data-ans-id={answer.id}
                         data-route-key={`${flowStep.id}:${answer.id}`}
                       >
+                        <button
+                          type="button"
+                          className="answer-grip"
+                          aria-label={`Reorder rule ${answerIndex + 1}. Drag, or press arrow up or down.`}
+                          onPointerDown={(event) => handleAnswerGripPointerDown(event, flowStep.id)}
+                          onKeyDown={(event) => handleAnswerGripKeyDown(event, flowStep.id, answer.id)}
+                        >
+                          {ICONS.grip}
+                        </button>
                         <input
                           className="ans-input"
                           type="text"
@@ -1403,6 +1674,7 @@ export function CallFlowEditor({
                       data-ans-id="else"
                       data-route-key={`${flowStep.id}:else`}
                     >
+                      <span className="answer-grip-spacer" aria-hidden="true" />
                       <span className="ans-fixed">Anything else</span>
                       <span className="to" aria-hidden="true">
                         {ICONS.arrow}

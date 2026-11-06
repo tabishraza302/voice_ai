@@ -21,6 +21,11 @@ export interface CallFlowSaveOutput {
   signatures: Map<string, string>;
 }
 
+export interface CallFlowSaveState {
+  status: "idle" | "saving" | "saved" | "error";
+  message?: string;
+}
+
 /** Rewrites a whole working model through the temp-id -> server-id mapping. */
 function remapFlowSteps(
   flowSteps: CallFlowStep[],
