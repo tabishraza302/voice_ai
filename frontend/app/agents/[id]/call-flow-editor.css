@@ -188,9 +188,6 @@
   align-items: center;
   gap: 6px;
 }
-.call-flow-app .save-status.success {
-  color: var(--flow-accent);
-}
 .call-flow-app .save-status.error {
   color: var(--flow-danger);
 }
@@ -726,11 +723,6 @@
   background: var(--flow-exit-bg);
   color: var(--flow-exit-ink);
   border: 1px solid var(--flow-exit-bg);
-}
-.call-flow-app .term-transfer {
-  background: var(--flow-surface);
-  border: 1.5px dashed var(--flow-line-strong);
-  color: var(--flow-ink);
 }
 .call-flow-app .term.hl-to {
   box-shadow: 0 0 0 2px var(--flow-accent);

@@ -156,7 +156,7 @@ export function CallFlowEditor({
   const [sampleArmed, setSampleArmed] = useState(false);
   const [armedDeleteId, setArmedDeleteId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const [saveStatus, setSaveStatus] = useState<{ kind: "success" | "error"; message: string } | null>(null);
+  const [saveStatus, setSaveStatus] = useState<{ kind: "error"; message: string } | null>(null);
 
   const flowRef = useRef<HTMLElement | null>(null);
   const stepsRef = useRef<HTMLDivElement | null>(null);
@@ -273,27 +273,22 @@ export function CallFlowEditor({
     });
     let totalRoutes = 0;
     let routesToEnd = 0;
-    let routesToTransfer = 0;
     flowSteps.forEach((step, index) => {
       [...step.answers.map((answer) => answer.to), step.other].forEach((target) => {
         totalRoutes += 1;
         const resolved = resolveRoute(target, index, flowSteps);
         if (resolved === "end") routesToEnd += 1;
-        else if (resolved === "transfer") routesToTransfer += 1;
       });
     });
     const unreachedIds = new Set(
       flowSteps.filter((step) => !reachable.has(step.id)).map((step) => step.id)
     );
-    return { totalRoutes, routesToEnd, routesToTransfer, unreachedIds };
+    return { totalRoutes, routesToEnd, unreachedIds };
   }, [flowSteps]);
 
   const endCountText = stats.routesToEnd
     ? `${plural(stats.routesToEnd, "route ends", "routes end")} here`
     : "No routes end here";
-  const transferCountText = stats.routesToTransfer
-    ? `${plural(stats.routesToTransfer, "route hands", "routes hand")} off here`
-    : "No routes hand off here";
 
   /* ---------- Autosize, announcements, pending DOM actions ---------- */
 
@@ -394,7 +389,7 @@ export function CallFlowEditor({
         y0: rowRect.top + rowRect.height / 2 - flowRect.top,
         x1: targetNode.right,
         y1: 0,
-        exit: to === "end" || to === "transfer",
+        exit: to === "end",
       });
     });
     const byTarget: Record<string, RouteSpan[]> = {};
@@ -877,7 +872,7 @@ export function CallFlowEditor({
   function toExport() {
     const name = (target: string, index: number): string => {
       const resolved = resolveRoute(target, index, flowSteps);
-      if (resolved === "end" || resolved === "transfer") return resolved;
+      if (resolved === "end") return resolved;
       return `step_${flowSteps.findIndex((step) => step.id === resolved) + 1}`;
     };
     return {
@@ -956,16 +951,15 @@ export function CallFlowEditor({
       const referenced = new Set<string>();
       for (const flowStep of currentFlow) {
         for (const answer of flowStep.answers) {
-          if (answer.to === "end" || answer.to === "transfer") referenced.add(answer.to);
+          if (answer.to === "end") referenced.add(answer.to);
         }
-        if (flowStep.other === "end" || flowStep.other === "transfer") referenced.add(flowStep.other);
+        if (flowStep.other === "end") referenced.add(flowStep.other);
       }
 
       const ensured = await ensureOutcomeSteps(agentId, stepsAfterRemovals, referenced);
       const outcomeKeys = ensured.outcomeKeys;
       const requiredOutcomes = [
         { route: "end" as const, key: outcomeKeys.end ?? "end_call", label: "End call" },
-        { route: "transfer" as const, key: outcomeKeys.transfer ?? "transfer", label: "Transfer to a person" },
       ];
       for (const required of requiredOutcomes) {
         if (!referenced.has(required.route)) continue;
@@ -1037,7 +1031,7 @@ export function CallFlowEditor({
 
       onStepsChange(reordered);
       setFlowSteps(agentStepsToCallFlow(reordered).flowSteps);
-      setSaveStatus({ kind: "success", message: "Flow saved." });
+      setSaveStatus(null);
     } catch (reason) {
       setSaveStatus({ kind: "error", message: saveErrorMessage(reason) });
     } finally {
@@ -1053,7 +1047,6 @@ export function CallFlowEditor({
         <optgroup label="Flow">
           <option value="next">Next step</option>
           <option value="end">End call</option>
-          <option value="transfer">Transfer to a person</option>
         </optgroup>
         <optgroup label="Go to step">
           {flowSteps.map((step, index) =>
@@ -1140,7 +1133,7 @@ export function CallFlowEditor({
               <path className="lg-line lg-dash" d="M2 5H25" />
               <path className="lg-arrow" d="M31 5l-6 -3v6z" />
             </svg>
-            Ends the call or hands off
+            Ends the call
           </li>
         </ul>
         <p className="hint">Drag the handle to reorder. Hover an answer or a line to trace it. Sample content, edit freely.</p>
@@ -1314,15 +1307,6 @@ export function CallFlowEditor({
             <div className="term-main">
               <span className="term-title">End call</span>
               <span className="term-sub">{endCountText}</span>
-            </div>
-          </article>
-          <article className="node term term-transfer" data-node-id="transfer" aria-label="Transfer to a person">
-            <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-              <path d="M3 10h11M10.5 5.5 15 10l-4.5 4.5M17 4v12" />
-            </svg>
-            <div className="term-main">
-              <span className="term-title">Transfer to a person</span>
-              <span className="term-sub">{transferCountText}</span>
             </div>
           </article>
         </div>
