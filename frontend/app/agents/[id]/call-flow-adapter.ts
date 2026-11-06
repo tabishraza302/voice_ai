@@ -4,7 +4,7 @@ import type { AgentStep, BranchCondition, StepBranch, StepInput } from "@/lib/ty
 export interface CallFlowAnswer {
   id: string;
   label: string;
-  to: string; // "next" | "end" | "transfer" | target_step_id
+  to: string; // "next" | "end" | target_step_id
 }
 
 export interface CallFlowStep {
@@ -12,7 +12,7 @@ export interface CallFlowStep {
   title: string;
   say: string; // mapped to step.objective
   answers: CallFlowAnswer[];
-  other: string; // "next" | "end" | "transfer" | target_step_id
+  other: string; // "next" | "end" | target_step_id
   rawStep?: AgentStep;
 }
 
@@ -50,7 +50,7 @@ export function agentStepsToCallFlow(steps: AgentStep[]): {
       if (b.target_step_id) {
         target = b.target_step_id;
       } else if (b.outcome) {
-        target = b.outcome === "transfer" ? "transfer" : "end";
+        target = "end";
       }
 
       if (isConditional) {
@@ -83,12 +83,11 @@ export function callFlowToStepInput(
   flowStep: CallFlowStep,
   allFlowSteps: CallFlowStep[],
   index: number,
-  outcomeFieldKeys: { end?: string; transfer?: string } = {}
+  outcomeFieldKeys: { end?: string } = {}
 ): StepInput {
   const raw = flowStep.rawStep;
   const fieldKey = raw?.field_key || generateFieldKey(flowStep.title, index);
   const endKey = outcomeFieldKeys.end || "end_call";
-  const transferKey = outcomeFieldKeys.transfer || "transfer";
 
   const nextStep = allFlowSteps[index + 1];
 
@@ -112,8 +111,6 @@ export function callFlowToStepInput(
       }
     } else if (a.to === "end") {
       branches.push({ conditions, target_step_id: null, outcome: endKey });
-    } else if (a.to === "transfer") {
-      branches.push({ conditions, target_step_id: null, outcome: transferKey });
     } else {
       branches.push({ conditions, target_step_id: a.to, outcome: null });
     }
@@ -123,8 +120,6 @@ export function callFlowToStepInput(
   if (flowStep.other !== "next") {
     if (flowStep.other === "end") {
       branches.push({ conditions: [], target_step_id: null, outcome: endKey });
-    } else if (flowStep.other === "transfer") {
-      branches.push({ conditions: [], target_step_id: null, outcome: transferKey });
     } else {
       branches.push({ conditions: [], target_step_id: flowStep.other, outcome: null });
     }
@@ -157,9 +152,9 @@ export function callFlowToStepInput(
 }
 
 /**
- * Ensures that if any flow step routes to 'end' or 'transfer',
- * corresponding enabled outcome steps exist in the backend.
- * Auto-provisions them if missing to satisfy backend validate_publish constraints.
+ * Ensures that if any flow step routes to 'end',
+ * the corresponding enabled outcome step exists in the backend.
+ * Auto-provisions it if missing to satisfy backend validate_publish constraints.
  */
 export async function ensureOutcomeSteps(
   agentId: string,
@@ -167,10 +162,10 @@ export async function ensureOutcomeSteps(
   referencedOutcomes: Set<string>
 ): Promise<{
   steps: AgentStep[];
-  outcomeKeys: { end?: string; transfer?: string };
+  outcomeKeys: { end?: string };
 }> {
   let updatedSteps = [...currentSteps];
-  const outcomeKeys: { end?: string; transfer?: string } = {};
+  const outcomeKeys: { end?: string } = {};
 
   const existingOutcomes = updatedSteps.filter(
     (s) => s.answer_type === "outcome" && s.enabled && typeof s.field_key === "string"
@@ -181,11 +176,6 @@ export async function ensureOutcomeSteps(
   );
   if (existingEnd) {
     outcomeKeys.end = existingEnd.field_key!;
-  }
-
-  const existingTransfer = existingOutcomes.find((s) => s.field_key === "transfer");
-  if (existingTransfer) {
-    outcomeKeys.transfer = existingTransfer.field_key!;
   }
 
   // Auto-provision "end" outcome if referenced and not present
@@ -206,27 +196,6 @@ export async function ensureOutcomeSteps(
     } catch {
       // Step may already exist on server
       outcomeKeys.end = "end_call";
-    }
-  }
-
-  // Auto-provision "transfer" outcome if referenced and not present
-  if (referencedOutcomes.has("transfer") && !outcomeKeys.transfer) {
-    try {
-      const transferStep = await api<AgentStep>(`/agents/${agentId}/steps`, {
-        method: "POST",
-        body: JSON.stringify({
-          title: "Transfer to a person",
-          objective: "Transfer the caller to a human agent.",
-          field_key: "transfer",
-          answer_type: "outcome",
-          enabled: true,
-        }),
-      });
-      updatedSteps.push(transferStep);
-      outcomeKeys.transfer = transferStep.field_key || "transfer";
-    } catch {
-      // Step may already exist on server
-      outcomeKeys.transfer = "transfer";
     }
   }
 
@@ -284,7 +253,7 @@ export function getSampleHearingScript(): CallFlowStep[] {
         { id: "sample_a10", label: "Weekdays", to: "end" },
         { id: "sample_a11", label: "Weekends", to: "end" },
       ],
-      other: "transfer",
+      other: "end",
     },
     {
       id: "sample_s6",
