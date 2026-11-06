@@ -93,9 +93,10 @@ interface DragState {
   startY: number;
   startScroll: number;
   y: number;
+  lastY: number;
+  lastScroll: number;
   settling: boolean;
   raf: number;
-  lanes: LaneAssignment;
   controller: AbortController;
 }
 
@@ -112,9 +113,10 @@ interface AnswerDragState {
   startY: number;
   startScroll: number;
   y: number;
+  lastY: number;
+  lastScroll: number;
   settling: boolean;
   raf: number;
-  lanes: LaneAssignment;
   controller: AbortController;
 }
 
@@ -667,10 +669,6 @@ export function CallFlowEditor({
     });
   }
 
-  function drawFrozen(lanes: LaneAssignment) {
-    const m = measure();
-    draw(m, lanes, curGRef.current);
-  }
 
   /* ---------- Tracing (hover and focus) ---------- */
 
@@ -952,9 +950,10 @@ export function CallFlowEditor({
       startY: event.clientY,
       startScroll: scrollY,
       y: event.clientY,
+      lastY: event.clientY,
+      lastScroll: scrollY,
       settling: false,
       raf: 0,
-      lanes: assignLanes(measure().routes),
       controller,
     };
     try {
@@ -969,9 +968,9 @@ export function CallFlowEditor({
     hlRef.current.focusNode = null;
     applyHighlight();
     const { signal } = controller;
-    grip.addEventListener("pointermove", onDragMove, { signal });
-    grip.addEventListener("pointerup", onDragUp, { signal });
-    grip.addEventListener("pointercancel", onDragCancel, { signal });
+    window.addEventListener("pointermove", onDragMove, { signal });
+    window.addEventListener("pointerup", onDragUp, { signal });
+    window.addEventListener("pointercancel", onDragCancel, { signal });
     document.addEventListener("keydown", onDragKey, { signal });
     tick();
   }
@@ -992,7 +991,6 @@ export function CallFlowEditor({
   function onDragKey(event: KeyboardEvent) {
     if (event.key === "Escape") endDrag(false);
   }
-
   function tick() {
     const drag = dragRef.current;
     if (!drag) return;
@@ -1000,9 +998,12 @@ export function CallFlowEditor({
       const viewportHeight = window.innerHeight;
       if (drag.y < 64) window.scrollBy(0, -14);
       else if (drag.y > viewportHeight - 64) window.scrollBy(0, 14);
-      updateDrag();
-    } else {
-      drawFrozen(drag.lanes);
+      const scrollY = window.pageYOffset || document.documentElement.scrollTop || 0;
+      if (drag.y !== drag.lastY || scrollY !== drag.lastScroll) {
+        drag.lastY = drag.y;
+        drag.lastScroll = scrollY;
+        updateDrag();
+      }
     }
     drag.raf = requestAnimationFrame(tick);
   }
@@ -1016,7 +1017,7 @@ export function CallFlowEditor({
     const minDy = drag.tops[0] - drag.tops[drag.idx];
     const maxDy = drag.tops[last] + drag.hs[last] - (drag.tops[drag.idx] + drag.hs[drag.idx]);
     dy = Math.max(minDy, Math.min(maxDy, dy));
-    drag.el.style.transform = `translateY(${dy}px)`;
+    drag.el.style.transform = `translate3d(0, ${dy}px, 0)`;
     const center = drag.tops[drag.idx] + drag.hs[drag.idx] / 2 + dy;
     let target = 0;
     drag.els.forEach((_, index) => {
@@ -1030,9 +1031,8 @@ export function CallFlowEditor({
       let offset = 0;
       if (index < drag.idx && index >= target) offset = shift;
       else if (index > drag.idx && index <= target) offset = -shift;
-      node.style.transform = offset ? `translateY(${offset}px)` : "";
+      node.style.transform = offset ? `translate3d(0, ${offset}px, 0)` : "";
     });
-    drawFrozen(drag.lanes);
   }
 
   function endDrag(commit: boolean) {
@@ -1052,7 +1052,7 @@ export function CallFlowEditor({
         if (index === drag.idx) finalTop = y;
         y += drag.hs[index] + GAP;
       });
-      drag.el.style.transform = `translateY(${finalTop - drag.tops[drag.idx]}px)`;
+      drag.el.style.transform = `translate3d(0, ${finalTop - drag.tops[drag.idx]}px, 0)`;
     } else {
       drag.el.style.transform = "";
       drag.els.forEach((node) => {
@@ -1130,9 +1130,10 @@ export function CallFlowEditor({
       startY: event.clientY,
       startScroll: scrollY,
       y: event.clientY,
+      lastY: event.clientY,
+      lastScroll: scrollY,
       settling: false,
       raf: 0,
-      lanes: assignLanes(measure().routes),
       controller,
     };
     try {
@@ -1147,9 +1148,9 @@ export function CallFlowEditor({
     hlRef.current.focusNode = null;
     applyHighlight();
     const { signal } = controller;
-    grip.addEventListener("pointermove", onAnswerDragMove, { signal });
-    grip.addEventListener("pointerup", onAnswerDragUp, { signal });
-    grip.addEventListener("pointercancel", onAnswerDragCancel, { signal });
+    window.addEventListener("pointermove", onAnswerDragMove, { signal });
+    window.addEventListener("pointerup", onAnswerDragUp, { signal });
+    window.addEventListener("pointercancel", onAnswerDragCancel, { signal });
     document.addEventListener("keydown", onAnswerDragKey, { signal });
     answerTick();
   }
@@ -1170,7 +1171,6 @@ export function CallFlowEditor({
   function onAnswerDragKey(event: KeyboardEvent) {
     if (event.key === "Escape") endAnswerDrag(false);
   }
-
   function answerTick() {
     const drag = answerDragRef.current;
     if (!drag) return;
@@ -1178,13 +1178,15 @@ export function CallFlowEditor({
       const viewportHeight = window.innerHeight;
       if (drag.y < 64) window.scrollBy(0, -14);
       else if (drag.y > viewportHeight - 64) window.scrollBy(0, 14);
-      updateAnswerDrag();
-    } else {
-      drawFrozen(drag.lanes);
+      const scrollY = window.pageYOffset || document.documentElement.scrollTop || 0;
+      if (drag.y !== drag.lastY || scrollY !== drag.lastScroll) {
+        drag.lastY = drag.y;
+        drag.lastScroll = scrollY;
+        updateAnswerDrag();
+      }
     }
     drag.raf = requestAnimationFrame(answerTick);
   }
-
   function updateAnswerDrag() {
     const drag = answerDragRef.current;
     if (!drag) return;
@@ -1194,7 +1196,7 @@ export function CallFlowEditor({
     const minDy = drag.tops[0] - drag.tops[drag.idx];
     const maxDy = drag.tops[last] + drag.hs[last] - (drag.tops[drag.idx] + drag.hs[drag.idx]);
     dy = Math.max(minDy, Math.min(maxDy, dy));
-    drag.el.style.transform = `translateY(${dy}px)`;
+    drag.el.style.transform = `translate3d(0, ${dy}px, 0)`;
     const center = drag.tops[drag.idx] + drag.hs[drag.idx] / 2 + dy;
     let target = 0;
     drag.els.forEach((_, index) => {
@@ -1208,9 +1210,8 @@ export function CallFlowEditor({
       let offset = 0;
       if (index < drag.idx && index >= target) offset = shift;
       else if (index > drag.idx && index <= target) offset = -shift;
-      node.style.transform = offset ? `translateY(${offset}px)` : "";
+      node.style.transform = offset ? `translate3d(0, ${offset}px, 0)` : "";
     });
-    drawFrozen(drag.lanes);
   }
 
   function endAnswerDrag(commit: boolean) {
@@ -1230,7 +1231,7 @@ export function CallFlowEditor({
         if (index === drag.idx) finalTop = y;
         y += drag.hs[index] + drag.gap;
       });
-      drag.el.style.transform = `translateY(${finalTop - drag.tops[drag.idx]}px)`;
+      drag.el.style.transform = `translate3d(0, ${finalTop - drag.tops[drag.idx]}px, 0)`;
     } else {
       drag.el.style.transform = "";
       drag.els.forEach((node) => {
