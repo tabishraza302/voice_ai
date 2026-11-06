@@ -189,8 +189,6 @@ async def test_publish_fails_closed_without_server_provider_configuration(client
             "field_key": "welcome",
             "title": "Welcome",
             "objective": "Greet the caller",
-            "answer_type": "message",
-            "wording_mode": "flexible",
             "sort_order": 0,
         },
     )
@@ -292,8 +290,6 @@ async def test_publish_and_unpublish_persist_agent_state(client, monkeypatch):
             "field_key": "welcome",
             "title": "Welcome",
             "objective": "Greet the caller",
-            "answer_type": "message",
-            "wording_mode": "flexible",
             "sort_order": 0,
         },
         headers=headers,
