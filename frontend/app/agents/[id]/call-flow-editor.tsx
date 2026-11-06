@@ -8,22 +8,29 @@ import type {
   PointerEvent as ReactPointerEvent,
 } from "react";
 
-import { ApiError, api, apiErrorText } from "@/lib/api";
+import { ApiError, apiErrorText } from "@/lib/api";
 import type { AgentStep } from "@/lib/types";
 
 import {
   agentStepsToCallFlow,
   callFlowToStepInput,
-  ensureOutcomeSteps,
   getSampleHearingScript,
+  resolveCallFlowRoute,
 } from "./call-flow-adapter";
 import type { CallFlowAnswer, CallFlowStep } from "./call-flow-adapter";
 import { assignLanes, computeReachability, gutterFor, pathD } from "./call-flow-geometry";
 import type { GutterConfig, LaneAssignment, MeasuredNode, RouteSpan } from "./call-flow-geometry";
+import { saveCallFlow } from "./call-flow-save";
 import "./call-flow-editor.css";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 const GAP = 14;
+
+const SAVE_IDLE_MS = 1200;
+const SAVE_MAX_MS = 10000;
+const SAVE_COALESCE_MS = 250;
+const SAVE_RETRY_MS = [2000, 10000, 30000];
+const SAVED_FADE_MS = 2500;
 
 const ICONS = {
   grip: (
@@ -100,20 +107,17 @@ interface HighlightState {
   focusNode: string | null;
 }
 
+interface SaveState {
+  status: "idle" | "saving" | "saved" | "error";
+  message?: string;
+}
+
 function uid(prefix: string): string {
   return prefix + Math.random().toString(36).slice(2, 8);
 }
 
 function plural(count: number, one: string, many: string): string {
   return `${count} ${count === 1 ? one : many}`;
-}
-
-function resolveRoute(target: string, index: number, flowSteps: CallFlowStep[]): string {
-  if (target === "next") {
-    const nextStep = flowSteps[index + 1];
-    return nextStep ? nextStep.id : "end";
-  }
-  return target;
 }
 
 function routeOf(stepId: string, answerId: string, flowSteps: CallFlowStep[]): string {
@@ -128,6 +132,26 @@ function routeKeyOf(row: Element): string {
   return `${row.getAttribute("data-step-id") ?? ""}:${row.getAttribute("data-ans-id") ?? ""}`;
 }
 
+/** Rewrites a working model through the temp-id -> server-id mapping of a save. */
+function applyIdMap(
+  idMap: Map<string, string>,
+  createdById: Map<string, AgentStep>
+): (step: CallFlowStep) => CallFlowStep {
+  return (step) => {
+    const created = createdById.get(step.id);
+    return {
+      ...step,
+      id: idMap.get(step.id) ?? step.id,
+      rawStep: created ?? step.rawStep,
+      answers: step.answers.map((answer) => ({
+        ...answer,
+        to: idMap.get(answer.to) ?? answer.to,
+      })),
+      other: idMap.get(step.other) ?? step.other,
+    };
+  };
+}
+
 function prefersReducedMotion(): boolean {
   return typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 }
@@ -136,6 +160,14 @@ function saveErrorMessage(reason: unknown): string {
   if (reason instanceof ApiError) return apiErrorText(reason, "Could not save the flow. Try again.");
   if (reason instanceof Error && reason.message) return reason.message;
   return "Could not save the flow. Try again.";
+}
+
+/** Only network failures, 429s and server errors are worth a timed auto-retry. */
+function isRetryableSaveError(reason: unknown): boolean {
+  return (
+    reason instanceof ApiError &&
+    (reason.status === 0 || reason.status === 429 || reason.status >= 500)
+  );
 }
 
 export function CallFlowEditor({
@@ -155,8 +187,7 @@ export function CallFlowEditor({
   const [copyNote, setCopyNote] = useState("");
   const [sampleArmed, setSampleArmed] = useState(false);
   const [armedDeleteId, setArmedDeleteId] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [saveStatus, setSaveStatus] = useState<{ kind: "error"; message: string } | null>(null);
+  const [saveState, setSaveState] = useState<SaveState>({ status: "idle" });
 
   const flowRef = useRef<HTMLElement | null>(null);
   const stepsRef = useRef<HTMLDivElement | null>(null);
@@ -165,6 +196,25 @@ export function CallFlowEditor({
   const jsonRef = useRef<HTMLTextAreaElement | null>(null);
 
   const flowStepsRef = useRef(flowSteps);
+  const prevFlowStepsRef = useRef(flowSteps);
+  const serverStepsRef = useRef(steps);
+  const signaturesRef = useRef<Map<string, string>>(new Map());
+  const signaturesPrimedRef = useRef(false);
+  const dirtyRef = useRef(false);
+  const editCounterRef = useRef(0);
+  const savingRef = useRef(false);
+  const suppressDirtyRef = useRef(false);
+  const idleTimerRef = useRef(0);
+  const maxTimerRef = useRef(0);
+  const retryTimerRef = useRef(0);
+  const retryAttemptRef = useRef(0);
+  const savedTimerRef = useRef(0);
+  const mountedRef = useRef(true);
+  const beforeUnloadRef = useRef<(event: BeforeUnloadEvent) => void>((event) => {
+    if (!dirtyRef.current) return;
+    event.preventDefault();
+    event.returnValue = "";
+  });
   const wiresRef = useRef<Map<string, WireElements>>(new Map());
   const lastRoutesRef = useRef<RouteSpan[]>([]);
   const curGRef = useRef<GutterConfig>({ g: 96, gap: 10, lead: 20, rad: 8 });
@@ -183,9 +233,45 @@ export function CallFlowEditor({
     setTitle(agentName);
   }, [agentName]);
 
+  // External reloads replace the server snapshot; the working model is only
+  // re-derived from the prop when no local edit or save is in flight. A clean
+  // mount/sync also seeds the payload signatures from the derived model (same
+  // computation as the save module) so untouched steps are not rewritten on
+  // the first save. The prime runs once per mounted baseline; post-save
+  // propagations keep the authoritative signatures returned by the save.
   useEffect(() => {
-    setFlowSteps(agentStepsToCallFlow(steps).flowSteps);
+    const changed = steps !== serverStepsRef.current;
+    serverStepsRef.current = steps;
+    if (dirtyRef.current || savingRef.current) return;
+    if (!changed && signaturesPrimedRef.current) return;
+    signaturesPrimedRef.current = true;
+    const derived = agentStepsToCallFlow(steps).flowSteps;
+    derived.forEach((step, index) => {
+      signaturesRef.current.set(step.id, JSON.stringify(callFlowToStepInput(step, derived, index, {})));
+    });
+    if (!changed) return;
+    suppressDirtyRef.current = true;
+    setFlowSteps(derived);
   }, [steps]);
+
+  // Every model change marks the flow dirty and (re)schedules the debounced
+  // save. Programmatic updates (id remaps, canonical adoption, prop re-derive)
+  // set the suppress flag so they are never treated as edits.
+  useEffect(() => {
+    const previous = prevFlowStepsRef.current;
+    prevFlowStepsRef.current = flowSteps;
+    flowStepsRef.current = flowSteps;
+    if (previous === flowSteps) return; // initial model (and StrictMode replay)
+    if (suppressDirtyRef.current) {
+      suppressDirtyRef.current = false;
+      return;
+    }
+    dirtyRef.current = true;
+    editCounterRef.current += 1;
+    guardUnload();
+    if (!savingRef.current) scheduleIdleSave();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [flowSteps]);
 
   // Re-runs after every render: keeps the imperative geometry code on the
   // latest flow, re-sizes the "Agent says" boxes, and applies deferred actions
@@ -248,7 +334,14 @@ export function CallFlowEditor({
   }, [sampleArmed]);
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
+      clearTimer(idleTimerRef);
+      clearTimer(maxTimerRef);
+      clearTimer(retryTimerRef);
+      clearTimer(savedTimerRef);
+      unguardUnload();
       if (layoutRafRef.current) cancelAnimationFrame(layoutRafRef.current);
       if (settleTimerRef.current) window.clearTimeout(settleTimerRef.current);
       if (announceTimerRef.current) window.clearTimeout(announceTimerRef.current);
@@ -257,6 +350,22 @@ export function CallFlowEditor({
         drag.controller.abort();
         cancelAnimationFrame(drag.raf);
         dragRef.current = null;
+      }
+      // SPA navigation before the debounce fires: hand the pending model to
+      // the save module fire-and-forget. Refs only — no component state and no
+      // parent sync from this path; errors are swallowed.
+      if (dirtyRef.current && !savingRef.current) {
+        dirtyRef.current = false;
+        void saveCallFlow({
+          agentId,
+          model: flowStepsRef.current,
+          serverSteps: serverStepsRef.current,
+          signatures: signaturesRef.current,
+          onIdsMapped: (idMap, createdById) => {
+            const apply = applyIdMap(idMap, createdById);
+            flowStepsRef.current = flowStepsRef.current.map(apply);
+          },
+        }).catch(() => {});
       }
     };
   }, []);
@@ -268,7 +377,7 @@ export function CallFlowEditor({
       const step = flowSteps[index];
       if (!step) return [];
       return [...step.answers.map((answer) => answer.to), step.other].map((target) =>
-        resolveRoute(target, index, flowSteps)
+        resolveCallFlowRoute(target, index, flowSteps)
       );
     });
     let totalRoutes = 0;
@@ -276,7 +385,7 @@ export function CallFlowEditor({
     flowSteps.forEach((step, index) => {
       [...step.answers.map((answer) => answer.to), step.other].forEach((target) => {
         totalRoutes += 1;
-        const resolved = resolveRoute(target, index, flowSteps);
+        const resolved = resolveCallFlowRoute(target, index, flowSteps);
         if (resolved === "end") routesToEnd += 1;
       });
     });
@@ -377,7 +486,7 @@ export function CallFlowEditor({
       const node = stepId ? nodes[stepId] : undefined;
       const sourceKey = key ?? (stepId && answerId ? `${stepId}:${answerId}` : null);
       if (!stepId || !answerId || !sourceKey || index < 0 || !node) return;
-      const to = resolveRoute(routeOf(stepId, answerId, current), index, current);
+      const to = resolveCallFlowRoute(routeOf(stepId, answerId, current), index, current);
       const targetNode = nodes[to];
       if (!targetNode) return;
       const rowRect = row.getBoundingClientRect();
@@ -652,7 +761,7 @@ export function CallFlowEditor({
       id: uid("s"),
       title: "New step",
       say: "",
-      answers: [{ id: uid("a"), label: "Yes", to: "next" }],
+      answers: [],
       other: "next",
     };
     pendingAddStepRef.current = step.id;
@@ -871,7 +980,7 @@ export function CallFlowEditor({
 
   function toExport() {
     const name = (target: string, index: number): string => {
-      const resolved = resolveRoute(target, index, flowSteps);
+      const resolved = resolveCallFlowRoute(target, index, flowSteps);
       if (resolved === "end") return resolved;
       return `step_${flowSteps.findIndex((step) => step.id === resolved) + 1}`;
     };
@@ -927,115 +1036,133 @@ export function CallFlowEditor({
     announce("Sample script loaded");
   }
 
-  /* ---------- Save ---------- */
+  /* ---------- Auto-save ---------- */
 
-  async function handleSave() {
-    if (saving) return;
-    setSaving(true);
-    setSaveStatus(null);
+  function clearTimer(ref: { current: number }) {
+    if (ref.current) {
+      window.clearTimeout(ref.current);
+      ref.current = 0;
+    }
+  }
+
+  function guardUnload() {
+    window.addEventListener("beforeunload", beforeUnloadRef.current);
+  }
+
+  function unguardUnload() {
+    window.removeEventListener("beforeunload", beforeUnloadRef.current);
+  }
+
+  function scheduleIdleSave() {
+    clearTimer(idleTimerRef);
+    idleTimerRef.current = window.setTimeout(() => {
+      idleTimerRef.current = 0;
+      void runSave();
+    }, SAVE_IDLE_MS);
+    if (!maxTimerRef.current) {
+      maxTimerRef.current = window.setTimeout(() => {
+        maxTimerRef.current = 0;
+        void runSave();
+      }, SAVE_MAX_MS);
+    }
+  }
+
+  function scheduleNextPass() {
+    clearTimer(idleTimerRef);
+    idleTimerRef.current = window.setTimeout(() => {
+      idleTimerRef.current = 0;
+      void runSave();
+    }, SAVE_COALESCE_MS);
+  }
+
+  function showSaved() {
+    clearTimer(savedTimerRef);
+    setSaveState({ status: "saved" });
+    savedTimerRef.current = window.setTimeout(() => {
+      savedTimerRef.current = 0;
+      if (mountedRef.current && !dirtyRef.current && !savingRef.current) {
+        setSaveState({ status: "idle" });
+      }
+    }, SAVED_FADE_MS);
+  }
+
+  function flush() {
+    retryAttemptRef.current = 0;
+    void runSave();
+  }
+
+  // Single-flight save: clears pending timers, then diffs and persists the
+  // current model. Edits made mid-save are carried into the next pass, and
+  // transient failures back off (2 s / 10 s / 30 s) while edits remain.
+  async function runSave() {
+    clearTimer(idleTimerRef);
+    clearTimer(maxTimerRef);
+    clearTimer(retryTimerRef);
+    if (savingRef.current || !dirtyRef.current) return;
+    clearTimer(savedTimerRef);
+    const captured = editCounterRef.current;
+    savingRef.current = true;
+    setSaveState({ status: "saving" });
+    let autoRetryBlocked = false;
     try {
-      const currentFlow = flowStepsRef.current;
-      const currentFlowIds = new Set(currentFlow.map((step) => step.id));
-      const removed = steps.filter((step) => step.answer_type !== "outcome" && !currentFlowIds.has(step.id));
-      for (const step of removed) {
-        try {
-          await api<void>(`/agents/${agentId}/steps/${step.id}`, { method: "DELETE" });
-        } catch (reason) {
-          if (!(reason instanceof ApiError) || reason.status !== 404) throw reason;
-        }
-      }
-      const stepsAfterRemovals = removed.length
-        ? steps.filter((step) => !removed.some((candidate) => candidate.id === step.id))
-        : steps;
-
-      const referenced = new Set<string>();
-      for (const flowStep of currentFlow) {
-        for (const answer of flowStep.answers) {
-          if (answer.to === "end") referenced.add(answer.to);
-        }
-        if (flowStep.other === "end") referenced.add(flowStep.other);
-      }
-
-      const ensured = await ensureOutcomeSteps(agentId, stepsAfterRemovals, referenced);
-      const outcomeKeys = ensured.outcomeKeys;
-      const requiredOutcomes = [
-        { route: "end" as const, key: outcomeKeys.end ?? "end_call", label: "End call" },
-      ];
-      for (const required of requiredOutcomes) {
-        if (!referenced.has(required.route)) continue;
-        const found = ensured.steps.some(
-          (step) => step.answer_type === "outcome" && step.enabled && step.field_key === required.key
-        );
-        if (!found) {
-          throw new Error(
-            `Routes to "${required.label}" need an enabled outcome step with field key "${required.key}", but none was found. Enable it or change the routes, then save again.`
-          );
-        }
-      }
-
-      const createdById = new Map<string, AgentStep>();
-      for (let index = 0; index < currentFlow.length; index++) {
-        const flowStep = currentFlow[index];
-        if (flowStep.rawStep) continue;
-        const created = await api<AgentStep>(`/agents/${agentId}/steps`, {
-          method: "POST",
-          body: JSON.stringify({ ...callFlowToStepInput(flowStep, currentFlow, index, outcomeKeys), branches: [] }),
-        });
-        createdById.set(flowStep.id, created);
-      }
-
-      let remapped = currentFlow;
-      if (createdById.size > 0) {
-        remapped = currentFlow.map((flowStep) => {
-          const created = createdById.get(flowStep.id);
-          return {
-            ...flowStep,
-            id: created ? created.id : flowStep.id,
-            rawStep: created ?? flowStep.rawStep,
-            answers: flowStep.answers.map((answer) => ({
-              ...answer,
-              to: createdById.get(answer.to)?.id ?? answer.to,
-            })),
-            other: createdById.get(flowStep.other)?.id ?? flowStep.other,
-          };
-        });
-        setFlowSteps(remapped);
-      }
-
-      for (let index = 0; index < remapped.length; index++) {
-        const flowStep = remapped[index];
-        await api<AgentStep>(`/agents/${agentId}/steps/${flowStep.id}`, {
-          method: "PATCH",
-          body: JSON.stringify(callFlowToStepInput(flowStep, remapped, index, outcomeKeys)),
-        });
-      }
-
-      const orderedIds: string[] = [];
-      const seenIds = new Set<string>();
-      for (const flowStep of remapped) {
-        if (seenIds.has(flowStep.id)) continue;
-        seenIds.add(flowStep.id);
-        orderedIds.push(flowStep.id);
-      }
-      for (const step of ensured.steps) {
-        if (step.answer_type !== "outcome") continue;
-        if (seenIds.has(step.id)) continue;
-        if (removed.some((candidate) => candidate.id === step.id)) continue;
-        seenIds.add(step.id);
-        orderedIds.push(step.id);
-      }
-      const reordered = await api<AgentStep[]>(`/agents/${agentId}/steps/order`, {
-        method: "PUT",
-        body: JSON.stringify({ step_ids: orderedIds }),
+      const result = await saveCallFlow({
+        agentId,
+        model: flowStepsRef.current,
+        serverSteps: serverStepsRef.current,
+        signatures: signaturesRef.current,
+        onIdsMapped: (idMap, createdById) => {
+          suppressDirtyRef.current = true;
+          const apply = applyIdMap(idMap, createdById);
+          // Functional update: composes the id remap with any keystrokes that
+          // are queued but not yet rendered, so they are never clobbered.
+          setFlowSteps((current) => {
+            const remapped = current.map(apply);
+            flowStepsRef.current = remapped;
+            return remapped;
+          });
+        },
       });
-
-      onStepsChange(reordered);
-      setFlowSteps(agentStepsToCallFlow(reordered).flowSteps);
-      setSaveStatus(null);
+      serverStepsRef.current = result.serverSteps;
+      signaturesRef.current = result.signatures;
+      retryAttemptRef.current = 0;
+      onStepsChange(result.serverSteps);
+      if (!mountedRef.current) return;
+      if (editCounterRef.current === captured) {
+        dirtyRef.current = false;
+        unguardUnload();
+        suppressDirtyRef.current = true;
+        const canonical = agentStepsToCallFlow(result.serverSteps).flowSteps;
+        flowStepsRef.current = canonical;
+        setFlowSteps(canonical);
+        showSaved();
+      } else {
+        scheduleNextPass();
+      }
     } catch (reason) {
-      setSaveStatus({ kind: "error", message: saveErrorMessage(reason) });
+      if (!mountedRef.current) return;
+      autoRetryBlocked = !isRetryableSaveError(reason);
+      setSaveState({ status: "error", message: `Couldn't save — ${saveErrorMessage(reason)}` });
+      if (!autoRetryBlocked && dirtyRef.current) {
+        const attempt = retryAttemptRef.current;
+        const delay = SAVE_RETRY_MS[Math.min(attempt, SAVE_RETRY_MS.length - 1)];
+        retryAttemptRef.current = attempt + 1;
+        retryTimerRef.current = window.setTimeout(() => {
+          retryTimerRef.current = 0;
+          void runSave();
+        }, delay);
+      }
     } finally {
-      setSaving(false);
+      savingRef.current = false;
+      if (
+        mountedRef.current &&
+        dirtyRef.current &&
+        !autoRetryBlocked &&
+        !idleTimerRef.current &&
+        !maxTimerRef.current &&
+        !retryTimerRef.current
+      ) {
+        scheduleIdleSave();
+      }
     }
   }
 
@@ -1112,10 +1239,21 @@ export function CallFlowEditor({
           >
             {sampleArmed ? "Replace script?" : "Load sample"}
           </button>
-          <button type="button" className="flow-btn flow-btn-save" disabled={saving} onClick={() => void handleSave()}>
-            Save flow
+          <button
+            type="button"
+            className={`save-status ${saveState.status}`}
+            onClick={flush}
+          >
+            {saveState.status === "idle" ? "Auto-saves as you edit" : null}
+            {saveState.status === "saving" ? "Saving…" : null}
+            {saveState.status === "saved" ? "Saved" : null}
+            {saveState.status === "error" ? (
+              <>
+                {saveState.message}
+                <span className="retry">Retry</span>
+              </>
+            ) : null}
           </button>
-          {saveStatus ? <span className={`save-status ${saveStatus.kind}`}>{saveStatus.message}</span> : null}
         </div>
       </header>
 

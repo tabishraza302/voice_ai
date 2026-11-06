@@ -130,7 +130,7 @@ export function computeReachability(
     const current = queue.shift()!;
     const targets = getTargets(current);
     for (const target of targets) {
-      if (target !== "end" && target !== "transfer" && stepSet.has(target) && !reachable.has(target)) {
+      if (target !== "end" && stepSet.has(target) && !reachable.has(target)) {
         reachable.add(target);
         queue.push(target);
       }
