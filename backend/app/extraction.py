@@ -11,7 +11,6 @@ if TYPE_CHECKING:
     from .workflow import FieldExtraction
 
 
-AnswerType = Literal["boolean", "text", "number", "currency", "enum"]
 ConversationRole = Literal["user", "assistant"]
 
 
@@ -19,16 +18,7 @@ class ExtractionField(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     field_key: str = Field(min_length=1, max_length=128)
-    answer_type: AnswerType
-    enum_values: tuple[str, ...] = ()
-    enabled: bool = True
-
-    @model_validator(mode="after")
-    def enum_values_only_for_enum(self) -> ExtractionField:
-        if self.answer_type != "enum" and self.enum_values:
-            raise ValueError("enum_values are only valid for enum fields")
-        return self
-
+    options: tuple[str, ...] = ()
 
 class ConversationTurn(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -50,14 +40,6 @@ class PromptStep(BaseModel):
     field_key: str | None
     title: str
     objective: str
-    required: bool = True
-    answer_type: str | None = None
-    extraction_instructions: str = ""
-    clarification_instructions: str = ""
-    wording_mode: Literal["exact", "flexible"] = "flexible"
-    localized_phrases: dict[str, str] = Field(default_factory=dict)
-    enabled: bool = True
-
 
 class PromptConfigurationError(ValueError):
     pass
@@ -75,7 +57,6 @@ class _Message(TypedDict):
 @dataclass(frozen=True, slots=True)
 class TurnMessages:
     messages: tuple[_Message, ...]
-    direct_tts_text: str | None = None
 
 
 class _ChatCompletions(Protocol):
@@ -138,11 +119,10 @@ def _schema(field_keys: Sequence[str]) -> dict[str, Any]:
 
 
 def _field_data(field: ExtractionField) -> dict[str, Any]:
-    return {
-        "field_key": field.field_key,
-        "answer_type": field.answer_type,
-        "enum_values": list(field.enum_values),
-    }
+    data: dict[str, Any] = {"field_key": field.field_key}
+    if field.options:
+        data["options"] = list(field.options)
+    return data
 
 
 def _json_load(content: str) -> Any:
@@ -160,8 +140,8 @@ def _eligible_fields(
     correction_fields: Sequence[ExtractionField],
     confirmed_answers: Mapping[str, Any],
 ) -> tuple[list[ExtractionField], list[ExtractionField], dict[str, Any]]:
-    unanswered = [field for field in unanswered_fields if field.enabled]
-    corrections = [field for field in correction_fields if field.enabled]
+    unanswered = list(unanswered_fields)
+    corrections = list(correction_fields)
     keys = [field.field_key for field in (*unanswered, *corrections)]
     if len(keys) != len(set(keys)):
         raise ValueError("field keys must be unique across unanswered and correction fields")
@@ -288,23 +268,12 @@ def build_turn_messages(
     active_step: PromptStep | None,
     recent_conversation: Sequence[ConversationTurn],
     confirmed_answers: Mapping[str, Any],
-    validation_feedback: Sequence[str],
+    validation_feedback: Sequence[str] = (),
     language: str,
-    exact_opening_pending: bool = False,
 ) -> TurnMessages:
     """Build priority-separated messages from frozen instructions and current turn state."""
     if not language:
         raise PromptConfigurationError("a call language is required")
-    if active_step is not None and not active_step.enabled:
-        raise PromptConfigurationError("a disabled step cannot be used for a turn")
-
-    if exact_opening_pending:
-        if active_step is None or active_step.wording_mode != "exact":
-            raise PromptConfigurationError("an exact opening requires an active exact-wording step")
-        phrase = active_step.localized_phrases.get(language)
-        if not phrase:
-            raise PromptConfigurationError("the exact opening is missing for the call language")
-        return TurnMessages(messages=(), direct_tts_text=phrase)
 
     messages: list[_Message] = [
         {"role": "system", "content": instructions.global_policy},
@@ -315,10 +284,6 @@ def build_turn_messages(
             "field_key": active_step.field_key,
             "title": active_step.title,
             "objective": active_step.objective,
-            "required": active_step.required,
-            "answer_type": active_step.answer_type,
-            "extraction_instructions": active_step.extraction_instructions,
-            "clarification_instructions": active_step.clarification_instructions,
         }
         messages.append(
             {"role": "developer", "content": _json_text({"active_step": step_instructions})}

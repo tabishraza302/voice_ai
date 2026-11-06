@@ -332,31 +332,6 @@ async def test_tts_without_matching_output_audio_fails_closed() -> None:
 
 
 @pytest.mark.anyio
-async def test_interrupted_exact_opening_stays_interrupted_after_transport_drain() -> None:
-    runtime = object.__new__(CallRuntime)
-    runtime.playbacks = {
-        "opening": _Playback(
-            context_id="opening",
-            kind="exact",
-            generation=1,
-            step_id="step-1",
-            interrupted=True,
-        )
-    }
-    runtime.pending_exact_step = "step-1"
-    runtime.exact_generation = 1
-    runtime.workflow_state = SimpleNamespace(opening_states={"step-1": "interrupted"})
-
-    await runtime.on_tts_stopped(
-        TTSStoppedFrame(context_id="opening"),
-        transport_completed=True,
-    )
-
-    assert runtime.workflow_state.opening_states["step-1"] == "interrupted"
-    assert runtime.pending_exact_step == "step-1"
-    assert runtime.playbacks == {}
-
-@pytest.mark.anyio
 async def test_successful_call_sends_only_safe_completion_event(monkeypatch) -> None:
     messages: list[dict[str, str]] = []
 

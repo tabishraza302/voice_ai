@@ -24,7 +24,6 @@ from pipecat.frames.frames import (
     TTSStartedFrame,
     TTSStoppedFrame,
     TTSAudioRawFrame,
-    TTSSpeakFrame,
     TranscriptionFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
@@ -61,9 +60,6 @@ from .workflow import (
     WorkflowStep,
     WorkflowTransition,
     advance_workflow,
-    mark_output_completed,
-    mark_output_interrupted,
-    mark_output_started,
     start_workflow,
 )
 
@@ -357,9 +353,6 @@ class CallRuntime:
         self.termination_status: str | None = None
         self.termination_outcome: str | None = None
         self.user_speaking = False
-        self.pending_exact_step: str | None = None
-        self.pending_exact_text: str | None = None
-        self.exact_generation = 0
         self.response_generation = 0
         self.active_response_generation: int | None = None
         self.response_text: dict[int, list[str]] = {}
@@ -562,16 +555,6 @@ class CallRuntime:
 
     def note_interruption(self) -> None:
         self.user_speaking = True
-        if (
-            self.pending_exact_step is not None
-            and self.workflow_state.opening_states.get(self.pending_exact_step) != "interrupted"
-        ):
-            try:
-                transition = mark_output_interrupted(self.workflow_state, self.pending_exact_step)
-            except WorkflowConfigurationError:
-                self.request_stop("failed")
-                return
-            self.workflow_state = transition.state
         generation = self.active_response_generation
         if generation is not None:
             self.response_interrupted.add(generation)
@@ -582,25 +565,6 @@ class CallRuntime:
         context_id = frame.context_id
         if context_id in self.playbacks:
             self.request_stop("failed")
-            return
-        if self.pending_exact_step is not None:
-            interrupted = self.user_speaking
-            if not interrupted:
-                try:
-                    self.workflow_state = mark_output_started(
-                        self.workflow_state,
-                        self.pending_exact_step,
-                    ).state
-                except WorkflowConfigurationError:
-                    self.request_stop("failed")
-                    return
-            self.playbacks[context_id] = _Playback(
-                context_id=context_id,
-                kind="exact",
-                generation=self.exact_generation,
-                step_id=self.pending_exact_step,
-                interrupted=interrupted,
-            )
             return
         generation = self.active_response_generation
         if generation is not None:
@@ -618,26 +582,6 @@ class CallRuntime:
         if not transport_completed:
             if not playback.interrupted:
                 self.request_stop("failed")
-            return
-        if playback.kind == "exact":
-            if (
-                playback.interrupted
-                or playback.step_id != self.pending_exact_step
-                or playback.generation != self.exact_generation
-                or self.workflow_state.opening_states.get(playback.step_id or "") != "playing"
-            ):
-                return
-            transition = mark_output_completed(self.workflow_state, playback.step_id or "")
-            self.workflow_state = transition.state
-            self._persist_message(self.pending_exact_text or "")
-            self.recent_conversation.append(
-                ConversationTurn(role="assistant", content=self.pending_exact_text or "")
-            )
-            await self._send_caption("assistant", self.pending_exact_text or "")
-            self.pending_exact_step = None
-            self.pending_exact_text = None
-            if transition.action is not None:
-                await self.dispatch(transition.action)
             return
 
         generation = playback.generation
@@ -670,27 +614,32 @@ class CallRuntime:
         self.recent_conversation.append(ConversationTurn(role="user", content=transcript))
         await self._send_caption("user", transcript)
 
-        value_types = {"boolean", "text", "number", "currency", "enum"}
-        by_key = {step.field_key: step for step in self.workflow_state.steps if step.enabled}
+        def _step_options(step: WorkflowStep) -> tuple[str, ...]:
+            options: list[str] = []
+            for branch in step.branches:
+                for condition in branch.conditions:
+                    if condition.field_key == step.field_key and condition.operand is not None:
+                        val = str(condition.operand).strip()
+                        if val and val not in options:
+                            options.append(val)
+            return tuple(options)
+
+        by_key = {step.field_key: step for step in self.workflow_state.steps}
         unanswered = [
             ExtractionField(
                 field_key=step.field_key,
-                answer_type=step.answer_type,
-                enum_values=step.enum_values,
+                options=_step_options(step),
             )
             for step in self.workflow_state.steps
-            if step.enabled
-            and step.answer_type in value_types
-            and step.field_key not in self.workflow_state.answers
+            if step.field_key not in self.workflow_state.answers
         ]
         corrections = [
             ExtractionField(
                 field_key=field_key,
-                answer_type=by_key[field_key].answer_type,
-                enum_values=by_key[field_key].enum_values,
+                options=_step_options(by_key[field_key]) if field_key in by_key else (),
             )
             for field_key in self.workflow_state.answers
-            if field_key in by_key and by_key[field_key].answer_type in value_types
+            if field_key in by_key
         ]
         extracted = await extract_answers(
             self.extraction_client,
@@ -700,24 +649,8 @@ class CallRuntime:
             correction_fields=corrections,
             confirmed_answers=self.workflow_state.answers,
         )
-        before_step = self.workflow_state.current_step_id
         transition = advance_workflow(self.workflow_state, extracted)
         action = transition.action
-        if (
-            action is not None
-            and action.kind == "clarify"
-            and action.reason == "missing"
-            and before_step is not None
-            and self.workflow_state.opening_states.get(before_step) == "interrupted"
-            and extracted.get(by_key[before_step].field_key) is not None
-            and extracted[by_key[before_step].field_key].status == "missing"
-        ):
-            resumed = mark_output_interrupted(transition.state, before_step)
-            transition = WorkflowTransition(transition.state, transition.events, resumed.action)
-            action = resumed.action
-        if self.pending_exact_step is not None and (action is None or action.kind != "exact_opening"):
-            self.pending_exact_step = None
-            self.pending_exact_text = None
         self.apply_transition_events(transition.events)
         self.workflow_state = transition.state
         if action is not None:
@@ -789,31 +722,6 @@ class CallRuntime:
         elif action.kind == "complete":
             feedback.append("The workflow is complete. Thank the caller and close the call politely.")
 
-        if action.kind == "exact_opening":
-            if active_step is None:
-                raise VoiceRuntimeError("An exact opening has no active workflow step.")
-            turn = build_turn_messages(
-                instructions=self.prompt_instructions,
-                active_step=active_step,
-                recent_conversation=tuple(self.recent_conversation),
-                confirmed_answers=self.workflow_state.answers,
-                validation_feedback=feedback,
-                language=self.definition.language,
-                exact_opening_pending=True,
-            )
-            text = turn.direct_tts_text
-            if not text:
-                raise VoiceRuntimeError("The exact opening is missing for the frozen call language.")
-            self.pending_exact_step = action.step_id
-            self.pending_exact_text = text
-            self.exact_generation += 1
-            self.terminal_narration_pending = False
-            self.terminal_generation = None
-            await self.workflow_processor.push_frame(
-                TTSSpeakFrame(text, append_to_context=False),
-                FrameDirection.DOWNSTREAM,
-            )
-            return
 
         if action.kind in {"complete", "outcome"}:
             self.terminal_narration_pending = True
@@ -876,13 +784,6 @@ class CallRuntime:
             field_key=step.field_key,
             title=step.title,
             objective=step.objective,
-            required=step.required,
-            answer_type=step.answer_type,
-            extraction_instructions=step.extraction_instructions,
-            clarification_instructions=step.clarification_instructions,
-            wording_mode=step.wording_mode,
-            localized_phrases=dict(step.localized_phrases),
-            enabled=step.enabled,
         )
 
     def _persist_message(self, content: str, *, role: str = "assistant") -> None:
