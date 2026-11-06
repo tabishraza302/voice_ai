@@ -14,7 +14,6 @@ import { AgentDraft, AgentInstructions, AgentPipelineToolbar, agentDraftFromAgen
 import { AgentTesting } from "./agent-testing";
 import { CallFlowEditor } from "./call-flow-editor";
 import type { CallFlowSaveState } from "./call-flow-save";
-import { QuestionsEditor } from "./questions-editor";
 import { useDraftAutosave } from "./use-draft-autosave";
 type EditorTab = "workflow" | "instructions" | "testing" | "history";
 
@@ -45,7 +44,6 @@ export default function AgentEditorPage() {
   const [pageError, setPageError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<EditorTab>("workflow");
   const [reload, setReload] = useState(0);
-  const [workflowView, setWorkflowView] = useState<"flow" | "form">("flow");
   const [draftSaveState, setDraftSaveState] = useState<CallFlowSaveState>({ status: "idle" });
   const [flowSaveState, setFlowSaveState] = useState<CallFlowSaveState>({ status: "idle" });
   const [flushToken, setFlushToken] = useState(0);
@@ -238,51 +236,14 @@ export default function AgentEditorPage() {
                       onPatch={patchDraft}
                       onRetryCatalog={() => void loadCatalog()}
                     />
-                    <div role="group" aria-label="Workflow view" className="inline-flex items-center gap-1 rounded-xl border bg-muted/40 p-1">
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        aria-pressed={workflowView === "flow"}
-                        onClick={() => setWorkflowView("flow")}
-                        className={cn(
-                          "min-h-8 rounded-lg px-3",
-                          workflowView === "flow" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:bg-transparent hover:text-foreground",
-                        )}
-                      >
-                        Visual Flow
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        aria-pressed={workflowView === "form"}
-                        onClick={() => setWorkflowView("form")}
-                        className={cn(
-                          "min-h-8 rounded-lg px-3",
-                          workflowView === "form" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:bg-transparent hover:text-foreground",
-                        )}
-                      >
-                        Detailed Form
-                      </Button>
-                    </div>
-                    <div className={cn(workflowView !== "flow" && "hidden")}>
-                      <CallFlowEditor
-                        agentId={agentId}
-                        agentName={draft.name || agent.name}
-                        steps={steps}
-                        onStepsChange={setSteps}
-                        onSaveStateChange={setFlowSaveState}
-                        flushToken={flushToken}
-                      />
-                    </div>
-                    <div className={cn(workflowView !== "form" && "hidden")}>
-                      <QuestionsEditor
-                        agentId={agentId}
-                        languages={draft.languages}
-                        steps={steps}
-                        published={false}
-                        onStepsChange={setSteps}
-                      />
-                    </div>
+                    <CallFlowEditor
+                      agentId={agentId}
+                      agentName={draft.name || agent.name}
+                      steps={steps}
+                      onStepsChange={setSteps}
+                      onSaveStateChange={setFlowSaveState}
+                      flushToken={flushToken}
+                    />
                   </div>
                 ) : null}
                 {activeTab === "instructions" ? <AgentInstructions draft={draft} onPatch={patchDraft} /> : null}

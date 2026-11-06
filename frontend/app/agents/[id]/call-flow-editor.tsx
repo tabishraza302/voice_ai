@@ -264,7 +264,7 @@ export function CallFlowEditor({
     signaturesPrimedRef.current = true;
     const derived = agentStepsToCallFlow(steps).flowSteps;
     derived.forEach((step, index) => {
-      signaturesRef.current.set(step.id, JSON.stringify(callFlowToStepInput(step, derived, index, {})));
+      signaturesRef.current.set(step.id, JSON.stringify(callFlowToStepInput(step, derived, index)));
     });
     if (!changed) return;
     suppressDirtyRef.current = true;
