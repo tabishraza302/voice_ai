@@ -5,9 +5,6 @@ import uuid
 from app.workflow import (
     FieldExtraction,
     advance_workflow,
-    mark_output_completed,
-    mark_output_interrupted,
-    mark_output_started,
     start_workflow,
 )
 
@@ -15,15 +12,10 @@ from app.workflow import (
 def step(
     field_key: str,
     sort_order: int,
-    answer_type: str,
     *,
-    enum_values: list[str] | None = None,
-    validation_rules: list[dict] | None = None,
+    title: str | None = None,
+    objective: str | None = None,
     branches: list[dict] | None = None,
-    validation_failure_target: dict | None = None,
-    wording_mode: str = "flexible",
-    phrases: dict[str, str] | None = None,
-    required: bool = True,
 ) -> dict:
     step_id = str(uuid.uuid5(uuid.NAMESPACE_URL, field_key))
     return {
@@ -31,24 +23,10 @@ def step(
         "agent_id": str(uuid.UUID(int=1)),
         "field_key": field_key,
         "sort_order": sort_order,
-        "title": field_key.replace("_", " ").title(),
-        "objective": f"Collect {field_key}.",
-        "required": required,
-        "enabled": True,
-        "answer_type": answer_type,
-        "enum_values": enum_values or [],
-        "wording_mode": wording_mode,
-        "localized_phrases": phrases or {},
-        "extraction_instructions": f"Extract {field_key}.",
-        "clarification_instructions": f"Clarify {field_key}.",
-        "validation_rules": validation_rules or [],
+        "title": title or field_key.replace("_", " ").title(),
+        "objective": objective or f"Collect {field_key}.",
         "branches": branches or [],
-        "validation_failure_target": validation_failure_target,
     }
-
-
-def outcome(field_key: str, sort_order: int) -> dict:
-    return step(field_key, sort_order, "outcome")
 
 
 def branch(*conditions: dict, target_step_id: str | None = None, target_outcome: str | None = None) -> dict:
@@ -63,8 +41,8 @@ def condition(field_key: str, operator: str, operand: object) -> dict:
     return {"field_key": field_key, "operator": operator, "operand": operand}
 
 
-def value(value: object, *, correction: bool = False) -> FieldExtraction:
-    return FieldExtraction(status="value", value=value, is_correction=correction)
+def value(val: object, *, correction: bool = False) -> FieldExtraction:
+    return FieldExtraction(status="value", value=val, is_correction=correction)
 
 
 def missing() -> FieldExtraction:
@@ -75,265 +53,233 @@ def ambiguous(*, correction: bool = False) -> FieldExtraction:
     return FieldExtraction(status="ambiguous", is_correction=correction)
 
 
-def eligibility_steps() -> list[dict]:
-    age = step(
-        "age",
-        1,
-        "number",
-        validation_rules=[{"operator": "gt", "operand": 24}],
-        validation_failure_target={"target_step_id": None, "outcome": "ineligible"},
-    )
-    salary = step(
-        "monthly_salary",
-        2,
-        "currency",
-        validation_rules=[{"operator": "gt", "operand": "6000.00"}],
-        validation_failure_target={"target_step_id": None, "outcome": "ineligible"},
-    )
-    employed = step(
-        "is_salaried",
+def test_start_workflow_begins_at_first_step_and_emits_ask():
+    first = step("greeting", 0, title="Greeting", objective="Say hello")
+    second = step("name", 1, title="Name", objective="Ask caller name")
+    transition = start_workflow([first, second], "en")
+
+    assert transition.state.current_step_id == first["id"]
+    assert transition.state.answers == {}
+    assert transition.action is not None
+    assert transition.action.kind == "ask"
+    assert transition.action.step_id == first["id"]
+    assert transition.action.field_key == "greeting"
+
+
+def test_visual_flow_branch_matches_conditional_answer_and_routes_to_target_step():
+    interested = step("details", 1, title="Details", objective="Discuss details")
+    greeting = step(
+        "intro",
         0,
-        "boolean",
+        title="Intro",
+        objective="Are you interested?",
         branches=[
-            branch(condition("is_salaried", "eq", True), target_step_id=age["id"]),
-            branch(condition("is_salaried", "eq", False), target_outcome="ineligible"),
+            branch(condition("intro", "eq", "yes"), target_step_id=interested["id"]),
+            branch(condition("intro", "eq", "no"), target_outcome="end"),
         ],
     )
-    return [employed, age, salary, outcome("eligible", 3), outcome("ineligible", 4)]
+    result = start_workflow([greeting, interested], "en")
+    result = advance_workflow(result.state, {"intro": value("yes")})
+
+    assert result.state.answers == {"intro": "yes"}
+    assert result.state.current_step_id == interested["id"]
+    assert result.action is not None
+    assert result.action.kind == "ask"
+    assert result.action.step_id == interested["id"]
+    assert result.action.field_key == "details"
 
 
-def test_enum_candidates_must_match_the_frozen_choice_list():
-    choice = step("plan", 0, "enum", enum_values=["basic", "premium"])
-    rejected = advance_workflow(
-        start_workflow([choice], "en").state,
-        {"plan": value("enterprise")},
+def test_visual_flow_branch_matches_case_insensitively():
+    interested = step("details", 1, title="Details", objective="Discuss details")
+    greeting = step(
+        "intro",
+        0,
+        branches=[
+            branch(condition("intro", "eq", "Yes"), target_step_id=interested["id"]),
+            branch(target_outcome="end"),
+        ],
     )
+    result = start_workflow([greeting, interested], "en")
+    result = advance_workflow(result.state, {"intro": value("yes")})
 
-    assert rejected.state.answers == {}
-    assert rejected.action.kind == "clarify"
-    assert rejected.action.reason == "invalid_type"
+    assert result.state.answers == {"intro": "yes"}
+    assert result.state.current_step_id == interested["id"]
+    assert result.action is not None
+    assert result.action.kind == "ask"
 
-    accepted = advance_workflow(
-        start_workflow([choice], "en").state,
-        {"plan": value("premium")},
+def test_visual_flow_conditional_branch_after_fallback_still_matches():
+    interested = step("details", 1)
+    greeting = step(
+        "intro",
+        0,
+        branches=[
+            branch(target_outcome="end"),
+            branch(condition("intro", "eq", "yes"), target_step_id=interested["id"]),
+        ],
     )
+    result = start_workflow([greeting, interested], "en")
+    result = advance_workflow(result.state, {"intro": value("yes")})
 
-    assert accepted.state.answers == {"plan": "premium"}
-    assert accepted.action.kind == "complete"
-
-
-def answer_all(values: dict[str, object]) -> dict[str, FieldExtraction]:
-    return {key: value(candidate) for key, candidate in values.items()}
+    assert result.state.current_step_id == interested["id"]
+    assert result.state.outcome is None
 
 
-def test_eligible_multi_field_turn_validates_and_finishes_without_reasking():
-    result = start_workflow(eligibility_steps(), "en")
-    result = advance_workflow(
-        result.state,
-        answer_all({"is_salaried": True, "age": 27, "monthly_salary": "24000"}),
+def test_visual_flow_unknown_operator_does_not_match_equal_value():
+    interested = step("details", 1)
+    greeting = step(
+        "intro",
+        0,
+        branches=[
+            branch(target_outcome="end"),
+            branch(condition("intro", "bogus", "yes"), target_step_id=interested["id"]),
+        ],
     )
+    result = start_workflow([greeting, interested], "en")
+    result = advance_workflow(result.state, {"intro": value("yes")})
 
-    assert result.state.answers == {
-        "is_salaried": True,
-        "age": 27,
-        "monthly_salary": "24000",
-    }
-    assert result.state.outcome == "eligible"
+    assert result.state.outcome == "end"
     assert result.state.completed is True
-    assert result.action.kind == "outcome"
-    assert result.action.content == "eligible"
-    assert [event["field_key"] for event in result.events if event["type"] == "answer"] == [
-        "is_salaried",
-        "age",
-        "monthly_salary",
-    ]
 
 
-def test_business_rule_boundaries_take_the_explicit_failure_outcome():
-    for age_value, salary_value in [(24, "6000"), (25, "6000")]:
-        result = start_workflow(eligibility_steps(), "en")
-        result = advance_workflow(
-            result.state,
-            answer_all(
-                {"is_salaried": True, "age": age_value, "monthly_salary": salary_value}
-            ),
-        )
-
-        assert result.state.outcome == "ineligible"
-        rejected = [event for event in result.events if event["type"] == "answer"]
-        assert rejected[-1]["accepted"] is False
-        assert rejected[-1]["field_key"] == ("age" if age_value == 24 else "monthly_salary")
-        assert result.action.kind == "outcome"
-        assert result.action.content == "ineligible"
-
-
-def test_failed_rule_can_route_to_an_explicit_failure_step():
-    follow_up = step("follow_up", 1, "text")
+def test_visual_flow_equality_matches_numeric_answer_to_string_label():
+    adult = step("adult_details", 1)
     age = step(
         "age",
         0,
-        "number",
-        validation_rules=[{"operator": "gt", "operand": 24}],
-        validation_failure_target={"target_step_id": follow_up["id"], "outcome": None},
-    )
-    result = start_workflow([age, follow_up, outcome("complete", 2)], "en")
-    failed = advance_workflow(result.state, {"age": value(18)})
-
-    assert failed.state.answers == {}
-    assert failed.state.current_step_id == follow_up["id"]
-    assert failed.action.kind == "ask"
-    assert failed.action.field_key == "follow_up"
-
-
-def test_ambiguous_required_value_clarifies_without_taking_failure_route():
-    result = start_workflow(eligibility_steps(), "en")
-    result = advance_workflow(
-        result.state,
-        {"is_salaried": ambiguous()},
-    )
-
-    assert result.state.answers == {}
-    assert result.state.outcome is None
-    assert result.action.kind == "clarify"
-    assert result.action.field_key == "is_salaried"
-    assert result.action.reason == "ambiguous"
-    assert result.events == ()
-
-
-def test_changed_answer_revalidates_and_invalidates_stale_downstream_outcome():
-    result = start_workflow(eligibility_steps(), "en")
-    result = advance_workflow(
-        result.state,
-        answer_all({"is_salaried": True, "age": 27, "monthly_salary": "24000"}),
-    )
-    assert result.state.outcome == "eligible"
-
-    corrected = advance_workflow(
-        result.state,
-        {"age": value(24, correction=True)},
-    )
-
-    assert corrected.state.answers == {"is_salaried": True}
-    assert corrected.state.outcome == "ineligible"
-    assert any(
-        event["type"] == "answer_invalidated" and event["field_key"] == "monthly_salary"
-        for event in corrected.events
-    )
-    assert any(
-        event["type"] == "outcome_invalidated" and event["value"] == "eligible"
-        for event in corrected.events
-    )
-    assert any(
-        event["type"] == "answer"
-        and event["field_key"] == "age"
-        and event["accepted"] is False
-        for event in corrected.events
-    )
-    assert corrected.action.kind == "outcome"
-    assert corrected.action.content == "ineligible"
-
-
-def test_ambiguous_correction_preserves_confirmed_answer_until_clarified():
-    result = start_workflow(eligibility_steps(), "en")
-    result = advance_workflow(
-        result.state,
-        answer_all({"is_salaried": True, "age": 27}),
-    )
-
-    correction = advance_workflow(
-        result.state,
-        {"age": ambiguous(correction=True)},
-    )
-
-    assert correction.state.answers["age"] == 27
-    assert correction.action.kind == "clarify"
-    assert correction.action.field_key == "age"
-    assert correction.action.reason == "ambiguous"
-
-
-def test_branching_uses_typed_comparisons_and_first_matching_branch():
-    risk = step(
-        "risk",
-        0,
-        "number",
         branches=[
-            branch(condition("risk", "gt", 24), target_outcome="first"),
-            branch(condition("risk", "gt", 10), target_outcome="second"),
-            branch(target_outcome="fallback"),
+            branch(target_outcome="end"),
+            branch(condition("age", "eq", "18"), target_step_id=adult["id"]),
         ],
     )
-    result = start_workflow(
-        [risk, outcome("first", 1), outcome("second", 2), outcome("fallback", 3)],
-        "en",
-    )
-    result = advance_workflow(result.state, {"risk": value(27)})
+    result = start_workflow([age, adult], "en")
+    result = advance_workflow(result.state, {"age": value(18)})
 
-    assert result.state.outcome == "first"
-    assert result.action.content == "first"
-
-
-def test_invalid_or_non_finite_extraction_is_rejected_for_clarification():
-    number = step(
-        "age",
-        0,
-        "number",
-        validation_rules=[{"operator": "gt", "operand": 24}],
-        validation_failure_target={"target_step_id": None, "outcome": "ineligible"},
-    )
-    result = start_workflow([number, outcome("ineligible", 1)], "en")
-    result = advance_workflow(result.state, {"age": value(float("inf"))})
-
-    assert result.state.answers == {}
+    assert result.state.current_step_id == adult["id"]
     assert result.state.outcome is None
-    assert result.action.kind == "clarify"
-    assert result.action.reason == "invalid_type"
-    assert result.events[0]["accepted"] is False
 
 
-def test_exact_opening_is_completed_only_after_output_and_resumes_after_interrupt():
-    exact = step(
-        "name",
+def test_visual_flow_equality_does_not_match_boolean_to_integer():
+    interested = step("details", 1)
+    answer = step(
+        "answer",
         0,
-        "text",
-        wording_mode="exact",
-        phrases={"en": "What is your name?"},
+        branches=[
+            branch(condition("answer", "eq", 1), target_step_id=interested["id"]),
+            branch(target_outcome="end"),
+        ],
     )
-    started = start_workflow([exact], "en")
+    result = start_workflow([answer, interested], "en")
+    result = advance_workflow(result.state, {"answer": value(True)})
 
-    assert started.action.kind == "exact_opening"
-    assert started.action.content == "What is your name?"
-    assert started.state.opening_states[exact["id"]] == "pending"
-
-    playing = mark_output_started(started.state, exact["id"])
-    interrupted = mark_output_interrupted(playing.state, exact["id"])
-
-    assert interrupted.state.opening_states[exact["id"]] == "interrupted"
-    assert interrupted.action.kind == "exact_opening"
-    assert interrupted.action.resume is True
-
-    playing_again = mark_output_started(interrupted.state, exact["id"])
-    completed = mark_output_completed(playing_again.state, exact["id"])
-
-    assert completed.state.opening_states[exact["id"]] == "complete"
-    follow_up = advance_workflow(completed.state, {"name": missing()})
-    assert follow_up.action.kind == "clarify"
-    assert follow_up.action.kind != "exact_opening"
+    assert result.state.outcome == "end"
+    assert result.state.completed is True
 
 
-def test_informational_message_and_outcome_are_each_emitted_once():
-    message = step("intro", 0, "message", wording_mode="flexible")
-    name = step("name", 1, "text")
-    result = start_workflow([message, name, outcome("complete", 2)], "en")
 
-    assert result.action.kind == "message"
-    assert result.action.step_id == message["id"]
-    assert result.state.current_step_id == name["id"]
+def test_visual_flow_fallback_other_branch_takes_fallback_target():
+    interested = step("details", 1, title="Details", objective="Discuss details")
+    greeting = step(
+        "intro",
+        0,
+        branches=[
+            branch(condition("intro", "eq", "yes"), target_step_id=interested["id"]),
+            branch(target_outcome="end"),
+        ],
+    )
+    result = start_workflow([greeting, interested], "en")
+    result = advance_workflow(result.state, {"intro": value("maybe")})
 
-    next_turn = advance_workflow(result.state, {"name": missing()})
-    assert next_turn.action.kind == "clarify"
-    finished = advance_workflow(next_turn.state, {"name": value("Ari")})
-    assert finished.action.kind == "outcome"
-    assert finished.state.outcome == "complete"
-    repeated = advance_workflow(finished.state, {"name": missing()})
-    assert repeated.action is None
-    assert repeated.events == ()
+    assert result.state.answers == {"intro": "maybe"}
+    assert result.state.outcome == "end"
+    assert result.state.completed is True
+    assert result.action is not None
+    assert result.action.kind == "outcome"
+    assert result.action.content == "end"
+
+
+def test_visual_flow_advances_to_next_step_in_sort_order_when_no_branch_matches():
+    first = step("step_one", 0)
+    second = step("step_two", 1)
+    result = start_workflow([first, second], "en")
+    result = advance_workflow(result.state, {"step_one": value("acknowledged")})
+
+    assert result.state.answers == {"step_one": "acknowledged"}
+    assert result.state.current_step_id == second["id"]
+    assert result.action is not None
+    assert result.action.kind == "ask"
+    assert result.action.step_id == second["id"]
+
+
+def test_workflow_completes_at_end_of_flow():
+    only = step("confirm", 0)
+    result = start_workflow([only], "en")
+    result = advance_workflow(result.state, {"confirm": value("done")})
+
+    assert result.state.answers == {"confirm": "done"}
+    assert result.state.completed is True
+    assert result.action is not None
+    assert result.action.kind == "complete"
+
+
+def test_workflow_completes_when_branch_targets_end_outcome():
+    intro = step(
+        "intro",
+        0,
+        branches=[
+            branch(condition("intro", "eq", "no"), target_outcome="end"),
+        ],
+    )
+    follow_up = step("follow_up", 1)
+    result = start_workflow([intro, follow_up], "en")
+    result = advance_workflow(result.state, {"intro": value("no")})
+
+    assert result.state.outcome == "end"
+    assert result.state.completed is True
+    assert result.action is not None
+    assert result.action.kind == "outcome"
+    assert result.action.content == "end"
+
+
+def test_correction_invalidates_downstream_answers_and_reroutes():
+    step_b = step("path_b", 1)
+    step_c = step("path_c", 2)
+    step_a = step(
+        "choice",
+        0,
+        branches=[
+            branch(condition("choice", "eq", "b"), target_step_id=step_b["id"]),
+            branch(condition("choice", "eq", "c"), target_step_id=step_c["id"]),
+        ],
+    )
+    result = start_workflow([step_a, step_b, step_c], "en")
+    result = advance_workflow(result.state, {"choice": value("b")})
+    assert result.state.current_step_id == step_b["id"]
+
+    result = advance_workflow(result.state, {"path_b": value("b_details")})
+    assert result.state.answers == {"choice": "b", "path_b": "b_details"}
+
+    # Correction on step A from 'b' to 'c'
+    corrected = advance_workflow(result.state, {"choice": value("c", correction=True)})
+    assert corrected.state.answers == {"choice": "c"}
+    assert corrected.state.current_step_id == step_c["id"]
+    assert any(
+        event["type"] == "answer_invalidated" and event["field_key"] == "path_b"
+        for event in corrected.events
+    )
+
+
+def test_unanswered_or_ambiguous_step_emits_ask():
+    first = step("first", 0)
+    result = start_workflow([first], "en")
+
+    missing_turn = advance_workflow(result.state, {"first": missing()})
+    assert missing_turn.state.answers == {}
+    assert missing_turn.action is not None
+    assert missing_turn.action.kind == "ask"
+    assert missing_turn.action.step_id == first["id"]
+
+    ambiguous_turn = advance_workflow(result.state, {"first": ambiguous()})
+    assert ambiguous_turn.state.answers == {}
+    assert ambiguous_turn.action is not None
+    assert ambiguous_turn.action.kind == "ask"
+    assert ambiguous_turn.action.step_id == first["id"]

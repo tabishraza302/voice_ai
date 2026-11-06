@@ -52,17 +52,16 @@ async def test_extraction_distinguishes_values_missing_ambiguity_and_corrections
         client,
         "gpt-4o-mini",
         unanswered_fields=[
-            ExtractionField(field_key="age", answer_type="number"),
-            ExtractionField(field_key="is_salaried", answer_type="boolean"),
-            ExtractionField(field_key="employer", answer_type="text"),
-            ExtractionField(field_key="secret_step", answer_type="text", enabled=False),
+            ExtractionField(field_key="age"),
+            ExtractionField(field_key="is_salaried"),
+            ExtractionField(field_key="employer"),
         ],
         recent_conversation=[
             ConversationTurn(role="user", content="I am either twenty-four or twenty-five."),
             ConversationTurn(role="assistant", content="You said twenty-four."),
             ConversationTurn(role="user", content="Actually, my monthly salary is 24000."),
         ],
-        correction_fields=[ExtractionField(field_key="monthly_salary", answer_type="currency")],
+        correction_fields=[ExtractionField(field_key="monthly_salary")],
         confirmed_answers={"monthly_salary": "21000", "unrelated_answer": "private"},
     )
 
@@ -83,33 +82,32 @@ async def test_extraction_distinguishes_values_missing_ambiguity_and_corrections
     assert request["response_format"]["json_schema"]["strict"] is True
     payload = json.loads(request["messages"][1]["content"])
     assert payload["unanswered_fields"] == [
-        {"field_key": "age", "answer_type": "number", "enum_values": []},
-        {"field_key": "is_salaried", "answer_type": "boolean", "enum_values": []},
-        {"field_key": "employer", "answer_type": "text", "enum_values": []},
+        {"field_key": "age"},
+        {"field_key": "is_salaried"},
+        {"field_key": "employer"},
     ]
     assert payload["correction_fields"] == [
-        {"field_key": "monthly_salary", "answer_type": "currency", "enum_values": []}
+        {"field_key": "monthly_salary"}
     ]
     assert payload["confirmed_answers"] == {"monthly_salary": "21000"}
-    assert "secret_step" not in request["messages"][1]["content"]
+    assert "unrelated_answer" not in request["messages"][1]["content"]
     assert "unrelated_answer" not in request["messages"][1]["content"]
     assert "full unrelated prompt" not in request["messages"][1]["content"]
 
 
 @pytest.mark.anyio
-async def test_extraction_skips_model_when_no_enabled_fields_remain():
+async def test_extraction_skips_model_when_no_fields_remain():
     client, completions = model_client('{"answers": []}')
 
     result = await extract_answers(
         client,
         "gpt-4o-mini",
-        unanswered_fields=[ExtractionField(field_key="disabled", answer_type="text", enabled=False)],
+        unanswered_fields=[],
         recent_conversation=[ConversationTurn(role="user", content="Thanks, goodbye.")],
     )
 
     assert result == {}
     assert completions.requests == []
-
 
 @pytest.mark.anyio
 async def test_extraction_rejects_a_response_that_omits_an_eligible_field():
@@ -128,8 +126,8 @@ async def test_extraction_rejects_a_response_that_omits_an_eligible_field():
             client,
             "gpt-4o-mini",
             unanswered_fields=[
-                ExtractionField(field_key="age", answer_type="number"),
-                ExtractionField(field_key="city", answer_type="text"),
+                ExtractionField(field_key="age"),
+                ExtractionField(field_key="city"),
             ],
             recent_conversation=[ConversationTurn(role="user", content="I am 27.")],
         )
@@ -145,11 +143,6 @@ def test_turn_messages_keep_policy_and_agent_priority_and_only_include_the_activ
             field_key="age",
             title="Age",
             objective="Collect the caller's age.",
-            answer_type="number",
-            extraction_instructions="Extract a finite age.",
-            clarification_instructions="Ask for the age again clearly.",
-            wording_mode="flexible",
-            localized_phrases={"en": "An opening phrase not to repeat."},
         ),
         recent_conversation=[
             ConversationTurn(role="user", content="I am 27."),
@@ -171,10 +164,7 @@ def test_turn_messages_keep_policy_and_agent_priority_and_only_include_the_activ
     assert built.messages[0]["content"] == "Frozen policy text."
     assert built.messages[1]["content"] == "Agent-level instructions."
     assert "Collect the caller's age." in built.messages[2]["content"]
-    assert "Ask for the age again clearly." in built.messages[2]["content"]
-    assert "An opening phrase not to repeat." not in "\n".join(
-        message["content"] for message in built.messages
-    )
+    assert "Age" in built.messages[2]["content"]
     turn_context = json.loads(built.messages[3]["content"])
     assert turn_context == {
         "language": "en",
@@ -185,56 +175,3 @@ def test_turn_messages_keep_policy_and_agent_priority_and_only_include_the_activ
         "I am 27.",
         "Thank you.",
     ]
-    assert built.direct_tts_text is None
-
-
-def test_exact_opening_is_returned_for_tts_without_any_llm_messages():
-    built = build_turn_messages(
-        instructions=FrozenPromptInstructions(
-            global_policy="Frozen policy text.",
-            agent_instructions="Agent-level instructions.",
-        ),
-        active_step=PromptStep(
-            field_key="name",
-            title="Name",
-            objective="Collect the caller's name.",
-            answer_type="text",
-            extraction_instructions="Extract the name.",
-            clarification_instructions="Ask for the name again.",
-            wording_mode="exact",
-            localized_phrases={"en": "What name should I use?"},
-        ),
-        recent_conversation=[],
-        confirmed_answers={},
-        validation_feedback=[],
-        language="en",
-        exact_opening_pending=True,
-    )
-
-    assert built.messages == ()
-    assert built.direct_tts_text == "What name should I use?"
-
-
-def test_exact_opening_requires_a_saved_phrase_for_the_call_language():
-    with pytest.raises(PromptConfigurationError):
-        build_turn_messages(
-            instructions=FrozenPromptInstructions(
-                global_policy="Frozen policy text.",
-                agent_instructions="Agent-level instructions.",
-            ),
-            active_step=PromptStep(
-                field_key="name",
-                title="Name",
-                objective="Collect the caller's name.",
-                answer_type="text",
-                extraction_instructions="Extract the name.",
-                clarification_instructions="Ask for the name again.",
-                wording_mode="exact",
-                localized_phrases={"en": "What name should I use?"},
-            ),
-            recent_conversation=[],
-            confirmed_answers={},
-            validation_feedback=[],
-            language="hi",
-            exact_opening_pending=True,
-        )
