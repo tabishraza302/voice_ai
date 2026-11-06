@@ -5,6 +5,7 @@
 .omp/
 .superpowers/
 .omp_*
+docs/
 
 # Generated state
 .venv/
