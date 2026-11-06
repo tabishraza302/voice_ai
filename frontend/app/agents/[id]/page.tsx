@@ -10,11 +10,12 @@ import { Card } from "@/components/ui/card";
 import { TabPanel, TabsBar } from "@/components/ui/tabs";
 import { cn } from "@/components/ui/utils";
 import { OwnerShell } from "@/app/dashboard/owner-shell";
-import { AgentDraft, AgentInstructions, AgentPipelineToolbar, agentDraftFromAgent, draftChanges } from "./agent-sections";
+import { AgentDraft, AgentInstructions, AgentPipelineToolbar, agentDraftFromAgent } from "./agent-sections";
 import { AgentTesting } from "./agent-testing";
 import { CallFlowEditor } from "./call-flow-editor";
+import type { CallFlowSaveState } from "./call-flow-save";
 import { QuestionsEditor } from "./questions-editor";
-
+import { useDraftAutosave } from "./use-draft-autosave";
 type EditorTab = "workflow" | "instructions" | "testing" | "history";
 
 const editorTabs: Array<{ value: EditorTab; label: string }> = [
@@ -42,17 +43,20 @@ export default function AgentEditorPage() {
   const [catalogLoading, setCatalogLoading] = useState(true);
   const [loading, setLoading] = useState(true);
   const [pageError, setPageError] = useState<string | null>(null);
-  const [saveError, setSaveError] = useState<string | null>(null);
-  const [saveMessage, setSaveMessage] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
   const [activeTab, setActiveTab] = useState<EditorTab>("workflow");
   const [reload, setReload] = useState(0);
   const [workflowView, setWorkflowView] = useState<"flow" | "form">("flow");
+  const [draftSaveState, setDraftSaveState] = useState<CallFlowSaveState>({ status: "idle" });
+  const [flowSaveState, setFlowSaveState] = useState<CallFlowSaveState>({ status: "idle" });
+  const [flushToken, setFlushToken] = useState(0);
 
-  const dirty = useMemo(() => {
-    if (!agent || !draft) return false;
-    return JSON.stringify(agentDraftFromAgent(agent)) !== JSON.stringify(draft);
-  }, [agent, draft]);
+  const { flush: flushDraft } = useDraftAutosave({
+    agentId,
+    agent,
+    draft,
+    onServerAgent: setAgent,
+    onState: setDraftSaveState,
+  });
 
   const loadCatalog = useCallback(async (signal?: AbortSignal) => {
     setCatalogLoading(true);
@@ -123,29 +127,7 @@ export default function AgentEditorPage() {
   }, [agentId, loadCatalog, reload, router]);
 
   function patchDraft(patch: Partial<AgentDraft>) {
-    setDraft((current) => current ? { ...current, ...patch } : current);
-    setSaveError(null);
-    setSaveMessage(null);
-  }
-
-  async function saveAgent() {
-    if (!draft) return;
-    setSaving(true);
-    setSaveError(null);
-    setSaveMessage(null);
-    try {
-      const updated = await api<Agent>(`/agents/${agentId}`, {
-        method: "PATCH",
-        body: JSON.stringify(draftChanges(draft)),
-      });
-      setAgent(updated);
-      setDraft(agentDraftFromAgent(updated));
-      setSaveMessage("Changes saved.");
-    } catch (reason) {
-      setSaveError(apiErrorText(reason, "Could not save this agent."));
-    } finally {
-      setSaving(false);
-    }
+    setDraft((current) => (current ? { ...current, ...patch } : current));
   }
 
 
@@ -194,13 +176,51 @@ export default function AgentEditorPage() {
                 </div>
               </div>
               <div className="flex flex-wrap items-center gap-3">
-                {dirty ? <span className="text-sm text-muted-foreground">Unsaved changes</span> : saveMessage ? <span role="status" className="text-sm text-primary">{saveMessage}</span> : null}
-                <Button onClick={() => void saveAgent()} disabled={!dirty || saving}>
-                  {saving ? "Saving..." : "Save changes"}
-                </Button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    flushDraft();
+                    setFlushToken((token) => token + 1);
+                  }}
+                  className={cn(
+                    "flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors",
+                    draftSaveState.status === "error" || flowSaveState.status === "error"
+                      ? "border-destructive/40 bg-destructive/10 text-destructive hover:bg-destructive/15"
+                      : "border-border/60 bg-muted/30 text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+                  )}
+                  role="status"
+                  aria-label={
+                    draftSaveState.status === "error" || flowSaveState.status === "error"
+                      ? `Error: ${draftSaveState.status === "error" ? draftSaveState.message : flowSaveState.message}. Click to retry.`
+                      : draftSaveState.status === "saving" || flowSaveState.status === "saving"
+                      ? "Saving changes…"
+                      : draftSaveState.status === "saved" || flowSaveState.status === "saved"
+                      ? "All changes saved"
+                      : "All changes save automatically. Click to save now."
+                  }
+                >
+                  {draftSaveState.status === "saving" || flowSaveState.status === "saving" ? (
+                    <>
+                      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-500" />
+                      <span>Saving…</span>
+                    </>
+                  ) : draftSaveState.status === "error" || flowSaveState.status === "error" ? (
+                    <>
+                      <span className="h-1.5 w-1.5 rounded-full bg-destructive" />
+                      <span>{draftSaveState.status === "error" ? draftSaveState.message : flowSaveState.message || "Couldn't save"}</span>
+                      <span className="ml-1 font-semibold underline underline-offset-2">Retry</span>
+                    </>
+                  ) : draftSaveState.status === "saved" || flowSaveState.status === "saved" ? (
+                    <>
+                      <span className="h-1.5 w-1.5 rounded-full bg-primary" />
+                      <span className="text-primary font-medium">Saved</span>
+                    </>
+                  ) : (
+                    <span>Auto-saves as you edit</span>
+                  )}
+                </button>
               </div>
             </div>
-            {saveError ? <p role="alert" className="mt-4 rounded-xl border border-destructive/30 bg-destructive/10 px-3.5 py-3 text-sm text-destructive">{saveError}</p> : null}
 
             <div className="mt-7">
               <TabsBar id="agent-editor" label="Agent settings" items={editorTabs} value={activeTab} onValueChange={(value) => {
@@ -250,6 +270,8 @@ export default function AgentEditorPage() {
                         agentName={draft.name || agent.name}
                         steps={steps}
                         onStepsChange={setSteps}
+                        onSaveStateChange={setFlowSaveState}
+                        flushToken={flushToken}
                       />
                     </div>
                     <div className={cn(workflowView !== "form" && "hidden")}>
