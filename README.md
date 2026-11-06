@@ -1,6 +1,6 @@
 # Voice Agent Builder
 
-A self-service voice agent platform. Owners create agents, questions, validation rules and routing; callers use a public `/a/[slug]` page; administrators manage global prompt policy, users and suspensions. Voice calls use Pipecat SmallWebRTC with provider keys held only by the backend. PostgreSQL stores configuration, call snapshots, messages and answers. Phoenix receives redacted OpenTelemetry timing and error spans.
+A self-service voice agent platform. Owners create agents with question steps and answer-based routing; callers use a public `/a/[slug]` page; administrators manage global prompt policy, users and suspensions. Voice calls use Pipecat SmallWebRTC with provider keys held only by the backend. PostgreSQL stores configuration, call snapshots, messages and answers. Phoenix receives redacted OpenTelemetry timing and error spans.
 
 Stack: FastAPI + async SQLAlchemy/Alembic + PostgreSQL, Next.js 15 + Tailwind, Pipecat SmallWebRTC (Deepgram STT, OpenAI LLM, Cartesia/ElevenLabs TTS), Phoenix.
 
@@ -70,7 +70,8 @@ docker compose exec frontend npm run build
 | `SMALLWEBRTC_TURN_CREDENTIAL_TTL_SECONDS` | TURN credential lifetime, 60–3600 seconds. |
 | `BACKEND_URL` | Next.js proxy target. Compose sets `http://backend:8000`; local dev defaults to `http://127.0.0.1:8000`. |
 
-Provider/model/voice publishing is fail-closed. A draft saves incomplete, but publish returns field errors unless the exact combination is approved by server configuration. While an agent is published, step changes must keep it valid; the question editor adds new questions disabled until you configure and enable them.
+Provider/model/voice publishing is fail-closed. A draft saves incomplete, but publish returns field errors unless the exact combination is approved by server configuration. The visual-flow editor lets owners set each step's title and objective, collect free-form answers, and route to another step or End call. Saved steps are active.
+Migration 0008 drops legacy step configuration columns; historical session snapshots remain unchanged.
 
 ```dotenv
 VERIFIED_OPENAI_MODELS=gpt-4.1-mini,gpt-4o-mini
