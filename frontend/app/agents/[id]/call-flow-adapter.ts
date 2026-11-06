@@ -1,5 +1,4 @@
-import { ApiError, api } from "@/lib/api";
-import type { AgentStep, AnswerType, BranchCondition, JsonValue, StepBranch, StepInput } from "@/lib/types";
+import type { AgentStep, BranchCondition, JsonValue, StepBranch, StepInput } from "@/lib/types";
 
 export interface CallFlowAnswer {
   id: string;
@@ -27,17 +26,11 @@ export function generateFieldKey(title: string, index: number): string {
 
 export function agentStepsToCallFlow(steps: AgentStep[]): {
   flowSteps: CallFlowStep[];
-  outcomes: AgentStep[];
 } {
   const sorted = [...steps].sort((a, b) => a.sort_order - b.sort_order);
   const flowSteps: CallFlowStep[] = [];
-  const outcomes: AgentStep[] = [];
 
   for (const step of sorted) {
-    if (step.answer_type === "outcome") {
-      outcomes.push(step);
-      continue;
-    }
 
     const answers: CallFlowAnswer[] = [];
     let other = "next";
@@ -76,7 +69,7 @@ export function agentStepsToCallFlow(steps: AgentStep[]): {
     });
   }
 
-  return { flowSteps, outcomes };
+  return { flowSteps };
 }
 
 export function resolveCallFlowRoute(target: string, index: number, steps: CallFlowStep[]): string {
@@ -92,31 +85,17 @@ function answerBranchIndex(stepId: string, answerId: string): number | null {
   return Number(suffix);
 }
 
-/** Synthesized condition operands follow the step's answer type. */
-function coerceOperand(label: string, answerType: AnswerType | null): JsonValue {
-  if (answerType === "boolean") {
-    if (label === "true") return true;
-    if (label === "false") return false;
-    return label;
-  }
-  if (answerType === "number") {
-    const value = Number(label);
-    return label !== "" && Number.isFinite(value) ? value : label;
-  }
-  return label;
+function coerceOperand(label: string): JsonValue {
+  return label.trim();
 }
 
 export function callFlowToStepInput(
   flowStep: CallFlowStep,
   allFlowSteps: CallFlowStep[],
-  index: number,
-  outcomeFieldKeys: { end?: string } = {}
+  index: number
 ): StepInput {
   const raw = flowStep.rawStep;
   const fieldKey = raw?.field_key || generateFieldKey(flowStep.title, index);
-  const endKey = outcomeFieldKeys.end || "end_call";
-  const answerType = raw?.answer_type || (flowStep.answers.length > 0 ? "enum" : "text");
-
   const nextStep = allFlowSteps[index + 1];
 
   const branches: StepBranch[] = [];
@@ -128,21 +107,19 @@ export function callFlowToStepInput(
     let conditions: BranchCondition[];
 
     if (rawBranch && rawBranch.conditions.length > 1) {
-      // Multi-condition branches are reused verbatim; only the target may change.
       conditions = rawBranch.conditions;
     } else if (
       rawBranch &&
       rawBranch.conditions.length === 1 &&
       String(rawBranch.conditions[0].operand) === a.label
     ) {
-      // Label untouched: keep the original operator and operand type.
       conditions = [rawBranch.conditions[0]];
     } else {
       conditions = [
         {
           field_key: fieldKey,
           operator: "eq",
-          operand: coerceOperand(a.label.trim(), answerType),
+          operand: coerceOperand(a.label),
         },
       ];
     }
@@ -151,10 +128,10 @@ export function callFlowToStepInput(
       if (nextStep) {
         branches.push({ conditions, target_step_id: nextStep.id, outcome: null });
       } else {
-        branches.push({ conditions, target_step_id: null, outcome: endKey });
+        branches.push({ conditions, target_step_id: null, outcome: "end" });
       }
     } else if (a.to === "end") {
-      branches.push({ conditions, target_step_id: null, outcome: endKey });
+      branches.push({ conditions, target_step_id: null, outcome: "end" });
     } else {
       branches.push({ conditions, target_step_id: a.to, outcome: null });
     }
@@ -163,96 +140,20 @@ export function callFlowToStepInput(
   // Fallback "other" route
   if (flowStep.other !== "next") {
     if (flowStep.other === "end") {
-      branches.push({ conditions: [], target_step_id: null, outcome: endKey });
+      branches.push({ conditions: [], target_step_id: null, outcome: "end" });
     } else {
       branches.push({ conditions: [], target_step_id: flowStep.other, outcome: null });
     }
   }
 
-  const answerLabels = flowStep.answers.map((a) => a.label.trim()).filter(Boolean);
-
   return {
     title: flowStep.title.trim() || `Step ${index + 1}`,
     objective: flowStep.say.trim() || "Follow conversation flow.",
     field_key: fieldKey,
-    answer_type: answerType,
-    required: raw?.required ?? true,
-    enabled: raw?.enabled ?? true,
-    enum_values:
-      answerType === "enum"
-        ? [...new Set([...(raw?.enum_values ?? []), ...answerLabels])]
-        : raw?.enum_values ?? [],
-    wording_mode: raw?.wording_mode || "flexible",
-    localized_phrases: raw?.localized_phrases || {},
-    extraction_instructions:
-      raw?.extraction_instructions ||
-      (flowStep.answers.length > 0
-        ? "Extract the caller's answer from the supported options."
-        : "Extract the caller's response."),
-    clarification_instructions:
-      raw?.clarification_instructions || "Ask the caller to clarify their response.",
-    validation_rules: raw?.validation_rules || [],
     branches,
-    validation_failure_target: raw?.validation_failure_target || null,
   };
 }
 
-/**
- * Ensures that if any flow step routes to 'end',
- * the corresponding enabled outcome step exists in the backend.
- * Auto-provisions it if missing to satisfy backend validate_publish constraints.
- */
-export async function ensureOutcomeSteps(
-  agentId: string,
-  currentSteps: AgentStep[],
-  referencedOutcomes: Set<string>
-): Promise<{
-  steps: AgentStep[];
-  outcomeKeys: { end?: string };
-}> {
-  let updatedSteps = [...currentSteps];
-  const outcomeKeys: { end?: string } = {};
-
-  const existingOutcomes = updatedSteps.filter(
-    (s) => s.answer_type === "outcome" && s.enabled && typeof s.field_key === "string"
-  );
-
-  const existingEnd = existingOutcomes.find((s) =>
-    ["end_call", "end", "completed", "finish"].includes(s.field_key || "")
-  );
-  if (existingEnd) {
-    outcomeKeys.end = existingEnd.field_key!;
-  }
-
-  // Auto-provision "end" outcome if referenced and not present
-  if (referencedOutcomes.has("end") && !outcomeKeys.end) {
-    try {
-      const endStep = await api<AgentStep>(`/agents/${agentId}/steps`, {
-        method: "POST",
-        body: JSON.stringify({
-          title: "End call",
-          objective: "End the call gracefully.",
-          field_key: "end_call",
-          answer_type: "outcome",
-          enabled: true,
-        }),
-      });
-      updatedSteps.push(endStep);
-      outcomeKeys.end = endStep.field_key || "end_call";
-    } catch (reason) {
-      if (!(reason instanceof ApiError) || reason.status !== 409) throw reason;
-      // A previous or concurrent save already created the outcome; adopt it.
-      const serverSteps = await api<AgentStep[]>(`/agents/${agentId}/steps`);
-      const serverEnd = serverSteps.find(
-        (step) => step.answer_type === "outcome" && step.field_key === "end_call"
-      );
-      if (serverEnd) updatedSteps.push(serverEnd);
-      outcomeKeys.end = "end_call";
-    }
-  }
-
-  return { steps: updatedSteps, outcomeKeys };
-}
 
 export function getSampleHearingScript(): CallFlowStep[] {
   return [

@@ -55,31 +55,10 @@ export type AgentPatch = Partial<
   >
 >;
 
-export type AnswerType =
-  | "boolean"
-  | "text"
-  | "number"
-  | "currency"
-  | "enum"
-  | "message"
-  | "outcome";
-export type WordingMode = "exact" | "flexible";
-export type ValidationOperator = "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "in";
-
 export interface BranchCondition {
   field_key: string | null;
-  operator: ValidationOperator | null;
+  operator: string | null;
   operand: JsonValue;
-}
-
-export interface ValidationRule {
-  operator: ValidationOperator | null;
-  operand: JsonValue;
-}
-
-export interface ValidationFailureTarget {
-  target_step_id?: string | null;
-  outcome?: string | null;
 }
 
 export interface StepBranch {
@@ -89,20 +68,10 @@ export interface StepBranch {
 }
 
 export interface StepInput {
-  field_key: string | null;
+  field_key?: string | null;
   title: string;
   objective: string;
-  required: boolean;
-  enabled: boolean;
-  answer_type: AnswerType | null;
-  enum_values: string[];
-  wording_mode: WordingMode | null;
-  localized_phrases: Record<string, string>;
-  extraction_instructions: string;
-  clarification_instructions: string;
-  validation_rules: ValidationRule[];
   branches: StepBranch[];
-  validation_failure_target: ValidationFailureTarget | null;
 }
 
 export interface AgentStep extends StepInput {
