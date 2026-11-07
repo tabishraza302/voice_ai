@@ -42,7 +42,6 @@ export default function AgentEditorPage() {
   const [agent, setAgent] = useState<Agent | null>(null);
   const [draft, setDraft] = useState<AgentDraft | null>(null);
   const [chatOpen, setChatOpen] = useState(false);
-  const [steps, setSteps] = useState<AgentStep[]>([]);
   const [catalog, setCatalog] = useState<ProviderCatalog | null>(null);
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [catalogLoading, setCatalogLoading] = useState(true);
@@ -91,7 +90,6 @@ export default function AgentEditorPage() {
       setPageError(null);
       setAgent(null);
       setDraft(null);
-      setSteps([]);
       setCatalog(null);
       setCatalogError(null);
       try {
@@ -101,15 +99,13 @@ export default function AgentEditorPage() {
           router.replace("/admin");
           return;
         }
-        const [agentResult, stepResult] = await Promise.all([
-          api<Agent>(`/agents/${agentId}`, { signal: controller.signal }),
-          api<AgentStep[]>(`/agents/${agentId}/steps`, { signal: controller.signal }),
-        ]);
+        const agentResult = await api<Agent>(`/agents/${agentId}`, {
+          signal: controller.signal,
+        });
         if (!current) return;
         setUser(currentUser);
         setAgent(agentResult);
         setDraft(agentDraftFromAgent(agentResult));
-        setSteps(stepResult);
         void loadCatalog(controller.signal);
       } catch (reason) {
         if (!current || controller.signal.aborted) return;

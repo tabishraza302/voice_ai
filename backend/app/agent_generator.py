@@ -38,45 +38,35 @@ Do not include any conversational filler or preambles outside these sections."""
 
 
 _GENERATE_SYSTEM_PROMPT = """You are an expert voice AI architect.
-Given a user request or prompt, generate a fully configured voice agent specification and call flow steps.
+Given a user request or prompt, generate a fully configured voice agent specification with goal-based information fields and completion outcomes.
 You MUST output ONLY a valid raw JSON object matching this schema:
 {
   "name": "Short, human-friendly agent name (max 120 chars)",
   "description": "Brief 1-2 sentence description (max 500 chars)",
   "instructions": "Comprehensive system prompt for the voice AI (persona, tone, speaking style, concise answers, rules, edge cases)",
-  "steps": [
+  "fields": [
     {
       "field_key": "unique_snake_case_key",
-      "title": "Clear step title",
-      "objective": "Clear instructions for what the agent should accomplish and collect in this turn/step",
-      "branches": [
-        {
-          "target_step_index": 2,
-          "outcome": null,
-          "conditions": [
-            {
-              "field_key": "unique_snake_case_key",
-              "operator": "eq",
-              "operand": "value_to_match"
-            }
-          ]
-        }
-      ]
+      "description": "Short description of what to collect",
+      "guidance": "Instruction on how to ask the caller for this information",
+      "options": ["optional_enum_1", "optional_enum_2"],
+      "required": true
+    }
+  ],
+  "outcomes": [
+    {
+      "label": "outcome_label",
+      "required_fields": ["field_key_1", "field_key_2"]
     }
   ]
 }
 
-Guidelines for Conversation Flow:
-- Generate between 2 and 6 steps representing the conversational workflow.
-- IF the prompt describes a LINEAR sequential flow (e.g. simple reminder, sequential intake, simple survey):
-  Generate clean sequential steps where each step proceeds naturally to the next. Leave branches empty ([]) or omit them. DO NOT force unnecessary branches.
-- IF the prompt describes a BRANCHED flow (e.g. multiple services, triage, or if/then decision rules):
-  Actively design branches: in the triage/decision step, add branches checking the step's own field_key and jumping to the target step (via target_step_index) or exiting with an outcome.
-- When branches are used: EXACTLY ONE of target_step_index or outcome must be set on each branch (never both, never neither).
-- In each condition, field_key MUST be that step's own field_key. Allowed operators: "eq", "ne", "gt", "gte", "lt", "lte", "in".
-- Allowed operators: "eq", "ne", "gt", "gte", "lt", "lte", "in".
+Guidelines for Goal-Based Configuration:
+- Generate 2 to 6 information fields representing what the agent needs to collect.
+- Mark primary triage/intent fields as required: true.
+- For fields with defined choices, include non-empty options array. Free-text fields have options: [].
+- Generate at least 1 outcome with the required_fields that mark it complete.
 - Do NOT output any markdown ticks (like ```json), commentary, or text outside the raw JSON object."""
-
 
 def get_openai_client(model_override: str | None = None) -> tuple[AsyncOpenAI, str]:
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
@@ -208,10 +198,12 @@ async def stream_agent_generation(
             "name": name,
             "description": f"Generated agent for: {cleaned[:80]}",
             "instructions": cleaned,
-            "steps": [
-                {"field_key": "greeting", "title": "Greeting & Purpose", "objective": "Greet caller and determine goal."},
-                {"field_key": "collect_info", "title": "Collect Information", "objective": "Gather details from caller."},
-                {"field_key": "conclusion", "title": "Closing", "objective": "Confirm details and conclude call."}
+            "fields": [
+                {"field_key": "caller_intent", "description": "Caller's request", "guidance": "Ask how you can help.", "required": True, "options": []},
+                {"field_key": "details", "description": "Request details", "guidance": "Gather details from caller.", "required": False, "options": []},
+            ],
+            "outcomes": [
+                {"label": "request_completed", "required_fields": ["caller_intent", "details"]}
             ]
         }
 
@@ -235,52 +227,64 @@ async def stream_agent_generation(
     )
     db.add(agent)
 
-    raw_steps = parsed.get("steps")
-    if not isinstance(raw_steps, list) or not raw_steps:
-        raw_steps = [
-            {"field_key": "greeting", "title": "Greeting & Purpose", "objective": "Greet caller and determine goal."},
-            {"field_key": "collect_info", "title": "Collect Information", "objective": "Gather details from caller."},
-            {"field_key": "conclusion", "title": "Closing", "objective": "Confirm details and conclude call."}
+    raw_fields = parsed.get("fields") or parsed.get("steps") or []
+    if not isinstance(raw_fields, list) or not raw_fields:
+        raw_fields = [
+            {"field_key": "caller_intent", "description": "Caller's request", "guidance": "Ask how you can help.", "required": True, "options": []},
+            {"field_key": "details", "description": "Request details", "guidance": "Gather details from caller.", "required": False, "options": []},
         ]
 
-    step_ids = [uuid.uuid4() for _ in raw_steps]
-
-    # Pre-extract cleaned field_keys for all steps to validate cross-references
-    step_keys: list[str] = []
     seen_keys: set[str] = set()
-    for index, s_data in enumerate(raw_steps):
-        if not isinstance(s_data, dict):
-            raw_key = f"step_{index+1}"
-        else:
-            raw_key = re.sub(r"[^a-zA-Z0-9_]+", "_", str(s_data.get("field_key") or f"step_{index+1}")).strip("_").lower()
+    created_fields: list[AgentField] = []
+    for index, f_data in enumerate(raw_fields):
+        if not isinstance(f_data, dict):
+            f_data = {}
+        raw_key = re.sub(r"[^a-zA-Z0-9_]+", "_", str(f_data.get("field_key") or f"field_{index+1}")).strip("_").lower()
         if not raw_key:
-            raw_key = f"step_{index+1}"
+            raw_key = f"field_{index+1}"
         if raw_key in seen_keys:
             raw_key = f"{raw_key}_{index+1}"
         seen_keys.add(raw_key)
-        step_keys.append(raw_key)
-    created_fields: list[AgentField] = []
-    for index, s_data in enumerate(raw_steps):
-        if not isinstance(s_data, dict):
-            s_data = {}
 
-        raw_key = step_keys[index]
-        title = str(s_data.get("title") or f"Step {index+1}").strip()[:255] or f"Step {index+1}"
-        objective = str(s_data.get("objective") or title).strip() or title
+        title = str(f_data.get("description") or f_data.get("title") or f"Field {index+1}").strip()[:255]
+        guidance = str(f_data.get("guidance") or f_data.get("objective") or title).strip()
+        options = [str(opt).strip() for opt in f_data.get("options") or () if str(opt).strip()]
+        required = bool(f_data.get("required", index == 0))
 
         field_model = AgentField(
-            id=step_ids[index],
+            id=uuid.uuid4(),
             agent_id=agent_id,
             field_key=raw_key,
             description=title,
-            guidance=objective,
-            required=index == 0,
-            options=[],
+            guidance=guidance,
+            required=required,
+            options=options,
             required_when=[],
             sort_order=index,
         )
         db.add(field_model)
         created_fields.append(field_model)
+
+    raw_outcomes = parsed.get("outcomes") or []
+    if isinstance(raw_outcomes, list):
+        for o_data in raw_outcomes:
+            if not isinstance(o_data, dict):
+                continue
+            label = re.sub(r"[^a-zA-Z0-9_]+", "_", str(o_data.get("label") or "completed")).strip("_").lower() or "completed"
+            req_fields = [
+                str(rf).strip()
+                for rf in o_data.get("required_fields") or ()
+                if str(rf).strip() in seen_keys
+            ]
+            outcome_model = AgentOutcome(
+                id=uuid.uuid4(),
+                agent_id=agent_id,
+                label=label,
+                conditions=[],
+                required_fields=req_fields,
+            )
+            db.add(outcome_model)
+
     try:
         await db.commit()
     except Exception as exc:
