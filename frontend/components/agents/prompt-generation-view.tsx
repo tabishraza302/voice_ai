@@ -72,7 +72,7 @@ export function PromptGenerationView({ onCancel }: { onCancel: () => void }) {
   }
 
   async function startGenerating() {
-    if (!canSubmit || generating) return;
+    if (!canSubmit || (generating && !generationError)) return;
     setGenerating(true);
     setGenerationError(null);
     setActivePhase("analyzing");
