@@ -80,7 +80,7 @@ export interface AgentStep extends StepInput {
   sort_order: number;
 }
 
-export type CallType = "test" | "public";
+export type CallType = "test" | "public" | "chat_test";
 export type SessionStatus = "created" | "active" | "completed" | "failed" | "cancelled" | "expired";
 
 export interface CallSession {
@@ -98,6 +98,10 @@ export interface CallSessionGrant {
   session_id: string;
   signaling_token: string;
 }
+export interface ChatSessionCreated {
+  session_id: string;
+}
+
 
 export interface CallMessage {
   id: string;
