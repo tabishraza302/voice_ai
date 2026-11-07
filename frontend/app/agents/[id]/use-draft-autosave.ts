@@ -7,8 +7,7 @@ import type { Agent } from "@/lib/types";
 
 import { agentDraftFromAgent, draftChanges } from "./agent-sections";
 import type { AgentDraft } from "./agent-sections";
-import type { CallFlowSaveState } from "./call-flow-save";
-
+import type { SaveState } from "./page";
 const SAVE_IDLE_MS = 1200;
 const SAVE_MAX_MS = 10000;
 const SAVE_COALESCE_MS = 250;
@@ -46,7 +45,7 @@ export function useDraftAutosave(options: {
   agent: Agent | null;
   draft: AgentDraft | null;
   onServerAgent: (agent: Agent) => void;
-  onState: (state: CallFlowSaveState) => void;
+  onState: (state: SaveState) => void;
 }): { flush: () => void; dirty: boolean } {
   const { agent, draft } = options;
 

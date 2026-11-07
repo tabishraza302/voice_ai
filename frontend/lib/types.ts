@@ -55,25 +55,66 @@ export type AgentPatch = Partial<
   >
 >;
 
-export interface BranchCondition {
-  field_key: string | null;
-  operator: string | null;
+export interface FieldCondition {
+  field_key: string;
+  operator: string;
   operand: JsonValue;
 }
 
+export interface AgentField {
+  id: string;
+  agent_id: string;
+  field_key: string;
+  description: string;
+  guidance: string;
+  options: string[];
+  required: boolean;
+  required_when: FieldCondition[];
+  sort_order: number;
+}
+
+export interface FieldInput {
+  field_key?: string | null;
+  description?: string;
+  guidance?: string;
+  options?: string[];
+  required?: boolean;
+  required_when?: FieldCondition[];
+  sort_order?: number | null;
+}
+
+export interface AgentOutcome {
+  id: string;
+  agent_id: string;
+  label: string;
+  conditions: FieldCondition[];
+  required_fields: string[];
+}
+
+export interface OutcomeInput {
+  label?: string | null;
+  conditions?: FieldCondition[];
+  required_fields?: string[];
+}
+
+export interface SessionOutcomeRecord {
+  label: string;
+  completed_at?: string | null;
+}
+
+// Backward-compatible aliases for transition
+export type BranchCondition = FieldCondition;
 export interface StepBranch {
   conditions: BranchCondition[];
   target_step_id?: string | null;
   outcome?: string | null;
 }
-
 export interface StepInput {
   field_key?: string | null;
   title: string;
   objective: string;
   branches: StepBranch[];
 }
-
 export interface AgentStep extends StepInput {
   id: string;
   agent_id: string;
@@ -88,7 +129,7 @@ export interface CallSession {
   agent_id: string;
   call_type: CallType;
   status: SessionStatus;
-  outcome: string | null;
+  outcome: SessionOutcomeRecord[] | string | null;
   created_at: string;
   started_at: string | null;
   ended_at: string | null;
