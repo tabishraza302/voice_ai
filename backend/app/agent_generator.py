@@ -17,15 +17,14 @@ You MUST format your output using the following markdown headings exactly:
 ### Primary Objective
 [Define the main goals of the conversation clearly and concisely]
 
-### Conversational Workflow & Decision Branching
-[Break down the conversation into numbered steps with explicit decision branching:
-- Step 1: Initial Greeting & Intent Identification (identify caller purpose).
-  - If intent is [A]: route to Step 2 (Handling A)
-  - If intent is [B]: route to Step 3 (Handling B)
-  - If intent is [C]: route to Step 4 (Handling C)
-- Distinct Paths: Detail each branch step-by-step with instructions on what to ask and collect.
-- Path Exits: For each path that finishes its task, specify an exit outcome (e.g. outcome='order_confirmed') or a route to a common closing step so paths never fall through into unrelated steps.]
-
+### Conversational Workflow & Routing
+[Analyze whether the use case is LINEAR (a single sequential flow) or BRANCHED (multiple intents, triage, or conditional decisions).
+- IF LINEAR (e.g. simple reminder, sequential intake, short survey):
+  Detail a clean sequential step-by-step list (Step 1 -> Step 2 -> Step 3). DO NOT invent fake intents or artificial branches.
+- IF BRANCHED (e.g. multiple services, triage, or if/then choices):
+  Structure with numbered steps and explicit routing rules:
+  - Step 1 (Triage): If X route to Step 2, if Y route to Step 3.
+  - Path Exits: each path exits with an outcome or joins a common closing step so parallel paths do not cross.]
 ### Information to Collect & Field Keys
 [List specific fields or decisions to obtain with snake_case keys like caller_intent, customer_name, order_id]
 
@@ -67,15 +66,14 @@ You MUST output ONLY a valid raw JSON object matching this schema:
   ]
 }
 
-Guidelines for Branching and Conversation Flow:
-- Generate between 3 and 7 steps.
-- DO NOT default to a purely linear sequential flow if the prompt describes multiple intents, actions, customer types, or decision criteria.
-- In the initial intake/triage step (e.g. caller_intent), add multiple branches where each branch checks conditions on that step's own field_key and jumps to the specific step handling that intent (via target_step_index).
-- CRITICAL for parallel paths: When a path finishes its action (e.g. Confirm Order), it MUST NOT fall through into another unrelated path (e.g. Cancel Order). It must either:
-  1) Route to a common closing/wrap-up step (via target_step_index), or
-  2) Exit the conversation with an outcome (e.g. outcome="order_confirmed").
-- EXACTLY ONE of target_step_index or outcome must be set on each branch (never both, never neither).
-- In each condition, field_key MUST be that step's own field_key.
+Guidelines for Conversation Flow:
+- Generate between 2 and 6 steps representing the conversational workflow.
+- IF the prompt describes a LINEAR sequential flow (e.g. simple reminder, sequential intake, simple survey):
+  Generate clean sequential steps where each step proceeds naturally to the next. Leave branches empty ([]) or omit them. DO NOT force unnecessary branches.
+- IF the prompt describes a BRANCHED flow (e.g. multiple services, triage, or if/then decision rules):
+  Actively design branches: in the triage/decision step, add branches checking the step's own field_key and jumping to the target step (via target_step_index) or exiting with an outcome.
+- When branches are used: EXACTLY ONE of target_step_index or outcome must be set on each branch (never both, never neither).
+- In each condition, field_key MUST be that step's own field_key. Allowed operators: "eq", "ne", "gt", "gte", "lt", "lte", "in".
 - Allowed operators: "eq", "ne", "gt", "gte", "lt", "lte", "in".
 - Do NOT output any markdown ticks (like ```json), commentary, or text outside the raw JSON object."""
 
