@@ -190,3 +190,44 @@ async def test_generate_stream_drops_invalid_branches_and_passes_publish_validat
             has_target = branch["target_step_id"] is not None
             has_outcome = branch["outcome"] is not None
             assert has_target != has_outcome
+
+
+@pytest.mark.anyio
+async def test_generate_stream_uses_custom_model(client, monkeypatch):
+    token = await login(client, f"{uuid.uuid4()}@example.com")
+    captured_models = []
+
+    generated_json = '{"name": "Custom Model Bot", "description": "Desc", "instructions": "Inst", "steps": []}'
+
+    async def mock_stream(*args, **kwargs):
+        captured_models.append(kwargs.get("model"))
+        class MockDelta:
+            content = generated_json
+        class MockStreamChoice:
+            delta = MockDelta()
+        class MockStreamChunk:
+            choices = [MockStreamChoice()]
+        yield MockStreamChunk()
+
+    monkeypatch.setattr("openai.resources.chat.completions.AsyncCompletions.create", AsyncMock(side_effect=mock_stream))
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("VERIFIED_OPENAI_MODELS", "gpt-4.1-mini,gpt-4o-mini")
+
+    response = await client.post(
+        "/agents/generate-stream",
+        json={"prompt": "A test prompt specifying custom model", "model": "gpt-4.1-mini"},
+        headers=mutation_headers(token),
+    )
+    assert response.status_code == 200
+    assert captured_models == ["gpt-4.1-mini"]
+
+    import json
+    agent_id = None
+    for line in response.text.split("\n"):
+        if line.startswith("data:") and "agent_id" in line:
+            agent_id = json.loads(line[5:].strip())["agent_id"]
+    assert agent_id is not None
+
+    agent_resp = await client.get(f"/agents/{agent_id}", headers=mutation_headers(token))
+    assert agent_resp.status_code == 200
+    assert agent_resp.json()["llm_model"] == "gpt-4.1-mini"
