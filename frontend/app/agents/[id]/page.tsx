@@ -17,6 +17,7 @@ import { CallFlowEditor } from "./call-flow-editor";
 import type { CallFlowSaveState } from "./call-flow-save";
 import { CompiledPromptView } from "./compiled-prompt-view";
 import { useDraftAutosave } from "./use-draft-autosave";
+import { ChatPanel } from "@/components/chat-panel";
 type EditorTab = "workflow" | "instructions" | "testing" | "history";
 
 const editorTabs: Array<{ value: EditorTab; label: string }> = [
@@ -38,6 +39,7 @@ export default function AgentEditorPage() {
   const [user, setUser] = useState<CurrentUser | null>(null);
   const [agent, setAgent] = useState<Agent | null>(null);
   const [draft, setDraft] = useState<AgentDraft | null>(null);
+  const [chatOpen, setChatOpen] = useState(false);
   const [steps, setSteps] = useState<AgentStep[]>([]);
   const [catalog, setCatalog] = useState<ProviderCatalog | null>(null);
   const [catalogError, setCatalogError] = useState<string | null>(null);
@@ -135,7 +137,7 @@ export default function AgentEditorPage() {
 
   return (
     <OwnerShell active="agents" email={user?.email}>
-      <main className="w-full px-6 py-8 sm:px-8 sm:py-10 lg:px-12">
+      <main className={cn("w-full px-6 py-8 sm:px-8 sm:py-10 lg:px-12 transition-[padding] duration-300", chatOpen && "pr-[380px] sm:pr-[380px] lg:pr-[380px]")}>
         {loading ? (
           <div className="space-y-5" aria-busy="true" aria-label="Loading agent editor">
             <div className="h-12 w-1/2 animate-pulse rounded-xl bg-muted" />
@@ -180,8 +182,17 @@ export default function AgentEditorPage() {
                 <button
                   type="button"
                   onClick={() => {
-                    flushDraft();
-                    setFlushToken((token) => token + 1);
+                    const isBusyOrError =
+                      draftSaveState.status === "saving" ||
+                      flowSaveState.status === "saving" ||
+                      draftSaveState.status === "error" ||
+                      flowSaveState.status === "error";
+                    if (isBusyOrError) {
+                      flushDraft();
+                      setFlushToken((token) => token + 1);
+                    } else {
+                      setChatOpen((prev) => !prev);
+                    }
                   }}
                   className={cn(
                     "flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors",
@@ -197,7 +208,7 @@ export default function AgentEditorPage() {
                       ? "Saving changes…"
                       : draftSaveState.status === "saved" || flowSaveState.status === "saved"
                       ? "All changes saved"
-                      : "All changes save automatically. Click to save now."
+                      : "Test chat"
                   }
                 >
                   {draftSaveState.status === "saving" || flowSaveState.status === "saving" ? (
@@ -217,7 +228,12 @@ export default function AgentEditorPage() {
                       <span className="text-primary font-medium">Saved</span>
                     </>
                   ) : (
-                    <span>Auto-saves as you edit</span>
+                    <>
+                      <svg className="h-3.5 w-3.5 text-muted-foreground" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+                      </svg>
+                      <span>Test chat</span>
+                    </>
                   )}
                 </button>
               </div>
@@ -303,6 +319,16 @@ export default function AgentEditorPage() {
           </>
         ) : null}
       </main>
+      {agent && draft ? (
+        <ChatPanel
+          agentId={agentId}
+          agentName={draft.name || agent.name}
+          languages={draft.languages}
+          defaultLanguage={draft.default_language}
+          open={chatOpen}
+          onClose={() => setChatOpen(false)}
+        />
+      ) : null}
     </OwnerShell>
   );
 }

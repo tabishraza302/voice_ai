@@ -187,7 +187,7 @@ export function AgentTesting({
                     onClick={() => setSelectedId(item.id)}
                   >
                     <span className="flex items-center justify-between gap-2">
-                      <span className="text-sm font-semibold">{item.call_type === "test" ? "Test call" : "Public call"}</span>
+                      <span className="text-sm font-semibold">{item.call_type === "chat_test" ? "Chat test" : item.call_type === "test" ? "Test call" : "Public call"}</span>
                       <Badge variant={item.status === "completed" ? "success" : item.status === "failed" ? "danger" : item.status === "active" ? "warning" : "muted"}>{item.status}</Badge>
                     </span>
                     <span className="mt-2 block text-xs text-muted-foreground">{formatDate(item.created_at)}</span>
