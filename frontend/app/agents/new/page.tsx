@@ -145,39 +145,44 @@ export default function NewAgentPage() {
                   Try again
                 </Button>
               </div>
-            ) : creationMode === "ai" ? (
-              <PromptGenerationView onCancel={() => router.push("/dashboard")} />
             ) : (
-              <form className="space-y-5" onSubmit={createDraft}>
-                {error ? (
-                  <p
-                    role="alert"
-                    className="rounded-xl border border-destructive/30 bg-destructive/10 px-3.5 py-3 text-sm text-destructive"
-                  >
-                    {error}
-                  </p>
-                ) : null}
-                <div className="space-y-2">
-                  <Label htmlFor="agent-name">Agent name</Label>
-                  <Input
-                    id="agent-name"
-                    name="name"
-                    autoComplete="off"
-                    maxLength={120}
-                    required
-                    value={name}
-                    onChange={(event) => setName(event.currentTarget.value)}
-                  />
+              <>
+                <div className={creationMode === "ai" ? "block" : "hidden"}>
+                  <PromptGenerationView onCancel={() => router.push("/dashboard")} />
                 </div>
-                <div className="flex flex-col-reverse gap-3 border-t pt-5 sm:flex-row sm:justify-end">
-                  <Link href="/dashboard" className={buttonClassName("outline")}>
-                    Cancel
-                  </Link>
-                  <Button type="submit" disabled={saving || !name.trim()}>
-                    {saving ? "Saving draft..." : "Create draft"}
-                  </Button>
+                <div className={creationMode === "blank" ? "block" : "hidden"}>
+                  <form className="space-y-5" onSubmit={createDraft}>
+                    {error ? (
+                      <p
+                        role="alert"
+                        className="rounded-xl border border-destructive/30 bg-destructive/10 px-3.5 py-3 text-sm text-destructive"
+                      >
+                        {error}
+                      </p>
+                    ) : null}
+                    <div className="space-y-2">
+                      <Label htmlFor="agent-name">Agent name</Label>
+                      <Input
+                        id="agent-name"
+                        name="name"
+                        autoComplete="off"
+                        maxLength={120}
+                        required
+                        value={name}
+                        onChange={(event) => setName(event.currentTarget.value)}
+                      />
+                    </div>
+                    <div className="flex flex-col-reverse gap-3 border-t pt-5 sm:flex-row sm:justify-end">
+                      <Link href="/dashboard" className={buttonClassName("outline")}>
+                        Cancel
+                      </Link>
+                      <Button type="submit" disabled={saving || !name.trim()}>
+                        {saving ? "Saving draft..." : "Create draft"}
+                      </Button>
+                    </div>
+                  </form>
                 </div>
-              </form>
+              </>
             )}
           </CardContent>
         </Card>

@@ -136,3 +136,57 @@ async def test_generate_stream_creates_agent_and_steps(client, monkeypatch):
     assert "event: milestone" in content
     assert "event: complete" in content
     assert "Dental Assistant" in content
+
+
+@pytest.mark.anyio
+async def test_generate_stream_drops_invalid_branches_and_passes_publish_validation(client, monkeypatch):
+    token = await login(client, f"{uuid.uuid4()}@example.com")
+
+    # Includes out-of-range index (99), self-target (0), and both target + outcome
+    generated_json = (
+        '{"name": "Booking Bot", '
+        '"description": "Validates branches", '
+        '"instructions": "Instructions text", '
+        '"steps": ['
+        '{"field_key": "step_one", "title": "First", "objective": "Obj 1", "branches": [{"target_step_index": 0, "outcome": "loop"}]}, '
+        '{"field_key": "step_two", "title": "Second", "objective": "Obj 2", "branches": [{"target_step_index": 99}]}, '
+        '{"field_key": "step_three", "title": "Third", "objective": "Obj 3", "branches": [{"target_step_index": 2, "outcome": "finish"}]}'
+        ']}'
+    )
+
+    async def mock_stream(*args, **kwargs):
+        class MockDelta:
+            content = generated_json
+        class MockStreamChoice:
+            delta = MockDelta()
+        class MockStreamChunk:
+            choices = [MockStreamChoice()]
+        yield MockStreamChunk()
+
+    monkeypatch.setattr("openai.resources.chat.completions.AsyncCompletions.create", AsyncMock(side_effect=mock_stream))
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    response = await client.post(
+        "/agents/generate-stream",
+        json={"prompt": "A test prompt for validating branches"},
+        headers=mutation_headers(token),
+    )
+    assert response.status_code == 200
+    import json
+    agent_id = None
+    for line in response.text.split("\n"):
+        if line.startswith("data:") and "agent_id" in line:
+            agent_id = json.loads(line[5:].strip())["agent_id"]
+    assert agent_id is not None
+
+    # Verify steps can be fetched without 500 error
+    steps_resp = await client.get(f"/agents/{agent_id}/steps", headers=mutation_headers(token))
+    assert steps_resp.status_code == 200
+    steps = steps_resp.json()
+    assert len(steps) == 3
+    # None of the branches should have both target_step_id AND outcome, or neither
+    for step in steps:
+        for branch in step["branches"]:
+            has_target = branch["target_step_id"] is not None
+            has_outcome = branch["outcome"] is not None
+            assert has_target != has_outcome

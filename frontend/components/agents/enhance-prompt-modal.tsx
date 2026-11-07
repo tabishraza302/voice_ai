@@ -44,6 +44,11 @@ export function EnhancePromptModal({
       aria-labelledby={titleId}
       aria-describedby={descriptionId}
       onClose={onClose}
+      onClick={(e) => {
+        if (e.target === dialogRef.current) {
+          onClose();
+        }
+      }}
       className="w-[min(94vw,56rem)] rounded-2xl border bg-card p-0 text-card-foreground shadow-2xl backdrop:bg-foreground/35"
     >
       <div className="flex flex-col max-h-[90vh]">

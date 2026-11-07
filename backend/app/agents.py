@@ -188,6 +188,14 @@ class EnhancePromptRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     prompt: str = Field(min_length=10, max_length=10000)
 
+    @field_validator("prompt")
+    @classmethod
+    def validate_prompt(cls, value: str) -> str:
+        trimmed = value.strip()
+        if len(trimmed) < 10:
+            raise ValueError("Prompt must contain at least 10 non-whitespace characters")
+        return trimmed
+
 
 class EnhancePromptResponse(BaseModel):
     enhanced_prompt: str
@@ -197,6 +205,13 @@ class GenerateAgentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     prompt: str = Field(min_length=10, max_length=10000)
 
+    @field_validator("prompt")
+    @classmethod
+    def validate_prompt(cls, value: str) -> str:
+        trimmed = value.strip()
+        if len(trimmed) < 10:
+            raise ValueError("Prompt must contain at least 10 non-whitespace characters")
+        return trimmed
 async def _get_owned_agent(
     db: AsyncSession, owner_id: uuid.UUID, agent_id: uuid.UUID, *, lock: bool
 ) -> Agent:
