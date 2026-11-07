@@ -354,7 +354,7 @@ async def test_agent_delete_rejects_an_active_call_while_agent_is_locked(client)
     deletion = await client.delete(f"/agents/{agent['id']}", headers=mutation_headers(token))
     assert deletion.status_code == 409
 
-    await set_session_status(session_id, "completed", outcome="finished")
+    await set_session_status(session_id, "completed")
     deletion = await client.delete(f"/agents/{agent['id']}", headers=mutation_headers(token))
     assert deletion.status_code == 204
     async with Session() as db:

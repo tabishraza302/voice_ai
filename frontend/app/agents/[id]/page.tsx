@@ -27,9 +27,6 @@ const editorTabs: Array<{ value: EditorTab; label: string }> = [
   { value: "history", label: "History" },
 ];
 
-function targetForField(_field: string): EditorTab {
-  return "prompt";
-}
 
 export default function AgentEditorPage() {
   const params = useParams<{ id: string }>();
