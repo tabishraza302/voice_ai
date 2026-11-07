@@ -1,5 +1,6 @@
 import asyncio
 import uuid
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Literal, TypedDict
@@ -30,9 +31,9 @@ from sqlalchemy.sql import text
 from .agents import Agent
 from .auth import csrf, current_user
 from .db import Base, Session as DbSession, get_db
+from .fields import AgentField, AgentOutcome
 from .models import User
 from .observability import TraceUnavailableError, fetch_session_trace
-from .steps import Step
 
 CallType = Literal["test", "public"]
 SessionStatus = Literal["created", "active", "completed", "failed", "cancelled", "expired"]
@@ -56,6 +57,8 @@ class FrozenCallSnapshot(TypedDict):
     policy: dict[str, int]
     language: str
     agent: dict[str, Any]
+    fields: list[dict[str, Any]]
+    outcomes: list[dict[str, Any]]
     steps: list[dict[str, Any]]
 
 class SignalingContext(TypedDict):
@@ -266,15 +269,60 @@ def _agent_snapshot(agent: Agent) -> dict[str, Any]:
     }
 
 
-def _step_snapshot(step: Step) -> dict[str, Any]:
+def _field_snapshot(field: AgentField) -> dict[str, Any]:
     return {
-        "id": str(step.id),
-        "field_key": step.field_key,
-        "sort_order": step.sort_order,
-        "title": step.title,
-        "objective": step.objective,
-        "branches": step.branches,
+        "id": str(field.id),
+        "field_key": field.field_key,
+        "description": field.description,
+        "guidance": field.guidance,
+        "options": list(field.options),
+        "required": field.required,
+        "required_when": [dict(condition) for condition in field.required_when],
+        "sort_order": field.sort_order,
     }
+
+
+def _outcome_snapshot(outcome: AgentOutcome) -> dict[str, Any]:
+    return {
+        "id": str(outcome.id),
+        "label": outcome.label,
+        "conditions": [dict(condition) for condition in outcome.conditions],
+        "required_fields": list(outcome.required_fields),
+    }
+
+
+def _legacy_steps(
+    fields: Sequence[Mapping[str, Any]],
+    outcomes: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Temporary view for the pre-goal chat/voice runtimes until Tasks 4-5 land."""
+    steps: list[dict[str, Any]] = []
+    for field in fields:
+        branches: list[dict[str, Any]] = []
+        for outcome in outcomes:
+            conditions = outcome.get("conditions") or []
+            required_fields = outcome.get("required_fields") or []
+            references_field = any(
+                condition.get("field_key") == field["field_key"] for condition in conditions
+            )
+            if field["field_key"] in required_fields or references_field:
+                branches.append(
+                    {
+                        "conditions": [dict(condition) for condition in conditions],
+                        "outcome": outcome["label"],
+                    }
+                )
+        steps.append(
+            {
+                "id": field["id"],
+                "field_key": field["field_key"],
+                "sort_order": field["sort_order"],
+                "title": field["description"] or field["field_key"],
+                "objective": field["guidance"],
+                "branches": branches,
+            }
+        )
+    return steps
 
 
 async def _frozen_call_snapshot(
@@ -283,19 +331,30 @@ async def _frozen_call_snapshot(
     from .admin import get_frozen_settings
 
     settings = await get_frozen_settings(db)
-    steps = list(
+    fields = list(
         await db.scalars(
-            select(Step)
-            .where(Step.agent_id == agent.id)
-            .order_by(Step.sort_order, Step.id)
+            select(AgentField)
+            .where(AgentField.agent_id == agent.id)
+            .order_by(AgentField.sort_order, AgentField.id)
         )
     )
+    outcomes = list(
+        await db.scalars(
+            select(AgentOutcome)
+            .where(AgentOutcome.agent_id == agent.id)
+            .order_by(AgentOutcome.label, AgentOutcome.id)
+        )
+    )
+    field_rows = [_field_snapshot(field) for field in fields]
+    outcome_rows = [_outcome_snapshot(outcome) for outcome in outcomes]
     return {
         "global_prompt": settings["global_prompt"],
         "policy": settings["policy"],
         "language": language,
         "agent": _agent_snapshot(agent),
-        "steps": [_step_snapshot(step) for step in steps],
+        "fields": field_rows,
+        "outcomes": outcome_rows,
+        "steps": _legacy_steps(field_rows, outcome_rows),
     }
 
 
