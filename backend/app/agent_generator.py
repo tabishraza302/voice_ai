@@ -1,6 +1,11 @@
+import json
 import os
+import re
+import uuid
+from collections.abc import AsyncIterator
 from fastapi import HTTPException
 from openai import AsyncOpenAI
+from sqlalchemy.ext.asyncio import AsyncSession
 
 _ENHANCE_SYSTEM_PROMPT = """You are an expert prompt engineer specializing in voice AI agents.
 Your task is to take a user's rough idea or prompt for a voice agent and rewrite it into a clear, professional, and comprehensive voice agent prompt.
@@ -24,6 +29,37 @@ You MUST format your output using the following markdown headings exactly:
 Do not include any conversational filler or preambles outside these sections."""
 
 
+_GENERATE_SYSTEM_PROMPT = """You are an expert voice AI architect.
+Given a user request or prompt, generate a fully configured voice agent specification and call flow steps.
+You MUST output ONLY a valid JSON object matching this schema:
+{
+  "name": "Short, human-friendly agent name (max 120 chars)",
+  "description": "Brief 1-2 sentence description (max 500 chars)",
+  "instructions": "Comprehensive system prompt for the voice AI (persona, tone, speaking style, concise answers, rules, edge cases)",
+  "steps": [
+    {
+      "field_key": "unique_snake_case_key",
+      "title": "Clear step title",
+      "objective": "Clear instructions for what the agent should accomplish and collect in this turn/step",
+      "branches": [
+        {
+          "target_step_index": 1,
+          "outcome": "optional outcome label (e.g. transfer, completed)",
+          "conditions": []
+        }
+      ]
+    }
+  ]
+}
+
+Guidelines:
+- Generate between 2 and 6 sequential steps representing the conversation flow (e.g. greeting, identifying purpose/user, gathering details, confirming action, wrap up).
+- Each step's field_key MUST be unique, concise, and snake_case (e.g. caller_name, appointment_date, issue_type).
+- If the request requires conditional branching (e.g. if new customer vs existing, or if reschedule vs cancel), set target_step_index to the 0-based integer index of the target step.
+- Otherwise, branches can be empty or omit target_step_index to proceed linearly to the next step.
+- Do NOT output any markdown ticks (like ```json), commentary, or text outside the raw JSON object."""
+
+
 def get_openai_client() -> tuple[AsyncOpenAI, str]:
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
@@ -36,7 +72,7 @@ def get_openai_client() -> tuple[AsyncOpenAI, str]:
     else:
         model = "gpt-4o-mini"
 
-    return AsyncOpenAI(api_key=api_key, timeout=45.0), model
+    return AsyncOpenAI(api_key=api_key, timeout=60.0), model
 
 
 async def enhance_prompt(prompt: str) -> str:
@@ -64,3 +100,175 @@ async def enhance_prompt(prompt: str) -> str:
         raise
     except Exception as exc:
         raise HTTPException(502, f"Failed to enhance prompt with OpenAI: {str(exc)}") from exc
+
+
+def _format_sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+async def stream_agent_generation(
+    prompt: str,
+    db: AsyncSession,
+    owner_id: uuid.UUID,
+) -> AsyncIterator[str]:
+    from .agents import Agent, generate_slug
+    from .steps import Step
+
+    cleaned = prompt.strip()
+    if not cleaned:
+        yield _format_sse("error", {"message": "Prompt cannot be empty."})
+        return
+    if len(cleaned) < 10:
+        yield _format_sse("error", {"message": "Prompt must be at least 10 characters long."})
+        return
+
+    try:
+        client, model = get_openai_client()
+    except HTTPException as e:
+        yield _format_sse("error", {"message": e.detail})
+        return
+
+    yield _format_sse("milestone", {"phase": "analyzing"})
+
+    full_text = ""
+    instruction_milestone_sent = False
+    call_flow_milestone_sent = False
+
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": _GENERATE_SYSTEM_PROMPT},
+                {"role": "user", "content": cleaned},
+            ],
+            temperature=0.7,
+            stream=True,
+        )
+
+        async for chunk in response:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            delta_content = getattr(delta, "content", None)
+            if delta_content:
+                full_text += delta_content
+                yield _format_sse("token", {"text": delta_content})
+
+                if not instruction_milestone_sent and '"instructions"' in full_text:
+                    instruction_milestone_sent = True
+                    yield _format_sse("milestone", {"phase": "instructions"})
+
+                if not call_flow_milestone_sent and '"steps"' in full_text:
+                    call_flow_milestone_sent = True
+                    yield _format_sse("milestone", {"phase": "call_flow"})
+
+    except Exception as exc:
+        yield _format_sse("error", {"message": f"OpenAI streaming failed: {str(exc)}"})
+        return
+
+    yield _format_sse("milestone", {"phase": "saving"})
+
+    raw_json = full_text.strip()
+    if raw_json.startswith("```"):
+        raw_json = re.sub(r"^```[a-zA-Z]*\n", "", raw_json)
+        raw_json = re.sub(r"\n```$", "", raw_json).strip()
+
+    try:
+        parsed = json.loads(raw_json)
+        if not isinstance(parsed, dict):
+            raise ValueError("Expected JSON object")
+    except Exception:
+        name_match = re.search(r'"name":\s*"([^"]+)"', full_text)
+        name = name_match.group(1) if name_match else "AI Assistant"
+        parsed = {
+            "name": name,
+            "description": f"Generated agent for: {cleaned[:80]}",
+            "instructions": cleaned,
+            "steps": [
+                {"field_key": "greeting", "title": "Greeting & Identification", "objective": "Greet the caller and ask how to help."},
+                {"field_key": "details", "title": "Collect Details", "objective": "Collect required information from the caller."},
+                {"field_key": "wrapup", "title": "Confirmation & Closing", "objective": "Confirm the request and politely end the call."}
+            ]
+        }
+
+    agent_name = str(parsed.get("name") or "AI Assistant").strip()[:120]
+    description = str(parsed.get("description") or "").strip()[:500] or None
+    instructions = str(parsed.get("instructions") or cleaned).strip()
+
+    agent_id = uuid.uuid4()
+    agent = Agent(
+        id=agent_id,
+        owner_id=owner_id,
+        name=agent_name,
+        slug=generate_slug(agent_name),
+        description=description,
+        instructions=instructions,
+        languages=["en"],
+        default_language="en",
+        status="draft",
+    )
+    db.add(agent)
+
+    raw_steps = parsed.get("steps")
+    if not isinstance(raw_steps, list) or not raw_steps:
+        raw_steps = [
+            {"field_key": "greeting", "title": "Greeting & Purpose", "objective": "Greet caller and determine goal."},
+            {"field_key": "collect_info", "title": "Collect Information", "objective": "Gather details from caller."},
+            {"field_key": "conclusion", "title": "Closing", "objective": "Confirm details and conclude call."}
+        ]
+
+    step_ids = [uuid.uuid4() for _ in raw_steps]
+    seen_keys: set[str] = set()
+
+    for index, s_data in enumerate(raw_steps):
+        if not isinstance(s_data, dict):
+            s_data = {"field_key": f"step_{index+1}", "title": f"Step {index+1}", "objective": f"Step {index+1}"}
+
+        raw_key = re.sub(r"[^a-zA-Z0-9_]+", "_", str(s_data.get("field_key") or f"step_{index+1}")).strip("_").lower()
+        if not raw_key:
+            raw_key = f"step_{index+1}"
+        if raw_key in seen_keys:
+            raw_key = f"{raw_key}_{index+1}"
+        seen_keys.add(raw_key)
+
+        title = str(s_data.get("title") or f"Step {index+1}").strip()[:255] or f"Step {index+1}"
+        objective = str(s_data.get("objective") or title).strip() or title
+
+        sanitized_branches = []
+        branches_input = s_data.get("branches")
+        if isinstance(branches_input, list):
+            for b in branches_input:
+                if not isinstance(b, dict):
+                    continue
+                target_idx = b.get("target_step_index")
+                target_id = None
+                if isinstance(target_idx, int) and 0 <= target_idx < len(raw_steps) and target_idx != index:
+                    target_id = str(step_ids[target_idx])
+
+                conditions = b.get("conditions") if isinstance(b.get("conditions"), list) else []
+                outcome = str(b.get("outcome")).strip() if b.get("outcome") is not None else None
+                sanitized_branches.append({
+                    "conditions": conditions,
+                    "target_step_id": target_id,
+                    "outcome": outcome,
+                })
+
+        step = Step(
+            id=step_ids[index],
+            agent_id=agent_id,
+            field_key=raw_key,
+            sort_order=index,
+            title=title,
+            objective=objective,
+            branches=sanitized_branches,
+        )
+        db.add(step)
+
+    try:
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        yield _format_sse("error", {"message": f"Database commit failed: {str(exc)}"})
+        return
+
+    yield _format_sse("complete", {"agent_id": str(agent_id), "name": agent_name})
