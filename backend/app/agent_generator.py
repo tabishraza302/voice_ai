@@ -17,8 +17,17 @@ You MUST format your output using the following markdown headings exactly:
 ### Primary Objective
 [Define the main goals of the conversation clearly and concisely]
 
-### Information to Collect
-[List the specific fields, customer details, or decisions the agent needs to obtain from the caller]
+### Conversational Workflow & Decision Branching
+[Break down the conversation into numbered steps with explicit decision branching:
+- Step 1: Initial Greeting & Intent Identification (identify caller purpose).
+  - If intent is [A]: route to Step 2 (Handling A)
+  - If intent is [B]: route to Step 3 (Handling B)
+  - If intent is [C]: route to Step 4 (Handling C)
+- Distinct Paths: Detail each branch step-by-step with instructions on what to ask and collect.
+- Path Exits: For each path that finishes its task, specify an exit outcome (e.g. outcome='order_confirmed') or a route to a common closing step so paths never fall through into unrelated steps.]
+
+### Information to Collect & Field Keys
+[List specific fields or decisions to obtain with snake_case keys like caller_intent, customer_name, order_id]
 
 ### Tone & Style Guidelines
 [Describe voice-friendly speaking style: brief sentences, natural transitions, empathetic and professional tone, avoid robotic jargon]
