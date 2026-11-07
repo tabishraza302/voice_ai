@@ -1,4 +1,5 @@
 import asyncio
+import json
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -35,7 +36,7 @@ from .fields import AgentField, AgentOutcome
 from .models import User
 from .observability import TraceUnavailableError, fetch_session_trace
 
-CallType = Literal["test", "public"]
+CallType = Literal["test", "public", "chat_test"]
 SessionStatus = Literal["created", "active", "completed", "failed", "cancelled", "expired"]
 
 SIGNALING_TOKEN_TTL_SECONDS = 120
@@ -73,13 +74,16 @@ class CallSession(Base):
     __table_args__ = (
         Index("ix_sessions_agent_status", "agent_id", "status"),
         Index("ix_sessions_owner_created", "owner_id", "created_at"),
-        CheckConstraint("call_type IN ('test', 'public')", name="sessions_call_type_check"),
+        CheckConstraint("call_type IN ('test', 'public', 'chat_test')", name="sessions_call_type_check"),
         CheckConstraint(
             "status IN ('created', 'active', 'completed', 'failed', 'cancelled', 'expired')",
             name="sessions_status_check",
         ),
         CheckConstraint("jsonb_typeof(snapshot) = 'object'", name="sessions_snapshot_object_check"),
-        CheckConstraint("outcome IS NULL OR btrim(outcome) <> ''", name="sessions_outcome_nonempty_check"),
+        CheckConstraint(
+            "outcome IS NULL OR jsonb_typeof(outcome) = 'array'",
+            name="sessions_outcome_array_check",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -92,8 +96,8 @@ class CallSession(Base):
     call_type: Mapped[str] = mapped_column(String(16), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default=text("'created'"))
     snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
-    outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
-    signaling_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    outcome: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
+    signaling_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -174,7 +178,7 @@ class SessionRead(BaseModel):
     agent_id: uuid.UUID
     call_type: CallType
     status: SessionStatus
-    outcome: str | None
+    outcome: list[dict[str, Any]] | None
     created_at: datetime
     started_at: datetime | None
     ended_at: datetime | None
@@ -384,7 +388,10 @@ async def recover_interrupted_sessions() -> None:
 def _open_call_predicate(now: datetime):
     return or_(
         CallSession.status == "active",
-        and_(CallSession.status == "created", CallSession.signaling_expires_at > now),
+        and_(
+            CallSession.status == "created",
+            or_(CallSession.signaling_expires_at.is_(None), CallSession.signaling_expires_at > now),
+        ),
     )
 
 
@@ -662,12 +669,82 @@ class SessionWriter:
         if self._failure is not None:
             raise SessionWriteError("Session persistence failed") from self._failure
 
+    async def drain(self) -> None:
+        """Wait for queued writes to be persisted without closing the writer."""
+        await self._queue.join()
+        if self._failure is not None:
+            raise SessionWriteError("Session persistence failed") from self._failure
+
+
+def _outcome_record(label: str, completed_at: Any = None) -> dict[str, str]:
+    if isinstance(completed_at, datetime):
+        timestamp = completed_at.isoformat()
+    elif isinstance(completed_at, str) and completed_at.strip():
+        timestamp = completed_at
+    else:
+        timestamp = datetime.now(timezone.utc).isoformat()
+    return {"label": label, "completed_at": timestamp}
+
+
+def _normalize_outcome_records(value: Any) -> list[dict[str, str]]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text[0] in "[{":
+            try:
+                return _normalize_outcome_records(json.loads(text))
+            except (TypeError, ValueError):
+                pass
+        return [_outcome_record(text)]
+    if isinstance(value, Mapping):
+        return _normalize_outcome_records([value])
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        records: list[dict[str, str]] = []
+        for item in value:
+            if isinstance(item, str):
+                label = item.strip()
+                if label:
+                    records.append(_outcome_record(label))
+            elif isinstance(item, Mapping):
+                label = item.get("label")
+                if isinstance(label, str) and label.strip():
+                    records.append(_outcome_record(label.strip(), item.get("completed_at")))
+        return records
+    return []
+
+
+async def record_session_outcome(session_id: uuid.UUID, label: str) -> bool:
+    if not isinstance(label, str) or not label.strip():
+        raise ValueError("outcome label must not be empty")
+    record = _outcome_record(label.strip())
+
+    async with DbSession() as db:
+        call = await db.scalar(
+            select(CallSession).where(CallSession.id == session_id).with_for_update()
+        )
+        if call is None:
+            return False
+        records = _normalize_outcome_records(call.outcome)
+        if any(existing["label"] == record["label"] for existing in records):
+            return True
+        records.append(record)
+        call.outcome = records
+        await db.commit()
+        return True
+
 
 async def set_session_status(
-    session_id: uuid.UUID, status: SessionStatus, *, outcome: str | None = None
+    session_id: uuid.UUID,
+    status: SessionStatus,
+    *,
+    outcome: str | Sequence[Mapping[str, Any]] | None = None,
 ) -> bool:
     if status not in _TRANSITIONS:
         raise ValueError("Unsupported session status")
+    requested_outcomes = _normalize_outcome_records(outcome)
 
     async with DbSession() as db:
         agent_id = await db.scalar(select(CallSession.agent_id).where(CallSession.id == session_id))
@@ -681,20 +758,27 @@ async def set_session_status(
             return False
 
         if call.status == status:
-            if outcome is not None and call.outcome is None:
-                call.outcome = outcome
-                await db.commit()
-            elif outcome is not None and call.outcome != outcome:
-                raise SessionUnavailableError("Session outcome is already final")
+            if requested_outcomes:
+                records = _normalize_outcome_records(call.outcome)
+                known = {record["label"] for record in records}
+                changed = False
+                for record in requested_outcomes:
+                    if record["label"] not in known:
+                        records.append(record)
+                        known.add(record["label"])
+                        changed = True
+                if changed:
+                    call.outcome = records
+                    await db.commit()
             return True
         if status not in _TRANSITIONS[call.status]:
             raise SessionUnavailableError(f"Cannot change session status from {call.status} to {status}")
         if status == "active":
             if call.call_type == "public" and agent.status != "published":
                 raise SessionUnavailableError("Public calls require a published agent")
-            if call.call_type == "test" and agent.status == "suspended":
+            if call.call_type in {"test", "chat_test"} and agent.status == "suspended":
                 raise SessionUnavailableError("Suspended agents cannot start calls")
-            if call.status == "created" and call.signaling_expires_at <= datetime.now(timezone.utc):
+            if call.status == "created" and call.signaling_expires_at is not None and call.signaling_expires_at <= datetime.now(timezone.utc):
                 raise SessionUnavailableError("Call signaling token has expired")
 
         now = datetime.now(timezone.utc)
@@ -703,8 +787,14 @@ async def set_session_status(
             call.started_at = call.started_at or now
         if status in _TERMINAL_STATUSES:
             call.ended_at = call.ended_at or now
-        if outcome is not None:
-            call.outcome = outcome
+        if requested_outcomes:
+            records = _normalize_outcome_records(call.outcome)
+            known = {record["label"] for record in records}
+            for record in requested_outcomes:
+                if record["label"] not in known:
+                    records.append(record)
+                    known.add(record["label"])
+            call.outcome = records
         await db.commit()
         return True
 
@@ -722,7 +812,7 @@ async def load_signaling_context(session_id: uuid.UUID) -> SignalingContext | No
         call, agent_status = result
         if call.status not in _ACTIVE_STATUSES:
             return None
-        if call.status == "created" and call.signaling_expires_at <= datetime.now(timezone.utc):
+        if call.status == "created" and call.signaling_expires_at is not None and call.signaling_expires_at <= datetime.now(timezone.utc):
             expired = True
         else:
             expired = False
