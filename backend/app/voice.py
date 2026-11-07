@@ -31,7 +31,8 @@ from pipecat.frames.frames import (
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.task import PipelineParams
 from pipecat.pipeline.worker import PipelineWorker, WorkerParams
-from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.adapters.schemas.function_schema import FunctionSchema
+from pipecat.processors.aggregators.llm_context import NOT_GIVEN, LLMContext
 from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.cartesia.tts import CartesiaTTSService, CartesiaTTSSettings
@@ -42,27 +43,79 @@ from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.utils.asyncio.task_manager import TaskManager
-from openai import AsyncOpenAI
-
-from .extraction import (
-    ConversationTurn,
-    ExtractionField,
-    FrozenPromptInstructions,
-    PromptStep,
-    build_turn_messages,
-    extract_answers,
+from .goals import (
+    FieldCondition,
+    GoalEvaluation,
+    GoalField,
+    GoalOutcome,
+    GoalState,
+    apply_answers,
+    build_tool_schema,
+    evaluate_goals,
+    reset_for_next_request,
 )
 from .observability import tracing_enabled
-from .workflow import (
-    WorkflowAction,
-    WorkflowConfigurationError,
-    WorkflowState,
-    WorkflowStep,
-    WorkflowTransition,
-    advance_workflow,
-    start_workflow,
-)
+from .sessions import record_session_outcome
 
+
+def _conditions_from_snapshot(value: Any) -> tuple[FieldCondition, ...]:
+    conditions: list[FieldCondition] = []
+    for condition in value or ():
+        if not isinstance(condition, Mapping):
+            continue
+        field_key = condition.get("field_key")
+        if not field_key:
+            continue
+        conditions.append(
+            FieldCondition(
+                field_key=str(field_key),
+                operator=str(condition.get("operator", "eq")),
+                operand=condition.get("operand"),
+            )
+        )
+    return tuple(conditions)
+
+
+def _fields_from_snapshot(snapshot: Mapping[str, Any]) -> tuple[GoalField, ...]:
+    fields: list[GoalField] = []
+    for row in snapshot.get("fields") or ():
+        if not isinstance(row, Mapping) or not row.get("field_key"):
+            continue
+        field_key = str(row["field_key"])
+        fields.append(
+            GoalField(
+                field_key=field_key,
+                description=str(row.get("description") or field_key),
+                options=tuple(str(option) for option in row.get("options") or ()),
+                required=bool(row.get("required", False)),
+                required_when=_conditions_from_snapshot(row.get("required_when")),
+                sort_order=int(row.get("sort_order", 0)),
+            )
+        )
+    return tuple(fields)
+
+
+def _outcomes_from_snapshot(snapshot: Mapping[str, Any]) -> tuple[GoalOutcome, ...]:
+    outcomes: list[GoalOutcome] = []
+    for row in snapshot.get("outcomes") or ():
+        if not isinstance(row, Mapping) or not row.get("label"):
+            continue
+        outcomes.append(
+            GoalOutcome(
+                label=str(row["label"]),
+                conditions=_conditions_from_snapshot(row.get("conditions")),
+                required_fields=tuple(str(key) for key in row.get("required_fields") or ()),
+            )
+        )
+    return tuple(outcomes)
+
+
+def _field_guidance(snapshot: Mapping[str, Any]) -> dict[str, str]:
+    guidance: dict[str, str] = {}
+    for row in snapshot.get("fields") or ():
+        if isinstance(row, Mapping) and row.get("field_key"):
+            guidance[str(row["field_key"])] = str(row.get("guidance") or "")
+    return guidance
 
 SUPPORTED_LANGUAGES = frozenset({"en", "hi"})
 SUPPORTED_STT_PROVIDER = "deepgram"
@@ -221,6 +274,9 @@ class CallDefinition:
     max_call_duration_seconds: int
     max_concurrent_calls_per_agent: int
     max_concurrent_calls_overall: int
+    fields: tuple[GoalField, ...]
+    outcomes: tuple[GoalOutcome, ...]
+    field_guidance: Mapping[str, str]
     steps: tuple[Mapping[str, Any], ...]
     providers: ProviderConfig
 
@@ -238,13 +294,23 @@ class CallDefinition:
         policy = snapshot.get("policy")
         prompt = snapshot.get("global_prompt")
         language = snapshot.get("language")
+        raw_fields = snapshot.get("fields")
+        raw_outcomes = snapshot.get("outcomes")
         rows = snapshot.get("steps")
         if not isinstance(agent, Mapping) or not isinstance(policy, Mapping) or not isinstance(prompt, Mapping):
             raise VoiceUnavailableError("The frozen call snapshot is incomplete.")
         if not isinstance(language, str) or language not in SUPPORTED_LANGUAGES:
             raise VoiceUnavailableError("The frozen call language is unavailable.")
-        if not isinstance(rows, list) or any(not isinstance(row, Mapping) for row in rows):
-            raise VoiceUnavailableError("The frozen workflow snapshot is malformed.")
+        if raw_fields is not None and (
+            not isinstance(raw_fields, list)
+            or any(not isinstance(row, Mapping) for row in raw_fields)
+        ):
+            raise VoiceUnavailableError("The frozen fields snapshot is malformed.")
+        if raw_outcomes is not None and (
+            not isinstance(raw_outcomes, list)
+            or any(not isinstance(row, Mapping) for row in raw_outcomes)
+        ):
+            raise VoiceUnavailableError("The frozen outcomes snapshot is malformed.")
         if not isinstance(prompt.get("text"), str) or not prompt.get("text", "").strip():
             raise VoiceUnavailableError("The frozen global prompt is unavailable.")
         prompt_version = prompt.get("version")
@@ -290,6 +356,10 @@ class CallDefinition:
             voice_id=voice_id,
             language=language,
         )
+        fields = _fields_from_snapshot(snapshot)
+        outcomes = _outcomes_from_snapshot(snapshot)
+        field_guidance = _field_guidance(snapshot)
+        steps_tuple = tuple(copy.deepcopy(dict(row)) for row in rows) if isinstance(rows, list) else ()
         return cls(
             session_id=session_id,
             agent_id=uuid.UUID(str(agent_data["id"])),
@@ -303,7 +373,10 @@ class CallDefinition:
             max_call_duration_seconds=limits[0],
             max_concurrent_calls_per_agent=limits[1],
             max_concurrent_calls_overall=limits[2],
-            steps=tuple(copy.deepcopy(dict(row)) for row in rows),
+            fields=fields,
+            outcomes=outcomes,
+            field_guidance=field_guidance,
+            steps=steps_tuple,
             providers=providers,
         )
 
@@ -318,27 +391,24 @@ class _Playback:
 
 
 class CallRuntime:
-    """One call's frozen settings, pipeline, extraction client and workflow."""
+    """One call's frozen settings, pipeline, and goal-driven dialogue."""
 
     def __init__(
         self,
         definition: CallDefinition,
-        initial: WorkflowTransition,
         writer: Any,
-        extraction_client: AsyncOpenAI,
+        initial_goal_state: GoalState | None = None,
     ) -> None:
         self.definition = definition
-        self.workflow_state: WorkflowState = initial.state
-        self._initial_action = initial.action
-        self._initial_action_sent = False
         self.writer = writer
-        self.extraction_client = extraction_client
-        self.prompt_instructions = FrozenPromptInstructions(
-            global_policy=definition.global_prompt,
-            agent_instructions=definition.agent_instructions,
+        self.goal_state = initial_goal_state or GoalState(
+            fields=definition.fields,
+            outcomes=definition.outcomes,
+            answers={},
+            completed_outcomes=(),
+            language=definition.language,
         )
-        self.recent_conversation: deque[ConversationTurn] = deque(maxlen=_RECENT_TURNS)
-        self.validation_feedback: tuple[str, ...] = ()
+        self.recent_conversation: deque[dict[str, str]] = deque(maxlen=_RECENT_TURNS)
         self.transcript_segments: list[str] = []
         self.connection: SmallWebRTCConnection | None = None
         self.transport: SmallWebRTCTransport | None = None
@@ -358,8 +428,6 @@ class CallRuntime:
         self.response_text: dict[int, list[str]] = {}
         self.response_complete: set[int] = set()
         self.response_interrupted: set[int] = set()
-        self.terminal_narration_pending = False
-        self.terminal_generation: int | None = None
         self.playbacks: dict[str | None, _Playback] = {}
         self.workflow_processor = _WorkflowProcessor(self)
         self.response_capture = _ResponseCaptureProcessor(self)
@@ -376,20 +444,10 @@ class CallRuntime:
     ) -> CallRuntime:
         settings = os.environ if env is None else env
         definition = CallDefinition.from_snapshot(session_id, call_type, snapshot, settings)
-        initial = start_workflow(definition.steps, definition.language)
-        if initial.action is None:
-            raise VoiceUnavailableError("The frozen workflow has no initial action.")
-        try:
-            client = AsyncOpenAI(
-                api_key=definition.providers.llm_api_key,
-                timeout=30.0,
-            )
-        except Exception:
-            raise VoiceUnavailableError("The OpenAI extraction client could not be created.") from None
         from .sessions import SessionWriter
 
         writer = SessionWriter(session_id)
-        return cls(definition, initial, writer, client)
+        return cls(definition, writer)
 
     @property
     def session_id(self) -> uuid.UUID:
@@ -444,6 +502,7 @@ class CallRuntime:
             api_key=providers.llm_api_key,
             model=providers.llm_model,
         )
+        llm.register_function("save_answers", self._handle_save_answers)
         if providers.tts_provider == "cartesia":
             tts = CartesiaTTSService(
                 api_key=providers.tts_api_key,
@@ -591,17 +650,10 @@ class CallRuntime:
         self.response_complete.discard(generation)
         self.response_interrupted.discard(generation)
         if playback.interrupted or not is_complete or not text:
-            if self.terminal_generation == generation:
-                self.terminal_generation = None
-                self.terminal_narration_pending = True
             return
         self._persist_message(text)
-        self.recent_conversation.append(ConversationTurn(role="assistant", content=text))
+        self.recent_conversation.append({"role": "assistant", "content": text})
         await self._send_caption("assistant", text)
-        if self.terminal_generation == generation:
-            self.terminal_generation = None
-            self.terminal_narration_pending = False
-            self.request_stop("completed", self.workflow_state.outcome)
 
     async def handle_final_transcription(self, text: str) -> None:
         transcript = text.strip()
@@ -611,142 +663,140 @@ class CallRuntime:
             raise VoiceRuntimeError("Caller speech exceeded the per-turn transcript limit.")
         self.user_speaking = False
         self._persist_message(transcript, role="user")
-        self.recent_conversation.append(ConversationTurn(role="user", content=transcript))
+        self.recent_conversation.append({"role": "user", "content": transcript})
         await self._send_caption("user", transcript)
+        await self._push_dialogue_turn()
 
-        def _step_options(step: WorkflowStep) -> tuple[str, ...]:
-            options: list[str] = []
-            for branch in step.branches:
-                for condition in branch.conditions:
-                    if condition.field_key == step.field_key and condition.operand is not None:
-                        val = str(condition.operand).strip()
-                        if val and val not in options:
-                            options.append(val)
-            return tuple(options)
+    def _build_system_message(self, directive: str | None = None) -> dict[str, str]:
+        evaluation = evaluate_goals(self.goal_state)
+        lines: list[str] = []
+        if self.definition.global_prompt.strip():
+            lines.append(self.definition.global_prompt.strip())
+        if self.definition.agent_instructions.strip():
+            lines.append(self.definition.agent_instructions.strip())
+        lines.append(f"Respond in language: {self.definition.language}.")
+        if evaluation.needed_fields:
+            lines.append("Information to collect in this turn:")
+            for field in evaluation.needed_fields:
+                detail = f"- {field.field_key}: {field.description}"
+                guidance = self.definition.field_guidance.get(field.field_key)
+                if guidance:
+                    detail = f"{detail} {guidance}"
+                if field.options:
+                    detail = f"{detail} Options: {', '.join(field.options)}."
+                lines.append(detail)
+        if evaluation.correction_fields:
+            lines.append(
+                "The caller may correct previously confirmed information; update it when they do."
+            )
+        if self.goal_state.answers:
+            lines.append(
+                "Confirmed answers: "
+                + json.dumps(dict(self.goal_state.answers), ensure_ascii=False)
+            )
+        if directive:
+            lines.append(directive)
+        return {"role": "system", "content": "\n".join(lines)}
 
-        by_key = {step.field_key: step for step in self.workflow_state.steps}
-        unanswered = [
-            ExtractionField(
-                field_key=step.field_key,
-                options=_step_options(step),
-            )
-            for step in self.workflow_state.steps
-            if step.field_key not in self.workflow_state.answers
-        ]
-        corrections = [
-            ExtractionField(
-                field_key=field_key,
-                options=_step_options(by_key[field_key]) if field_key in by_key else (),
-            )
-            for field_key in self.workflow_state.answers
-            if field_key in by_key
-        ]
-        extracted = await extract_answers(
-            self.extraction_client,
-            self.definition.providers.llm_model,
-            unanswered,
-            tuple(self.recent_conversation),
-            correction_fields=corrections,
-            confirmed_answers=self.workflow_state.answers,
+    def _build_context_messages(self, directive: str | None = None) -> list[dict[str, Any]]:
+        return [self._build_system_message(directive), *self.recent_conversation]
+
+    def _build_tools(self) -> list[Any] | NotGiven:
+        evaluation = evaluate_goals(self.goal_state)
+        tool_schema = build_tool_schema(evaluation)
+        if tool_schema is None:
+            return NOT_GIVEN
+        fn = tool_schema.get("function", {})
+        params = fn.get("parameters", {})
+        schema = FunctionSchema(
+            name=fn.get("name", "save_answers"),
+            description=fn.get("description", ""),
+            properties=params.get("properties", {}),
+            required=params.get("required", []),
         )
-        transition = advance_workflow(self.workflow_state, extracted)
-        action = transition.action
-        self.apply_transition_events(transition.events)
-        self.workflow_state = transition.state
-        if action is not None:
-            await self.dispatch(action)
-        elif transition.state.completed and not self.closing and self.terminal_generation is None:
-            if transition.state.outcome is not None:
-                await self.dispatch(
-                    WorkflowAction(
-                        kind="outcome",
-                        field_key=transition.state.outcome,
-                        content=transition.state.outcome,
-                    )
-                )
-            else:
-                await self.dispatch(WorkflowAction(kind="complete"))
+        return [schema]
 
-    def apply_transition_events(self, events: Sequence[Mapping[str, Any]]) -> None:
-        feedback: list[str] = []
-        for event in events:
-            event_type = event.get("type")
-            if event_type == "answer":
-                accepted = event.get("accepted") is True
-                validation_errors = event.get("validation_errors", [])
-                value = event.get("value")
-                field_key = event.get("field_key")
-                if not accepted:
-                    self.writer.enqueue_answer(
-                        str(field_key),
-                        value,
-                        False,
-                        {
-                            "reason": event.get("reason", "invalid"),
-                            "validation_errors": list(validation_errors) if isinstance(validation_errors, (list, tuple)) else [],
-                        },
-                    )
-                    feedback.append(
-                        "The caller's answer did not meet the configured requirements. Ask for a corrected value without explaining internal rules."
-                    )
-                else:
-                    self.writer.enqueue_answer(
-                        str(field_key),
-                        value,
-                        True,
-                        {"reason": "accepted", "validation_errors": []},
-                    )
-            elif event_type == "answer_invalidated":
-                self.writer.enqueue_answer(
-                    str(event.get("field_key", "")),
-                    event.get("value"),
-                    False,
-                    {"reason": "correction", "invalidated": True},
-                )
-        self.validation_feedback = tuple(feedback)
-
-    async def dispatch(self, action: WorkflowAction) -> None:
-        step = self._step_for_action(action)
-        active_step = self._prompt_step(step) if step is not None else None
-        feedback = list(self.validation_feedback)
-        if action.kind == "clarify":
-            if action.reason == "ambiguous":
-                feedback.append("Ask the caller to clarify the answer because more than one value is possible.")
-            elif action.reason == "missing":
-                feedback.append("Ask only for the current unanswered information.")
-            else:
-                feedback.append("Ask the caller for a corrected value without revealing private validation rules.")
-        elif action.kind == "outcome":
-            outcome = action.content or action.field_key or ""
-            feedback.append(f"The configured call outcome is {outcome}. Explain the result plainly and close the call.")
-        elif action.kind == "complete":
-            feedback.append("The workflow is complete. Thank the caller and close the call politely.")
-
-
-        if action.kind in {"complete", "outcome"}:
-            self.terminal_narration_pending = True
-            self.terminal_generation = None
-        turn = build_turn_messages(
-            instructions=self.prompt_instructions,
-            active_step=active_step,
-            recent_conversation=tuple(self.recent_conversation),
-            confirmed_answers=self.workflow_state.answers,
-            validation_feedback=feedback,
-            language=self.definition.language,
+    async def _push_dialogue_turn(self, directive: str | None = None) -> None:
+        messages = self._build_context_messages(directive)
+        tools = self._build_tools()
+        context = LLMContext(
+            messages=messages,
+            tools=tools,
         )
         await self.workflow_processor.push_frame(
-            LLMContextFrame(LLMContext(messages=[dict(message) for message in turn.messages])),
+            LLMContextFrame(context),
             FrameDirection.DOWNSTREAM,
         )
+
+    async def _handle_save_answers(self, params: Any) -> None:
+        arguments = params.arguments or {}
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments) if arguments.strip() else {}
+            except Exception:
+                arguments = {}
+        valid_keys = {field.field_key for field in self.goal_state.fields}
+        saved = {
+            str(k): v
+            for k, v in arguments.items()
+            if k in valid_keys and v is not None
+        }
+        self.goal_state = apply_answers(self.goal_state, saved)
+        for key, value in saved.items():
+            self.writer.enqueue_answer(
+                key,
+                value,
+                True,
+                {"reason": "accepted", "validation_errors": []},
+            )
+        evaluation = evaluate_goals(self.goal_state)
+        reached = evaluation.reached_outcome
+        confirmed_answers = dict(self.goal_state.answers)
+        directive: str | None = None
+        if reached is not None:
+            directive = (
+                f"The outcome '{reached}' has been reached. Briefly confirm it to the caller, "
+                "then ask if there is anything else you can help with."
+            )
+            try:
+                await self.writer.drain()
+                await record_session_outcome(self.definition.session_id, reached)
+            except Exception:
+                pass
+            self.goal_state = reset_for_next_request(self.goal_state, reached)
+
+        payload: dict[str, Any] = {
+            "saved": saved,
+            "confirmed_answers": confirmed_answers,
+            "needed_fields": [
+                {
+                    "field_key": field.field_key,
+                    "description": field.description,
+                    "options": list(field.options),
+                }
+                for field in evaluation.needed_fields
+            ],
+            "outcome": reached,
+        }
+        if directive is not None:
+            payload["instruction"] = directive
+
+        context = getattr(params, "context", None)
+        if isinstance(context, LLMContext):
+            post_tools = self._build_tools()
+            context.set_tools(post_tools)
+            if directive is not None:
+                context.add_message({"role": "system", "content": directive})
+
+        result_callback = getattr(params, "result_callback", None)
+        if callable(result_callback):
+            await result_callback(json.dumps(payload, ensure_ascii=False))
 
     def begin_llm_response(self) -> int:
         self.response_generation += 1
         generation = self.response_generation
         self.active_response_generation = generation
         self.response_text[generation] = []
-        if self.terminal_narration_pending:
-            self.terminal_generation = generation
-            self.terminal_narration_pending = False
         return generation
 
     def append_llm_text(self, text: str) -> None:
@@ -771,21 +821,6 @@ class CallRuntime:
             self.response_interrupted.add(generation)
         self.note_interruption()
 
-    def _step_for_action(self, action: WorkflowAction) -> WorkflowStep | None:
-        if action.step_id is not None:
-            return next((step for step in self.workflow_state.steps if step.id == action.step_id), None)
-        if action.field_key is not None:
-            return next((step for step in self.workflow_state.steps if step.field_key == action.field_key), None)
-        return None
-
-    @staticmethod
-    def _prompt_step(step: WorkflowStep) -> PromptStep:
-        return PromptStep(
-            field_key=step.field_key,
-            title=step.title,
-            objective=step.objective,
-        )
-
     def _persist_message(self, content: str, *, role: str = "assistant") -> None:
         if content:
             self.writer.enqueue_message(role, content)
@@ -798,7 +833,6 @@ class CallRuntime:
             if asyncio.iscoroutine(result):
                 await result
         except Exception:
-            # Audio and persistence do not depend on the optional caption channel.
             return
 
 
@@ -816,9 +850,10 @@ class _WorkflowProcessor(FrameProcessor):
         if direction != FrameDirection.DOWNSTREAM:
             return
         if isinstance(frame, StartFrame):
-            if not self.runtime._initial_action_sent and self.runtime._initial_action is not None:
-                self.runtime._initial_action_sent = True
-                await self.runtime.dispatch(self.runtime._initial_action)
+            directive = (
+                "Greet the caller warmly in one short sentence and ask how you can help."
+            )
+            await self.runtime._push_dialogue_turn(directive=directive)
         elif isinstance(frame, VADUserStartedSpeakingFrame):
             self.runtime.user_speaking = True
             self.runtime.note_interruption()
@@ -965,10 +1000,6 @@ async def _cleanup_runtime(runtime: CallRuntime) -> None:
         )
     except Exception:
         status = "failed"
-    try:
-        await runtime.extraction_client.close()
-    except Exception:
-        pass
     runtime.closed = True
     runtime.termination_status = status
     from .signaling import release_call_runtime
