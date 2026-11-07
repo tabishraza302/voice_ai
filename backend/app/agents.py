@@ -187,6 +187,7 @@ class AgentRead(BaseModel):
 class EnhancePromptRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     prompt: str = Field(min_length=10, max_length=10000)
+    model: str | None = Field(default=None, max_length=120)
 
     @field_validator("prompt")
     @classmethod
@@ -204,6 +205,7 @@ class EnhancePromptResponse(BaseModel):
 class GenerateAgentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     prompt: str = Field(min_length=10, max_length=10000)
+    model: str | None = Field(default=None, max_length=120)
 
     @field_validator("prompt")
     @classmethod
@@ -310,7 +312,7 @@ async def enhance_agent_prompt(
     user: Annotated[User, Depends(csrf)],
 ):
     from .agent_generator import enhance_prompt
-    enhanced = await enhance_prompt(data.prompt)
+    enhanced = await enhance_prompt(data.prompt, data.model)
     return EnhancePromptResponse(enhanced_prompt=enhanced)
 
 
@@ -322,7 +324,7 @@ async def generate_agent_stream(
 ):
     from .agent_generator import stream_agent_generation
     return StreamingResponse(
-        stream_agent_generation(data.prompt, db, user.id),
+        stream_agent_generation(data.prompt, db, user.id, data.model),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

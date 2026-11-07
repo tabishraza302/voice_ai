@@ -23,6 +23,8 @@ const MILESTONES: Array<{ id: MilestonePhase; label: string }> = [
 export function PromptGenerationView({ onCancel }: { onCancel: () => void }) {
   const router = useRouter();
   const [prompt, setPrompt] = useState("");
+  const [availableModels, setAvailableModels] = useState<string[]>(["gpt-4o-mini", "gpt-4.1-mini"]);
+  const [selectedModel, setSelectedModel] = useState("gpt-4o-mini");
   const [enhancing, setEnhancing] = useState(false);
   const [enhanceModalOpen, setEnhanceModalOpen] = useState(false);
   const [enhancedResult, setEnhancedResult] = useState("");
@@ -38,6 +40,25 @@ export function PromptGenerationView({ onCancel }: { onCancel: () => void }) {
   const abortControllerRef = useRef<AbortController | null>(null);
 
   const canSubmit = prompt.trim().length >= 10;
+
+  useEffect(() => {
+    let current = true;
+    api<{ openai?: { models?: Array<{ id: string; available: boolean }> } }>("/provider-catalog")
+      .then((catalog) => {
+        if (!current) return;
+        const models = catalog.openai?.models
+          ?.filter((m) => m.available)
+          .map((m) => m.id);
+        if (models && models.length > 0) {
+          setAvailableModels(models);
+          setSelectedModel((prev) => (models.includes(prev) ? prev : models[0]));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (generating && typewriterBottomRef.current) {
@@ -60,7 +81,7 @@ export function PromptGenerationView({ onCancel }: { onCancel: () => void }) {
     try {
       const response = await api<EnhanceResponse>("/agents/enhance-prompt", {
         method: "POST",
-        body: JSON.stringify({ prompt: prompt.trim() }),
+        body: JSON.stringify({ prompt: prompt.trim(), model: selectedModel }),
       });
       setEnhancedResult(response.enhanced_prompt);
       setEnhanceModalOpen(true);
@@ -84,7 +105,7 @@ export function PromptGenerationView({ onCancel }: { onCancel: () => void }) {
     try {
       await streamSse(
         "/agents/generate-stream",
-        { prompt: prompt.trim() },
+        { prompt: prompt.trim(), model: selectedModel },
         (event, data) => {
           if (event === "milestone") {
             const payload = data as { phase?: MilestonePhase };
@@ -217,7 +238,9 @@ export function PromptGenerationView({ onCancel }: { onCancel: () => void }) {
                 <span className="h-2 w-2 rounded-full bg-green-500 inline-block" />
                 Live Agent Generation Stream
               </span>
-              <span>OpenAI</span>
+              <span className="rounded-md bg-muted px-2 py-0.5 text-xs text-foreground font-mono">
+                {selectedModel}
+              </span>
             </div>
             <div className="max-h-[22rem] overflow-y-auto whitespace-pre-wrap leading-relaxed text-foreground/90">
               {streamedText ? (
@@ -226,7 +249,9 @@ export function PromptGenerationView({ onCancel }: { onCancel: () => void }) {
                   <span className="inline-block w-2 h-4 bg-primary align-middle ml-1 animate-pulse" />
                 </>
               ) : (
-                <span className="text-muted-foreground italic">Connecting to model and generating agent...</span>
+                <span className="text-muted-foreground italic">
+                  Connecting to {selectedModel} and generating agent...
+                </span>
               )}
               <div ref={typewriterBottomRef} />
             </div>
@@ -250,14 +275,31 @@ export function PromptGenerationView({ onCancel }: { onCancel: () => void }) {
           ) : null}
 
           <div className="space-y-2">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
               <Label htmlFor="agent-prompt" className="text-sm font-medium">
                 Describe the agent you want to build
               </Label>
-              <span className="text-xs text-muted-foreground">
-                {prompt.length} character{prompt.length === 1 ? "" : "s"}
-                {prompt.length > 0 && prompt.length < 10 ? " (min 10)" : ""}
-              </span>
+              <div className="flex items-center gap-2">
+                <Label htmlFor="model-select" className="text-xs text-muted-foreground whitespace-nowrap">
+                  LLM Model:
+                </Label>
+                <select
+                  id="model-select"
+                  value={selectedModel}
+                  onChange={(e) => setSelectedModel(e.target.value)}
+                  className="rounded-lg border bg-background px-2.5 py-1 text-xs text-foreground outline-none focus:ring-1 focus:ring-primary shadow-xs font-mono"
+                >
+                  {availableModels.map((modelId) => (
+                    <option key={modelId} value={modelId}>
+                      {modelId}
+                    </option>
+                  ))}
+                </select>
+                <span className="text-xs text-muted-foreground ml-1">
+                  {prompt.length} char{prompt.length === 1 ? "" : "s"}
+                  {prompt.length > 0 && prompt.length < 10 ? " (min 10)" : ""}
+                </span>
+              </div>
             </div>
             <textarea
               id="agent-prompt"
@@ -269,7 +311,7 @@ export function PromptGenerationView({ onCancel }: { onCancel: () => void }) {
               className="w-full rounded-xl border border-input bg-background p-4 text-sm leading-relaxed text-foreground shadow-xs placeholder:text-muted-foreground/60 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary resize-y"
             />
             <p className="text-xs text-muted-foreground">
-              The AI will generate the agent&apos;s name, voice instructions, and call flow steps from your prompt.
+              {selectedModel} will generate the agent&apos;s name, voice instructions, and call flow steps from your prompt.
             </p>
           </div>
 

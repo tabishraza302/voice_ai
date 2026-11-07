@@ -31,7 +31,7 @@ Do not include any conversational filler or preambles outside these sections."""
 
 _GENERATE_SYSTEM_PROMPT = """You are an expert voice AI architect.
 Given a user request or prompt, generate a fully configured voice agent specification and call flow steps.
-You MUST output ONLY a valid JSON object matching this schema:
+You MUST output ONLY a valid raw JSON object matching this schema:
 {
   "name": "Short, human-friendly agent name (max 120 chars)",
   "description": "Brief 1-2 sentence description (max 500 chars)",
@@ -43,46 +43,63 @@ You MUST output ONLY a valid JSON object matching this schema:
       "objective": "Clear instructions for what the agent should accomplish and collect in this turn/step",
       "branches": [
         {
-          "target_step_index": 1,
-          "outcome": "optional outcome label (e.g. transfer, completed)",
-          "conditions": []
+          "target_step_index": 2,
+          "outcome": null,
+          "conditions": [
+            {
+              "field_key": "unique_snake_case_key",
+              "operator": "eq",
+              "operand": "value_to_match"
+            }
+          ]
         }
       ]
     }
   ]
 }
 
-Guidelines:
-- Generate between 2 and 6 sequential steps representing the conversation flow (e.g. greeting, identifying purpose/user, gathering details, confirming action, wrap up).
-- Each step's field_key MUST be unique, concise, and snake_case (e.g. caller_name, appointment_date, issue_type).
-- If the request requires conditional branching (e.g. if new customer vs existing, or if reschedule vs cancel), set target_step_index to the 0-based integer index of the target step.
-- Otherwise, branches can be empty or omit target_step_index to proceed linearly to the next step.
+Guidelines for Branching and Conversation Flow:
+- Generate between 3 and 7 steps.
+- DO NOT default to a purely linear sequential flow if the prompt describes multiple intents, actions, customer types, or decision criteria.
+- In the initial intake/triage step (e.g. caller_intent), add multiple branches where each branch checks conditions on that step's own field_key and jumps to the specific step handling that intent (via target_step_index).
+- CRITICAL for parallel paths: When a path finishes its action (e.g. Confirm Order), it MUST NOT fall through into another unrelated path (e.g. Cancel Order). It must either:
+  1) Route to a common closing/wrap-up step (via target_step_index), or
+  2) Exit the conversation with an outcome (e.g. outcome="order_confirmed").
+- EXACTLY ONE of target_step_index or outcome must be set on each branch (never both, never neither).
+- In each condition, field_key MUST be that step's own field_key.
+- Allowed operators: "eq", "ne", "gt", "gte", "lt", "lte", "in".
 - Do NOT output any markdown ticks (like ```json), commentary, or text outside the raw JSON object."""
 
 
-def get_openai_client() -> tuple[AsyncOpenAI, str]:
+def get_openai_client(model_override: str | None = None) -> tuple[AsyncOpenAI, str]:
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise HTTPException(503, "OpenAI is unavailable because OPENAI_API_KEY is not configured on the server.")
 
     models_env = os.environ.get("VERIFIED_OPENAI_MODELS", "").strip()
-    if models_env:
-        models = [m.strip() for m in models_env.split(",") if m.strip()]
-        model = models[0] if models else "gpt-4o-mini"
+    verified_models = [m.strip() for m in models_env.split(",") if m.strip()] if models_env else []
+
+    if model_override and model_override.strip():
+        chosen = model_override.strip()
+        if verified_models and chosen not in verified_models:
+            raise HTTPException(422, f"Model '{chosen}' is not in the server allowlist.")
+        model = chosen
+    elif verified_models:
+        model = verified_models[0]
     else:
         model = "gpt-4o-mini"
 
     return AsyncOpenAI(api_key=api_key, timeout=60.0), model
 
 
-async def enhance_prompt(prompt: str) -> str:
+async def enhance_prompt(prompt: str, model_name: str | None = None) -> str:
     cleaned = prompt.strip()
     if not cleaned:
         raise HTTPException(422, "Prompt cannot be empty.")
     if len(cleaned) < 10:
         raise HTTPException(422, "Prompt must be at least 10 characters long.")
 
-    client, model = get_openai_client()
+    client, model = get_openai_client(model_name)
     try:
         response = await client.chat.completions.create(
             model=model,
@@ -110,9 +127,10 @@ async def stream_agent_generation(
     prompt: str,
     db: AsyncSession,
     owner_id: uuid.UUID,
+    model_name: str | None = None,
 ) -> AsyncIterator[str]:
     from .agents import Agent, generate_slug
-    from .steps import Step
+    from .steps import Step, validate_publish
 
     cleaned = prompt.strip()
     if not cleaned:
@@ -123,7 +141,7 @@ async def stream_agent_generation(
         return
 
     try:
-        client, model = get_openai_client()
+        client, model = get_openai_client(model_name)
     except HTTPException as e:
         yield _format_sse("error", {"message": e.detail})
         return
@@ -185,9 +203,9 @@ async def stream_agent_generation(
             "description": f"Generated agent for: {cleaned[:80]}",
             "instructions": cleaned,
             "steps": [
-                {"field_key": "greeting", "title": "Greeting & Identification", "objective": "Greet the caller and ask how to help."},
-                {"field_key": "details", "title": "Collect Details", "objective": "Collect required information from the caller."},
-                {"field_key": "wrapup", "title": "Confirmation & Closing", "objective": "Confirm the request and politely end the call."}
+                {"field_key": "greeting", "title": "Greeting & Purpose", "objective": "Greet caller and determine goal."},
+                {"field_key": "collect_info", "title": "Collect Information", "objective": "Gather details from caller."},
+                {"field_key": "conclusion", "title": "Closing", "objective": "Confirm details and conclude call."}
             ]
         }
 
@@ -205,6 +223,8 @@ async def stream_agent_generation(
         instructions=instructions,
         languages=["en"],
         default_language="en",
+        llm_provider="openai",
+        llm_model=model,
         status="draft",
     )
     db.add(agent)
@@ -218,20 +238,37 @@ async def stream_agent_generation(
         ]
 
     step_ids = [uuid.uuid4() for _ in raw_steps]
-    seen_keys: set[str] = set()
 
-    created_steps: list[Step] = []
+    # Pre-extract cleaned field_keys for all steps to validate cross-references
+    step_keys: list[str] = []
+    seen_keys: set[str] = set()
     for index, s_data in enumerate(raw_steps):
         if not isinstance(s_data, dict):
-            s_data = {"field_key": f"step_{index+1}", "title": f"Step {index+1}", "objective": f"Step {index+1}"}
-
-        raw_key = re.sub(r"[^a-zA-Z0-9_]+", "_", str(s_data.get("field_key") or f"step_{index+1}")).strip("_").lower()
+            raw_key = f"step_{index+1}"
+        else:
+            raw_key = re.sub(r"[^a-zA-Z0-9_]+", "_", str(s_data.get("field_key") or f"step_{index+1}")).strip("_").lower()
         if not raw_key:
             raw_key = f"step_{index+1}"
         if raw_key in seen_keys:
             raw_key = f"{raw_key}_{index+1}"
         seen_keys.add(raw_key)
+        step_keys.append(raw_key)
+    created_steps: list[Step] = []
+    op_map = {
+        "=": "eq", "==": "eq", "eq": "eq", "equals": "eq", "is": "eq",
+        "!=": "ne", "<>": "ne", "ne": "ne", "not_equals": "ne",
+        ">": "gt", "gt": "gt",
+        ">=": "gte", "gte": "gte",
+        "<": "lt", "lt": "lt",
+        "<=": "lte", "lte": "lte",
+        "in": "in",
+    }
 
+    for index, s_data in enumerate(raw_steps):
+        if not isinstance(s_data, dict):
+            s_data = {}
+
+        raw_key = step_keys[index]
         title = str(s_data.get("title") or f"Step {index+1}").strip()[:255] or f"Step {index+1}"
         objective = str(s_data.get("objective") or title).strip() or title
 
@@ -248,25 +285,21 @@ async def stream_agent_generation(
 
                 sanitized_conditions = []
                 conditions_input = b.get("conditions") if isinstance(b.get("conditions"), list) else []
-                op_map = {
-                    "=": "eq", "==": "eq", "eq": "eq",
-                    "!=": "ne", "<>": "ne", "ne": "ne",
-                    ">": "gt", "gt": "gt",
-                    ">=": "gte", "gte": "gte",
-                    "<": "lt", "lt": "lt",
-                    "<=": "lte", "lte": "lte",
-                    "in": "in",
-                }
                 for c in conditions_input:
                     if not isinstance(c, dict):
                         continue
+                    # Condition field_key must match an existing step in this agent
                     f_key = c.get("field_key") or c.get("field")
                     field_name = str(f_key).strip() if f_key else raw_key
+                    if field_name not in seen_keys:
+                        field_name = raw_key
+
                     raw_op = str(c.get("operator") or "eq").strip().lower()
                     operator = op_map.get(raw_op, "eq")
                     operand = c.get("operand") if "operand" in c else c.get("value", True)
                     if operand is None:
                         operand = True
+
                     sanitized_conditions.append({
                         "field_key": field_name,
                         "operator": operator,
@@ -277,7 +310,7 @@ async def stream_agent_generation(
                 if target_id is not None:
                     outcome = None
                 elif not outcome:
-                    # Neither a valid target nor an outcome: drop branch
+                    # Neither a target nor an outcome: drop branch
                     continue
 
                 sanitized_branches.append({
@@ -298,10 +331,16 @@ async def stream_agent_generation(
         db.add(step)
         created_steps.append(step)
 
-    from .steps import validate_publish
-    if validate_publish(agent, created_steps):
-        for step in created_steps:
-            step.branches = []
+    # Validate publish rules: if specific step branches cause graph cycles or errors, clean only the problematic step
+    publish_errors = validate_publish(agent, created_steps)
+    if publish_errors:
+        for err_key in publish_errors:
+            # E.g. "steps[0].branches"
+            match = re.search(r"steps\[(\d+)\]\.branches", err_key)
+            if match:
+                err_idx = int(match.group(1))
+                if 0 <= err_idx < len(created_steps):
+                    created_steps[err_idx].branches = []
 
     try:
         await db.commit()
