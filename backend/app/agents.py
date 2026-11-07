@@ -270,12 +270,9 @@ def _agent_publish_errors(agent: Agent) -> dict[str, list[str]]:
 
 
 async def _publish_errors(db: AsyncSession, agent: Agent) -> dict[str, list[str]]:
-    from .fields import AgentField
-
-    fields = list(await db.scalars(select(AgentField).where(AgentField.agent_id == agent.id).order_by(AgentField.sort_order)))
     errors = _agent_publish_errors(agent)
-    if not fields:
-        errors.setdefault("fields", []).append("at least one field is required before publishing")
+    if not agent.instructions or not agent.instructions.strip():
+        errors.setdefault("instructions", []).append("Agent instructions cannot be empty before publishing")
     return errors
 
 

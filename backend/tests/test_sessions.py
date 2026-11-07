@@ -15,7 +15,6 @@ from app.db import Base, Session, engine
 from app.main import app
 from app.models import User
 from app.sessions import (
-    CallAnswer,
     CallMessage,
     CallSession,
     SessionUnavailableError,
@@ -240,32 +239,25 @@ async def test_session_history_is_owner_scoped_for_detail_messages_and_answers(c
     writer = SessionWriter(session_id)
     writer.enqueue_message("user", "I need help.")
     writer.enqueue_message("assistant", "How can I help?")
-    writer.enqueue_answer("reason", "support", True, {"valid": True})
     await writer.flush()
 
     history = await client.get(f"/agents/{agent['id']}/sessions")
     assert history.status_code == 200
     assert [item["id"] for item in history.json()] == [str(session_id)]
     messages = await client.get(f"/sessions/{session_id}/messages")
-    answers = await client.get(f"/sessions/{session_id}/answers")
-    assert messages.status_code == answers.status_code == 200
+    assert messages.status_code == 200
     assert [message["content"] for message in messages.json()] == ["I need help.", "How can I help?"]
     assert [message["sequence"] for message in messages.json()] == [1, 2]
-    assert answers.json()[0]["field_key"] == "reason"
-
     await login(client, f"{uuid.uuid4()}@example.com")
     assert (await client.get(f"/sessions/{session_id}")).status_code == 404
     assert (await client.get(f"/sessions/{session_id}/messages")).status_code == 404
-    assert (await client.get(f"/sessions/{session_id}/answers")).status_code == 404
     assert (await client.get(f"/agents/{agent['id']}/sessions")).status_code == 404
 
     async with Session() as db:
         stored_messages = list(
             await db.scalars(select(CallMessage).where(CallMessage.session_id == session_id).order_by(CallMessage.sequence))
         )
-        stored_answers = list(await db.scalars(select(CallAnswer).where(CallAnswer.session_id == session_id)))
     assert len(stored_messages) == 2
-    assert len(stored_answers) == 1
 
 
 @pytest.mark.anyio
@@ -356,7 +348,6 @@ async def test_agent_delete_rejects_an_active_call_while_agent_is_locked(client)
     session_id = uuid.UUID(call.json()["session_id"])
     writer = SessionWriter(session_id)
     writer.enqueue_message("user", "Please call me back.")
-    writer.enqueue_answer("callback", True, True, {"valid": True})
     await writer.flush()
     await set_session_status(session_id, "active")
 
@@ -369,7 +360,6 @@ async def test_agent_delete_rejects_an_active_call_while_agent_is_locked(client)
     async with Session() as db:
         assert await db.get(CallSession, session_id) is None
         assert await db.scalar(select(CallMessage.id).where(CallMessage.session_id == session_id)) is None
-        assert await db.scalar(select(CallAnswer.id).where(CallAnswer.session_id == session_id)) is None
 
 
 @pytest.mark.anyio

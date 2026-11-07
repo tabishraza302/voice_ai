@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { ApiError, api, apiErrorText } from "@/lib/api";
-import type { Agent, AgentStep, CurrentUser, ProviderCatalog } from "@/lib/types";
+import type { Agent, CurrentUser, ProviderCatalog } from "@/lib/types";
 import { Button, buttonClassName } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { TabPanel, TabsBar } from "@/components/ui/tabs";
@@ -12,7 +12,6 @@ import { cn } from "@/components/ui/utils";
 import { OwnerShell } from "@/app/dashboard/owner-shell";
 import { AgentDraft, AgentInstructions, AgentPipelineToolbar, agentDraftFromAgent } from "./agent-sections";
 import { AgentTesting } from "./agent-testing";
-import { GoalEditor } from "./goal-editor";
 import { useDraftAutosave } from "./use-draft-autosave";
 import { ChatPanel } from "@/components/chat-panel";
 
@@ -21,17 +20,15 @@ export interface SaveState {
   message?: string;
 }
 
-type EditorTab = "workflow" | "instructions" | "testing" | "history";
+type EditorTab = "prompt" | "testing" | "history";
 const editorTabs: Array<{ value: EditorTab; label: string }> = [
-  { value: "workflow", label: "Workflow" },
-  { value: "instructions", label: "Instructions" },
+  { value: "prompt", label: "Agent Prompt" },
   { value: "testing", label: "Testing" },
   { value: "history", label: "History" },
 ];
 
-function targetForField(field: string): EditorTab {
-  if (field.includes("instruction")) return "instructions";
-  return "workflow";
+function targetForField(_field: string): EditorTab {
+  return "prompt";
 }
 
 export default function AgentEditorPage() {
@@ -47,11 +44,9 @@ export default function AgentEditorPage() {
   const [catalogLoading, setCatalogLoading] = useState(true);
   const [loading, setLoading] = useState(true);
   const [pageError, setPageError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<EditorTab>("workflow");
+  const [activeTab, setActiveTab] = useState<EditorTab>("prompt");
   const [reload, setReload] = useState(0);
   const [draftSaveState, setDraftSaveState] = useState<SaveState>({ status: "idle" });
-  const [flowSaveState, setFlowSaveState] = useState<SaveState>({ status: "idle" });
-  const [workflowView, setWorkflowView] = useState<"flow" | "prompt">("flow");
   const [flushToken, setFlushToken] = useState(0);
   const { flush: flushDraft } = useDraftAutosave({
     agentId,
@@ -181,9 +176,7 @@ export default function AgentEditorPage() {
                   onClick={() => {
                     const isBusyOrError =
                       draftSaveState.status === "saving" ||
-                      flowSaveState.status === "saving" ||
-                      draftSaveState.status === "error" ||
-                      flowSaveState.status === "error";
+                      draftSaveState.status === "error";
                     if (isBusyOrError) {
                       flushDraft();
                       setFlushToken((token) => token + 1);
@@ -193,33 +186,33 @@ export default function AgentEditorPage() {
                   }}
                   className={cn(
                     "flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors",
-                    draftSaveState.status === "error" || flowSaveState.status === "error"
+                    draftSaveState.status === "error"
                       ? "border-destructive/40 bg-destructive/10 text-destructive hover:bg-destructive/15"
                       : "border-border/60 bg-muted/30 text-muted-foreground hover:bg-muted/50 hover:text-foreground"
                   )}
                   role="status"
                   aria-label={
-                    draftSaveState.status === "error" || flowSaveState.status === "error"
-                      ? `Error: ${draftSaveState.status === "error" ? draftSaveState.message : flowSaveState.message}. Click to retry.`
-                      : draftSaveState.status === "saving" || flowSaveState.status === "saving"
-                      ? "Saving changes…"
-                      : draftSaveState.status === "saved" || flowSaveState.status === "saved"
-                      ? "All changes saved"
+                    draftSaveState.status === "error"
+                      ? `Error: ${draftSaveState.message}. Click to retry.`
+                      : draftSaveState.status === "saving"
+                      ? "Saving changes"
+                      : draftSaveState.status === "saved"
+                      ? "Changes saved"
                       : "Test chat"
                   }
                 >
-                  {draftSaveState.status === "saving" || flowSaveState.status === "saving" ? (
+                  {draftSaveState.status === "saving" ? (
                     <>
-                      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-500" />
-                      <span>Saving…</span>
+                      <span className="h-2 w-2 animate-pulse rounded-full bg-primary" />
+                      <span className="text-muted-foreground">Saving...</span>
                     </>
-                  ) : draftSaveState.status === "error" || flowSaveState.status === "error" ? (
+                  ) : draftSaveState.status === "error" ? (
                     <>
                       <span className="h-1.5 w-1.5 rounded-full bg-destructive" />
-                      <span>{draftSaveState.status === "error" ? draftSaveState.message : flowSaveState.message || "Couldn't save"}</span>
+                      <span>{draftSaveState.message || "Couldn't save"}</span>
                       <span className="ml-1 font-semibold underline underline-offset-2">Retry</span>
                     </>
-                  ) : draftSaveState.status === "saved" || flowSaveState.status === "saved" ? (
+                  ) : draftSaveState.status === "saved" ? (
                     <>
                       <span className="h-1.5 w-1.5 rounded-full bg-primary" />
                       <span className="text-primary font-medium">Saved</span>
@@ -242,7 +235,7 @@ export default function AgentEditorPage() {
                 if (tab) setActiveTab(tab.value);
               }} />
               <TabPanel id="agent-editor" value={activeTab} labelledBy={`tab-agent-editor-${activeTab}`} className="pt-6">
-                {activeTab === "workflow" ? (
+                {activeTab === "prompt" ? (
                   <div className="space-y-6">
                     <AgentPipelineToolbar
                       draft={draft}
@@ -252,54 +245,9 @@ export default function AgentEditorPage() {
                       onPatch={patchDraft}
                       onRetryCatalog={() => void loadCatalog()}
                     />
-                    <div
-                      role="group"
-                      aria-label="Workflow view"
-                      className="inline-flex items-center gap-1 rounded-xl border bg-muted/40 p-1"
-                    >
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        aria-pressed={workflowView === "flow"}
-                        onClick={() => setWorkflowView("flow")}
-                        className={cn(
-                          "min-h-8 rounded-lg px-3 text-xs font-medium",
-                          workflowView === "flow"
-                            ? "bg-background text-foreground shadow-sm"
-                            : "text-muted-foreground hover:bg-transparent hover:text-foreground",
-                        )}
-                      >
-                        Visual Flow
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        aria-pressed={workflowView === "prompt"}
-                        onClick={() => setWorkflowView("prompt")}
-                        className={cn(
-                          "min-h-8 rounded-lg px-3 text-xs font-medium",
-                          workflowView === "prompt"
-                            ? "bg-background text-foreground shadow-sm"
-                            : "text-muted-foreground hover:bg-transparent hover:text-foreground",
-                        )}
-                      >
-                        Compiled Prompt
-                      </Button>
-                    </div>
-                    <div className={cn(workflowView !== "flow" && "hidden")}>
-                      <GoalEditor
-                        agentId={agentId}
-                        agentName={draft.name || agent.name}
-                      />
-                    </div>
-                    {workflowView === "prompt" ? (
-                      <div className="rounded-xl border border-dashed py-8 text-center text-sm text-muted-foreground">
-                        Goal-based prompts are dynamically generated per turn from the agent&apos;s fields and outcomes.
-                      </div>
-                    ) : null}
+                    <AgentInstructions draft={draft} onPatch={patchDraft} />
                   </div>
                 ) : null}
-                {activeTab === "instructions" ? <AgentInstructions draft={draft} onPatch={patchDraft} /> : null}
                 {activeTab === "testing" || activeTab === "history" ? (
                   <AgentTesting view={activeTab} agentId={agentId} agentName={agent.name} languages={draft.languages} defaultLanguage={draft.default_language} />
                 ) : null}
