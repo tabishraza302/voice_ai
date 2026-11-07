@@ -371,17 +371,3 @@ async def test_frozen_snapshot_reads_fields_and_outcomes(client):
             "required_fields": ["items"],
         }
     ]
-    assert [step["field_key"] for step in snapshot["steps"]] == ["intent", "items"]
-    assert snapshot["steps"][0] == {
-        "id": str(first.id),
-        "field_key": "intent",
-        "sort_order": 0,
-        "title": "Caller intent",
-        "objective": "Ask why they called.",
-        "branches": [
-            {
-                "conditions": [condition("intent", "eq", "order")],
-                "outcome": "order_placed",
-            }
-        ],
-    }

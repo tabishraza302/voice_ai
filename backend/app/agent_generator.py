@@ -137,8 +137,7 @@ async def stream_agent_generation(
     model_name: str | None = None,
 ) -> AsyncIterator[str]:
     from .agents import Agent, generate_slug
-    from .steps import Step, validate_publish
-
+    from .fields import AgentField, AgentOutcome
     cleaned = prompt.strip()
     if not cleaned:
         yield _format_sse("error", {"message": "Prompt cannot be empty."})
@@ -260,17 +259,7 @@ async def stream_agent_generation(
             raw_key = f"{raw_key}_{index+1}"
         seen_keys.add(raw_key)
         step_keys.append(raw_key)
-    created_steps: list[Step] = []
-    op_map = {
-        "=": "eq", "==": "eq", "eq": "eq", "equals": "eq", "is": "eq",
-        "!=": "ne", "<>": "ne", "ne": "ne", "not_equals": "ne",
-        ">": "gt", "gt": "gt",
-        ">=": "gte", "gte": "gte",
-        "<": "lt", "lt": "lt",
-        "<=": "lte", "lte": "lte",
-        "in": "in",
-    }
-
+    created_fields: list[AgentField] = []
     for index, s_data in enumerate(raw_steps):
         if not isinstance(s_data, dict):
             s_data = {}
@@ -279,77 +268,19 @@ async def stream_agent_generation(
         title = str(s_data.get("title") or f"Step {index+1}").strip()[:255] or f"Step {index+1}"
         objective = str(s_data.get("objective") or title).strip() or title
 
-        sanitized_branches = []
-        branches_input = s_data.get("branches")
-        if isinstance(branches_input, list):
-            for b in branches_input:
-                if not isinstance(b, dict):
-                    continue
-                target_idx = b.get("target_step_index")
-                target_id = None
-                if isinstance(target_idx, int) and 0 <= target_idx < len(raw_steps) and target_idx != index:
-                    target_id = str(step_ids[target_idx])
-
-                sanitized_conditions = []
-                conditions_input = b.get("conditions") if isinstance(b.get("conditions"), list) else []
-                for c in conditions_input:
-                    if not isinstance(c, dict):
-                        continue
-                    # Condition field_key must match an existing step in this agent
-                    f_key = c.get("field_key") or c.get("field")
-                    field_name = str(f_key).strip() if f_key else raw_key
-                    if field_name not in seen_keys:
-                        field_name = raw_key
-
-                    raw_op = str(c.get("operator") or "eq").strip().lower()
-                    operator = op_map.get(raw_op, "eq")
-                    operand = c.get("operand") if "operand" in c else c.get("value", True)
-                    if operand is None:
-                        operand = True
-
-                    sanitized_conditions.append({
-                        "field_key": field_name,
-                        "operator": operator,
-                        "operand": operand,
-                    })
-
-                outcome = str(b.get("outcome")).strip() if b.get("outcome") is not None else None
-                if target_id is not None:
-                    outcome = None
-                elif not outcome:
-                    # Neither a target nor an outcome: drop branch
-                    continue
-
-                sanitized_branches.append({
-                    "conditions": sanitized_conditions,
-                    "target_step_id": target_id,
-                    "outcome": outcome,
-                })
-
-        step = Step(
+        field_model = AgentField(
             id=step_ids[index],
             agent_id=agent_id,
             field_key=raw_key,
+            description=title,
+            guidance=objective,
+            required=index == 0,
+            options=[],
+            required_when=[],
             sort_order=index,
-            title=title,
-            objective=objective,
-            branches=sanitized_branches,
         )
-        db.add(step)
-        created_steps.append(step)
-
-    # Validate publish rules: if specific step branches cause graph cycles or errors, clean only the problematic step
-    publish_errors = validate_publish(agent, created_steps)
-    if publish_errors:
-        step_id_to_index = {str(s.id): i for i, s in enumerate(created_steps)}
-        for err_key in publish_errors:
-            # _step_path produces "steps.<uuid>" keys; extract the UUID segment
-            match = re.match(r"steps\.([0-9a-f-]+)\.branches", err_key)
-            if match:
-                err_idx = step_id_to_index.get(match.group(1))
-                if err_idx is not None:
-                    created_steps[err_idx].branches = []
-
+        db.add(field_model)
+        created_fields.append(field_model)
     try:
         await db.commit()
     except Exception as exc:

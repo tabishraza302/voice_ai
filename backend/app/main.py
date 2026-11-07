@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from . import admin, agents, auth, chat, fields, observability, provider_catalog, sessions, signaling, steps
+from . import admin, agents, auth, chat, fields, observability, provider_catalog, sessions, signaling
 
 
 @asynccontextmanager
@@ -16,7 +16,6 @@ app = FastAPI(lifespan=lifespan)
 app.include_router(auth.router)
 app.include_router(agents.router)
 app.include_router(fields.router)
-app.include_router(steps.router)
 app.include_router(admin.router)
 app.include_router(provider_catalog.router)
 app.include_router(sessions.router)

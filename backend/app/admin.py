@@ -21,8 +21,8 @@ from sqlalchemy.orm import Mapped, mapped_column
 from .agents import Agent
 from .auth import admin_user, csrf
 from .db import Base, get_db
+from .fields import AgentField
 from .models import User
-from .steps import Step
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -276,7 +276,7 @@ async def list_admin_agents(
     from .sessions import CallSession
 
     step_count = (
-        select(func.count(Step.id)).where(Step.agent_id == Agent.id).correlate(Agent).scalar_subquery()
+        select(func.count(AgentField.id)).where(AgentField.agent_id == Agent.id).correlate(Agent).scalar_subquery()
     )
     session_count = (
         select(func.count(CallSession.id))
