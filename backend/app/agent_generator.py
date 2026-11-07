@@ -341,12 +341,13 @@ async def stream_agent_generation(
     # Validate publish rules: if specific step branches cause graph cycles or errors, clean only the problematic step
     publish_errors = validate_publish(agent, created_steps)
     if publish_errors:
+        step_id_to_index = {str(s.id): i for i, s in enumerate(created_steps)}
         for err_key in publish_errors:
-            # E.g. "steps[0].branches"
-            match = re.search(r"steps\[(\d+)\]\.branches", err_key)
+            # _step_path produces "steps.<uuid>" keys; extract the UUID segment
+            match = re.match(r"steps\.([0-9a-f-]+)\.branches", err_key)
             if match:
-                err_idx = int(match.group(1))
-                if 0 <= err_idx < len(created_steps):
+                err_idx = step_id_to_index.get(match.group(1))
+                if err_idx is not None:
                     created_steps[err_idx].branches = []
 
     try:
