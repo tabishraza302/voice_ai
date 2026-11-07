@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import (
     CheckConstraint,
@@ -183,6 +184,36 @@ class AgentRead(BaseModel):
     updated_at: datetime
 
 
+class EnhancePromptRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    prompt: str = Field(min_length=10, max_length=10000)
+    model: str | None = Field(default=None, max_length=120)
+
+    @field_validator("prompt")
+    @classmethod
+    def validate_prompt(cls, value: str) -> str:
+        trimmed = value.strip()
+        if len(trimmed) < 10:
+            raise ValueError("Prompt must contain at least 10 non-whitespace characters")
+        return trimmed
+
+
+class EnhancePromptResponse(BaseModel):
+    enhanced_prompt: str
+
+
+class GenerateAgentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    prompt: str = Field(min_length=10, max_length=10000)
+    model: str | None = Field(default=None, max_length=120)
+
+    @field_validator("prompt")
+    @classmethod
+    def validate_prompt(cls, value: str) -> str:
+        trimmed = value.strip()
+        if len(trimmed) < 10:
+            raise ValueError("Prompt must contain at least 10 non-whitespace characters")
+        return trimmed
 async def _get_owned_agent(
     db: AsyncSession, owner_id: uuid.UUID, agent_id: uuid.UUID, *, lock: bool
 ) -> Agent:
@@ -273,6 +304,34 @@ async def create_agent(
     await _commit_agent(db, agent)
     await db.refresh(agent)
     return agent
+
+
+@router.post("/enhance-prompt", response_model=EnhancePromptResponse)
+async def enhance_agent_prompt(
+    data: EnhancePromptRequest,
+    user: Annotated[User, Depends(csrf)],
+):
+    from .agent_generator import enhance_prompt
+    enhanced = await enhance_prompt(data.prompt, data.model)
+    return EnhancePromptResponse(enhanced_prompt=enhanced)
+
+
+@router.post("/generate-stream")
+async def generate_agent_stream(
+    data: GenerateAgentRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[User, Depends(csrf)],
+):
+    from .agent_generator import stream_agent_generation
+    return StreamingResponse(
+        stream_agent_generation(data.prompt, db, user.id, data.model),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/{agent_id}", response_model=AgentRead)

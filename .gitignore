@@ -5,6 +5,7 @@
 .omp/
 .superpowers/
 .omp_*
+.worktree/
 docs/
 
 # Generated state
