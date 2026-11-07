@@ -137,3 +137,69 @@ export function apiFieldErrors(error: ApiError): Record<string, string[]> {
     }),
   );
 }
+
+export async function streamSse(
+  path: string,
+  body: unknown,
+  onEvent: (event: string, data: unknown) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const url = apiUrl(path);
+  const token = await csrfToken(signal);
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+        "X-CSRF-Token": token,
+      },
+      body: JSON.stringify(body),
+      credentials: "same-origin",
+      signal,
+    });
+  } catch {
+    throw new ApiError(0, "Could not connect to the service. Try again.");
+  }
+
+  if (!response.ok) {
+    const payload = await responsePayload(response);
+    throwResponseError(response, payload);
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) throw new ApiError(0, "No response stream received from server.");
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop() ?? "";
+    for (const part of parts) {
+      if (!part.trim()) continue;
+      let eventType = "message";
+      let dataText = "";
+      for (const line of part.split("\n")) {
+        if (line.startsWith("event:")) {
+          eventType = line.slice(6).trim();
+        } else if (line.startsWith("data:")) {
+          dataText += line.slice(5).trim();
+        }
+      }
+      if (dataText) {
+        try {
+          const parsedData = JSON.parse(dataText) as unknown;
+          onEvent(eventType, parsedData);
+        } catch {
+          onEvent(eventType, dataText);
+        }
+      }
+    }
+  }
+}
