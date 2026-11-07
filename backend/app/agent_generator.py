@@ -38,34 +38,16 @@ Do not include any conversational filler or preambles outside these sections."""
 
 
 _GENERATE_SYSTEM_PROMPT = """You are an expert voice AI architect.
-Given a user request or prompt, generate a fully configured voice agent specification with goal-based information fields and completion outcomes.
+Given a user request or prompt, generate a fully configured voice agent specification with a single comprehensive system prompt.
 You MUST output ONLY a valid raw JSON object matching this schema:
 {
   "name": "Short, human-friendly agent name (max 120 chars)",
   "description": "Brief 1-2 sentence description (max 500 chars)",
-  "instructions": "Comprehensive system prompt for the voice AI (persona, tone, speaking style, concise answers, rules, edge cases)",
-  "fields": [
-    {
-      "field_key": "unique_snake_case_key",
-      "description": "Short description of what to collect",
-      "guidance": "Instruction on how to ask the caller for this information",
-      "options": ["optional_enum_1", "optional_enum_2"],
-      "required": true
-    }
-  ],
-  "outcomes": [
-    {
-      "label": "outcome_label",
-      "required_fields": ["field_key_1", "field_key_2"]
-    }
-  ]
+  "instructions": "Comprehensive system prompt for the voice AI (persona, tone, speaking style, concise answers, conversational flow, rules, edge cases)"
 }
 
-Guidelines for Goal-Based Configuration:
-- Generate 2 to 6 information fields representing what the agent needs to collect.
-- Mark primary triage/intent fields as required: true.
-- For fields with defined choices, include non-empty options array. Free-text fields have options: [].
-- Generate at least 1 outcome with the required_fields that mark it complete.
+Guidelines:
+- The instructions must be a complete, self-contained prompt detailing how the voice agent should speak, ask questions, handle user requests, and close the call.
 - Do NOT output any markdown ticks (like ```json), commentary, or text outside the raw JSON object."""
 
 def get_openai_client(model_override: str | None = None) -> tuple[AsyncOpenAI, str]:
@@ -127,7 +109,6 @@ async def stream_agent_generation(
     model_name: str | None = None,
 ) -> AsyncIterator[str]:
     from .agents import Agent, generate_slug
-    from .fields import AgentField, AgentOutcome
     cleaned = prompt.strip()
     if not cleaned:
         yield _format_sse("error", {"message": "Prompt cannot be empty."})
@@ -198,13 +179,6 @@ async def stream_agent_generation(
             "name": name,
             "description": f"Generated agent for: {cleaned[:80]}",
             "instructions": cleaned,
-            "fields": [
-                {"field_key": "caller_intent", "description": "Caller's request", "guidance": "Ask how you can help.", "required": True, "options": []},
-                {"field_key": "details", "description": "Request details", "guidance": "Gather details from caller.", "required": False, "options": []},
-            ],
-            "outcomes": [
-                {"label": "request_completed", "required_fields": ["caller_intent", "details"]}
-            ]
         }
 
     agent_name = str(parsed.get("name") or "AI Assistant").strip()[:120]
@@ -226,65 +200,6 @@ async def stream_agent_generation(
         status="draft",
     )
     db.add(agent)
-
-    raw_fields = parsed.get("fields") or parsed.get("steps") or []
-    if not isinstance(raw_fields, list) or not raw_fields:
-        raw_fields = [
-            {"field_key": "caller_intent", "description": "Caller's request", "guidance": "Ask how you can help.", "required": True, "options": []},
-            {"field_key": "details", "description": "Request details", "guidance": "Gather details from caller.", "required": False, "options": []},
-        ]
-
-    seen_keys: set[str] = set()
-    created_fields: list[AgentField] = []
-    for index, f_data in enumerate(raw_fields):
-        if not isinstance(f_data, dict):
-            f_data = {}
-        raw_key = re.sub(r"[^a-zA-Z0-9_]+", "_", str(f_data.get("field_key") or f"field_{index+1}")).strip("_").lower()
-        if not raw_key:
-            raw_key = f"field_{index+1}"
-        if raw_key in seen_keys:
-            raw_key = f"{raw_key}_{index+1}"
-        seen_keys.add(raw_key)
-
-        title = str(f_data.get("description") or f_data.get("title") or f"Field {index+1}").strip()[:255]
-        guidance = str(f_data.get("guidance") or f_data.get("objective") or title).strip()
-        options = [str(opt).strip() for opt in f_data.get("options") or () if str(opt).strip()]
-        required = bool(f_data.get("required", index == 0))
-
-        field_model = AgentField(
-            id=uuid.uuid4(),
-            agent_id=agent_id,
-            field_key=raw_key,
-            description=title,
-            guidance=guidance,
-            required=required,
-            options=options,
-            required_when=[],
-            sort_order=index,
-        )
-        db.add(field_model)
-        created_fields.append(field_model)
-
-    raw_outcomes = parsed.get("outcomes") or []
-    if isinstance(raw_outcomes, list):
-        for o_data in raw_outcomes:
-            if not isinstance(o_data, dict):
-                continue
-            label = re.sub(r"[^a-zA-Z0-9_]+", "_", str(o_data.get("label") or "completed")).strip("_").lower() or "completed"
-            req_fields = [
-                str(rf).strip()
-                for rf in o_data.get("required_fields") or ()
-                if str(rf).strip() in seen_keys
-            ]
-            outcome_model = AgentOutcome(
-                id=uuid.uuid4(),
-                agent_id=agent_id,
-                label=label,
-                conditions=[],
-                required_fields=req_fields,
-            )
-            db.add(outcome_model)
-
     try:
         await db.commit()
     except Exception as exc:

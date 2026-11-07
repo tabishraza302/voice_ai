@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { CallPanel } from "@/components/call-panel";
 import { ApiError, api, apiErrorText } from "@/lib/api";
-import type { CallAnswer, CallMessage, CallSession, CallSessionGrant } from "@/lib/types";
+import type { CallMessage, CallSession, CallSessionGrant } from "@/lib/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -35,7 +35,6 @@ export function AgentTesting({
   const [latestSessionId, setLatestSessionId] = useState<string | null>(null);
   const [session, setSession] = useState<CallSession | null>(null);
   const [messages, setMessages] = useState<CallMessage[]>([]);
-  const [answers, setAnswers] = useState<CallAnswer[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(true);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
@@ -68,7 +67,6 @@ export function AgentTesting({
     if (!selectedId) {
       setSession(null);
       setMessages([]);
-      setAnswers([]);
       setDetailError(null);
       return;
     }
@@ -79,12 +77,10 @@ export function AgentTesting({
     Promise.all([
       api<CallSession>(`/sessions/${selectedId}`, { signal: controller.signal }),
       api<CallMessage[]>(`/sessions/${selectedId}/messages`, { signal: controller.signal }),
-      api<CallAnswer[]>(`/sessions/${selectedId}/answers`, { signal: controller.signal }),
-    ]).then(([call, callMessages, callAnswers]) => {
+    ]).then(([call, callMessages]) => {
       if (!current) return;
       setSession(call);
       setMessages(callMessages);
-      setAnswers(callAnswers);
     }).catch((reason: unknown) => {
       if (!current || controller.signal.aborted) return;
       if (reason instanceof ApiError && reason.status === 401) {
@@ -93,7 +89,6 @@ export function AgentTesting({
       }
       setSession(null);
       setMessages([]);
-      setAnswers([]);
       setDetailError(apiErrorText(reason, "Could not load this session."));
     }).finally(() => {
       if (current) setLoadingDetail(false);
@@ -210,18 +205,8 @@ export function AgentTesting({
                 {detailError ? <p role="alert" className="text-sm text-destructive">{detailError}</p> : null}
                 {session ? (
                   <>
-                    <dl className="grid grid-cols-1 gap-3 text-sm sm:grid-cols-2">
+                    <dl className="grid grid-cols-1 gap-3 text-sm sm:grid-cols-3">
                       <div><dt className="text-xs text-muted-foreground">Created</dt><dd className="mt-1">{formatDate(session.created_at)}</dd></div>
-                      <div>
-                        <dt className="text-xs text-muted-foreground">Outcomes</dt>
-                        <dd className="mt-1">
-                          {Array.isArray(session.outcome)
-                            ? session.outcome.length > 0
-                              ? session.outcome.map((o) => o.label).join(", ")
-                              : "None reached"
-                            : session.outcome ?? "Not set"}
-                        </dd>
-                      </div>
                       <div><dt className="text-xs text-muted-foreground">Started</dt><dd className="mt-1">{session.started_at ? formatDate(session.started_at) : "Not started"}</dd></div>
                       <div><dt className="text-xs text-muted-foreground">Ended</dt><dd className="mt-1">{session.ended_at ? formatDate(session.ended_at) : "Not ended"}</dd></div>
                     </dl>
@@ -241,25 +226,8 @@ export function AgentTesting({
                         </ol>
                       )}
                     </section>
-                    <section aria-labelledby="answers-heading">
-                      <h4 id="answers-heading" className="font-semibold">Collected answers</h4>
-                      {answers.length === 0 ? <p className="mt-2 text-sm text-muted-foreground">No answers have been saved.</p> : (
-                        <ul className="mt-3 divide-y rounded-xl border">
-                          {answers.map((answer) => (
-                            <li key={answer.id} className="space-y-2 p-3">
-                              <div className="flex flex-wrap items-center justify-between gap-2">
-                                <span className="text-sm font-medium">{answer.field_key}</span>
-                                <Badge variant={answer.accepted ? "success" : "warning"}>{answer.accepted ? "Accepted" : "Not accepted"}</Badge>
-                              </div>
-                              <p className="break-words text-sm">{typeof answer.value === "string" ? answer.value : JSON.stringify(answer.value)}</p>
-                              <p className="break-words text-xs text-muted-foreground">Validation: {JSON.stringify(answer.validation_result)}</p>
-                            </li>
-                          ))}
-                        </ul>
-                      )}
-                    </section>
                   </>
-                ) : !loadingDetail && !detailError ? <p className="text-sm text-muted-foreground">Select a session to view its transcript and answers.</p> : null}
+                ) : !loadingDetail && !detailError ? <p className="text-sm text-muted-foreground">Select a session to view its transcript.</p> : null}
               </CardContent>
             </Card>
           </div>

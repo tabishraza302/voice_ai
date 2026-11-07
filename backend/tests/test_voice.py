@@ -16,7 +16,6 @@ from pipecat.frames.frames import (
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection
 
-from app.goals import apply_answers
 from app.voice import (
     CallDefinition,
     CallRuntime,
@@ -69,51 +68,9 @@ def provider_agent(**overrides: object) -> dict[str, object]:
     return agent
 
 
-def condition(field_key: str, operator: str = "eq", operand: object = None) -> dict[str, object]:
-    return {"field_key": field_key, "operator": operator, "operand": operand}
 
 
-def field_row(
-    field_key: str,
-    *,
-    description: str | None = None,
-    guidance: str | None = None,
-    options: tuple[str, ...] = (),
-    required: bool = False,
-    required_when: tuple[dict[str, object], ...] = (),
-    sort_order: int = 0,
-) -> dict[str, object]:
-    return {
-        "id": str(uuid.uuid4()),
-        "field_key": field_key,
-        "description": f"Collect {field_key}" if description is None else description,
-        "guidance": f"Ask for {field_key}." if guidance is None else guidance,
-        "options": list(options),
-        "required": required,
-        "required_when": list(required_when),
-        "sort_order": sort_order,
-    }
-
-
-def outcome_row(
-    label: str,
-    *,
-    conditions: tuple[dict[str, object], ...] = (),
-    required_fields: tuple[str, ...] = (),
-) -> dict[str, object]:
-    return {
-        "id": str(uuid.uuid4()),
-        "label": label,
-        "conditions": list(conditions),
-        "required_fields": list(required_fields),
-    }
-
-
-def voice_snapshot(
-    *,
-    fields: tuple[dict[str, object], ...] = (),
-    outcomes: tuple[dict[str, object], ...] = (),
-) -> dict[str, object]:
+def voice_snapshot() -> dict[str, object]:
     return {
         "global_prompt": {"text": "Global call policy", "version": 7},
         "policy": {
@@ -127,23 +84,16 @@ def voice_snapshot(
             "name": "Reception",
             "instructions": "Help the caller.",
         },
-        "fields": list(fields),
-        "outcomes": list(outcomes),
     }
 
 
-def make_definition(
-    *,
-    fields: tuple[dict[str, object], ...] = (),
-    outcomes: tuple[dict[str, object], ...] = (),
-) -> CallDefinition:
+def make_definition() -> CallDefinition:
     return CallDefinition.from_snapshot(
         uuid.uuid4(),
         "test",
-        voice_snapshot(fields=fields, outcomes=outcomes),
+        voice_snapshot(),
         verified_environment(),
     )
-
 
 class FakeWriter:
     def __init__(self) -> None:
@@ -281,7 +231,6 @@ def test_call_definition_copies_frozen_snapshot_and_provider_keys() -> None:
             "instructions": "Help the caller.",
             "languages": ["en"],
         },
-        "steps": [{"id": "step-1", "nested": {"title": "Question"}}],
     }
     env = verified_environment()
 
@@ -289,13 +238,11 @@ def test_call_definition_copies_frozen_snapshot_and_provider_keys() -> None:
 
     snapshot["global_prompt"]["text"] = "Changed prompt"
     snapshot["agent"]["instructions"] = "Changed instructions"
-    snapshot["steps"][0]["nested"]["title"] = "Changed step"
     env["OPENAI_API_KEY"] = "rotated-key"
 
     assert definition.global_prompt == "Global call policy"
     assert definition.prompt_version == 7
     assert definition.agent_instructions == "Help the caller."
-    assert definition.steps[0]["nested"]["title"] == "Question"
     assert definition.providers.llm_api_key == "openai-test-secret"
     assert definition.providers.tts_api_key == "cartesia-test-secret"
 
@@ -485,98 +432,10 @@ async def test_successful_call_sends_only_safe_completion_event(monkeypatch) -> 
     await runtime.cleanup_task
 
 @pytest.mark.anyio
-async def test_tool_handler_applies_answers_and_enqueues_answers(monkeypatch) -> None:
-    definition = make_definition(
-        fields=(
-            field_row("caller_name", required=True),
-            field_row("order_items", required_when=(condition("caller_name", "ne", ""),)),
-        ),
-    )
-    writer = FakeWriter()
-    runtime = CallRuntime(definition, writer)
-
-    result_payload: list[str] = []
-
-    async def fake_result_callback(data: str) -> None:
-        result_payload.append(data)
-
-    context = LLMContext(messages=[])
-    params = ToolParams(
-        arguments={"caller_name": "Alice"},
-        context=context,
-        result_callback=fake_result_callback,
-    )
-
-    await runtime._handle_save_answers(params)
-
-    assert runtime.goal_state.answers == {"caller_name": "Alice"}
-    assert len(writer.answers) == 1
-    assert writer.answers[0][0] == "caller_name"
-    assert writer.answers[0][1] == "Alice"
-    assert writer.answers[0][2] is True
-    assert len(result_payload) == 1
-    data = json.loads(result_payload[0])
-    assert data["saved"] == {"caller_name": "Alice"}
-    assert data["confirmed_answers"] == {"caller_name": "Alice"}
-    assert any(f["field_key"] == "order_items" for f in data["needed_fields"])
-    # Post-tool schema in context updated
-    assert context.tools is not None
-
-
-@pytest.mark.anyio
-async def test_tool_handler_fires_outcome_checkpoint(monkeypatch) -> None:
-    definition = make_definition(
-        fields=(
-            field_row("intent", required=True, options=("order", "faq")),
-            field_row("order_items", required_when=(condition("intent", "eq", "order"),)),
-        ),
-        outcomes=(
-            outcome_row("order_placed", conditions=(condition("intent", "eq", "order"),), required_fields=("order_items",)),
-        ),
-    )
-    writer = FakeWriter()
-    runtime = CallRuntime(definition, writer)
-
-    recorded_outcomes: list[tuple[uuid.UUID, str]] = []
-
-    async def fake_record_session_outcome(session_id: uuid.UUID, label: str) -> bool:
-        recorded_outcomes.append((session_id, label))
-        return True
-
-    monkeypatch.setattr("app.voice.record_session_outcome", fake_record_session_outcome)
-
-    result_payload: list[str] = []
-
-    async def fake_result_callback(data: str) -> None:
-        result_payload.append(data)
-
-    context = LLMContext(messages=[])
-    params = ToolParams(
-        arguments={"intent": "order", "order_items": "2 pizzas"},
-        context=context,
-        result_callback=fake_result_callback,
-    )
-
-    await runtime._handle_save_answers(params)
-
-    # Verified outcome recorded
-    assert len(recorded_outcomes) == 1
-    assert recorded_outcomes[0][1] == "order_placed"
-    # Goal state reset for next request: universal fields kept (intent), conditional cleared (order_items)
-    assert "order_placed" in runtime.goal_state.completed_outcomes
-    assert runtime.goal_state.answers.get("intent") == "order"
-    assert "order_items" not in runtime.goal_state.answers
-    # Directive added to context
-    data = json.loads(result_payload[0])
-    assert data["outcome"] == "order_placed"
-    assert "instruction" in data
-
 
 @pytest.mark.anyio
 async def test_transcription_pushes_dialogue_turn() -> None:
-    definition = make_definition(
-        fields=(field_row("caller_name", required=True),),
-    )
+    definition = make_definition()
     writer = FakeWriter()
     runtime = CallRuntime(definition, writer)
     recorder = RecordingProcessor()
@@ -592,8 +451,7 @@ async def test_transcription_pushes_dialogue_turn() -> None:
     frame, direction = recorder.frames[0]
     assert isinstance(frame, LLMContextFrame)
     assert direction == FrameDirection.DOWNSTREAM
-    # System message built with needed fields
     sys_msg = frame.context.messages[0]
-    assert "caller_name" in sys_msg["content"]
+    assert "Help the caller" in sys_msg["content"]
     user_msg = frame.context.messages[1]
     assert user_msg["content"] == "Hello, my name is Bob."

@@ -32,7 +32,6 @@ from sqlalchemy.sql import text
 from .agents import Agent
 from .auth import csrf, current_user
 from .db import Base, Session as DbSession, get_db
-from .fields import AgentField, AgentOutcome
 from .models import User
 from .observability import TraceUnavailableError, fetch_session_trace
 
@@ -58,9 +57,6 @@ class FrozenCallSnapshot(TypedDict):
     policy: dict[str, int]
     language: str
     agent: dict[str, Any]
-    fields: list[dict[str, Any]]
-    outcomes: list[dict[str, Any]]
-    steps: list[dict[str, Any]]
 
 class SignalingContext(TypedDict):
     snapshot: FrozenCallSnapshot
@@ -80,10 +76,6 @@ class CallSession(Base):
             name="sessions_status_check",
         ),
         CheckConstraint("jsonb_typeof(snapshot) = 'object'", name="sessions_snapshot_object_check"),
-        CheckConstraint(
-            "outcome IS NULL OR jsonb_typeof(outcome) = 'array'",
-            name="sessions_outcome_array_check",
-        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -96,7 +88,6 @@ class CallSession(Base):
     call_type: Mapped[str] = mapped_column(String(16), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default=text("'created'"))
     snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
-    outcome: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
     signaling_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -123,23 +114,6 @@ class CallMessage(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
-
-class CallAnswer(Base):
-    __tablename__ = "answers"
-    __table_args__ = (
-        CheckConstraint("field_key <> '' AND field_key = btrim(field_key)", name="answers_field_key_check"),
-        Index("ix_answers_session_created", "session_id", "created_at"),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    session_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
-    )
-    field_key: Mapped[str] = mapped_column(String(128), nullable=False)
-    value: Mapped[Any] = mapped_column(JSONB, nullable=False)
-    accepted: Mapped[bool] = mapped_column(nullable=False)
-    validation_result: Mapped[Any] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 class SessionCreated(BaseModel):
@@ -178,7 +152,7 @@ class SessionRead(BaseModel):
     agent_id: uuid.UUID
     call_type: CallType
     status: SessionStatus
-    outcome: list[dict[str, Any]] | None
+    outcome: list[dict[str, Any]] | None = None
     created_at: datetime
     started_at: datetime | None
     ended_at: datetime | None
@@ -193,16 +167,6 @@ class MessageRead(BaseModel):
     content: str
     created_at: datetime
 
-
-class AnswerRead(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: uuid.UUID
-    field_key: str
-    value: Any
-    accepted: bool
-    validation_result: Any
-    created_at: datetime
 
 
 class TraceSpanRead(BaseModel):
@@ -241,15 +205,8 @@ class _MessageWrite:
     content: str
 
 
-@dataclass(frozen=True, slots=True)
-class _AnswerWrite:
-    field_key: str
-    value: Any
-    accepted: bool
-    validation_result: Any
 
-
-_SessionWrite = _MessageWrite | _AnswerWrite
+_SessionWrite = _MessageWrite
 _STOP = object()
 
 
@@ -273,58 +230,17 @@ def _agent_snapshot(agent: Agent) -> dict[str, Any]:
     }
 
 
-def _field_snapshot(field: AgentField) -> dict[str, Any]:
-    return {
-        "id": str(field.id),
-        "field_key": field.field_key,
-        "description": field.description,
-        "guidance": field.guidance,
-        "options": list(field.options),
-        "required": field.required,
-        "required_when": [dict(condition) for condition in field.required_when],
-        "sort_order": field.sort_order,
-    }
-
-
-def _outcome_snapshot(outcome: AgentOutcome) -> dict[str, Any]:
-    return {
-        "id": str(outcome.id),
-        "label": outcome.label,
-        "conditions": [dict(condition) for condition in outcome.conditions],
-        "required_fields": list(outcome.required_fields),
-    }
-
-
-
 async def _frozen_call_snapshot(
     db: AsyncSession, agent: Agent, language: str
 ) -> FrozenCallSnapshot:
     from .admin import get_frozen_settings
 
     settings = await get_frozen_settings(db)
-    fields = list(
-        await db.scalars(
-            select(AgentField)
-            .where(AgentField.agent_id == agent.id)
-            .order_by(AgentField.sort_order, AgentField.id)
-        )
-    )
-    outcomes = list(
-        await db.scalars(
-            select(AgentOutcome)
-            .where(AgentOutcome.agent_id == agent.id)
-            .order_by(AgentOutcome.label, AgentOutcome.id)
-        )
-    )
-    field_rows = [_field_snapshot(field) for field in fields]
-    outcome_rows = [_outcome_snapshot(outcome) for outcome in outcomes]
     return {
         "global_prompt": settings["global_prompt"],
         "policy": settings["policy"],
         "language": language,
         "agent": _agent_snapshot(agent),
-        "fields": field_rows,
-        "outcomes": outcome_rows,
     }
 
 
@@ -505,17 +421,6 @@ async def list_session_messages(session_id: uuid.UUID, db: Db, user: Reader):
     )
 
 
-@router.get("/sessions/{session_id}/answers", response_model=list[AnswerRead])
-async def list_session_answers(session_id: uuid.UUID, db: Db, user: Reader):
-    await _owned_session(db, user.id, session_id)
-    return list(
-        await db.scalars(
-            select(CallAnswer)
-            .where(CallAnswer.session_id == session_id)
-            .order_by(CallAnswer.created_at, CallAnswer.id)
-        )
-    )
-
 
 @public_router.get("/agents/{slug}", response_model=PublicAgentRead)
 async def get_public_agent(slug: str, db: Db):
@@ -551,20 +456,6 @@ class SessionWriter:
         if not isinstance(content, str):
             raise TypeError("message content must be text")
         self._enqueue(_MessageWrite(role=role, content=content))
-
-    def enqueue_answer(self, field_key: str, value: Any, accepted: bool, validation_result: Any) -> None:
-        if not isinstance(field_key, str) or not field_key.strip():
-            raise ValueError("field_key must not be empty")
-        if not isinstance(accepted, bool):
-            raise TypeError("accepted must be a boolean")
-        self._enqueue(
-            _AnswerWrite(
-                field_key=field_key,
-                value=value,
-                accepted=accepted,
-                validation_result=validation_result,
-            )
-        )
 
     def _enqueue(self, event: _SessionWrite) -> None:
         if self._closed:
@@ -613,16 +504,6 @@ class SessionWriter:
                         content=event.content,
                     )
                 )
-            else:
-                db.add(
-                    CallAnswer(
-                        session_id=self.session_id,
-                        field_key=event.field_key,
-                        value=event.value,
-                        accepted=event.accepted,
-                        validation_result=event.validation_result,
-                    )
-                )
             await db.commit()
             if isinstance(event, _MessageWrite):
                 self._next_sequence += 1
@@ -642,76 +523,15 @@ class SessionWriter:
             raise SessionWriteError("Session persistence failed") from self._failure
 
 
-def _outcome_record(label: str, completed_at: Any = None) -> dict[str, str]:
-    if isinstance(completed_at, datetime):
-        timestamp = completed_at.isoformat()
-    elif isinstance(completed_at, str) and completed_at.strip():
-        timestamp = completed_at
-    else:
-        timestamp = datetime.now(timezone.utc).isoformat()
-    return {"label": label, "completed_at": timestamp}
-
-
-def _normalize_outcome_records(value: Any) -> list[dict[str, str]]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return []
-        if text[0] in "[{":
-            try:
-                return _normalize_outcome_records(json.loads(text))
-            except (TypeError, ValueError):
-                pass
-        return [_outcome_record(text)]
-    if isinstance(value, Mapping):
-        return _normalize_outcome_records([value])
-    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
-        records: list[dict[str, str]] = []
-        for item in value:
-            if isinstance(item, str):
-                label = item.strip()
-                if label:
-                    records.append(_outcome_record(label))
-            elif isinstance(item, Mapping):
-                label = item.get("label")
-                if isinstance(label, str) and label.strip():
-                    records.append(_outcome_record(label.strip(), item.get("completed_at")))
-        return records
-    return []
-
-
-async def record_session_outcome(session_id: uuid.UUID, label: str) -> bool:
-    if not isinstance(label, str) or not label.strip():
-        raise ValueError("outcome label must not be empty")
-    record = _outcome_record(label.strip())
-
-    async with DbSession() as db:
-        call = await db.scalar(
-            select(CallSession).where(CallSession.id == session_id).with_for_update()
-        )
-        if call is None:
-            return False
-        records = _normalize_outcome_records(call.outcome)
-        if any(existing["label"] == record["label"] for existing in records):
-            return True
-        records.append(record)
-        call.outcome = records
-        await db.commit()
-        return True
-
 
 async def set_session_status(
     session_id: uuid.UUID,
     status: SessionStatus,
     *,
-    outcome: str | Sequence[Mapping[str, Any]] | None = None,
+    outcome: Any = None,
 ) -> bool:
     if status not in _TRANSITIONS:
         raise ValueError("Unsupported session status")
-    requested_outcomes = _normalize_outcome_records(outcome)
-
     async with DbSession() as db:
         agent_id = await db.scalar(select(CallSession.agent_id).where(CallSession.id == session_id))
         if agent_id is None:
@@ -724,18 +544,6 @@ async def set_session_status(
             return False
 
         if call.status == status:
-            if requested_outcomes:
-                records = _normalize_outcome_records(call.outcome)
-                known = {record["label"] for record in records}
-                changed = False
-                for record in requested_outcomes:
-                    if record["label"] not in known:
-                        records.append(record)
-                        known.add(record["label"])
-                        changed = True
-                if changed:
-                    call.outcome = records
-                    await db.commit()
             return True
         if status not in _TRANSITIONS[call.status]:
             raise SessionUnavailableError(f"Cannot change session status from {call.status} to {status}")
@@ -753,17 +561,8 @@ async def set_session_status(
             call.started_at = call.started_at or now
         if status in _TERMINAL_STATUSES:
             call.ended_at = call.ended_at or now
-        if requested_outcomes:
-            records = _normalize_outcome_records(call.outcome)
-            known = {record["label"] for record in records}
-            for record in requested_outcomes:
-                if record["label"] not in known:
-                    records.append(record)
-                    known.add(record["label"])
-            call.outcome = records
         await db.commit()
         return True
-
 
 async def load_signaling_context(session_id: uuid.UUID) -> SignalingContext | None:
     async with DbSession() as db:

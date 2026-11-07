@@ -55,72 +55,6 @@ export type AgentPatch = Partial<
   >
 >;
 
-export interface FieldCondition {
-  field_key: string;
-  operator: string;
-  operand: JsonValue;
-}
-
-export interface AgentField {
-  id: string;
-  agent_id: string;
-  field_key: string;
-  description: string;
-  guidance: string;
-  options: string[];
-  required: boolean;
-  required_when: FieldCondition[];
-  sort_order: number;
-}
-
-export interface FieldInput {
-  field_key?: string | null;
-  description?: string;
-  guidance?: string;
-  options?: string[];
-  required?: boolean;
-  required_when?: FieldCondition[];
-  sort_order?: number | null;
-}
-
-export interface AgentOutcome {
-  id: string;
-  agent_id: string;
-  label: string;
-  conditions: FieldCondition[];
-  required_fields: string[];
-}
-
-export interface OutcomeInput {
-  label?: string | null;
-  conditions?: FieldCondition[];
-  required_fields?: string[];
-}
-
-export interface SessionOutcomeRecord {
-  label: string;
-  completed_at?: string | null;
-}
-
-// Backward-compatible aliases for transition
-export type BranchCondition = FieldCondition;
-export interface StepBranch {
-  conditions: BranchCondition[];
-  target_step_id?: string | null;
-  outcome?: string | null;
-}
-export interface StepInput {
-  field_key?: string | null;
-  title: string;
-  objective: string;
-  branches: StepBranch[];
-}
-export interface AgentStep extends StepInput {
-  id: string;
-  agent_id: string;
-  sort_order: number;
-}
-
 export type CallType = "test" | "public" | "chat_test";
 export type SessionStatus = "created" | "active" | "completed" | "failed" | "cancelled" | "expired";
 
@@ -129,7 +63,7 @@ export interface CallSession {
   agent_id: string;
   call_type: CallType;
   status: SessionStatus;
-  outcome: SessionOutcomeRecord[] | string | null;
+  outcome?: string | null;
   created_at: string;
   started_at: string | null;
   ended_at: string | null;
@@ -149,15 +83,6 @@ export interface CallMessage {
   sequence: number;
   role: "user" | "assistant";
   content: string;
-  created_at: string;
-}
-
-export interface CallAnswer {
-  id: string;
-  field_key: string;
-  value: JsonValue;
-  accepted: boolean;
-  validation_result: JsonValue;
   created_at: string;
 }
 

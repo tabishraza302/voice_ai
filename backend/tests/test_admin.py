@@ -17,7 +17,6 @@ from app.db import Base, Session, engine
 from app.main import app
 from app.models import User
 from app.sessions import CallSession
-from app.fields import AgentField
 
 
 @pytest.fixture
@@ -181,7 +180,6 @@ async def test_admin_directories_expose_metadata_counts_and_suspend_with_csrf(cl
     async with Session() as db:
         agent = await db.get(Agent, agent_id)
         assert agent is not None
-        db.add(AgentField(agent_id=agent_id, field_key="private_q", sort_order=0, description="PRIVATE QUESTION", guidance="PRIVATE OBJECTIVE"))
         await db.commit()
         expiry = datetime.now(timezone.utc) + timedelta(minutes=2)
         db.add_all(
@@ -217,7 +215,7 @@ async def test_admin_directories_expose_metadata_counts_and_suspend_with_csrf(cl
     assert owner["active_session_count"] == 1
     assert agent["owner_id"] == owner["id"]
     assert agent["owner_email"] == owner_email
-    assert agent["step_count"] == 1
+    assert agent["step_count"] == 0
     assert agent["session_count"] == 2
     assert agent["active_session_count"] == 1
     assert admin_email in {item["email"] for item in users_response.json()}
@@ -226,8 +224,6 @@ async def test_admin_directories_expose_metadata_counts_and_suspend_with_csrf(cl
     for private_value in (
         "password_hash",
         "PRIVATE AGENT PROMPT",
-        "PRIVATE QUESTION",
-        "PRIVATE OBJECTIVE",
         "PRIVATE SESSION DATA",
         "prompt_text",
         "answers",

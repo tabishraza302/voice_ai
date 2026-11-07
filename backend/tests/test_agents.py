@@ -12,7 +12,6 @@ os.environ.setdefault("APP_ORIGIN", "http://localhost:3000")
 from app.agents import Agent
 from app.db import Base, Session, engine
 from app.main import app
-from app.fields import AgentField
 
 
 @pytest.fixture
@@ -169,7 +168,7 @@ async def test_publish_fails_closed_without_server_provider_configuration(client
         f"/agents/{agent['id']}",
         headers=mutation_headers(token),
         json={
-            "instructions": "Help callers find the right team.",
+            "instructions": "Test instructions",
             "languages": ["en"],
             "default_language": "en",
             "stt_provider": "deepgram",
@@ -182,18 +181,6 @@ async def test_publish_fails_closed_without_server_provider_configuration(client
         },
     )
     assert updated.status_code == 200
-    field = await client.post(
-        f"/agents/{agent['id']}/fields",
-        headers=mutation_headers(token),
-        json={
-            "field_key": "welcome",
-            "description": "Welcome",
-            "guidance": "Greet the caller",
-            "sort_order": 0,
-            "required": True,
-        },
-    )
-    assert field.status_code == 201
 
     response = await client.post(
         f"/agents/{agent['id']}/publish",
@@ -238,20 +225,16 @@ async def test_suspension_cannot_be_cleared_by_owner_edit_or_publish(client):
     assert (await client.get(f"/agents/{agent['id']}")).json()["status"] == "suspended"
 
 @pytest.mark.anyio
-async def test_deleting_agent_cascades_to_its_question_steps(client):
+async def test_deleting_agent_removes_agent_record(client):
     token = await login(client, f"{uuid.uuid4()}@example.com")
-    agent = await create_agent(client, token, "agent-with-step")
+    agent = await create_agent(client, token, "agent-to-delete")
     agent_id = uuid.UUID(agent["id"])
-
-    async with Session() as db:
-        db.add(AgentField(agent_id=agent_id, field_key="field_1", sort_order=0))
-        await db.commit()
 
     response = await client.delete(f"/agents/{agent['id']}", headers=mutation_headers(token))
     assert response.status_code == 204
     async with Session() as db:
-        remaining_steps = list(await db.scalars(select(AgentField.id).where(AgentField.agent_id == agent_id)))
-    assert remaining_steps == []
+        remaining = await db.get(Agent, agent_id)
+    assert remaining is None
 
 @pytest.mark.anyio
 async def test_publish_and_unpublish_persist_agent_state(client, monkeypatch):
@@ -285,18 +268,6 @@ async def test_publish_and_unpublish_persist_agent_state(client, monkeypatch):
     )
     assert updated.status_code == 200
 
-    field = await client.post(
-        f"/agents/{agent['id']}/fields",
-        json={
-            "field_key": "welcome",
-            "description": "Welcome",
-            "guidance": "Greet the caller",
-            "sort_order": 0,
-            "required": True,
-        },
-        headers=headers,
-    )
-    assert field.status_code == 201
 
     published = await client.post(f"/agents/{agent['id']}/publish", headers=headers)
     assert published.status_code == 200

@@ -43,79 +43,6 @@ from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.utils.asyncio.task_manager import TaskManager
-from .goals import (
-    FieldCondition,
-    GoalEvaluation,
-    GoalField,
-    GoalOutcome,
-    GoalState,
-    apply_answers,
-    build_tool_schema,
-    evaluate_goals,
-    reset_for_next_request,
-)
-from .observability import tracing_enabled
-from .sessions import record_session_outcome
-
-
-def _conditions_from_snapshot(value: Any) -> tuple[FieldCondition, ...]:
-    conditions: list[FieldCondition] = []
-    for condition in value or ():
-        if not isinstance(condition, Mapping):
-            continue
-        field_key = condition.get("field_key")
-        if not field_key:
-            continue
-        conditions.append(
-            FieldCondition(
-                field_key=str(field_key),
-                operator=str(condition.get("operator", "eq")),
-                operand=condition.get("operand"),
-            )
-        )
-    return tuple(conditions)
-
-
-def _fields_from_snapshot(snapshot: Mapping[str, Any]) -> tuple[GoalField, ...]:
-    fields: list[GoalField] = []
-    for row in snapshot.get("fields") or ():
-        if not isinstance(row, Mapping) or not row.get("field_key"):
-            continue
-        field_key = str(row["field_key"])
-        fields.append(
-            GoalField(
-                field_key=field_key,
-                description=str(row.get("description") or field_key),
-                options=tuple(str(option) for option in row.get("options") or ()),
-                required=bool(row.get("required", False)),
-                required_when=_conditions_from_snapshot(row.get("required_when")),
-                sort_order=int(row.get("sort_order", 0)),
-            )
-        )
-    return tuple(fields)
-
-
-def _outcomes_from_snapshot(snapshot: Mapping[str, Any]) -> tuple[GoalOutcome, ...]:
-    outcomes: list[GoalOutcome] = []
-    for row in snapshot.get("outcomes") or ():
-        if not isinstance(row, Mapping) or not row.get("label"):
-            continue
-        outcomes.append(
-            GoalOutcome(
-                label=str(row["label"]),
-                conditions=_conditions_from_snapshot(row.get("conditions")),
-                required_fields=tuple(str(key) for key in row.get("required_fields") or ()),
-            )
-        )
-    return tuple(outcomes)
-
-
-def _field_guidance(snapshot: Mapping[str, Any]) -> dict[str, str]:
-    guidance: dict[str, str] = {}
-    for row in snapshot.get("fields") or ():
-        if isinstance(row, Mapping) and row.get("field_key"):
-            guidance[str(row["field_key"])] = str(row.get("guidance") or "")
-    return guidance
 
 SUPPORTED_LANGUAGES = frozenset({"en", "hi"})
 SUPPORTED_STT_PROVIDER = "deepgram"
@@ -274,10 +201,6 @@ class CallDefinition:
     max_call_duration_seconds: int
     max_concurrent_calls_per_agent: int
     max_concurrent_calls_overall: int
-    fields: tuple[GoalField, ...]
-    outcomes: tuple[GoalOutcome, ...]
-    field_guidance: Mapping[str, str]
-    steps: tuple[Mapping[str, Any], ...]
     providers: ProviderConfig
 
     @classmethod
@@ -294,23 +217,10 @@ class CallDefinition:
         policy = snapshot.get("policy")
         prompt = snapshot.get("global_prompt")
         language = snapshot.get("language")
-        raw_fields = snapshot.get("fields")
-        raw_outcomes = snapshot.get("outcomes")
-        rows = snapshot.get("steps")
         if not isinstance(agent, Mapping) or not isinstance(policy, Mapping) or not isinstance(prompt, Mapping):
             raise VoiceUnavailableError("The frozen call snapshot is incomplete.")
         if not isinstance(language, str) or language not in SUPPORTED_LANGUAGES:
             raise VoiceUnavailableError("The frozen call language is unavailable.")
-        if raw_fields is not None and (
-            not isinstance(raw_fields, list)
-            or any(not isinstance(row, Mapping) for row in raw_fields)
-        ):
-            raise VoiceUnavailableError("The frozen fields snapshot is malformed.")
-        if raw_outcomes is not None and (
-            not isinstance(raw_outcomes, list)
-            or any(not isinstance(row, Mapping) for row in raw_outcomes)
-        ):
-            raise VoiceUnavailableError("The frozen outcomes snapshot is malformed.")
         if not isinstance(prompt.get("text"), str) or not prompt.get("text", "").strip():
             raise VoiceUnavailableError("The frozen global prompt is unavailable.")
         prompt_version = prompt.get("version")
@@ -356,10 +266,6 @@ class CallDefinition:
             voice_id=voice_id,
             language=language,
         )
-        fields = _fields_from_snapshot(snapshot)
-        outcomes = _outcomes_from_snapshot(snapshot)
-        field_guidance = _field_guidance(snapshot)
-        steps_tuple = tuple(copy.deepcopy(dict(row)) for row in rows) if isinstance(rows, list) else ()
         return cls(
             session_id=session_id,
             agent_id=uuid.UUID(str(agent_data["id"])),
@@ -373,10 +279,6 @@ class CallDefinition:
             max_call_duration_seconds=limits[0],
             max_concurrent_calls_per_agent=limits[1],
             max_concurrent_calls_overall=limits[2],
-            fields=fields,
-            outcomes=outcomes,
-            field_guidance=field_guidance,
-            steps=steps_tuple,
             providers=providers,
         )
 
@@ -397,17 +299,9 @@ class CallRuntime:
         self,
         definition: CallDefinition,
         writer: Any,
-        initial_goal_state: GoalState | None = None,
     ) -> None:
         self.definition = definition
         self.writer = writer
-        self.goal_state = initial_goal_state or GoalState(
-            fields=definition.fields,
-            outcomes=definition.outcomes,
-            answers={},
-            completed_outcomes=(),
-            language=definition.language,
-        )
         self.recent_conversation: deque[dict[str, str]] = deque(maxlen=_RECENT_TURNS)
         self.transcript_segments: list[str] = []
         self.connection: SmallWebRTCConnection | None = None
@@ -502,7 +396,6 @@ class CallRuntime:
             api_key=providers.llm_api_key,
             model=providers.llm_model,
         )
-        llm.register_function("save_answers", self._handle_save_answers)
         if providers.tts_provider == "cartesia":
             tts = CartesiaTTSService(
                 api_key=providers.tts_api_key,
@@ -668,32 +561,12 @@ class CallRuntime:
         await self._push_dialogue_turn()
 
     def _build_system_message(self, directive: str | None = None) -> dict[str, str]:
-        evaluation = evaluate_goals(self.goal_state)
         lines: list[str] = []
         if self.definition.global_prompt.strip():
             lines.append(self.definition.global_prompt.strip())
         if self.definition.agent_instructions.strip():
             lines.append(self.definition.agent_instructions.strip())
         lines.append(f"Respond in language: {self.definition.language}.")
-        if evaluation.needed_fields:
-            lines.append("Information to collect in this turn:")
-            for field in evaluation.needed_fields:
-                detail = f"- {field.field_key}: {field.description}"
-                guidance = self.definition.field_guidance.get(field.field_key)
-                if guidance:
-                    detail = f"{detail} {guidance}"
-                if field.options:
-                    detail = f"{detail} Options: {', '.join(field.options)}."
-                lines.append(detail)
-        if evaluation.correction_fields:
-            lines.append(
-                "The caller may correct previously confirmed information; update it when they do."
-            )
-        if self.goal_state.answers:
-            lines.append(
-                "Confirmed answers: "
-                + json.dumps(dict(self.goal_state.answers), ensure_ascii=False)
-            )
         if directive:
             lines.append(directive)
         return {"role": "system", "content": "\n".join(lines)}
@@ -701,96 +574,16 @@ class CallRuntime:
     def _build_context_messages(self, directive: str | None = None) -> list[dict[str, Any]]:
         return [self._build_system_message(directive), *self.recent_conversation]
 
-    def _build_tools(self) -> list[Any] | NotGiven:
-        evaluation = evaluate_goals(self.goal_state)
-        tool_schema = build_tool_schema(evaluation)
-        if tool_schema is None:
-            return NOT_GIVEN
-        fn = tool_schema.get("function", {})
-        params = fn.get("parameters", {})
-        schema = FunctionSchema(
-            name=fn.get("name", "save_answers"),
-            description=fn.get("description", ""),
-            properties=params.get("properties", {}),
-            required=params.get("required", []),
-        )
-        return [schema]
-
     async def _push_dialogue_turn(self, directive: str | None = None) -> None:
         messages = self._build_context_messages(directive)
-        tools = self._build_tools()
         context = LLMContext(
             messages=messages,
-            tools=tools,
+            tools=NOT_GIVEN,
         )
         await self.workflow_processor.push_frame(
             LLMContextFrame(context),
             FrameDirection.DOWNSTREAM,
         )
-
-    async def _handle_save_answers(self, params: Any) -> None:
-        arguments = params.arguments or {}
-        if isinstance(arguments, str):
-            try:
-                arguments = json.loads(arguments) if arguments.strip() else {}
-            except Exception:
-                arguments = {}
-        valid_keys = {field.field_key for field in self.goal_state.fields}
-        saved = {
-            str(k): v
-            for k, v in arguments.items()
-            if k in valid_keys and v is not None
-        }
-        self.goal_state = apply_answers(self.goal_state, saved)
-        for key, value in saved.items():
-            self.writer.enqueue_answer(
-                key,
-                value,
-                True,
-                {"reason": "accepted", "validation_errors": []},
-            )
-        evaluation = evaluate_goals(self.goal_state)
-        reached = evaluation.reached_outcome
-        confirmed_answers = dict(self.goal_state.answers)
-        directive: str | None = None
-        if reached is not None:
-            directive = (
-                f"The outcome '{reached}' has been reached. Briefly confirm it to the caller, "
-                "then ask if there is anything else you can help with."
-            )
-            try:
-                await self.writer.drain()
-                await record_session_outcome(self.definition.session_id, reached)
-            except Exception:
-                pass
-            self.goal_state = reset_for_next_request(self.goal_state, reached)
-
-        payload: dict[str, Any] = {
-            "saved": saved,
-            "confirmed_answers": confirmed_answers,
-            "needed_fields": [
-                {
-                    "field_key": field.field_key,
-                    "description": field.description,
-                    "options": list(field.options),
-                }
-                for field in evaluation.needed_fields
-            ],
-            "outcome": reached,
-        }
-        if directive is not None:
-            payload["instruction"] = directive
-
-        context = getattr(params, "context", None)
-        if isinstance(context, LLMContext):
-            post_tools = self._build_tools()
-            context.set_tools(post_tools)
-            if directive is not None:
-                context.add_message({"role": "system", "content": directive})
-
-        result_callback = getattr(params, "result_callback", None)
-        if callable(result_callback):
-            await result_callback(json.dumps(payload, ensure_ascii=False))
 
     def begin_llm_response(self) -> int:
         self.response_generation += 1

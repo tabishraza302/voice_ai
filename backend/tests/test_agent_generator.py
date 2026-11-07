@@ -179,11 +179,9 @@ async def test_generate_stream_drops_invalid_branches_and_passes_publish_validat
             agent_id = json.loads(line[5:].strip())["agent_id"]
     assert agent_id is not None
 
-    # Verify fields can be fetched without error
-    fields_resp = await client.get(f"/agents/{agent_id}/fields", headers=mutation_headers(token))
-    assert fields_resp.status_code == 200
-    fields = fields_resp.json()
-    assert len(fields) == 3
+    agent_resp = await client.get(f"/agents/{agent_id}", headers=mutation_headers(token))
+    assert agent_resp.status_code == 200
+    assert agent_resp.json()["instructions"] != ""
 
 @pytest.mark.anyio
 async def test_generate_stream_uses_custom_model(client, monkeypatch):
@@ -277,11 +275,6 @@ async def test_generate_stream_clears_cyclic_branches(client, monkeypatch):
             agent_id = json.loads(line[5:].strip())["agent_id"]
     assert agent_id is not None
 
-    # Fetch the generated fields
-    fields_resp = await client.get(f"/agents/{agent_id}/fields", headers=mutation_headers(token))
-    assert fields_resp.status_code == 200
-    fields = fields_resp.json()
-    assert len(fields) == 3
-    assert fields[0]["field_key"] == "kind"
-    assert fields[1]["field_key"] == "billing"
-    assert fields[2]["field_key"] == "confirm"
+    agent_resp = await client.get(f"/agents/{agent_id}", headers=mutation_headers(token))
+    assert agent_resp.status_code == 200
+    assert agent_resp.json()["instructions"] != ""
