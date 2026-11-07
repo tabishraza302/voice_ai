@@ -183,6 +183,14 @@ class AgentRead(BaseModel):
     updated_at: datetime
 
 
+class EnhancePromptRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    prompt: str = Field(min_length=10, max_length=10000)
+
+
+class EnhancePromptResponse(BaseModel):
+    enhanced_prompt: str
+
 async def _get_owned_agent(
     db: AsyncSession, owner_id: uuid.UUID, agent_id: uuid.UUID, *, lock: bool
 ) -> Agent:
@@ -273,6 +281,16 @@ async def create_agent(
     await _commit_agent(db, agent)
     await db.refresh(agent)
     return agent
+
+
+@router.post("/enhance-prompt", response_model=EnhancePromptResponse)
+async def enhance_agent_prompt(
+    data: EnhancePromptRequest,
+    user: Annotated[User, Depends(csrf)],
+):
+    from .agent_generator import enhance_prompt
+    enhanced = await enhance_prompt(data.prompt)
+    return EnhancePromptResponse(enhanced_prompt=enhanced)
 
 
 @router.get("/{agent_id}", response_model=AgentRead)
