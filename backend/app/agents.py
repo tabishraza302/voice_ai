@@ -270,12 +270,12 @@ def _agent_publish_errors(agent: Agent) -> dict[str, list[str]]:
 
 
 async def _publish_errors(db: AsyncSession, agent: Agent) -> dict[str, list[str]]:
-    from .steps import Step, validate_publish
+    from .fields import AgentField
 
-    steps = list(await db.scalars(select(Step).where(Step.agent_id == agent.id).order_by(Step.sort_order)))
+    fields = list(await db.scalars(select(AgentField).where(AgentField.agent_id == agent.id).order_by(AgentField.sort_order)))
     errors = _agent_publish_errors(agent)
-    for field, messages in validate_publish(agent, steps).items():
-        errors.setdefault(field, []).extend(messages)
+    if not fields:
+        errors.setdefault("fields", []).append("at least one field is required before publishing")
     return errors
 
 

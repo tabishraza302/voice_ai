@@ -179,18 +179,11 @@ async def test_generate_stream_drops_invalid_branches_and_passes_publish_validat
             agent_id = json.loads(line[5:].strip())["agent_id"]
     assert agent_id is not None
 
-    # Verify steps can be fetched without 500 error
-    steps_resp = await client.get(f"/agents/{agent_id}/steps", headers=mutation_headers(token))
-    assert steps_resp.status_code == 200
-    steps = steps_resp.json()
-    assert len(steps) == 3
-    # None of the branches should have both target_step_id AND outcome, or neither
-    for step in steps:
-        for branch in step["branches"]:
-            has_target = branch["target_step_id"] is not None
-            has_outcome = branch["outcome"] is not None
-            assert has_target != has_outcome
-
+    # Verify fields can be fetched without error
+    fields_resp = await client.get(f"/agents/{agent_id}/fields", headers=mutation_headers(token))
+    assert fields_resp.status_code == 200
+    fields = fields_resp.json()
+    assert len(fields) == 3
 
 @pytest.mark.anyio
 async def test_generate_stream_uses_custom_model(client, monkeypatch):
@@ -284,14 +277,11 @@ async def test_generate_stream_clears_cyclic_branches(client, monkeypatch):
             agent_id = json.loads(line[5:].strip())["agent_id"]
     assert agent_id is not None
 
-    # Fetch the steps and assert that the backward cyclic branch on step 2 was cleared,
-    # while the forward branch on step 0 remains intact.
-    steps_resp = await client.get(f"/agents/{agent_id}/steps", headers=mutation_headers(token))
-    assert steps_resp.status_code == 200
-    steps = steps_resp.json()
-    assert len(steps) == 3
-    # Step 0 had forward branches to 1 and 2 (valid) — must be preserved
-    assert len(steps[0]["branches"]) == 2
-    assert steps[0]["branches"][0]["target_step_id"] == steps[1]["id"]
-    # Step 2 had a backward branch to 1 that completed a cycle — must be cleared
-    assert steps[2]["branches"] == []
+    # Fetch the generated fields
+    fields_resp = await client.get(f"/agents/{agent_id}/fields", headers=mutation_headers(token))
+    assert fields_resp.status_code == 200
+    fields = fields_resp.json()
+    assert len(fields) == 3
+    assert fields[0]["field_key"] == "kind"
+    assert fields[1]["field_key"] == "billing"
+    assert fields[2]["field_key"] == "confirm"

@@ -17,7 +17,7 @@ from app.db import Base, Session, engine
 from app.main import app
 from app.models import User
 from app.sessions import CallSession
-from app.steps import Step
+from app.fields import AgentField
 
 
 @pytest.fixture
@@ -181,7 +181,7 @@ async def test_admin_directories_expose_metadata_counts_and_suspend_with_csrf(cl
     async with Session() as db:
         agent = await db.get(Agent, agent_id)
         assert agent is not None
-        db.add(Step(agent_id=agent_id, sort_order=0, title="PRIVATE QUESTION", objective="PRIVATE OBJECTIVE"))
+        db.add(AgentField(agent_id=agent_id, field_key="private_q", sort_order=0, description="PRIVATE QUESTION", guidance="PRIVATE OBJECTIVE"))
         await db.commit()
         expiry = datetime.now(timezone.utc) + timedelta(minutes=2)
         db.add_all(

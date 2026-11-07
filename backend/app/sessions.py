@@ -295,39 +295,6 @@ def _outcome_snapshot(outcome: AgentOutcome) -> dict[str, Any]:
     }
 
 
-def _legacy_steps(
-    fields: Sequence[Mapping[str, Any]],
-    outcomes: Sequence[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    """Temporary view for the pre-goal chat/voice runtimes until Tasks 4-5 land."""
-    steps: list[dict[str, Any]] = []
-    for field in fields:
-        branches: list[dict[str, Any]] = []
-        for outcome in outcomes:
-            conditions = outcome.get("conditions") or []
-            required_fields = outcome.get("required_fields") or []
-            references_field = any(
-                condition.get("field_key") == field["field_key"] for condition in conditions
-            )
-            if field["field_key"] in required_fields or references_field:
-                branches.append(
-                    {
-                        "conditions": [dict(condition) for condition in conditions],
-                        "outcome": outcome["label"],
-                    }
-                )
-        steps.append(
-            {
-                "id": field["id"],
-                "field_key": field["field_key"],
-                "sort_order": field["sort_order"],
-                "title": field["description"] or field["field_key"],
-                "objective": field["guidance"],
-                "branches": branches,
-            }
-        )
-    return steps
-
 
 async def _frozen_call_snapshot(
     db: AsyncSession, agent: Agent, language: str
@@ -358,7 +325,6 @@ async def _frozen_call_snapshot(
         "agent": _agent_snapshot(agent),
         "fields": field_rows,
         "outcomes": outcome_rows,
-        "steps": _legacy_steps(field_rows, outcome_rows),
     }
 
 

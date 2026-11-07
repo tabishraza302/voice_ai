@@ -12,7 +12,7 @@ os.environ.setdefault("APP_ORIGIN", "http://localhost:3000")
 from app.agents import Agent
 from app.db import Base, Session, engine
 from app.main import app
-from app.steps import Step
+from app.fields import AgentField
 
 
 @pytest.fixture
@@ -182,17 +182,18 @@ async def test_publish_fails_closed_without_server_provider_configuration(client
         },
     )
     assert updated.status_code == 200
-    step = await client.post(
-        f"/agents/{agent['id']}/steps",
+    field = await client.post(
+        f"/agents/{agent['id']}/fields",
         headers=mutation_headers(token),
         json={
             "field_key": "welcome",
-            "title": "Welcome",
-            "objective": "Greet the caller",
+            "description": "Welcome",
+            "guidance": "Greet the caller",
             "sort_order": 0,
+            "required": True,
         },
     )
-    assert step.status_code == 201
+    assert field.status_code == 201
 
     response = await client.post(
         f"/agents/{agent['id']}/publish",
@@ -243,13 +244,13 @@ async def test_deleting_agent_cascades_to_its_question_steps(client):
     agent_id = uuid.UUID(agent["id"])
 
     async with Session() as db:
-        db.add(Step(agent_id=agent_id, sort_order=0))
+        db.add(AgentField(agent_id=agent_id, field_key="field_1", sort_order=0))
         await db.commit()
 
     response = await client.delete(f"/agents/{agent['id']}", headers=mutation_headers(token))
     assert response.status_code == 204
     async with Session() as db:
-        remaining_steps = list(await db.scalars(select(Step.id).where(Step.agent_id == agent_id)))
+        remaining_steps = list(await db.scalars(select(AgentField.id).where(AgentField.agent_id == agent_id)))
     assert remaining_steps == []
 
 @pytest.mark.anyio
@@ -284,17 +285,18 @@ async def test_publish_and_unpublish_persist_agent_state(client, monkeypatch):
     )
     assert updated.status_code == 200
 
-    step = await client.post(
-        f"/agents/{agent['id']}/steps",
+    field = await client.post(
+        f"/agents/{agent['id']}/fields",
         json={
             "field_key": "welcome",
-            "title": "Welcome",
-            "objective": "Greet the caller",
+            "description": "Welcome",
+            "guidance": "Greet the caller",
             "sort_order": 0,
+            "required": True,
         },
         headers=headers,
     )
-    assert step.status_code == 201
+    assert field.status_code == 201
 
     published = await client.post(f"/agents/{agent['id']}/publish", headers=headers)
     assert published.status_code == 200
