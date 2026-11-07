@@ -527,8 +527,6 @@ class SessionWriter:
 async def set_session_status(
     session_id: uuid.UUID,
     status: SessionStatus,
-    *,
-    outcome: Any = None,
 ) -> bool:
     if status not in _TRANSITIONS:
         raise ValueError("Unsupported session status")

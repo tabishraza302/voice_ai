@@ -127,7 +127,6 @@ async def stream_agent_generation(
 
     full_text = ""
     instruction_milestone_sent = False
-    call_flow_milestone_sent = False
 
     try:
         response = await client.chat.completions.create(
@@ -153,9 +152,6 @@ async def stream_agent_generation(
                     instruction_milestone_sent = True
                     yield _format_sse("milestone", {"phase": "instructions"})
 
-                if not call_flow_milestone_sent and '"steps"' in full_text:
-                    call_flow_milestone_sent = True
-                    yield _format_sse("milestone", {"phase": "call_flow"})
 
     except Exception as exc:
         yield _format_sse("error", {"message": f"OpenAI streaming failed: {str(exc)}"})
