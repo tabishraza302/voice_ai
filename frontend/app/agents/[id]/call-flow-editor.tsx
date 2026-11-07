@@ -193,6 +193,7 @@ export function CallFlowEditor({
   onStepsChange,
   onSaveStateChange,
   flushToken,
+  onFlowStepsChange,
 }: {
   agentId: string;
   agentName?: string;
@@ -200,6 +201,7 @@ export function CallFlowEditor({
   onStepsChange: (steps: AgentStep[]) => void;
   onSaveStateChange?: (state: CallFlowSaveState) => void;
   flushToken?: number;
+  onFlowStepsChange?: (flowSteps: CallFlowStep[]) => void;
 }) {
   const [flowSteps, setFlowSteps] = useState<CallFlowStep[]>(() => agentStepsToCallFlow(steps).flowSteps);
   const [armedDeleteId, setArmedDeleteId] = useState<string | null>(null);
@@ -248,7 +250,8 @@ export function CallFlowEditor({
   const pendingFlashAnswerRef = useRef<string | null>(null);
   const onSaveStateChangeRef = useRef(onSaveStateChange);
   const flushTokenRef = useRef(flushToken);
-
+  const onFlowStepsChangeRef = useRef(onFlowStepsChange);
+  onFlowStepsChangeRef.current = onFlowStepsChange;
 
   // External reloads replace the server snapshot; the working model is only
   // re-derived from the prop when no local edit or save is in flight. A clean
@@ -278,6 +281,7 @@ export function CallFlowEditor({
     const previous = prevFlowStepsRef.current;
     prevFlowStepsRef.current = flowSteps;
     flowStepsRef.current = flowSteps;
+    onFlowStepsChangeRef.current?.(flowSteps);
     if (previous === flowSteps) return; // initial model (and StrictMode replay)
     if (suppressDirtyRef.current) {
       suppressDirtyRef.current = false;

@@ -12,8 +12,10 @@ import { cn } from "@/components/ui/utils";
 import { OwnerShell } from "@/app/dashboard/owner-shell";
 import { AgentDraft, AgentInstructions, AgentPipelineToolbar, agentDraftFromAgent } from "./agent-sections";
 import { AgentTesting } from "./agent-testing";
+import { agentStepsToCallFlow, type CallFlowStep } from "./call-flow-adapter";
 import { CallFlowEditor } from "./call-flow-editor";
 import type { CallFlowSaveState } from "./call-flow-save";
+import { CompiledPromptView } from "./compiled-prompt-view";
 import { useDraftAutosave } from "./use-draft-autosave";
 type EditorTab = "workflow" | "instructions" | "testing" | "history";
 
@@ -46,8 +48,9 @@ export default function AgentEditorPage() {
   const [reload, setReload] = useState(0);
   const [draftSaveState, setDraftSaveState] = useState<CallFlowSaveState>({ status: "idle" });
   const [flowSaveState, setFlowSaveState] = useState<CallFlowSaveState>({ status: "idle" });
+  const [workflowView, setWorkflowView] = useState<"flow" | "prompt">("flow");
+  const [liveFlowSteps, setLiveFlowSteps] = useState<CallFlowStep[]>([]);
   const [flushToken, setFlushToken] = useState(0);
-
   const { flush: flushDraft } = useDraftAutosave({
     agentId,
     agent,
@@ -236,14 +239,59 @@ export default function AgentEditorPage() {
                       onPatch={patchDraft}
                       onRetryCatalog={() => void loadCatalog()}
                     />
-                    <CallFlowEditor
-                      agentId={agentId}
-                      agentName={draft.name || agent.name}
-                      steps={steps}
-                      onStepsChange={setSteps}
-                      onSaveStateChange={setFlowSaveState}
-                      flushToken={flushToken}
-                    />
+                    <div
+                      role="group"
+                      aria-label="Workflow view"
+                      className="inline-flex items-center gap-1 rounded-xl border bg-muted/40 p-1"
+                    >
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        aria-pressed={workflowView === "flow"}
+                        onClick={() => setWorkflowView("flow")}
+                        className={cn(
+                          "min-h-8 rounded-lg px-3 text-xs font-medium",
+                          workflowView === "flow"
+                            ? "bg-background text-foreground shadow-sm"
+                            : "text-muted-foreground hover:bg-transparent hover:text-foreground",
+                        )}
+                      >
+                        Visual Flow
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        aria-pressed={workflowView === "prompt"}
+                        onClick={() => setWorkflowView("prompt")}
+                        className={cn(
+                          "min-h-8 rounded-lg px-3 text-xs font-medium",
+                          workflowView === "prompt"
+                            ? "bg-background text-foreground shadow-sm"
+                            : "text-muted-foreground hover:bg-transparent hover:text-foreground",
+                        )}
+                      >
+                        Compiled Prompt
+                      </Button>
+                    </div>
+                    <div className={cn(workflowView !== "flow" && "hidden")}>
+                      <CallFlowEditor
+                        agentId={agentId}
+                        agentName={draft.name || agent.name}
+                        steps={steps}
+                        onStepsChange={setSteps}
+                        onFlowStepsChange={setLiveFlowSteps}
+                        onSaveStateChange={setFlowSaveState}
+                        flushToken={flushToken}
+                      />
+                    </div>
+                    {workflowView === "prompt" ? (
+                      <CompiledPromptView
+                        draft={draft}
+                        flowSteps={
+                          liveFlowSteps.length > 0 ? liveFlowSteps : agentStepsToCallFlow(steps).flowSteps
+                        }
+                      />
+                    ) : null}
                   </div>
                 ) : null}
                 {activeTab === "instructions" ? <AgentInstructions draft={draft} onPatch={patchDraft} /> : null}
