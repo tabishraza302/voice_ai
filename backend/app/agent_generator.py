@@ -220,6 +220,7 @@ async def stream_agent_generation(
     step_ids = [uuid.uuid4() for _ in raw_steps]
     seen_keys: set[str] = set()
 
+    created_steps: list[Step] = []
     for index, s_data in enumerate(raw_steps):
         if not isinstance(s_data, dict):
             s_data = {"field_key": f"step_{index+1}", "title": f"Step {index+1}", "objective": f"Step {index+1}"}
@@ -273,6 +274,12 @@ async def stream_agent_generation(
                     })
 
                 outcome = str(b.get("outcome")).strip() if b.get("outcome") is not None else None
+                if target_id is not None:
+                    outcome = None
+                elif not outcome:
+                    # Neither a valid target nor an outcome: drop branch
+                    continue
+
                 sanitized_branches.append({
                     "conditions": sanitized_conditions,
                     "target_step_id": target_id,
@@ -289,6 +296,12 @@ async def stream_agent_generation(
             branches=sanitized_branches,
         )
         db.add(step)
+        created_steps.append(step)
+
+    from .steps import validate_publish
+    if validate_publish(agent, created_steps):
+        for step in created_steps:
+            step.branches = []
 
     try:
         await db.commit()
