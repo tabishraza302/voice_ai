@@ -85,3 +85,54 @@ async def test_enhance_prompt_success(client, monkeypatch):
     body = response.json()
     assert "enhanced_prompt" in body
     assert "Role & Persona" in body["enhanced_prompt"]
+
+
+@pytest.mark.anyio
+async def test_generate_stream_requires_auth_and_csrf(client):
+    unauth = await client.post("/agents/generate-stream", json={"prompt": "Dental receptionist"})
+    assert unauth.status_code == 401
+
+    token = await login(client, f"{uuid.uuid4()}@example.com")
+    no_csrf = await client.post("/agents/generate-stream", json={"prompt": "Dental receptionist"})
+    assert no_csrf.status_code == 403
+
+
+@pytest.mark.anyio
+async def test_generate_stream_creates_agent_and_steps(client, monkeypatch):
+    token = await login(client, f"{uuid.uuid4()}@example.com")
+
+    generated_json = (
+        '{"name": "Dental Assistant", '
+        '"description": "Handles patient bookings and questions", '
+        '"instructions": "Be polite, collect patient name and appointment time.", '
+        '"steps": ['
+        '{"field_key": "patient_name", "title": "Greet & Name", "objective": "Collect name", "branches": [{"target_step_index": 1}]}, '
+        '{"field_key": "appointment_date", "title": "Schedule Date", "objective": "Collect desired date", "branches": [{"target_step_index": 99}]}, '
+        '{"field_key": "confirm", "title": "Confirmation", "objective": "Confirm booking", "branches": []}'
+        ']}'
+    )
+
+    async def mock_stream(*args, **kwargs):
+        for chunk_text in [generated_json[:40], generated_json[40:100], generated_json[100:]]:
+            class MockDelta:
+                content = chunk_text
+            class MockStreamChoice:
+                delta = MockDelta()
+            class MockStreamChunk:
+                choices = [MockStreamChoice()]
+            yield MockStreamChunk()
+
+    monkeypatch.setattr("openai.resources.chat.completions.AsyncCompletions.create", AsyncMock(side_effect=mock_stream))
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    response = await client.post(
+        "/agents/generate-stream",
+        json={"prompt": "A dental clinic appointment booking assistant"},
+        headers=mutation_headers(token),
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    content = response.text
+    assert "event: milestone" in content
+    assert "event: complete" in content
+    assert "Dental Assistant" in content
