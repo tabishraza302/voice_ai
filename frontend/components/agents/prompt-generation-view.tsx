@@ -101,6 +101,7 @@ export function PromptGenerationView({ onCancel }: { onCancel: () => void }) {
 
     const controller = new AbortController();
     abortControllerRef.current = controller;
+    let completed = false;
 
     try {
       await streamSse(
@@ -118,6 +119,7 @@ export function PromptGenerationView({ onCancel }: { onCancel: () => void }) {
               setStreamedText((current) => current + payload.text);
             }
           } else if (event === "complete") {
+            completed = true;
             const payload = data as { agent_id?: string };
             setActivePhase("complete");
             if (payload?.agent_id) {
@@ -126,12 +128,16 @@ export function PromptGenerationView({ onCancel }: { onCancel: () => void }) {
               }, 400);
             }
           } else if (event === "error") {
+            completed = true;
             const payload = data as { message?: string };
             setGenerationError(payload?.message || "Generation failed.");
           }
         },
         controller.signal,
       );
+      if (!completed && !controller.signal.aborted) {
+        setGenerationError("Generation ended unexpectedly. Please try again.");
+      }
     } catch (err: unknown) {
       if (!controller.signal.aborted) {
         setGenerationError(apiErrorText(err, "Agent generation interrupted."));

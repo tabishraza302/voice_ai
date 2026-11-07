@@ -231,3 +231,67 @@ async def test_generate_stream_uses_custom_model(client, monkeypatch):
     agent_resp = await client.get(f"/agents/{agent_id}", headers=mutation_headers(token))
     assert agent_resp.status_code == 200
     assert agent_resp.json()["llm_model"] == "gpt-4.1-mini"
+
+
+@pytest.mark.anyio
+async def test_generate_stream_clears_cyclic_branches(client, monkeypatch):
+    """Backward conditional routes can form cycles; the sanitizer must clear
+    the offending branches even though validate_publish returns UUID-keyed
+    error paths (steps.<uuid>.branches), not index-keyed ones."""
+    import json
+
+    token = await login(client, f"{uuid.uuid4()}@example.com")
+
+    # Step 0 branches forward to 1 and 2 (valid).
+    # Step 2 branches backward to 1 (creates cycle with implicit next-step edges).
+    generated_json = json.dumps({
+        "name": "Support Router",
+        "description": "Routes callers",
+        "instructions": "Route to billing or tech support.",
+        "steps": [
+            {"field_key": "kind", "title": "Identify Type", "objective": "Ask type", "branches": [
+                {"target_step_index": 1, "conditions": [{"field_key": "kind", "operator": "eq", "operand": "billing"}]},
+                {"target_step_index": 2, "conditions": [{"field_key": "kind", "operator": "eq", "operand": "tech"}]},
+            ]},
+            {"field_key": "billing", "title": "Handle Billing", "objective": "Handle invoice", "branches": []},
+            {"field_key": "confirm", "title": "Confirm Resolution", "objective": "Confirm", "branches": [
+                {"target_step_index": 1, "conditions": [{"field_key": "confirm", "operator": "eq", "operand": "no"}]},
+            ]},
+        ],
+    })
+
+    async def mock_stream(*args, **kwargs):
+        class MockDelta:
+            content = generated_json
+        class MockStreamChoice:
+            delta = MockDelta()
+        class MockStreamChunk:
+            choices = [MockStreamChoice()]
+        yield MockStreamChunk()
+
+    monkeypatch.setattr("openai.resources.chat.completions.AsyncCompletions.create", AsyncMock(side_effect=mock_stream))
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    response = await client.post(
+        "/agents/generate-stream",
+        json={"prompt": "Route callers to the right support department"},
+        headers=mutation_headers(token),
+    )
+    assert response.status_code == 200
+    agent_id = None
+    for line in response.text.split("\n"):
+        if line.startswith("data:") and "agent_id" in line:
+            agent_id = json.loads(line[5:].strip())["agent_id"]
+    assert agent_id is not None
+
+    # Fetch the steps and assert that the backward cyclic branch on step 2 was cleared,
+    # while the forward branch on step 0 remains intact.
+    steps_resp = await client.get(f"/agents/{agent_id}/steps", headers=mutation_headers(token))
+    assert steps_resp.status_code == 200
+    steps = steps_resp.json()
+    assert len(steps) == 3
+    # Step 0 had forward branches to 1 and 2 (valid) — must be preserved
+    assert len(steps[0]["branches"]) == 2
+    assert steps[0]["branches"][0]["target_step_id"] == steps[1]["id"]
+    # Step 2 had a backward branch to 1 that completed a cycle — must be cleared
+    assert steps[2]["branches"] == []
