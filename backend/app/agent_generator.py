@@ -245,10 +245,36 @@ async def stream_agent_generation(
                 if isinstance(target_idx, int) and 0 <= target_idx < len(raw_steps) and target_idx != index:
                     target_id = str(step_ids[target_idx])
 
-                conditions = b.get("conditions") if isinstance(b.get("conditions"), list) else []
+                sanitized_conditions = []
+                conditions_input = b.get("conditions") if isinstance(b.get("conditions"), list) else []
+                op_map = {
+                    "=": "eq", "==": "eq", "eq": "eq",
+                    "!=": "ne", "<>": "ne", "ne": "ne",
+                    ">": "gt", "gt": "gt",
+                    ">=": "gte", "gte": "gte",
+                    "<": "lt", "lt": "lt",
+                    "<=": "lte", "lte": "lte",
+                    "in": "in",
+                }
+                for c in conditions_input:
+                    if not isinstance(c, dict):
+                        continue
+                    f_key = c.get("field_key") or c.get("field")
+                    field_name = str(f_key).strip() if f_key else raw_key
+                    raw_op = str(c.get("operator") or "eq").strip().lower()
+                    operator = op_map.get(raw_op, "eq")
+                    operand = c.get("operand") if "operand" in c else c.get("value", True)
+                    if operand is None:
+                        operand = True
+                    sanitized_conditions.append({
+                        "field_key": field_name,
+                        "operator": operator,
+                        "operand": operand,
+                    })
+
                 outcome = str(b.get("outcome")).strip() if b.get("outcome") is not None else None
                 sanitized_branches.append({
-                    "conditions": conditions,
+                    "conditions": sanitized_conditions,
                     "target_step_id": target_id,
                     "outcome": outcome,
                 })
