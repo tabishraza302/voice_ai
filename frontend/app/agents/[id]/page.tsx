@@ -12,14 +12,16 @@ import { cn } from "@/components/ui/utils";
 import { OwnerShell } from "@/app/dashboard/owner-shell";
 import { AgentDraft, AgentInstructions, AgentPipelineToolbar, agentDraftFromAgent } from "./agent-sections";
 import { AgentTesting } from "./agent-testing";
-import { agentStepsToCallFlow, type CallFlowStep } from "./call-flow-adapter";
-import { CallFlowEditor } from "./call-flow-editor";
-import type { CallFlowSaveState } from "./call-flow-save";
-import { CompiledPromptView } from "./compiled-prompt-view";
+import { GoalEditor } from "./goal-editor";
 import { useDraftAutosave } from "./use-draft-autosave";
 import { ChatPanel } from "@/components/chat-panel";
-type EditorTab = "workflow" | "instructions" | "testing" | "history";
 
+export interface SaveState {
+  status: "idle" | "saving" | "saved" | "error";
+  message?: string;
+}
+
+type EditorTab = "workflow" | "instructions" | "testing" | "history";
 const editorTabs: Array<{ value: EditorTab; label: string }> = [
   { value: "workflow", label: "Workflow" },
   { value: "instructions", label: "Instructions" },
@@ -48,10 +50,9 @@ export default function AgentEditorPage() {
   const [pageError, setPageError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<EditorTab>("workflow");
   const [reload, setReload] = useState(0);
-  const [draftSaveState, setDraftSaveState] = useState<CallFlowSaveState>({ status: "idle" });
-  const [flowSaveState, setFlowSaveState] = useState<CallFlowSaveState>({ status: "idle" });
+  const [draftSaveState, setDraftSaveState] = useState<SaveState>({ status: "idle" });
+  const [flowSaveState, setFlowSaveState] = useState<SaveState>({ status: "idle" });
   const [workflowView, setWorkflowView] = useState<"flow" | "prompt">("flow");
-  const [liveFlowSteps, setLiveFlowSteps] = useState<CallFlowStep[]>([]);
   const [flushToken, setFlushToken] = useState(0);
   const { flush: flushDraft } = useDraftAutosave({
     agentId,
@@ -290,23 +291,15 @@ export default function AgentEditorPage() {
                       </Button>
                     </div>
                     <div className={cn(workflowView !== "flow" && "hidden")}>
-                      <CallFlowEditor
+                      <GoalEditor
                         agentId={agentId}
                         agentName={draft.name || agent.name}
-                        steps={steps}
-                        onStepsChange={setSteps}
-                        onFlowStepsChange={setLiveFlowSteps}
-                        onSaveStateChange={setFlowSaveState}
-                        flushToken={flushToken}
                       />
                     </div>
                     {workflowView === "prompt" ? (
-                      <CompiledPromptView
-                        draft={draft}
-                        flowSteps={
-                          liveFlowSteps.length > 0 ? liveFlowSteps : agentStepsToCallFlow(steps).flowSteps
-                        }
-                      />
+                      <div className="rounded-xl border border-dashed py-8 text-center text-sm text-muted-foreground">
+                        Goal-based prompts are dynamically generated per turn from the agent&apos;s fields and outcomes.
+                      </div>
                     ) : null}
                   </div>
                 ) : null}

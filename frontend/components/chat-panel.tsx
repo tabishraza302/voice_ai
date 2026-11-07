@@ -17,7 +17,7 @@ export interface ChatPanelProps {
 
 export type ChatMessage = {
   id: number;
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "system" | "warning";
   content: string;
   streaming?: boolean;
 };
@@ -159,6 +159,26 @@ export function ChatPanel({
               messages: msgs,
               reason: data.reason || "completed",
             };
+          });
+        } else if (data.type === "outcome_reached") {
+          setState((prev) => {
+            if (prev.kind !== "active") return prev;
+            const msg: ChatMessage = {
+              id: nextIdRef.current++,
+              role: "system",
+              content: `Checkpoint reached: ${data.outcome}`,
+            };
+            return { ...prev, messages: [...prev.messages, msg] };
+          });
+        } else if (data.type === "warning") {
+          setState((prev) => {
+            if (prev.kind !== "active") return prev;
+            const msg: ChatMessage = {
+              id: nextIdRef.current++,
+              role: "warning",
+              content: data.message || "Warning",
+            };
+            return { ...prev, messages: [...prev.messages, msg] };
           });
         } else if (data.type === "error") {
           setState((prev) => {
@@ -342,22 +362,44 @@ export function ChatPanel({
                 <span>Waiting for agent to speak…</span>
               </div>
             )}
-            {state.messages.map((msg) => (
-              <div
-                key={msg.id}
-                className={cn(
-                  "flex flex-col max-w-[85%] rounded-2xl px-3.5 py-2 text-sm leading-relaxed",
-                  msg.role === "user"
-                    ? "ml-auto bg-primary text-primary-foreground rounded-tr-sm"
-                    : "mr-auto bg-muted text-foreground rounded-tl-sm"
-                )}
-              >
-                <span className="whitespace-pre-wrap break-words">{msg.content}</span>
-                {msg.streaming && (
-                  <span className="inline-block w-1.5 h-3.5 ml-0.5 bg-foreground/60 animate-pulse align-middle" />
-                )}
-              </div>
-            ))}
+            {state.messages.map((msg) => {
+              if (msg.role === "system") {
+                return (
+                  <div
+                    key={msg.id}
+                    className="mx-auto max-w-[90%] rounded-xl border border-primary/30 bg-primary/10 px-3.5 py-1.5 text-center text-xs font-medium text-primary"
+                  >
+                    {msg.content}
+                  </div>
+                );
+              }
+              if (msg.role === "warning") {
+                return (
+                  <div
+                    key={msg.id}
+                    className="mx-auto max-w-[90%] rounded-xl border border-warning/30 bg-warning/10 px-3.5 py-1.5 text-center text-xs text-muted-foreground"
+                  >
+                    {msg.content}
+                  </div>
+                );
+              }
+              return (
+                <div
+                  key={msg.id}
+                  className={cn(
+                    "flex flex-col max-w-[85%] rounded-2xl px-3.5 py-2 text-sm leading-relaxed",
+                    msg.role === "user"
+                      ? "ml-auto bg-primary text-primary-foreground rounded-tr-sm"
+                      : "mr-auto bg-muted text-foreground rounded-tl-sm"
+                  )}
+                >
+                  <span className="whitespace-pre-wrap break-words">{msg.content}</span>
+                  {msg.streaming && (
+                    <span className="inline-block w-1.5 h-3.5 ml-0.5 bg-foreground/60 animate-pulse align-middle" />
+                  )}
+                </div>
+              );
+            })}
             {state.kind === "ended" && (
               <div className="mt-4 rounded-xl border border-border/80 bg-muted/40 p-3.5 text-center space-y-2.5">
                 <p className="text-xs text-muted-foreground">

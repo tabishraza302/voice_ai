@@ -212,7 +212,16 @@ export function AgentTesting({
                   <>
                     <dl className="grid grid-cols-1 gap-3 text-sm sm:grid-cols-2">
                       <div><dt className="text-xs text-muted-foreground">Created</dt><dd className="mt-1">{formatDate(session.created_at)}</dd></div>
-                      <div><dt className="text-xs text-muted-foreground">Outcome</dt><dd className="mt-1">{session.outcome ?? "Not set"}</dd></div>
+                      <div>
+                        <dt className="text-xs text-muted-foreground">Outcomes</dt>
+                        <dd className="mt-1">
+                          {Array.isArray(session.outcome)
+                            ? session.outcome.length > 0
+                              ? session.outcome.map((o) => o.label).join(", ")
+                              : "None reached"
+                            : session.outcome ?? "Not set"}
+                        </dd>
+                      </div>
                       <div><dt className="text-xs text-muted-foreground">Started</dt><dd className="mt-1">{session.started_at ? formatDate(session.started_at) : "Not started"}</dd></div>
                       <div><dt className="text-xs text-muted-foreground">Ended</dt><dd className="mt-1">{session.ended_at ? formatDate(session.ended_at) : "Not ended"}</dd></div>
                     </dl>
