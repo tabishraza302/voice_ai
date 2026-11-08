@@ -30,6 +30,13 @@ export type ChatState =
   | { kind: "ended"; sessionId: string; messages: ChatMessage[]; reason: string }
   | { kind: "error"; message: string };
 
+function lastStreamingAssistantIndex(messages: ChatMessage[]): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "assistant" && messages[i].streaming) return i;
+  }
+  return -1;
+}
+
 export function ChatPanel({
   agentId,
   agentName,
@@ -111,11 +118,12 @@ export function ChatPanel({
           setState((prev) => {
             if (prev.kind !== "active") return prev;
             const msgs = [...prev.messages];
-            const last = msgs[msgs.length - 1];
-            if (last && last.role === "assistant" && last.streaming) {
-              msgs[msgs.length - 1] = {
-                ...last,
-                content: last.content + (data.content || ""),
+            const streamingIndex = lastStreamingAssistantIndex(msgs);
+            if (streamingIndex >= 0) {
+              const current = msgs[streamingIndex];
+              msgs[streamingIndex] = {
+                ...current,
+                content: current.content + (data.content || ""),
               };
             } else {
               msgs.push({
@@ -131,11 +139,12 @@ export function ChatPanel({
           setState((prev) => {
             if (prev.kind !== "active") return prev;
             const msgs = [...prev.messages];
-            const last = msgs[msgs.length - 1];
-            if (last && last.role === "assistant" && last.streaming) {
-              msgs[msgs.length - 1] = {
-                ...last,
-                content: data.content ?? last.content,
+            const streamingIndex = lastStreamingAssistantIndex(msgs);
+            if (streamingIndex >= 0) {
+              const current = msgs[streamingIndex];
+              msgs[streamingIndex] = {
+                ...current,
+                content: data.content ?? current.content,
                 streaming: false,
               };
             } else {
@@ -173,12 +182,13 @@ export function ChatPanel({
         } else if (data.type === "warning") {
           setState((prev) => {
             if (prev.kind !== "active") return prev;
-            const msg: ChatMessage = {
+            const msgs = prev.messages.map((m) => (m.streaming ? { ...m, streaming: false } : m));
+            msgs.push({
               id: nextIdRef.current++,
               role: "warning",
               content: data.message || "Warning",
-            };
-            return { ...prev, messages: [...prev.messages, msg] };
+            });
+            return { ...prev, messages: msgs };
           });
         } else if (data.type === "error") {
           setState((prev) => {
@@ -238,20 +248,19 @@ export function ChatPanel({
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [state.kind === "active" || state.kind === "ended" ? state.messages : null]);
 
-  // Auto-focus input when active
+  const isAssistantStreaming =
+    state.kind === "active" && state.messages.some((m) => m.streaming);
+
+  // Auto-focus input when active or when streaming ends
   useEffect(() => {
     if (open && state.kind === "active") {
       inputRef.current?.focus();
     }
-  }, [open, state.kind]);
-
-  const isAssistantStreaming =
-    state.kind === "active" && state.messages.some((m) => m.streaming);
-
+  }, [open, state.kind, isAssistantStreaming]);
   const handleSendMessage = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     const text = input.trim();
-    if (!text || state.kind !== "active" || isAssistantStreaming) return;
+    if (!text || state.kind !== "active") return;
 
     const userMsg: ChatMessage = {
       id: nextIdRef.current++,
@@ -266,6 +275,11 @@ export function ChatPanel({
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: "message", content: text }));
     }
+
+    // Maintain focus on input after sending
+    requestAnimationFrame(() => {
+      inputRef.current?.focus();
+    });
   };
 
   const handleEndChat = () => {
@@ -333,7 +347,14 @@ export function ChatPanel({
       </div>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-3.5 text-sm">
+      <div
+        className="flex-1 overflow-y-auto p-4 space-y-3.5 text-sm"
+        onClick={() => {
+          if (state.kind === "active" && !window.getSelection()?.toString()) {
+            inputRef.current?.focus();
+          }
+        }}
+      >
         {state.kind === "creating" && (
           <div className="flex flex-col items-center justify-center h-full text-muted-foreground gap-2 pt-16">
             <span className="h-5 w-5 animate-spin rounded-full border-2 border-primary border-t-transparent" />
@@ -433,18 +454,19 @@ export function ChatPanel({
           placeholder={
             state.kind === "active"
               ? isAssistantStreaming
-                ? "Agent is speaking…"
+                ? "Agent is speaking… type your message"
                 : "Type a message…"
               : "Chat not active"
           }
-          disabled={state.kind !== "active" || isAssistantStreaming}
+          disabled={state.kind !== "active"}
+          autoFocus
           className="flex-1 rounded-xl border border-input bg-background px-3 py-2 text-sm transition-colors placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring disabled:opacity-60 disabled:cursor-not-allowed"
         />
         <Button
           type="submit"
           size="sm"
           variant="primary"
-          disabled={!input.trim() || state.kind !== "active" || isAssistantStreaming}
+          disabled={!input.trim() || state.kind !== "active"}
           className="h-9 w-9 p-0 rounded-xl shrink-0"
           aria-label="Send message"
         >

@@ -317,7 +317,7 @@ export function PromptGenerationView({ onCancel }: { onCancel: () => void }) {
               className="w-full rounded-xl border border-input bg-background p-4 text-sm leading-relaxed text-foreground shadow-xs placeholder:text-muted-foreground/60 focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary resize-y"
             />
             <p className="text-xs text-muted-foreground">
-              {selectedModel} will generate the agent&apos;s name, voice instructions, and call flow steps from your prompt.
+              {selectedModel} will generate the agent&apos;s persona, conversation flow, data collection steps, and call-ending rules from your prompt.
             </p>
           </div>
 

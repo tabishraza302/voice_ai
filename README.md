@@ -42,6 +42,20 @@ docker compose exec frontend npm run build
 
 `backend/tests/conftest.py` forces `DATABASE_URL` to `TEST_DATABASE_URL`, and the test suite drops and recreates tables there. It must never point at the application database. Compose supplies `TEST_DATABASE_URL` automatically; without Compose, point it at a local disposable database (for example one running on port 55432).
 
+### Structured agent prompts
+
+AI-generated agent instructions use five sections, in order: `Role & Spoken Persona`,
+`Primary Objective`, `Turn-by-Turn Conversation Flow`, `Call Termination & Wrap-Up Criteria`,
+and `Spoken Voice Rules & Fallbacks`. Each numbered conversation step includes what to
+say or ask and what to collect. Generated instructions with missing or reordered
+headings, or a step without spoken-action or collection guidance, use structured
+fallback instructions instead. Agent names and fallback purposes are kept on one line.
+
+The single-prompt editor supports Write, Split, and Preview modes without changing
+the Markdown source or draft autosave behavior. Test chat stays editable while an
+assistant reply streams; sending another message does not move incoming tokens out
+of the assistant's bubble. Warnings preserve partial replies and clear streaming state.
+
 ## Environment
 
 `.env.example` is the tracked reference; `.env` is ignored and must never be committed. The backend reads:
