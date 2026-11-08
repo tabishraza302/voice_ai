@@ -56,6 +56,22 @@ _RECENT_TURNS = 12
 _MAX_TRANSCRIPT_CHARS = 8_000
 _MAX_LLM_RESPONSE_CHARS = 12_000
 _PIPELINE_START_TIMEOUT_SECONDS = 30
+_END_CALL_SCHEMA = FunctionSchema(
+    name="end_call",
+    description="End the call immediately. You MUST call this whenever the conversation reaches its conclusion, the user confirms they no longer need help, or the caller says goodbye. Deliver your final closing sign-off in the message parameter or in your response so the call terminates directly after the closing message.",
+    properties={
+        "message": {
+            "type": "string",
+            "description": "The final polite goodbye or closing sign-off message spoken to the caller before ending the call.",
+        },
+        "reason": {
+            "type": "string",
+            "description": "Reason for ending the call, e.g. booking confirmed, questions answered, caller said goodbye.",
+        },
+    },
+    required=[],
+)
+
 
 
 class VoiceUnavailableError(RuntimeError):
@@ -322,6 +338,7 @@ class CallRuntime:
         self.response_complete: set[int] = set()
         self.response_interrupted: set[int] = set()
         self.playbacks: dict[str | None, _Playback] = {}
+        self.end_call_pending = False
         self.workflow_processor = _WorkflowProcessor(self)
         self.response_capture = _ResponseCaptureProcessor(self)
         self.tts_context_tracker = _TTSContextTracker(self)
@@ -395,6 +412,7 @@ class CallRuntime:
             api_key=providers.llm_api_key,
             model=providers.llm_model,
         )
+        llm.register_function("end_call", self._handle_end_call)
         if providers.tts_provider == "cartesia":
             tts = CartesiaTTSService(
                 api_key=providers.tts_api_key,
@@ -540,12 +558,35 @@ class CallRuntime:
         is_complete = generation in self.response_complete
         self.response_complete.discard(generation)
         self.response_interrupted.discard(generation)
-        if playback.interrupted or not is_complete or not text:
-            return
-        self._persist_message(text)
-        self.recent_conversation.append({"role": "assistant", "content": text})
-        await self._send_caption("assistant", text)
+        if not playback.interrupted and is_complete and text:
+            self._persist_message(text)
+            self.recent_conversation.append({"role": "assistant", "content": text})
+            await self._send_caption("assistant", text)
 
+        if self.end_call_pending and not self.playbacks:
+            self.request_stop("completed")
+
+    async def _handle_end_call(self, params: Any) -> None:
+        args = getattr(params, "arguments", {}) or {}
+        message = args.get("message") if isinstance(args, dict) else None
+        if message and not self.playbacks:
+            await self.workflow_processor.push_frame(
+                LLMTextFrame(text=message),
+                FrameDirection.DOWNSTREAM,
+            )
+        callback = getattr(params, "result_callback", None)
+        if callable(callback):
+            res = callback({"status": "call_ending"})
+            if asyncio.iscoroutine(res):
+                await res
+        self.end_call_pending = True
+        if not self.playbacks:
+            async def _safety_stop() -> None:
+                await asyncio.sleep(1.5)
+                if not self.playbacks and not self.closing:
+                    self.request_stop("completed")
+
+            asyncio.create_task(_safety_stop())
     async def handle_final_transcription(self, text: str) -> None:
         transcript = text.strip()
         if not transcript:
@@ -565,6 +606,13 @@ class CallRuntime:
         if self.definition.agent_instructions.strip():
             lines.append(self.definition.agent_instructions.strip())
         lines.append(f"Respond in language: {self.definition.language}.")
+        lines.append(
+            "Call Termination Rule: Once the caller confirms they no longer need help, says goodbye, "
+            "or the conversation reaches its end state, you MUST call the end_call tool immediately. "
+            "Deliver your final polite closing message (either via the message argument of end_call or "
+            "in your response) and end the session directly. Never wait for another user response after "
+            "delivering the closing message."
+        )
         if directive:
             lines.append(directive)
         return {"role": "system", "content": "\n".join(lines)}
@@ -576,7 +624,7 @@ class CallRuntime:
         messages = self._build_context_messages(directive)
         context = LLMContext(
             messages=messages,
-            tools=NOT_GIVEN,
+            tools=[_END_CALL_SCHEMA],
         )
         await self.workflow_processor.push_frame(
             LLMContextFrame(context),

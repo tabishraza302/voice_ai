@@ -453,3 +453,98 @@ async def test_transcription_pushes_dialogue_turn() -> None:
     assert "Help the caller" in sys_msg["content"]
     user_msg = frame.context.messages[1]
     assert user_msg["content"] == "Hello, my name is Bob."
+
+
+@pytest.mark.anyio
+async def test_voice_runtime_handle_end_call_waits_for_playback(monkeypatch) -> None:
+    messages: list[dict[str, str]] = []
+
+    class Connection:
+        def send_app_message(self, message: dict[str, str]) -> None:
+            messages.append(message)
+
+    async def no_op_cleanup(runtime: CallRuntime) -> None:
+        return None
+
+    monkeypatch.setattr("app.voice._cleanup_runtime", no_op_cleanup)
+
+    definition = make_definition()
+    writer = FakeWriter()
+    runtime = CallRuntime(definition, writer)
+    runtime.connection = Connection()
+
+    # Simulate an active TTS playback
+    runtime.playbacks["farewell-ctx"] = _Playback(
+        context_id="farewell-ctx",
+        kind="llm",
+        generation=1,
+    )
+    runtime.response_text[1] = ["Goodbye and take care!"]
+    runtime.response_complete.add(1)
+
+    result_calls: list[dict[str, object]] = []
+
+    async def mock_callback(res):
+        result_calls.append(res)
+
+    params = ToolParams(arguments={"reason": "finished"}, context=None, result_callback=mock_callback)
+
+    await runtime._handle_end_call(params)
+
+    assert result_calls == [{"status": "call_ending"}]
+    assert runtime.end_call_pending is True
+    assert runtime.closing is False
+    assert messages == []
+
+    # Complete the playback
+    await runtime.on_tts_stopped(
+        TTSStoppedFrame(context_id="farewell-ctx"),
+        transport_completed=True,
+    )
+
+    assert runtime.closing is True
+    assert runtime.termination_status == "completed"
+    assert {"type": "call.completed"} in messages
+    assert messages[-1] == {"type": "call.completed"}
+    if runtime.cleanup_task:
+        await runtime.cleanup_task
+
+
+@pytest.mark.anyio
+async def test_voice_runtime_handle_end_call_safety_timer(monkeypatch) -> None:
+    messages: list[dict[str, str]] = []
+
+    class Connection:
+        def send_app_message(self, message: dict[str, str]) -> None:
+            messages.append(message)
+
+    async def no_op_cleanup(runtime: CallRuntime) -> None:
+        return None
+
+    monkeypatch.setattr("app.voice._cleanup_runtime", no_op_cleanup)
+
+    definition = make_definition()
+    writer = FakeWriter()
+    runtime = CallRuntime(definition, writer)
+    runtime.connection = Connection()
+
+    result_calls: list[dict[str, object]] = []
+
+    async def mock_callback(res):
+        result_calls.append(res)
+
+    params = ToolParams(arguments={}, context=None, result_callback=mock_callback)
+
+    await runtime._handle_end_call(params)
+    assert result_calls == [{"status": "call_ending"}]
+    assert runtime.end_call_pending is True
+
+    # Fast wait for safety timer
+    import asyncio
+    await asyncio.sleep(1.6)
+
+    assert runtime.closing is True
+    assert runtime.termination_status == "completed"
+    assert messages == [{"type": "call.completed"}]
+    if runtime.cleanup_task:
+        await runtime.cleanup_task
