@@ -79,8 +79,8 @@ export default function NewAgentPage() {
           </h1>
           <p className="max-w-2xl text-sm leading-6 text-muted-foreground">
             {creationMode === "ai"
-              ? "Describe your voice agent and our AI will generate its name, instructions, and call flow steps."
-              : "Name your agent to start configuring its voice, instructions, and questions from a blank canvas."}
+              ? "Describe your voice agent and our AI will generate its persona, conversation flow, data collection steps, and call-ending rules."
+              : "Name your agent to configure its voice, persona, and system prompt from a clean canvas."}
           </p>
         </div>
 

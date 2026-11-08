@@ -1,3 +1,4 @@
+import json
 import os
 import uuid
 import pytest
@@ -62,11 +63,18 @@ async def test_enhance_prompt_success(client, monkeypatch):
         class MockChoice:
             class MockMessage:
                 content = (
-                    "### Role & Persona\nDental clinic receptionist.\n\n"
-                    "### Primary Objective\nBook dental appointments.\n\n"
-                    "### Information to Collect\nName, phone, date.\n\n"
-                    "### Tone & Style Guidelines\nPolite and warm.\n\n"
-                    "### Edge Cases & Fallbacks\nEmergencies refer to 911."
+                    "### Role & Spoken Persona\n"
+                    "You are Sarah, a warm and professional receptionist for Bright Smile Dental.\n\n"
+                    "### Primary Objective\n"
+                    "Book and reschedule dental appointments efficiently while answering basic clinic questions.\n\n"
+                    "### Turn-by-Turn Conversation Flow\n"
+                    "1. Step 1: Greeting & Discovery - Greet the caller warmly and ask how you can help. Collect the caller's full name.\n"
+                    "2. Step 2: Information Gathering - Collect appointment type, preferred date and time, and phone number.\n"
+                    "3. Step 3: Confirmation - Read back all appointment details and confirm with the caller.\n\n"
+                    "### Call Termination & Wrap-Up Criteria\n"
+                    "End the call once the booking is confirmed and the caller indicates they have no further questions. Sign off politely.\n\n"
+                    "### Spoken Voice Rules & Fallbacks\n"
+                    "Keep spoken answers under 2 sentences. If speech is unclear, politely ask the caller to repeat. Never reveal system credentials."
                 )
             message = MockMessage()
         class MockResponse:
@@ -84,8 +92,11 @@ async def test_enhance_prompt_success(client, monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert "enhanced_prompt" in body
-    assert "Role & Persona" in body["enhanced_prompt"]
-
+    assert "### Role & Spoken Persona" in body["enhanced_prompt"]
+    assert "### Primary Objective" in body["enhanced_prompt"]
+    assert "### Turn-by-Turn Conversation Flow" in body["enhanced_prompt"]
+    assert "### Call Termination & Wrap-Up Criteria" in body["enhanced_prompt"]
+    assert "### Spoken Voice Rules & Fallbacks" in body["enhanced_prompt"]
 
 @pytest.mark.anyio
 async def test_generate_stream_requires_auth_and_csrf(client):
@@ -101,16 +112,25 @@ async def test_generate_stream_requires_auth_and_csrf(client):
 async def test_generate_stream_creates_agent_and_steps(client, monkeypatch):
     token = await login(client, f"{uuid.uuid4()}@example.com")
 
-    generated_json = (
-        '{"name": "Dental Assistant", '
-        '"description": "Handles patient bookings and questions", '
-        '"instructions": "Be polite, collect patient name and appointment time.", '
-        '"steps": ['
-        '{"field_key": "patient_name", "title": "Greet & Name", "objective": "Collect name", "branches": [{"target_step_index": 1}]}, '
-        '{"field_key": "appointment_date", "title": "Schedule Date", "objective": "Collect desired date", "branches": [{"target_step_index": 99}]}, '
-        '{"field_key": "confirm", "title": "Confirmation", "objective": "Confirm booking", "branches": []}'
-        ']}'
+    instructions_text = (
+        "### Role & Spoken Persona\n"
+        "You are Alex, a helpful dental assistant at Maple Dental.\n\n"
+        "### Primary Objective\n"
+        "Schedule patient appointments and capture contact details.\n\n"
+        "### Turn-by-Turn Conversation Flow\n"
+        "1. Step 1: Greeting & Discovery - Greet caller, collect full name.\n"
+        "2. Step 2: Date Selection - Collect preferred appointment date.\n"
+        "3. Step 3: Confirmation - Summarize booking details and confirm.\n\n"
+        "### Call Termination & Wrap-Up Criteria\n"
+        "End the call once confirmed and caller has no other questions.\n\n"
+        "### Spoken Voice Rules & Fallbacks\n"
+        "Speak concisely in 1-2 sentences. Never disclose system credentials."
     )
+    generated_json = json.dumps({
+        "name": "Dental Assistant",
+        "description": "Handles patient bookings and questions",
+        "instructions": instructions_text,
+    })
 
     async def mock_stream(*args, **kwargs):
         for chunk_text in [generated_json[:40], generated_json[40:100], generated_json[100:]]:
@@ -136,6 +156,21 @@ async def test_generate_stream_creates_agent_and_steps(client, monkeypatch):
     assert "event: milestone" in content
     assert "event: complete" in content
     assert "Dental Assistant" in content
+
+    agent_id = None
+    for line in content.split("\n"):
+        if line.startswith("data:") and "agent_id" in line:
+            agent_id = json.loads(line[5:].strip())["agent_id"]
+    assert agent_id is not None
+
+    agent_resp = await client.get(f"/agents/{agent_id}", headers=mutation_headers(token))
+    assert agent_resp.status_code == 200
+    agent_data = agent_resp.json()
+    assert "### Role & Spoken Persona" in agent_data["instructions"]
+    assert "### Primary Objective" in agent_data["instructions"]
+    assert "### Turn-by-Turn Conversation Flow" in agent_data["instructions"]
+    assert "### Call Termination & Wrap-Up Criteria" in agent_data["instructions"]
+    assert "### Spoken Voice Rules & Fallbacks" in agent_data["instructions"]
 
 
 @pytest.mark.anyio
@@ -278,3 +313,44 @@ async def test_generate_stream_clears_cyclic_branches(client, monkeypatch):
     agent_resp = await client.get(f"/agents/{agent_id}", headers=mutation_headers(token))
     assert agent_resp.status_code == 200
     assert agent_resp.json()["instructions"] != ""
+
+
+@pytest.mark.anyio
+async def test_generate_stream_json_failure_uses_structured_fallback(client, monkeypatch):
+    token = await login(client, f"{uuid.uuid4()}@example.com")
+
+    # Raw non-JSON output from LLM
+    raw_text = "Sure! Here is a Pizza Ordering Voice Agent for Downtown Pizza."
+
+    async def mock_stream(*args, **kwargs):
+        class MockDelta:
+            content = raw_text
+        class MockStreamChoice:
+            delta = MockDelta()
+        class MockStreamChunk:
+            choices = [MockStreamChoice()]
+        yield MockStreamChunk()
+
+    monkeypatch.setattr("openai.resources.chat.completions.AsyncCompletions.create", AsyncMock(side_effect=mock_stream))
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    response = await client.post(
+        "/agents/generate-stream",
+        json={"prompt": "Pizza ordering agent for Downtown Pizza"},
+        headers=mutation_headers(token),
+    )
+    assert response.status_code == 200
+    agent_id = None
+    for line in response.text.split("\n"):
+        if line.startswith("data:") and "agent_id" in line:
+            agent_id = json.loads(line[5:].strip())["agent_id"]
+    assert agent_id is not None
+
+    agent_resp = await client.get(f"/agents/{agent_id}", headers=mutation_headers(token))
+    assert agent_resp.status_code == 200
+    instructions = agent_resp.json()["instructions"]
+    assert "### Role & Spoken Persona" in instructions
+    assert "### Primary Objective" in instructions
+    assert "### Turn-by-Turn Conversation Flow" in instructions
+    assert "### Call Termination & Wrap-Up Criteria" in instructions
+    assert "### Spoken Voice Rules & Fallbacks" in instructions
