@@ -262,7 +262,6 @@ def test_call_definition_rejects_missing_provider_credentials() -> None:
             "instructions": "Help the caller.",
             "languages": ["en"],
         },
-        "steps": [],
     }
     env = verified_environment()
     env.pop("DEEPGRAM_API_KEY")
@@ -424,9 +423,8 @@ async def test_successful_call_sends_only_safe_completion_event(monkeypatch) -> 
     runtime.definition = SimpleNamespace(session_id=uuid.uuid4())
     runtime.connection = Connection()
     runtime.termination_status = None
-    runtime.termination_outcome = None
 
-    runtime.request_stop("completed", "private-outcome")
+    runtime.request_stop("completed")
 
     assert messages == [{"type": "call.completed"}]
     await runtime.cleanup_task
