@@ -33,9 +33,13 @@ class MockStream:
 class FakeWebSocket:
     def __init__(self):
         self.events = []
+        self.closed = False
 
     async def send_json(self, data):
         self.events.append(data)
+
+    async def close(self, code=1000, reason=None):
+        self.closed = True
 
 
 class FakeWriter:
@@ -59,6 +63,22 @@ def content_chunk(text):
         choices=[
             SimpleNamespace(
                 delta=SimpleNamespace(content=text, tool_calls=None),
+            )
+        ]
+    )
+def tool_call_chunk(name, arguments="{}", call_id="call_1"):
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(
+                    content=None,
+                    tool_calls=[
+                        SimpleNamespace(
+                            id=call_id,
+                            function=SimpleNamespace(name=name, arguments=arguments),
+                        )
+                    ],
+                )
             )
         ]
     )
@@ -276,6 +296,155 @@ async def test_handle_user_message_streams_text():
     assert runtime.writer.messages == [
         ("user", "Hello there"),
         ("assistant", "Hello! How can I help you?"),
+    ]
+@pytest.mark.anyio
+async def test_chat_run_turn_with_end_call_tool_completes_session():
+    snapshot = chat_snapshot()
+    runtime, client = await make_runtime(
+        snapshot,
+        [
+            MockStream(
+                [
+                    content_chunk("Thank you, "),
+                    content_chunk("goodbye!"),
+                    tool_call_chunk("end_call", '{"reason":"done"}'),
+                ]
+            )
+        ],
+    )
+    ws = FakeWebSocket()
+    with patch("app.chat.set_session_status", new_callable=AsyncMock) as mock_set_status:
+        terminal = await runtime.handle_user_message(ws, "Goodbye")
+        assert terminal is True
+        mock_set_status.assert_awaited_once_with(runtime.session_id, "completed")
+
+    tokens = [e["content"] for e in ws.events if e.get("type") == "token"]
+    assert "".join(tokens) == "Thank you, goodbye!"
+
+    complete = next(e for e in ws.events if e.get("type") == "turn_complete")
+    assert complete["content"] == "Thank you, goodbye!"
+
+    ended = next(e for e in ws.events if e.get("type") == "session_ended")
+    assert ended["reason"] == "completed"
+    assert ws.closed is True
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("fragments", [
+    ['{"message":"Thank you for calling. Have a wonderful day!","reason":"done"}'],
+    ['{"message":"Thank you for calling.', ' Have a wonderful day!",', '"reason":"done"}'],
+])
+async def test_chat_run_turn_with_end_call_message_argument(fragments):
+    snapshot = chat_snapshot()
+    runtime, client = await make_runtime(
+        snapshot,
+        [
+            MockStream(
+                [
+                    tool_call_chunk("end_call" if index == 0 else None, fragment)
+                    for index, fragment in enumerate(fragments)
+                ]
+            )
+        ],
+    )
+    ws = FakeWebSocket()
+    with patch("app.chat.set_session_status", new_callable=AsyncMock) as mock_set_status:
+        terminal = await runtime.handle_user_message(ws, "I don't need help anymore")
+        assert terminal is True
+        mock_set_status.assert_awaited_once_with(runtime.session_id, "completed")
+
+    tokens = [e["content"] for e in ws.events if e.get("type") == "token"]
+    assert "".join(tokens) == "Thank you for calling. Have a wonderful day!"
+
+    complete = next(e for e in ws.events if e.get("type") == "turn_complete")
+    assert complete["content"] == "Thank you for calling. Have a wonderful day!"
+
+    ended = next(e for e in ws.events if e.get("type") == "session_ended")
+    assert ended["reason"] == "completed"
+    assert ws.closed is True
+
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("response_text", "expected"), [
+    ("Your booking is confirmed.", "Your booking is confirmed.\n\nGoodbye!"),
+    ("Your booking is confirmed. Goodbye!", "Your booking is confirmed. Goodbye!"),
+])
+async def test_end_call_preserves_tool_farewell_after_response_text(response_text, expected):
+    runtime, _ = await make_runtime(chat_snapshot(), [
+        MockStream([
+            content_chunk(response_text),
+            tool_call_chunk("end_call", '{"message":"Goodbye!"}'),
+        ]),
+    ])
+    ws = FakeWebSocket()
+    with patch("app.chat.set_session_status", new_callable=AsyncMock):
+        terminal = await runtime.handle_user_message(ws, "I'm done, thanks.")
+
+    assert terminal is True
+    assert "".join(event["content"] for event in ws.events if event["type"] == "token") == expected
+    assert next(event for event in ws.events if event["type"] == "turn_complete")["content"] == expected
+    assert runtime.writer.messages[-1] == ("assistant", expected)
+    assert [event["type"] for event in ws.events][-2:] == ["turn_complete", "session_ended"]
+    assert ws.closed is True
+
+
+def test_websocket_agent_ends_chat_on_end_call():
+    sync_client = TestClient(app)
+    email = f"wsuser-{uuid.uuid4().hex[:8]}@example.com"
+    sync_client.post("/auth/register", json={"email": email, "password": "password123456"})
+    login_resp = sync_client.post("/auth/login", json={"email": email, "password": "password123456"})
+    csrf_token = login_resp.json()["csrf_token"]
+    auth_headers = {"Origin": "http://localhost:3000", "X-CSRF-Token": csrf_token}
+
+    agent_resp = sync_client.post(
+        "/agents",
+        json={"name": "End Agent", "instructions": "test", "languages": ["en"], "llm_provider": "openai", "llm_model": "gpt-4o-mini"},
+        headers=auth_headers,
+    )
+    agent_id = agent_resp.json()["id"]
+
+    session_resp = sync_client.post(f"/agents/{agent_id}/chat-sessions", headers=auth_headers)
+    session_id = session_resp.json()["session_id"]
+
+    stream = MockStream([
+        content_chunk("Goodbye! Have a great day!"),
+        tool_call_chunk("end_call", '{"reason":"finished"}'),
+    ])
+    mock_client = MagicMock()
+    mock_client.chat.completions.create = AsyncMock(side_effect=[
+        MockStream([content_chunk("How can I help?")]),
+        stream,
+    ])
+    mock_client.close = AsyncMock()
+
+    with patch("app.chat.AsyncOpenAI", return_value=mock_client):
+        with sync_client.websocket_connect(
+            f"/agents/{agent_id}/chat-sessions/{session_id}/ws"
+        ) as ws:
+            greeting = receive_until(ws, "turn_complete")
+            assert greeting[-1]["content"] == "How can I help?"
+            ws.send_json({"type": "message", "content": "I'm done, bye!"})
+            events = receive_until(ws, "session_ended")
+            ended = next(e for e in events if e.get("type") == "session_ended")
+            assert ended["reason"] == "completed"
+            assert next(e for e in events if e["type"] == "turn_complete")["content"] == "Goodbye! Have a great day!"
+
+    async def check_session():
+        async with Session() as db:
+            session = await db.get(CallSession, uuid.UUID(session_id))
+            messages = (await db.scalars(
+                select(CallMessage)
+                .where(CallMessage.session_id == uuid.UUID(session_id))
+                .order_by(CallMessage.sequence)
+            )).all()
+            return session.status, [(message.role, message.content) for message in messages]
+
+    status, messages = asyncio.run(check_session())
+    assert status == "completed"
+    assert messages == [
+        ("assistant", "How can I help?"),
+        ("user", "I'm done, bye!"),
+        ("assistant", "Goodbye! Have a great day!"),
     ]
 
 
