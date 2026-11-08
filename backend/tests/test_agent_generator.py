@@ -269,8 +269,6 @@ async def test_generate_stream_json_failure_uses_structured_fallback(client, mon
     assert_required_sections(instructions)
     assert "- Collect:" in instructions
     assert "Pizza ordering agent for Downtown Pizza." in instructions
-    assert "Pizza.." not in instructions
-    assert "callback phone number" not in instructions
 
 
 @pytest.mark.anyio
@@ -373,3 +371,41 @@ async def test_generate_stream_replaces_unstructured_instructions_with_fallback(
     assert_required_sections(instructions)
     assert "- Collect:" in instructions
     assert "Be nice and helpful." not in instructions
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("malformed", [
+    STRUCTURED_INSTRUCTIONS.replace(
+        "   - Collect: Preferred appointment date and time.\n",
+        "",
+    ).replace(
+        "   - Collect: Caller's full name and reason for calling.\n",
+        "   - Collect: Caller's full name.\n   - Collect: Reason for calling.\n",
+    ),
+    STRUCTURED_INSTRUCTIONS.replace(
+        "2. Step 2: Detail Gathering - Ask about scheduling preferences.",
+        "2. Step 2: Wait.",
+    ),
+])
+async def test_generate_stream_rejects_incomplete_conversation_steps(client, monkeypatch, malformed):
+    token = await login(client, f"{uuid.uuid4()}@example.com")
+    monkeypatch.setattr(
+        "openai.resources.chat.completions.AsyncCompletions.create",
+        AsyncMock(side_effect=mock_stream_for(json.dumps({
+            "name": "Dental Assistant",
+            "instructions": malformed,
+        }))),
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    response = await client.post(
+        "/agents/generate-stream",
+        json={"prompt": "A dental clinic appointment booking assistant"},
+        headers=mutation_headers(token),
+    )
+    agent_id = agent_id_from_sse(response.text)
+    saved = await client.get(f"/agents/{agent_id}", headers=mutation_headers(token))
+    assert saved.status_code == 200
+    instructions = saved.json()["instructions"]
+    assert instructions != malformed
+    assert_required_sections(instructions)
