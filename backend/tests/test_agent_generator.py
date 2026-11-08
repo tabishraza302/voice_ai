@@ -352,5 +352,51 @@ async def test_generate_stream_json_failure_uses_structured_fallback(client, mon
     assert "### Role & Spoken Persona" in instructions
     assert "### Primary Objective" in instructions
     assert "### Turn-by-Turn Conversation Flow" in instructions
+    assert "- Collect:" in instructions
+    assert "### Call Termination & Wrap-Up Criteria" in instructions
+    assert "### Spoken Voice Rules & Fallbacks" in instructions
+
+
+@pytest.mark.anyio
+async def test_generate_stream_json_with_empty_instructions_uses_structured_fallback(client, monkeypatch):
+    token = await login(client, f"{uuid.uuid4()}@example.com")
+
+    generated_json = json.dumps({
+        "name": "Pizza Bot",
+        "description": "Pizza order bot",
+        "instructions": "",
+    })
+
+    async def mock_stream(*args, **kwargs):
+        class MockDelta:
+            content = generated_json
+        class MockStreamChoice:
+            delta = MockDelta()
+        class MockStreamChunk:
+            choices = [MockStreamChoice()]
+        yield MockStreamChunk()
+
+    monkeypatch.setattr("openai.resources.chat.completions.AsyncCompletions.create", AsyncMock(side_effect=mock_stream))
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    response = await client.post(
+        "/agents/generate-stream",
+        json={"prompt": "Pizza ordering agent for Downtown Pizza"},
+        headers=mutation_headers(token),
+    )
+    assert response.status_code == 200
+    agent_id = None
+    for line in response.text.split("\n"):
+        if line.startswith("data:") and "agent_id" in line:
+            agent_id = json.loads(line[5:].strip())["agent_id"]
+    assert agent_id is not None
+
+    agent_resp = await client.get(f"/agents/{agent_id}", headers=mutation_headers(token))
+    assert agent_resp.status_code == 200
+    instructions = agent_resp.json()["instructions"]
+    assert "### Role & Spoken Persona" in instructions
+    assert "### Primary Objective" in instructions
+    assert "### Turn-by-Turn Conversation Flow" in instructions
+    assert "- Collect:" in instructions
     assert "### Call Termination & Wrap-Up Criteria" in instructions
     assert "### Spoken Voice Rules & Fallbacks" in instructions
