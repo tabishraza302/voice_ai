@@ -30,6 +30,13 @@ export type ChatState =
   | { kind: "ended"; sessionId: string; messages: ChatMessage[]; reason: string }
   | { kind: "error"; message: string };
 
+function lastStreamingAssistantIndex(messages: ChatMessage[]): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "assistant" && messages[i].streaming) return i;
+  }
+  return -1;
+}
+
 export function ChatPanel({
   agentId,
   agentName,
@@ -111,11 +118,12 @@ export function ChatPanel({
           setState((prev) => {
             if (prev.kind !== "active") return prev;
             const msgs = [...prev.messages];
-            const last = msgs[msgs.length - 1];
-            if (last && last.role === "assistant" && last.streaming) {
-              msgs[msgs.length - 1] = {
-                ...last,
-                content: last.content + (data.content || ""),
+            const streamingIndex = lastStreamingAssistantIndex(msgs);
+            if (streamingIndex >= 0) {
+              const current = msgs[streamingIndex];
+              msgs[streamingIndex] = {
+                ...current,
+                content: current.content + (data.content || ""),
               };
             } else {
               msgs.push({
@@ -131,11 +139,12 @@ export function ChatPanel({
           setState((prev) => {
             if (prev.kind !== "active") return prev;
             const msgs = [...prev.messages];
-            const last = msgs[msgs.length - 1];
-            if (last && last.role === "assistant" && last.streaming) {
-              msgs[msgs.length - 1] = {
-                ...last,
-                content: data.content ?? last.content,
+            const streamingIndex = lastStreamingAssistantIndex(msgs);
+            if (streamingIndex >= 0) {
+              const current = msgs[streamingIndex];
+              msgs[streamingIndex] = {
+                ...current,
+                content: data.content ?? current.content,
                 streaming: false,
               };
             } else {
@@ -173,12 +182,13 @@ export function ChatPanel({
         } else if (data.type === "warning") {
           setState((prev) => {
             if (prev.kind !== "active") return prev;
-            const msg: ChatMessage = {
+            const msgs = prev.messages.map((m) => (m.streaming ? { ...m, streaming: false } : m));
+            msgs.push({
               id: nextIdRef.current++,
               role: "warning",
               content: data.message || "Warning",
-            };
-            return { ...prev, messages: [...prev.messages, msg] };
+            });
+            return { ...prev, messages: msgs };
           });
         } else if (data.type === "error") {
           setState((prev) => {
@@ -250,7 +260,7 @@ export function ChatPanel({
   const handleSendMessage = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     const text = input.trim();
-    if (!text || state.kind !== "active" || isAssistantStreaming) return;
+    if (!text || state.kind !== "active") return;
 
     const userMsg: ChatMessage = {
       id: nextIdRef.current++,
@@ -456,7 +466,7 @@ export function ChatPanel({
           type="submit"
           size="sm"
           variant="primary"
-          disabled={!input.trim() || state.kind !== "active" || isAssistantStreaming}
+          disabled={!input.trim() || state.kind !== "active"}
           className="h-9 w-9 p-0 rounded-xl shrink-0"
           aria-label="Send message"
         >

@@ -315,7 +315,6 @@ class CallRuntime:
         self.renegotiating = False
         self.closed = False
         self.termination_status: str | None = None
-        self.termination_outcome: str | None = None
         self.user_speaking = False
         self.response_generation = 0
         self.active_response_generation: int | None = None
@@ -487,14 +486,13 @@ class CallRuntime:
         await asyncio.sleep(self.definition.max_call_duration_seconds)
         self.request_stop("expired")
 
-    def request_stop(self, status: str, outcome: str | None = None) -> None:
+    def request_stop(self, status: str) -> None:
         if self.closing:
             return
         if status not in {"completed", "failed", "cancelled", "expired"}:
             status = "failed"
         self.closing = True
         self.termination_status = status
-        self.termination_outcome = outcome
         if status == "completed" and self.connection is not None:
             try:
                 self.connection.send_app_message({"type": "call.completed"})
@@ -789,7 +787,6 @@ async def _cleanup_runtime(runtime: CallRuntime) -> None:
         await set_session_status(
             runtime.session_id,
             status,
-            outcome=runtime.termination_outcome if status == "completed" else None,
         )
     except Exception:
         status = "failed"
