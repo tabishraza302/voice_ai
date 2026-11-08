@@ -39,6 +39,28 @@ logger = logging.getLogger(__name__)
 _CHAT_IDLE_TIMEOUT_SECONDS = 1800
 _RECENT_TURNS = 12
 
+_END_CALL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "end_call",
+        "description": "End the call or chat session immediately. You MUST call this whenever the conversation reaches its conclusion, the user confirms they no longer need help, or the user says goodbye. Deliver your final closing sign-off in the message parameter or in your response so the call terminates directly after the closing message.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "The final polite goodbye or closing sign-off message to deliver to the user before ending the session (e.g. 'Thank you for calling. Have a great day!').",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Brief reason for ending the session (e.g. booking confirmed, inquiry resolved, caller no longer needs help, caller said goodbye).",
+                },
+            },
+            "required": [],
+        },
+    },
+}
+
 chat_router = APIRouter(tags=["chat"])
 _active_chats: dict[uuid.UUID, ChatRuntime] = {}
 
@@ -205,10 +227,16 @@ class ChatRuntime:
         if self.agent_instructions.strip():
             lines.append(self.agent_instructions.strip())
         lines.append(f"Respond in language: {self.language}.")
+        lines.append(
+            "Call Termination Rule: Once the user confirms they no longer need help, says goodbye, "
+            "or the conversation reaches its end state, you MUST call the end_call tool immediately. "
+            "Deliver your final polite closing message (either via the message argument of end_call or "
+            "in your response) and end the session directly. Never wait for another user response after "
+            "delivering the closing message."
+        )
         if directive:
             lines.append(directive)
         return {"role": "system", "content": "\n\n".join(lines)}
-
     def _messages(self, directive: str | None = None) -> list[dict[str, Any]]:
         return [self._system_message(directive), *self.recent_conversation]
 
@@ -226,9 +254,13 @@ class ChatRuntime:
         response = await self.client.chat.completions.create(
             model=self.llm_model,
             messages=messages,
+            tools=[_END_CALL_TOOL],
+            tool_choice="auto",
             stream=True,
         )
         content_parts: list[str] = []
+        tool_call_args_parts: list[str] = []
+        end_call_invoked = False
         async for chunk in response:
             if not chunk.choices:
                 continue
@@ -240,11 +272,51 @@ class ChatRuntime:
                 content_parts.append(content)
                 await websocket.send_json({"type": "token", "content": content})
 
+            tool_calls = getattr(delta, "tool_calls", None)
+            if tool_calls:
+                for tc in tool_calls:
+                    fn = tc.get("function") if isinstance(tc, dict) else getattr(tc, "function", None)
+                    fn_name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
+                    if fn_name == "end_call":
+                        end_call_invoked = True
+                    args_chunk = fn.get("arguments") if isinstance(fn, dict) else getattr(fn, "arguments", None)
+                    if args_chunk:
+                        tool_call_args_parts.append(args_chunk)
+
         text = "".join(content_parts)
-        if not text.strip():
+        if end_call_invoked:
+            raw_args = "".join(tool_call_args_parts)
+            try:
+                parsed_args = json.loads(raw_args) if raw_args else {}
+            except json.JSONDecodeError:
+                parsed_args = {}
+            message = parsed_args.get("message") if isinstance(parsed_args, dict) else None
+            if isinstance(message, str) and message.strip():
+                farewell = message.strip()
+                if not text.rstrip().endswith(farewell):
+                    closing_text = ("\n\n" if text.strip() else "") + farewell
+                    text += closing_text
+                    await websocket.send_json({"type": "token", "content": closing_text})
+            if not text.strip():
+                text = "Thank you. Have a great day!"
+                await websocket.send_json({"type": "token", "content": text})
+        elif not text.strip():
             text = "I'm here. How can I help you?"
             await websocket.send_json({"type": "token", "content": text})
+
         await self._finish_turn(websocket, text)
+
+        if end_call_invoked:
+            await set_session_status(self.session_id, "completed")
+            await websocket.send_json({"type": "session_ended", "reason": "completed"})
+            close_fn = getattr(websocket, "close", None)
+            if callable(close_fn):
+                try:
+                    await websocket.close()
+                except Exception:
+                    pass
+            return True
+
         return False
 
     async def send_greeting(self, websocket: WebSocket) -> bool:
@@ -352,13 +424,14 @@ async def chat_websocket(
     try:
         if not runtime.recent_conversation:
             try:
-                await runtime.send_greeting(websocket)
+                terminal = await runtime.send_greeting(websocket)
+                if terminal:
+                    return
             except Exception as error:
                 logger.exception("Initial greeting failed")
                 await websocket.send_json(
                     {"type": "warning", "message": f"Initial greeting failed: {error}"}
                 )
-
         while True:
             data = await websocket.receive_json()
             if not isinstance(data, dict):

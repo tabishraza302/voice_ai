@@ -43,8 +43,8 @@ For each step, explicitly specify:
     _PromptSection(
         key="termination",
         heading="### Call Termination & Wrap-Up Criteria",
-        guidance="[Explicit conditions under which the agent ends the call (e.g. all information collected and verified, caller has no further questions, or caller says goodbye/hangs up). Detail the exact polite closing statement and sign-off etiquette.]",
-        summary="Explicit conditions for ending the call, polite sign-off protocol",
+        guidance="[Explicit conditions under which the agent ends the call (e.g. all information collected and verified, caller has no further questions, or caller says goodbye/hangs up). Detail the exact polite closing statement and sign-off etiquette. When all objectives are fulfilled and you have spoken your final polite sign-off (or when the caller indicates they are done/says goodbye), call the end_call tool to terminate the session.]",
+        summary="Explicit conditions for ending the call, polite sign-off protocol, and calling the end_call tool upon delivering farewell",
     ),
     _PromptSection(
         key="voice_rules",
@@ -113,7 +113,8 @@ def _build_fallback_instructions(agent_name: str, prompt_text: str) -> str:
         f"   - Collect: Explicit verbal confirmation (yes/no).\n\n"
         f"{_SECTION_HEADINGS['termination']}\n"
         f"End the call once all required information is confirmed, the caller has no further questions, or the caller says goodbye. "
-        f"Provide a polite sign-off such as: 'Thank you for calling. Have a great day!' before ending the call.\n\n"
+        f"Provide a polite sign-off such as: 'Thank you for calling. Have a great day!' before ending the call.\n"
+        f"- Once you speak your closing sign-off or the caller says goodbye, invoke the end_call tool to conclude the call.\n\n"
         f"{_SECTION_HEADINGS['voice_rules']}\n"
         f"- Keep all spoken turns concise (1-2 sentences).\n"
         f"- If the caller is unclear or inaudible, ask: 'I'm sorry, could you please repeat that?'\n"

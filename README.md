@@ -56,6 +56,16 @@ the Markdown source or draft autosave behavior. Test chat stays editable while a
 assistant reply streams; sending another message does not move incoming tokens out
 of the assistant's bubble. Warnings preserve partial replies and clear streaming state.
 
+Chat and voice runtimes expose an `end_call` tool, and generated prompts include
+instructions to use it when the conversation is complete. In chat, the agent can
+provide its farewell in response text, the tool's `message` argument, or both.
+When both are present, the runtime keeps the streamed response and appends the
+tool farewell unless that exact farewell already ends the response. It saves
+the complete closing turn before marking the session `completed` and sending
+`session_ended`, then closes the WebSocket without requiring another user turn.
+Live voice farewell delivery remains unverified: the current handler can skip a
+tool-provided farewell during existing playback or stop before delayed audio starts.
+
 ## Environment
 
 `.env.example` is the tracked reference; `.env` is ignored and must never be committed. The backend reads:
