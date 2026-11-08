@@ -1,11 +1,39 @@
-import os
+import json
 import uuid
+from collections.abc import Callable
+from unittest.mock import AsyncMock
+
 import pytest
 from httpx import ASGITransport, AsyncClient
-from unittest.mock import AsyncMock
 
 from app.db import Base, engine
 from app.main import app
+
+REQUIRED_SECTIONS = (
+    "### Role & Spoken Persona",
+    "### Primary Objective",
+    "### Turn-by-Turn Conversation Flow",
+    "### Call Termination & Wrap-Up Criteria",
+    "### Spoken Voice Rules & Fallbacks",
+)
+
+STRUCTURED_INSTRUCTIONS = (
+    "### Role & Spoken Persona\n"
+    "You are Alex, a helpful dental assistant at Maple Dental.\n\n"
+    "### Primary Objective\n"
+    "Schedule patient appointments and capture contact details.\n\n"
+    "### Turn-by-Turn Conversation Flow\n"
+    "1. Step 1: Greeting & Discovery - Greet the caller and identify their request.\n"
+    "   - Collect: Caller's full name and reason for calling.\n"
+    "2. Step 2: Detail Gathering - Ask about scheduling preferences.\n"
+    "   - Collect: Preferred appointment date and time.\n"
+    "3. Step 3: Confirmation - Summarize the booking details.\n"
+    "   - Collect: Explicit verbal confirmation (yes/no).\n\n"
+    "### Call Termination & Wrap-Up Criteria\n"
+    "End the call once confirmed and caller has no other questions.\n\n"
+    "### Spoken Voice Rules & Fallbacks\n"
+    "Speak concisely in 1-2 sentences. Never disclose system credentials."
+)
 
 
 @pytest.fixture
@@ -31,6 +59,39 @@ async def login(client: AsyncClient, email: str) -> str:
 
 def mutation_headers(token: str) -> dict[str, str]:
     return {"Origin": "http://localhost:3000", "X-CSRF-Token": token}
+
+
+def mock_stream_for(*chunks: str, on_call: Callable[[dict], None] | None = None):
+    """Build an async streaming mock that yields the supplied text chunks in order."""
+
+    async def mock_stream(*args, **kwargs):
+        if on_call is not None:
+            on_call(kwargs)
+        for chunk_text in chunks:
+            class MockDelta:
+                content = chunk_text
+
+            class MockStreamChoice:
+                delta = MockDelta()
+
+            class MockStreamChunk:
+                choices = [MockStreamChoice()]
+
+            yield MockStreamChunk()
+
+    return mock_stream
+
+
+def agent_id_from_sse(content: str) -> str:
+    for line in content.split("\n"):
+        if line.startswith("data:") and "agent_id" in line:
+            return json.loads(line[5:].strip())["agent_id"]
+    raise AssertionError("SSE stream did not include an agent_id")
+
+
+def assert_required_sections(instructions: str) -> None:
+    for heading in REQUIRED_SECTIONS:
+        assert heading in instructions
 
 
 @pytest.mark.anyio
@@ -62,18 +123,31 @@ async def test_enhance_prompt_success(client, monkeypatch):
         class MockChoice:
             class MockMessage:
                 content = (
-                    "### Role & Persona\nDental clinic receptionist.\n\n"
-                    "### Primary Objective\nBook dental appointments.\n\n"
-                    "### Information to Collect\nName, phone, date.\n\n"
-                    "### Tone & Style Guidelines\nPolite and warm.\n\n"
-                    "### Edge Cases & Fallbacks\nEmergencies refer to 911."
+                    "### Role & Spoken Persona\n"
+                    "You are Sarah, a warm and professional receptionist for Bright Smile Dental.\n\n"
+                    "### Primary Objective\n"
+                    "Book and reschedule dental appointments efficiently while answering basic clinic questions.\n\n"
+                    "### Turn-by-Turn Conversation Flow\n"
+                    "1. Step 1: Greeting & Discovery - Greet the caller warmly and ask how you can help. Collect the caller's full name.\n"
+                    "2. Step 2: Detail Gathering - Collect appointment type, preferred date and time, and phone number.\n"
+                    "3. Step 3: Confirmation - Read back all appointment details and confirm with the caller.\n\n"
+                    "### Call Termination & Wrap-Up Criteria\n"
+                    "End the call once the booking is confirmed and the caller indicates they have no further questions. Sign off politely.\n\n"
+                    "### Spoken Voice Rules & Fallbacks\n"
+                    "Keep spoken answers under 2 sentences. If speech is unclear, politely ask the caller to repeat. Never reveal system credentials."
                 )
+
             message = MockMessage()
+
         class MockResponse:
             choices = [MockChoice()]
+
         return MockResponse()
 
-    monkeypatch.setattr("openai.resources.chat.completions.AsyncCompletions.create", AsyncMock(side_effect=mock_completion))
+    monkeypatch.setattr(
+        "openai.resources.chat.completions.AsyncCompletions.create",
+        AsyncMock(side_effect=mock_completion),
+    )
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
     response = await client.post(
@@ -84,7 +158,7 @@ async def test_enhance_prompt_success(client, monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert "enhanced_prompt" in body
-    assert "Role & Persona" in body["enhanced_prompt"]
+    assert_required_sections(body["enhanced_prompt"])
 
 
 @pytest.mark.anyio
@@ -98,31 +172,19 @@ async def test_generate_stream_requires_auth_and_csrf(client):
 
 
 @pytest.mark.anyio
-async def test_generate_stream_creates_agent_and_steps(client, monkeypatch):
+async def test_generate_stream_creates_agent_with_instructions(client, monkeypatch):
     token = await login(client, f"{uuid.uuid4()}@example.com")
 
-    generated_json = (
-        '{"name": "Dental Assistant", '
-        '"description": "Handles patient bookings and questions", '
-        '"instructions": "Be polite, collect patient name and appointment time.", '
-        '"steps": ['
-        '{"field_key": "patient_name", "title": "Greet & Name", "objective": "Collect name", "branches": [{"target_step_index": 1}]}, '
-        '{"field_key": "appointment_date", "title": "Schedule Date", "objective": "Collect desired date", "branches": [{"target_step_index": 99}]}, '
-        '{"field_key": "confirm", "title": "Confirmation", "objective": "Confirm booking", "branches": []}'
-        ']}'
+    generated_json = json.dumps({
+        "name": "Dental Assistant",
+        "description": "Handles patient bookings and questions",
+        "instructions": STRUCTURED_INSTRUCTIONS,
+    })
+
+    monkeypatch.setattr(
+        "openai.resources.chat.completions.AsyncCompletions.create",
+        AsyncMock(side_effect=mock_stream_for(generated_json[:40], generated_json[40:100], generated_json[100:])),
     )
-
-    async def mock_stream(*args, **kwargs):
-        for chunk_text in [generated_json[:40], generated_json[40:100], generated_json[100:]]:
-            class MockDelta:
-                content = chunk_text
-            class MockStreamChoice:
-                delta = MockDelta()
-            class MockStreamChunk:
-                choices = [MockStreamChoice()]
-            yield MockStreamChunk()
-
-    monkeypatch.setattr("openai.resources.chat.completions.AsyncCompletions.create", AsyncMock(side_effect=mock_stream))
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
     response = await client.post(
@@ -137,70 +199,32 @@ async def test_generate_stream_creates_agent_and_steps(client, monkeypatch):
     assert "event: complete" in content
     assert "Dental Assistant" in content
 
-
-@pytest.mark.anyio
-async def test_generate_stream_drops_invalid_branches_and_passes_publish_validation(client, monkeypatch):
-    token = await login(client, f"{uuid.uuid4()}@example.com")
-
-    # Includes out-of-range index (99), self-target (0), and both target + outcome
-    generated_json = (
-        '{"name": "Booking Bot", '
-        '"description": "Validates branches", '
-        '"instructions": "Instructions text", '
-        '"steps": ['
-        '{"field_key": "step_one", "title": "First", "objective": "Obj 1", "branches": [{"target_step_index": 0, "outcome": "loop"}]}, '
-        '{"field_key": "step_two", "title": "Second", "objective": "Obj 2", "branches": [{"target_step_index": 99}]}, '
-        '{"field_key": "step_three", "title": "Third", "objective": "Obj 3", "branches": [{"target_step_index": 2, "outcome": "finish"}]}'
-        ']}'
-    )
-
-    async def mock_stream(*args, **kwargs):
-        class MockDelta:
-            content = generated_json
-        class MockStreamChoice:
-            delta = MockDelta()
-        class MockStreamChunk:
-            choices = [MockStreamChoice()]
-        yield MockStreamChunk()
-
-    monkeypatch.setattr("openai.resources.chat.completions.AsyncCompletions.create", AsyncMock(side_effect=mock_stream))
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-
-    response = await client.post(
-        "/agents/generate-stream",
-        json={"prompt": "A test prompt for validating branches"},
-        headers=mutation_headers(token),
-    )
-    assert response.status_code == 200
-    import json
-    agent_id = None
-    for line in response.text.split("\n"):
-        if line.startswith("data:") and "agent_id" in line:
-            agent_id = json.loads(line[5:].strip())["agent_id"]
-    assert agent_id is not None
-
+    agent_id = agent_id_from_sse(content)
     agent_resp = await client.get(f"/agents/{agent_id}", headers=mutation_headers(token))
     assert agent_resp.status_code == 200
-    assert agent_resp.json()["instructions"] != ""
+    assert agent_resp.json()["instructions"] == STRUCTURED_INSTRUCTIONS
+
 
 @pytest.mark.anyio
 async def test_generate_stream_uses_custom_model(client, monkeypatch):
     token = await login(client, f"{uuid.uuid4()}@example.com")
     captured_models = []
 
-    generated_json = '{"name": "Custom Model Bot", "description": "Desc", "instructions": "Inst", "steps": []}'
+    generated_json = json.dumps({
+        "name": "Custom Model Bot",
+        "description": "Desc",
+        "instructions": STRUCTURED_INSTRUCTIONS,
+    })
 
-    async def mock_stream(*args, **kwargs):
-        captured_models.append(kwargs.get("model"))
-        class MockDelta:
-            content = generated_json
-        class MockStreamChoice:
-            delta = MockDelta()
-        class MockStreamChunk:
-            choices = [MockStreamChoice()]
-        yield MockStreamChunk()
-
-    monkeypatch.setattr("openai.resources.chat.completions.AsyncCompletions.create", AsyncMock(side_effect=mock_stream))
+    monkeypatch.setattr(
+        "openai.resources.chat.completions.AsyncCompletions.create",
+        AsyncMock(
+            side_effect=mock_stream_for(
+                generated_json,
+                on_call=lambda kwargs: captured_models.append(kwargs.get("model")),
+            )
+        ),
+    )
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("VERIFIED_OPENAI_MODELS", "gpt-4.1-mini,gpt-4o-mini")
 
@@ -212,69 +236,176 @@ async def test_generate_stream_uses_custom_model(client, monkeypatch):
     assert response.status_code == 200
     assert captured_models == ["gpt-4.1-mini"]
 
-    import json
-    agent_id = None
-    for line in response.text.split("\n"):
-        if line.startswith("data:") and "agent_id" in line:
-            agent_id = json.loads(line[5:].strip())["agent_id"]
-    assert agent_id is not None
-
+    agent_id = agent_id_from_sse(response.text)
     agent_resp = await client.get(f"/agents/{agent_id}", headers=mutation_headers(token))
     assert agent_resp.status_code == 200
     assert agent_resp.json()["llm_model"] == "gpt-4.1-mini"
 
 
 @pytest.mark.anyio
-async def test_generate_stream_clears_cyclic_branches(client, monkeypatch):
-    """Backward conditional routes can form cycles; the sanitizer must clear
-    the offending branches even though validate_publish returns UUID-keyed
-    error paths (steps.<uuid>.branches), not index-keyed ones."""
-    import json
-
+async def test_generate_stream_json_failure_uses_structured_fallback(client, monkeypatch):
     token = await login(client, f"{uuid.uuid4()}@example.com")
 
-    # Step 0 branches forward to 1 and 2 (valid).
-    # Step 2 branches backward to 1 (creates cycle with implicit next-step edges).
-    generated_json = json.dumps({
-        "name": "Support Router",
-        "description": "Routes callers",
-        "instructions": "Route to billing or tech support.",
-        "steps": [
-            {"field_key": "kind", "title": "Identify Type", "objective": "Ask type", "branches": [
-                {"target_step_index": 1, "conditions": [{"field_key": "kind", "operator": "eq", "operand": "billing"}]},
-                {"target_step_index": 2, "conditions": [{"field_key": "kind", "operator": "eq", "operand": "tech"}]},
-            ]},
-            {"field_key": "billing", "title": "Handle Billing", "objective": "Handle invoice", "branches": []},
-            {"field_key": "confirm", "title": "Confirm Resolution", "objective": "Confirm", "branches": [
-                {"target_step_index": 1, "conditions": [{"field_key": "confirm", "operator": "eq", "operand": "no"}]},
-            ]},
-        ],
-    })
+    # Raw non-JSON output from the LLM.
+    raw_text = "Sure! Here is a Pizza Ordering Voice Agent for Downtown Pizza."
 
-    async def mock_stream(*args, **kwargs):
-        class MockDelta:
-            content = generated_json
-        class MockStreamChoice:
-            delta = MockDelta()
-        class MockStreamChunk:
-            choices = [MockStreamChoice()]
-        yield MockStreamChunk()
-
-    monkeypatch.setattr("openai.resources.chat.completions.AsyncCompletions.create", AsyncMock(side_effect=mock_stream))
+    monkeypatch.setattr(
+        "openai.resources.chat.completions.AsyncCompletions.create",
+        AsyncMock(side_effect=mock_stream_for(raw_text)),
+    )
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
     response = await client.post(
         "/agents/generate-stream",
-        json={"prompt": "Route callers to the right support department"},
+        json={"prompt": "Pizza ordering agent for Downtown Pizza. "},
         headers=mutation_headers(token),
     )
     assert response.status_code == 200
-    agent_id = None
-    for line in response.text.split("\n"):
-        if line.startswith("data:") and "agent_id" in line:
-            agent_id = json.loads(line[5:].strip())["agent_id"]
-    assert agent_id is not None
 
+    agent_id = agent_id_from_sse(response.text)
     agent_resp = await client.get(f"/agents/{agent_id}", headers=mutation_headers(token))
     assert agent_resp.status_code == 200
-    assert agent_resp.json()["instructions"] != ""
+    instructions = agent_resp.json()["instructions"]
+    assert_required_sections(instructions)
+    assert "- Collect:" in instructions
+    assert "Pizza ordering agent for Downtown Pizza." in instructions
+
+
+@pytest.mark.anyio
+async def test_generate_stream_json_with_empty_instructions_uses_structured_fallback(client, monkeypatch):
+    token = await login(client, f"{uuid.uuid4()}@example.com")
+
+    generated_json = json.dumps({
+        "name": "Pizza Bot",
+        "description": "Pizza order bot",
+        "instructions": "",
+    })
+
+    monkeypatch.setattr(
+        "openai.resources.chat.completions.AsyncCompletions.create",
+        AsyncMock(side_effect=mock_stream_for(generated_json)),
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    response = await client.post(
+        "/agents/generate-stream",
+        json={"prompt": "Pizza ordering agent for Downtown Pizza"},
+        headers=mutation_headers(token),
+    )
+    assert response.status_code == 200
+
+    agent_id = agent_id_from_sse(response.text)
+    agent_resp = await client.get(f"/agents/{agent_id}", headers=mutation_headers(token))
+    assert agent_resp.status_code == 200
+    instructions = agent_resp.json()["instructions"]
+    assert_required_sections(instructions)
+    assert "- Collect:" in instructions
+
+
+@pytest.mark.anyio
+async def test_generate_stream_rejects_headings_without_collection_steps(client, monkeypatch):
+    token = await login(client, f"{uuid.uuid4()}@example.com")
+
+    generated_json = json.dumps({
+        "name": "Support Bot\n### Injected",
+        "description": "Handles support calls",
+        "instructions": (
+            "### Role & Spoken Persona\nYou are Support Bot.\n\n"
+            "### Primary Objective\nHelp callers.\n\n"
+            "### Turn-by-Turn Conversation Flow\n1. Greet the caller.\n2. Answer questions.\n\n"
+            "### Call Termination & Wrap-Up Criteria\nEnd politely.\n\n"
+            "### Spoken Voice Rules & Fallbacks\nBe concise."
+        ),
+    })
+
+    monkeypatch.setattr(
+        "openai.resources.chat.completions.AsyncCompletions.create",
+        AsyncMock(side_effect=mock_stream_for(generated_json)),
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    response = await client.post(
+        "/agents/generate-stream",
+        json={"prompt": "Support line for a billing team"},
+        headers=mutation_headers(token),
+    )
+    assert response.status_code == 200
+
+    agent_id = agent_id_from_sse(response.text)
+    agent_resp = await client.get(f"/agents/{agent_id}", headers=mutation_headers(token))
+    assert agent_resp.status_code == 200
+    agent_data = agent_resp.json()
+    assert "\n" not in agent_data["name"]
+    assert_required_sections(agent_data["instructions"])
+    assert "- Collect:" in agent_data["instructions"]
+    assert "1. Greet the caller." not in agent_data["instructions"]
+
+
+@pytest.mark.anyio
+async def test_generate_stream_replaces_unstructured_instructions_with_fallback(client, monkeypatch):
+    token = await login(client, f"{uuid.uuid4()}@example.com")
+
+    generated_json = json.dumps({
+        "name": "Support Bot",
+        "description": "Handles support calls",
+        "instructions": "Be nice and helpful.",
+    })
+
+    monkeypatch.setattr(
+        "openai.resources.chat.completions.AsyncCompletions.create",
+        AsyncMock(side_effect=mock_stream_for(generated_json)),
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    response = await client.post(
+        "/agents/generate-stream",
+        json={"prompt": "Support line for a billing team"},
+        headers=mutation_headers(token),
+    )
+    assert response.status_code == 200
+
+    agent_id = agent_id_from_sse(response.text)
+    agent_resp = await client.get(f"/agents/{agent_id}", headers=mutation_headers(token))
+    assert agent_resp.status_code == 200
+    instructions = agent_resp.json()["instructions"]
+    assert_required_sections(instructions)
+    assert "- Collect:" in instructions
+    assert "Be nice and helpful." not in instructions
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("malformed", [
+    STRUCTURED_INSTRUCTIONS.replace(
+        "   - Collect: Preferred appointment date and time.\n",
+        "",
+    ).replace(
+        "   - Collect: Caller's full name and reason for calling.\n",
+        "   - Collect: Caller's full name.\n   - Collect: Reason for calling.\n",
+    ),
+    STRUCTURED_INSTRUCTIONS.replace(
+        "2. Step 2: Detail Gathering - Ask about scheduling preferences.",
+        "2. Step 2: Wait.",
+    ),
+])
+async def test_generate_stream_rejects_incomplete_conversation_steps(client, monkeypatch, malformed):
+    token = await login(client, f"{uuid.uuid4()}@example.com")
+    monkeypatch.setattr(
+        "openai.resources.chat.completions.AsyncCompletions.create",
+        AsyncMock(side_effect=mock_stream_for(json.dumps({
+            "name": "Dental Assistant",
+            "instructions": malformed,
+        }))),
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    response = await client.post(
+        "/agents/generate-stream",
+        json={"prompt": "A dental clinic appointment booking assistant"},
+        headers=mutation_headers(token),
+    )
+    agent_id = agent_id_from_sse(response.text)
+    saved = await client.get(f"/agents/{agent_id}", headers=mutation_headers(token))
+    assert saved.status_code == 200
+    instructions = saved.json()["instructions"]
+    assert instructions != malformed
+    assert_required_sections(instructions)
