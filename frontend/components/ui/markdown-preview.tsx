@@ -163,6 +163,16 @@ export function MarkdownPreview({ content, className }: { content: string; class
       );
     }
   }
+  if (inCodeBlock) {
+    blocks.push(
+      <pre
+        key="code-eof"
+        className="my-3 overflow-x-auto rounded-xl bg-muted/80 p-3.5 font-mono text-xs text-foreground border border-border"
+      >
+        <code>{codeBlockLines.join("\n")}</code>
+      </pre>
+    );
+  }
 
   return <div className={cn("space-y-0.5", className)}>{blocks}</div>;
 }

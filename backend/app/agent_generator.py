@@ -123,7 +123,7 @@ def _build_fallback_instructions(agent_name: str, prompt_text: str) -> str:
 
 
 def _has_required_sections(instructions: str) -> bool:
-    """Require the exact headings in order, plus data collection for at least two steps."""
+    """Require ordered headings, spoken actions, and collection in every step."""
     lines = [line.strip() for line in instructions.splitlines()]
     positions: dict[str, int] = {}
     for heading in _REQUIRED_SECTIONS:
@@ -135,10 +135,25 @@ def _has_required_sections(instructions: str) -> bool:
     if ordered != sorted(ordered):
         return False
 
-    flow_lines = lines[positions[_SECTION_HEADINGS["flow"]] : positions[_SECTION_HEADINGS["termination"]]]
-    step_count = sum(1 for line in flow_lines if re.match(r"^\d+\.\s", line))
-    collect_count = sum(1 for line in flow_lines if "collect" in line.lower())
-    return step_count >= 2 and collect_count >= step_count
+    flow_lines = lines[positions[_SECTION_HEADINGS["flow"]] + 1 : positions[_SECTION_HEADINGS["termination"]]]
+    steps: list[list[str]] = []
+    for line in flow_lines:
+        if re.match(r"^\d+\.\s", line):
+            steps.append([line])
+        elif steps:
+            steps[-1].append(line)
+    return len(steps) >= 2 and all(
+        any(re.search(r"\bcollect\b", line, re.IGNORECASE) for line in step)
+        and any(
+            re.search(
+                r"\b(say|ask|greet|introduce|tell|explain|answer|confirm|summarize|read|clarify|thank|offer)\b",
+                line,
+                re.IGNORECASE,
+            )
+            for line in step
+        )
+        for step in steps
+    )
 
 
 def get_openai_client(model_override: str | None = None) -> tuple[AsyncOpenAI, str]:
