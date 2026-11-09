@@ -1,5 +1,6 @@
 "use client";
 
+
 import { useMemo } from "react";
 import type { Agent, AgentPatch, ProviderCatalog } from "@/lib/types";
 import { Button } from "@/components/ui/button";
@@ -8,6 +9,8 @@ import { Select } from "@/components/ui/select";
 import { MarkdownEditor } from "@/components/ui/markdown-editor";
 import { PROMPT_PLACEHOLDER } from "@/lib/prompt-template";
 import { TtsVoiceSelect, formatProviderName, type TtsProviderOption } from "@/components/ui/tts-voice-select";
+
+const EMPTY_TTS_PROVIDERS: NonNullable<ProviderCatalog["tts_providers"]> = [];
 
 export type AgentDraft = Pick<Agent,
   | "name"
@@ -44,12 +47,19 @@ export function agentDraftFromAgent(agent: Agent): AgentDraft {
 }
 
 export function draftChanges(draft: AgentDraft): AgentPatch {
-  const { slug: _slug, ...rest } = draft;
   return {
-    ...rest,
     name: draft.name.trim(),
     description: draft.description?.trim() || null,
     instructions: draft.instructions?.trim() || null,
+    languages: draft.languages,
+    default_language: draft.default_language,
+    stt_provider: draft.stt_provider,
+    stt_model: draft.stt_model,
+    llm_provider: draft.llm_provider,
+    llm_model: draft.llm_model,
+    tts_provider: draft.tts_provider,
+    tts_model: draft.tts_model,
+    voice_id: draft.voice_id,
   };
 }
 
@@ -70,7 +80,7 @@ export function AgentPipelineToolbar({
   onRetryCatalog: () => void;
 }) {
   const openAiAvailableModels = catalog?.openai.models.filter((model) => model.available) ?? [];
-  const allCatalogTtsProviders = catalog?.tts_providers ?? [];
+  const allCatalogTtsProviders = catalog?.tts_providers ?? EMPTY_TTS_PROVIDERS;
 
   const ttsProviders: TtsProviderOption[] = useMemo(() => {
     return allCatalogTtsProviders.map((provider) => ({
