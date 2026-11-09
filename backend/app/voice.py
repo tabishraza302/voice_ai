@@ -8,6 +8,7 @@ from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
+import re
 import uuid
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
@@ -24,7 +25,10 @@ from pipecat.frames.frames import (
     TTSStartedFrame,
     TTSStoppedFrame,
     TTSAudioRawFrame,
+    TTSSpeakFrame,
     TranscriptionFrame,
+    InterimTranscriptionFrame,
+    UserStartedSpeakingFrame,
     VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
@@ -40,12 +44,24 @@ from pipecat.services.deepgram.stt import DeepgramSTTService, DeepgramSTTSetting
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, ElevenLabsTTSSettings
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import TransportParams
+from pipecat.audio.filters.rnnoise_filter import RNNoiseFilter
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.utils.asyncio.task_manager import TaskManager
+from .observability import tracing_enabled
+from pipecat.workers.runner import WorkerRunner
 
 SUPPORTED_LANGUAGES = frozenset({"en", "hi"})
 SUPPORTED_STT_PROVIDER = "deepgram"
+def _build_transport_params() -> TransportParams:
+    return TransportParams(
+        audio_in_enabled=True,
+        audio_in_sample_rate=16_000,
+        audio_in_filter=RNNoiseFilter(),
+        audio_out_enabled=True,
+        audio_out_sample_rate=24_000,
+    )
+
 SUPPORTED_STT_MODEL = "nova-3"
 SUPPORTED_LLM_PROVIDER = "openai"
 SUPPORTED_TTS_MODELS = {
@@ -56,9 +72,38 @@ _RECENT_TURNS = 12
 _MAX_TRANSCRIPT_CHARS = 8_000
 _MAX_LLM_RESPONSE_CHARS = 12_000
 _PIPELINE_START_TIMEOUT_SECONDS = 30
+_BACKCHANNELS = frozenset({
+    "ok",
+    "okay",
+    "yeah",
+    "yes",
+    "yep",
+    "uh-huh",
+    "mhm",
+    "mm",
+    "right",
+    "sure",
+    "um",
+    "umm",
+    "ah",
+    "हाँ",    # hān — informal yes (Devanagari ha + combining anusvara + visarga)
+    "जी",     # jī — respectful yes/sir
+    "जी।",    # jī with danda punctuation (STT may include it)
+    "अच्छा",  # acchā — okay/good
+    "ठीक",    # ṭhīk — fine/okay
+    "हां",    # hāṁ — alternate transcription of hān
+})
+
+
+def _is_isolated_backchannel(text: str) -> bool:
+    cleaned = text.strip().casefold()
+    # Strip trailing punctuation (period, danda, question mark) for matching
+    cleaned = cleaned.rstrip(".।?\u0964")
+    return cleaned in _BACKCHANNELS or text.strip().casefold() in _BACKCHANNELS
+
 _END_CALL_SCHEMA = FunctionSchema(
     name="end_call",
-    description="End the call immediately. You MUST call this whenever the conversation reaches its conclusion, the user confirms they no longer need help, or the caller says goodbye. Deliver your final closing sign-off in the message parameter or in your response so the call terminates directly after the closing message.",
+    description="End the call immediately. You MUST call this tool in THAT SAME TURN whenever the conversation reaches its conclusion, the user confirms they no longer need help, or the caller says goodbye. Pass your polite farewell sign-off in the message parameter so it is spoken to the caller before disconnecting.",
     properties={
         "message": {
             "type": "string",
@@ -302,10 +347,20 @@ class CallDefinition:
 @dataclass(slots=True)
 class _Playback:
     context_id: str | None
-    kind: Literal["exact", "llm"]
+    kind: Literal["exact", "llm", "farewell"]
     generation: int
     step_id: str | None = None
     interrupted: bool = False
+
+
+@dataclass(slots=True)
+class _FarewellState:
+    pending: bool = False
+    started: bool = False
+    context_id: str | None = None
+    message: str | None = None
+    mode: Literal["natural", "explicit"] | None = None
+    generation: int | None = None
 
 
 class CallRuntime:
@@ -332,13 +387,21 @@ class CallRuntime:
         self.closed = False
         self.termination_status: str | None = None
         self.user_speaking = False
+        self.vad_speech_active = False
+        self.speech_generation = 0
+        self.flush_task: asyncio.Task[None] | None = None
         self.response_generation = 0
         self.active_response_generation: int | None = None
         self.response_text: dict[int, list[str]] = {}
         self.response_complete: set[int] = set()
         self.response_interrupted: set[int] = set()
         self.playbacks: dict[str | None, _Playback] = {}
+        self.runner: WorkerRunner | None = None
         self.end_call_pending = False
+        self.farewell = _FarewellState()
+        self.tts_request_texts: dict[str, str] = {}
+        self.transcript_overlapped_playback: bool = False
+        self.last_delivered_speech: str | None = None
         self.workflow_processor = _WorkflowProcessor(self)
         self.response_capture = _ResponseCaptureProcessor(self)
         self.tts_context_tracker = _TTSContextTracker(self)
@@ -380,20 +443,19 @@ class CallRuntime:
             if not self.renegotiating:
                 self.request_stop("cancelled")
 
-        async def receive_app_message(message: Any) -> None:
-            if isinstance(message, dict) and message.get("type") == "end":
-                self.request_stop("cancelled")
 
         connection.add_event_handler("closed", stop_for_connection_event)
         connection.add_event_handler("failed", stop_for_connection_event)
         connection.add_event_handler("disconnected", stop_for_disconnect)
-        connection.add_event_handler("app-message", receive_app_message)
-        params = TransportParams(
-            audio_in_enabled=True,
-            audio_in_sample_rate=16_000,
-            audio_out_enabled=True,
-            audio_out_sample_rate=24_000,
-        )
+        connection.add_event_handler("app-message", self.receive_app_message)
+        if hasattr(connection, "_pc") and connection._pc is not None:
+            @connection._pc.on("iceconnectionstatechange")
+            def on_ice_state_change() -> None:
+                if connection._pc and connection._pc.iceConnectionState in ("failed", "closed"):
+                    self.request_stop("cancelled")
+        if hasattr(connection, "connection_timeout_secs"):
+            connection.connection_timeout_secs = 15
+        params = _build_transport_params()
         self.transport = SmallWebRTCTransport(connection, params=params)
         providers = self.definition.providers
         stt = DeepgramSTTService(
@@ -402,10 +464,9 @@ class CallRuntime:
                 model=providers.stt_model,
                 language=providers.language,
                 endpointing=300,
-                interim_results=False,
+                interim_results=True,
                 smart_format=True,
                 numerals=True,
-                utterance_end_ms=1000,
             ),
         )
         llm = OpenAILLMService(
@@ -431,9 +492,10 @@ class CallRuntime:
                     language=providers.language,
                 ),
             )
+        tts.add_event_handler("on_tts_request", self._on_tts_request)
         vad = SileroVADAnalyzer(
             sample_rate=16_000,
-            params=VADParams(start_secs=0.2, stop_secs=0.35),
+            params=VADParams(start_secs=0.35, stop_secs=0.35),
         )
         pipeline = Pipeline(
             [
@@ -485,8 +547,11 @@ class CallRuntime:
         worker.add_event_handler("on_pipeline_started", on_started)
         worker.add_event_handler("on_pipeline_finished", on_finished)
         worker.add_event_handler("on_pipeline_error", on_error)
+        runner = WorkerRunner(handle_sigint=False, handle_sigterm=False)
+        await runner.add_workers(worker)
+        self.runner = runner
         self.worker_task = asyncio.create_task(
-            worker.run(WorkerParams(task_manager=TaskManager())),
+            runner.run(),
             name=f"voice-pipeline-{self.session_id}",
         )
         try:
@@ -520,36 +585,91 @@ class CallRuntime:
             _cleanup_runtime(self),
             name=f"voice-cleanup-{self.session_id}",
         )
+    async def receive_app_message(self, *args: Any, **kwargs: Any) -> None:
+        message = args[1] if len(args) > 1 else (args[0] if args else kwargs.get("message"))
+        if isinstance(message, dict) and message.get("type") == "end":
+            self.request_stop("completed")
+
+    def is_bot_speaking(self) -> bool:
+        return bool(self.playbacks) and not all(p.interrupted for p in self.playbacks.values())
+
 
     def note_interruption(self) -> None:
-        self.user_speaking = True
         generation = self.active_response_generation
         if generation is not None:
             self.response_interrupted.add(generation)
         for playback in self.playbacks.values():
             playback.interrupted = True
+        self.tts_request_texts.clear()
+
+    def _on_tts_request(self, service: Any, context_id: str, text: str) -> None:
+        text_str = str(text).strip() if text else ""
+        self.tts_request_texts[context_id] = text_str
+        if self.farewell.pending and self.farewell.message and not self.farewell.started:
+            farewell_text = self.farewell.message.strip()
+            if self.farewell.mode == "explicit":
+                if text_str.casefold() == farewell_text.casefold():
+                    self.farewell.context_id = context_id
+            elif self.farewell.mode == "natural":
+                if text_str and (text_str.casefold() in farewell_text.casefold() or farewell_text.casefold() in text_str.casefold()):
+                    self.farewell.context_id = context_id
 
     async def on_tts_started(self, frame: TTSStartedFrame) -> None:
         context_id = frame.context_id
         if context_id in self.playbacks:
             self.request_stop("failed")
             return
-        generation = self.active_response_generation
-        if generation is not None:
+        is_farewell_context = (
+            self.farewell.pending
+            and self.farewell.context_id is not None
+            and context_id == self.farewell.context_id
+        )
+        if is_farewell_context and not self.farewell.started:
+            self.farewell.started = True
+
+        if self.farewell.mode == "explicit" and is_farewell_context:
+            self.playbacks[context_id] = _Playback(
+                context_id=context_id,
+                kind="farewell",
+                generation=0,
+                interrupted=False,
+            )
+        elif self.active_response_generation is not None:
             self.playbacks[context_id] = _Playback(
                 context_id=context_id,
                 kind="llm",
-                generation=generation,
-                interrupted=self.user_speaking or generation in self.response_interrupted,
+                generation=self.active_response_generation,
+                interrupted=self.user_speaking or self.active_response_generation in self.response_interrupted,
+            )
+        else:
+            self.playbacks[context_id] = _Playback(
+                context_id=context_id,
+                kind="farewell",
+                generation=0,
+                interrupted=False,
             )
 
     async def on_tts_stopped(self, frame: TTSStoppedFrame, *, transport_completed: bool) -> None:
+        req_text = self.tts_request_texts.pop(frame.context_id, None) or ""
         playback = self.playbacks.pop(frame.context_id, None)
         if playback is None:
             return
+
+        is_farewell = False
+        if self.farewell.pending:
+            if self.farewell.mode == "natural" and self.farewell.generation is not None:
+                is_farewell = playback.generation == self.farewell.generation
+            elif self.farewell.mode == "explicit" and self.farewell.message:
+                is_farewell = (
+                    frame.context_id == self.farewell.context_id
+                    or req_text.casefold() == self.farewell.message.strip().casefold()
+                )
+
         if not transport_completed:
             if not playback.interrupted:
                 self.request_stop("failed")
+            if is_farewell:
+                self.farewell = _FarewellState()
             return
 
         generation = playback.generation
@@ -561,17 +681,69 @@ class CallRuntime:
         if not playback.interrupted and is_complete and text:
             self._persist_message(text)
             self.recent_conversation.append({"role": "assistant", "content": text})
-            await self._send_caption("assistant", text)
+            await self._send_caption("assistant", text, final=True)
+            self.last_delivered_speech = text
+        elif not playback.interrupted and is_farewell and self.farewell.mode == "explicit" and self.farewell.message:
+            farewell_text = self.farewell.message
+            self._persist_message(farewell_text, role="assistant")
+            self.recent_conversation.append({"role": "assistant", "content": farewell_text})
+            await self._send_caption("assistant", farewell_text, final=True)
+            self.last_delivered_speech = farewell_text
 
-        if self.end_call_pending and not self.playbacks:
+        if is_farewell:
+            self.farewell = _FarewellState()
+        if self.end_call_pending and not self.playbacks and not self.farewell.pending:
             self.request_stop("completed")
 
     async def _handle_end_call(self, params: Any) -> None:
         args = getattr(params, "arguments", {}) or {}
         message = args.get("message") if isinstance(args, dict) else None
-        if message and not self.playbacks:
+        current_text = ""
+        if self.active_response_generation is not None:
+            current_text = "".join(self.response_text.get(self.active_response_generation, [])).strip()
+
+        already_delivered = bool(
+            message
+            and self.last_delivered_speech
+            and message.casefold() in self.last_delivered_speech.casefold()
+        )
+        already_generating = bool(
+            message
+            and current_text
+            and message.casefold() in current_text.casefold()
+        )
+
+        for ctx_id in list(self.playbacks.keys()):
+            if self.playbacks[ctx_id].interrupted:
+                self.playbacks.pop(ctx_id, None)
+
+        if already_generating:
+            matching_playback_ctx = None
+            for ctx_id, pb in self.playbacks.items():
+                if pb.generation == self.active_response_generation:
+                    matching_playback_ctx = ctx_id
+                    break
+            self.farewell.pending = True
+            self.farewell.mode = "natural"
+            self.farewell.generation = self.active_response_generation
+            self.farewell.message = current_text
+            if matching_playback_ctx is not None:
+                self.farewell.started = True
+                self.farewell.context_id = matching_playback_ctx
+            else:
+                for ctx_id, req_text in self.tts_request_texts.items():
+                    if req_text and (req_text.casefold() in current_text.casefold() or current_text.casefold() in req_text.casefold()):
+                        self.farewell.context_id = ctx_id
+                        break
+        elif message and not already_delivered:
+
+            self.farewell = _FarewellState(
+                pending=True,
+                mode="explicit",
+                message=message,
+            )
             await self.workflow_processor.push_frame(
-                LLMTextFrame(text=message),
+                TTSSpeakFrame(text=message),
                 FrameDirection.DOWNSTREAM,
             )
         callback = getattr(params, "result_callback", None)
@@ -580,24 +752,33 @@ class CallRuntime:
             if asyncio.iscoroutine(res):
                 await res
         self.end_call_pending = True
-        if not self.playbacks:
-            async def _safety_stop() -> None:
-                await asyncio.sleep(1.5)
-                if not self.playbacks and not self.closing:
-                    self.request_stop("completed")
 
-            asyncio.create_task(_safety_stop())
+        async def _safety_stop() -> None:
+            max_wait = 10.0 if message else 1.5
+            poll_interval = 0.25
+            waited = 0.0
+            while waited < max_wait and not self.closing:
+                await asyncio.sleep(poll_interval)
+                waited += poll_interval
+                if not self.playbacks and not self.farewell.pending:
+                    break
+            if not self.closing:
+                self.request_stop("completed")
+        asyncio.create_task(_safety_stop())
     async def handle_final_transcription(self, text: str) -> None:
         transcript = text.strip()
         if not transcript:
             return
         if len(transcript) > _MAX_TRANSCRIPT_CHARS:
             raise VoiceRuntimeError("Caller speech exceeded the per-turn transcript limit.")
+        overlapped = self.transcript_overlapped_playback or self.is_bot_speaking()
+        self.transcript_overlapped_playback = False
         self.user_speaking = False
         self._persist_message(transcript, role="user")
         self.recent_conversation.append({"role": "user", "content": transcript})
-        await self._send_caption("user", transcript)
-        await self._push_dialogue_turn()
+        await self._send_caption("user", transcript, final=True)
+        if not (overlapped and _is_isolated_backchannel(transcript)):
+            await self._push_dialogue_turn()
 
     def _build_system_message(self, directive: str | None = None) -> dict[str, str]:
         lines: list[str] = []
@@ -608,10 +789,9 @@ class CallRuntime:
         lines.append(f"Respond in language: {self.definition.language}.")
         lines.append(
             "Call Termination Rule: Once the caller confirms they no longer need help, says goodbye, "
-            "or the conversation reaches its end state, you MUST call the end_call tool immediately. "
-            "Deliver your final polite closing message (either via the message argument of end_call or "
-            "in your response) and end the session directly. Never wait for another user response after "
-            "delivering the closing message."
+            "or the conversation reaches its end state, you MUST call the end_call tool in THAT SAME TURN. "
+            "Pass your final polite closing message in the message argument of end_call to end the session directly. "
+            "Never deliver a closing message without invoking end_call, and never wait for another user response to end the call."
         )
         if directive:
             lines.append(directive)
@@ -638,17 +818,17 @@ class CallRuntime:
         self.response_text[generation] = []
         return generation
 
-    def append_llm_text(self, text: str) -> None:
+    def append_llm_text(self, text: str) -> str:
         generation = self.active_response_generation
         if generation is None:
-            return
+            return ""
         chunks = self.response_text.get(generation)
         if chunks is None:
-            return
+            return ""
         if sum(map(len, chunks)) + len(text) > _MAX_LLM_RESPONSE_CHARS:
             raise VoiceRuntimeError("The generated response exceeded its per-turn limit.")
         chunks.append(text)
-
+        return "".join(chunks).strip()
     def finish_llm_response(self) -> None:
         generation = self.active_response_generation
         if generation is not None:
@@ -664,11 +844,15 @@ class CallRuntime:
         if content:
             self.writer.enqueue_message(role, content)
 
-    async def _send_caption(self, role: Literal["user", "assistant"], text: str) -> None:
+    async def _send_caption(
+        self, role: Literal["user", "assistant"], text: str, *, final: bool = True
+    ) -> None:
         if self.connection is None or not text:
             return
         try:
-            result = self.connection.send_app_message({"type": "caption", "role": role, "text": text})
+            result = self.connection.send_app_message(
+                {"type": "caption", "role": role, "text": text, "final": final}
+            )
             if asyncio.iscoroutine(result):
                 await result
         except Exception:
@@ -682,7 +866,9 @@ class _WorkflowProcessor(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
-        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, TranscriptionFrame):
+        if direction == FrameDirection.DOWNSTREAM and isinstance(
+            frame, (TranscriptionFrame, InterimTranscriptionFrame)
+        ):
             await self._handle_transcription_frame(frame)
             return
         await self.push_frame(frame, direction)
@@ -694,30 +880,107 @@ class _WorkflowProcessor(FrameProcessor):
             )
             await self.runtime._push_dialogue_turn(directive=directive)
         elif isinstance(frame, VADUserStartedSpeakingFrame):
+            is_continuation = bool(
+                self.runtime.flush_task is not None
+                and not self.runtime.flush_task.done()
+            )
+            self.runtime.vad_speech_active = True
             self.runtime.user_speaking = True
-            self.runtime.note_interruption()
-            await self.broadcast_interruption()
+            self.runtime.speech_generation += 1
+            if is_continuation:
+                self.runtime.flush_task.cancel()
+            if self.runtime.is_bot_speaking():
+                self.runtime.transcript_overlapped_playback = True
+            else:
+                if not is_continuation and not self.runtime.transcript_segments:
+                    self.runtime.transcript_overlapped_playback = False
+                self.runtime.note_interruption()
+                await self.broadcast_interruption()
+            await self.push_frame(UserStartedSpeakingFrame(), direction)
         elif isinstance(frame, VADUserStoppedSpeakingFrame):
+            self.runtime.vad_speech_active = False
             self.runtime.user_speaking = False
+            self.runtime.speech_generation += 1
+            gen = self.runtime.speech_generation
+
+            self._schedule_fallback_flush(gen)
         elif isinstance(frame, InterruptionFrame):
             self.runtime.note_interruption()
         elif isinstance(frame, ErrorFrame):
             self.runtime.request_stop("failed")
 
-    async def _handle_transcription_frame(self, frame: TranscriptionFrame) -> None:
-        result = frame.result
+    def _schedule_fallback_flush(self, expected_gen: int) -> None:
+        async def _fallback_flush() -> None:
+            try:
+                await asyncio.sleep(0.4)
+            except asyncio.CancelledError:
+                return
+            if self.runtime.closing or self.runtime.closed:
+                return
+            if self.runtime.speech_generation == expected_gen and self.runtime.transcript_segments:
+                text = " ".join(self.runtime.transcript_segments).strip()
+                self.runtime.transcript_segments.clear()
+                if text:
+                    await self.runtime.handle_final_transcription(text)
+
+        self.runtime.flush_task = asyncio.create_task(_fallback_flush())
+
+
+    async def _handle_transcription_frame(self, frame: Frame) -> None:
+        if isinstance(frame, InterimTranscriptionFrame):
+            raw_text = frame.text.strip()
+            if raw_text:
+                if self.runtime.is_bot_speaking():
+                    self.runtime.transcript_overlapped_playback = True
+                    if not _is_isolated_backchannel(raw_text):
+                        self.runtime.note_interruption()
+                        await self.broadcast_interruption()
+                text_so_far = " ".join([*self.runtime.transcript_segments, raw_text]).strip()
+                if text_so_far:
+                    await self.runtime._send_caption("user", text_so_far, final=False)
+            return
+
+        result = getattr(frame, "result", None)
         is_final = bool(getattr(result, "is_final", False))
         speech_final = bool(getattr(result, "speech_final", False))
         from_finalize = bool(getattr(result, "from_finalize", False))
-        if is_final and frame.text.strip():
-            self.runtime.transcript_segments.append(frame.text.strip())
+        raw_text = getattr(frame, "text", "").strip()
+        if raw_text and self.runtime.is_bot_speaking():
+            self.runtime.transcript_overlapped_playback = True
+            if not _is_isolated_backchannel(raw_text):
+                self.runtime.note_interruption()
+                await self.broadcast_interruption()
+
+        if is_final and raw_text:
+            self.runtime.transcript_segments.append(raw_text)
+
         if not (speech_final or from_finalize):
+            if raw_text:
+                text_so_far = (
+                    " ".join(self.runtime.transcript_segments).strip()
+                    if is_final
+                    else " ".join([*self.runtime.transcript_segments, raw_text]).strip()
+                )
+                if text_so_far:
+                    await self.runtime._send_caption("user", text_so_far, final=False)
+            if (
+                is_final
+                and raw_text
+                and not self.runtime.vad_speech_active
+                and self.runtime.flush_task is not None
+                and self.runtime.flush_task.done()
+            ):
+                self._schedule_fallback_flush(self.runtime.speech_generation)
             return
+
+        if not is_final and raw_text:
+            self.runtime.transcript_segments.append(raw_text)
+        self.runtime.speech_generation += 1
+
         text = " ".join(self.runtime.transcript_segments).strip()
         self.runtime.transcript_segments.clear()
         if text:
             await self.runtime.handle_final_transcription(text)
-
 
 class _ResponseCaptureProcessor(FrameProcessor):
     def __init__(self, runtime: CallRuntime) -> None:
@@ -730,7 +993,9 @@ class _ResponseCaptureProcessor(FrameProcessor):
             if isinstance(frame, LLMFullResponseStartFrame):
                 self.runtime.begin_llm_response()
             elif isinstance(frame, LLMTextFrame):
-                self.runtime.append_llm_text(frame.text)
+                full_text = self.runtime.append_llm_text(frame.text)
+                if full_text:
+                    await self.runtime._send_caption("assistant", full_text, final=False)
             elif isinstance(frame, LLMFullResponseEndFrame):
                 self.runtime.finish_llm_response()
             elif isinstance(frame, InterruptionFrame):
@@ -744,6 +1009,8 @@ class _TTSContextTracker(FrameProcessor):
     def __init__(self, runtime: CallRuntime) -> None:
         super().__init__()
         self.runtime = runtime
+        # Only this upstream tracker clears all contexts; downstream processing
+        # may lag behind newly queued speech and must not invalidate it.
         self.audio_contexts: set[str] = set()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
@@ -777,14 +1044,10 @@ class _OutputCompletionProcessor(FrameProcessor):
         await super().process_frame(frame, direction)
         transport_completed = False
         if direction == FrameDirection.DOWNSTREAM:
-            if isinstance(frame, InterruptionFrame):
-                self.audio_contexts.clear()
-            elif isinstance(frame, TTSStoppedFrame):
+            if isinstance(frame, TTSStoppedFrame):
                 if frame.context_id is not None:
                     transport_completed = frame.context_id in self.audio_contexts
                     self.audio_contexts.discard(frame.context_id)
-            elif isinstance(frame, ErrorFrame):
-                self.audio_contexts.clear()
         await self.push_frame(frame, direction)
         if direction == FrameDirection.DOWNSTREAM:
             if isinstance(frame, TTSStoppedFrame):
@@ -806,40 +1069,44 @@ def create_call_runtime(
 
 async def _cleanup_runtime(runtime: CallRuntime) -> None:
     status = runtime.termination_status or "failed"
-    worker_task = runtime.worker_task
-    current_task = asyncio.current_task()
-    if runtime.duration_task is not None and runtime.duration_task is not current_task:
-        runtime.duration_task.cancel()
-    if runtime.worker is not None and worker_task is not None and not worker_task.done():
-        try:
-            await runtime.worker.cancel()
-        except Exception:
-            status = "failed"
-        if worker_task is not current_task:
+    try:
+        worker_task = runtime.worker_task
+        current_task = asyncio.current_task()
+        if runtime.duration_task is not None and runtime.duration_task is not current_task:
+            runtime.duration_task.cancel()
+        if runtime.flush_task is not None and not runtime.flush_task.done():
+            runtime.flush_task.cancel()
+        if runtime.worker is not None and worker_task is not None and not worker_task.done():
             try:
-                await asyncio.wait_for(asyncio.shield(worker_task), timeout=10)
-            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                await runtime.worker.cancel()
+            except Exception:
                 status = "failed"
-    if runtime.connection is not None:
+            if worker_task is not current_task:
+                try:
+                    await asyncio.wait_for(asyncio.shield(worker_task), timeout=10)
+                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                    status = "failed"
+        if runtime.connection is not None:
+            try:
+                await runtime.connection.disconnect()
+            except Exception:
+                status = "failed"
         try:
-            await runtime.connection.disconnect()
+            await runtime.writer.flush()
         except Exception:
             status = "failed"
-    try:
-        await runtime.writer.flush()
-    except Exception:
-        status = "failed"
-    from .sessions import set_session_status
+        from .sessions import set_session_status
 
-    try:
-        await set_session_status(
-            runtime.session_id,
-            status,
-        )
-    except Exception:
-        status = "failed"
-    runtime.closed = True
-    runtime.termination_status = status
-    from .signaling import release_call_runtime
+        try:
+            await set_session_status(
+                runtime.session_id,
+                status,
+            )
+        except Exception:
+            status = "failed"
+        runtime.closed = True
+        runtime.termination_status = status
+    finally:
+        from .signaling import release_call_runtime
 
-    await release_call_runtime(runtime)
+        await release_call_runtime(runtime)
