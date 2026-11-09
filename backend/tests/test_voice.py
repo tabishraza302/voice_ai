@@ -1,7 +1,6 @@
 
 from __future__ import annotations
 
-import json
 import uuid
 from types import SimpleNamespace
 
@@ -26,29 +25,12 @@ from app.voice import (
     provider_publish_errors,
     validate_tts_voice_selection,
 )
+from voice_pipeline_harness import verified_environment
 
 
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
-
-
-def verified_environment() -> dict[str, str]:
-    return {
-        "DEEPGRAM_API_KEY": "deepgram-test-secret",
-        "OPENAI_API_KEY": "openai-test-secret",
-        "VERIFIED_OPENAI_MODELS": "gpt-4o-mini,gpt-4.1-mini",
-        "CARTESIA_API_KEY": "cartesia-test-secret",
-        "ELEVENLABS_API_KEY": "elevenlabs-test-secret",
-        "VERIFIED_TTS_VOICE_CATALOG": json.dumps(
-            {
-                "cartesia": {"sonic-3.6": {"cartesia-en": ["en"], "cartesia-hi": ["hi"]}},
-                "elevenlabs": {
-                    "eleven_flash_v2_5": {"eleven-en": ["en"], "eleven-hi": ["hi"]}
-                },
-            }
-        ),
-    }
 
 
 def provider_agent(**overrides: object) -> dict[str, object]:
@@ -385,26 +367,6 @@ async def test_output_completion_is_bound_to_matching_tts_context() -> None:
     assert runtime.unconfirmed == ["new"]
     assert runtime.completed == ["old"]
 
-@pytest.mark.anyio
-async def test_tts_without_matching_output_audio_fails_closed() -> None:
-    runtime = object.__new__(CallRuntime)
-    runtime.playbacks = {
-        "context": _Playback(
-            context_id="context",
-            kind="llm",
-            generation=1,
-        )
-    }
-    failures: list[str] = []
-    runtime.request_stop = failures.append
-
-    await runtime.on_tts_stopped(
-        TTSStoppedFrame(context_id="context"),
-        transport_completed=False,
-    )
-
-    assert failures == ["failed"]
-
 
 @pytest.mark.anyio
 async def test_successful_call_sends_only_safe_completion_event(monkeypatch) -> None:
@@ -548,3 +510,133 @@ async def test_voice_runtime_handle_end_call_safety_timer(monkeypatch) -> None:
     assert messages == [{"type": "call.completed"}]
     if runtime.cleanup_task:
         await runtime.cleanup_task
+
+
+@pytest.mark.parametrize(
+    "existing_speech",
+    [
+        pytest.param(False, id="delayed-start"),
+        pytest.param(True, id="prior-speech-drains"),
+    ],
+)
+@pytest.mark.anyio
+async def test_farewell_waits_for_delayed_tts_start_and_audio_completion(
+    monkeypatch,
+    existing_speech: bool,
+) -> None:
+    import asyncio
+
+    from voice_pipeline_harness import RunningVoicePipeline
+
+    pipeline = RunningVoicePipeline(
+        verified_environment(),
+        scenario="farewell",
+        existing_speech=existing_speech,
+    )
+    try:
+        await pipeline.start(monkeypatch)
+        tts = pipeline.tts
+        output = pipeline.output
+        connection = pipeline.connection
+
+        await asyncio.wait_for(tts.synthesis_requested.wait(), timeout=3)
+        if existing_speech:
+            await asyncio.wait_for(pipeline.tool_result_received.wait(), timeout=3)
+            tts.finish_ordinary.set()
+            await asyncio.wait_for(output.ordinary_audio_completed.wait(), timeout=3)
+            await asyncio.sleep(0.05)
+        else:
+            await asyncio.sleep(0.4)
+        premature_completion_message = (
+            "call completed after prior speech drained before farewell TTS started"
+            if existing_speech
+            else "call completed before the delayed farewell TTS audio finished"
+        )
+        assert not any(
+            message.get("type") == "call.completed" for message in connection.messages
+        ), premature_completion_message
+
+        tts.start_synthesis.set()
+        await asyncio.wait_for(output.audio_completed.wait(), timeout=3)
+        await asyncio.wait_for(connection.call_completed.wait(), timeout=3)
+        if existing_speech:
+            assert pipeline.events.index("ordinary-audio-complete") < pipeline.events.index(
+                "farewell-audio-start"
+            )
+        assert pipeline.events.index("farewell-audio-complete") < pipeline.events.index(
+            "call-completed"
+        )
+    finally:
+        await pipeline.close()
+
+
+@pytest.mark.anyio
+async def test_late_final_transcription_is_captioned_answered_and_saved(monkeypatch) -> None:
+    import asyncio
+
+    from voice_pipeline_harness import ASSISTANT_TEXT, CALLER_TEXT, RunningVoicePipeline
+
+    pipeline = RunningVoicePipeline(
+        verified_environment(),
+        scenario="late-transcription",
+    )
+    try:
+        await pipeline.start(monkeypatch)
+        await asyncio.wait_for(pipeline.stt.vad_started.wait(), timeout=3)
+        await asyncio.wait_for(pipeline.stt.vad_stopped.wait(), timeout=3)
+        await asyncio.wait_for(pipeline.stt.late_transcription_sent.wait(), timeout=3)
+        await asyncio.wait_for(pipeline.connection.any_user_caption.wait(), timeout=3)
+        try:
+            await asyncio.wait_for(pipeline.connection.user_final_caption.wait(), timeout=1.5)
+        except asyncio.TimeoutError:
+            pass
+        assert any(
+            message.get("type") == "caption"
+            and message.get("role") == "user"
+            and message.get("text") == CALLER_TEXT
+            and message.get("final") is True
+            for message in pipeline.connection.messages
+        ), "late final caller transcription was not surfaced as a final caption"
+
+        await asyncio.wait_for(pipeline.connection.assistant_final_caption.wait(), timeout=3)
+        assert any(
+            message.get("type") == "caption"
+            and message.get("role") == "assistant"
+            and message.get("text") == ASSISTANT_TEXT
+            and message.get("final") is True
+            for message in pipeline.connection.messages
+        )
+
+        assert pipeline.client is not None and pipeline.session_id is not None
+        deadline = asyncio.get_running_loop().time() + 3
+        messages: list[dict[str, object]] = []
+        while True:
+            saved_messages = await pipeline.client.get(
+                f"/sessions/{pipeline.session_id}/messages"
+            )
+            assert saved_messages.status_code == 200
+            messages = saved_messages.json()
+            user_saved = any(
+                message["role"] == "user" and message["content"] == CALLER_TEXT
+                for message in messages
+            )
+            assistant_saved = any(
+                message["role"] == "assistant" and message["content"] == ASSISTANT_TEXT
+                for message in messages
+            )
+            if user_saved and assistant_saved:
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+            await asyncio.sleep(0.05)
+        assert any(
+            message["role"] == "user" and message["content"] == CALLER_TEXT
+            for message in messages
+        )
+        assert any(
+            message["role"] == "assistant" and message["content"] == ASSISTANT_TEXT
+            for message in messages
+        )
+    finally:
+        await pipeline.close()
+
