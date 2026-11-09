@@ -1,7 +1,7 @@
 import type { InputHTMLAttributes } from "react";
 import { cn } from "./utils";
 
-export interface InputProps extends InputHTMLAttributes<HTMLInputElement> {}
+export type InputProps = InputHTMLAttributes<HTMLInputElement>;
 
 export function Input({ className, ...props }: InputProps) {
   return (

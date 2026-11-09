@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { ApiError, api, apiErrorText } from "@/lib/api";
@@ -11,19 +11,18 @@ import { TabPanel, TabsBar } from "@/components/ui/tabs";
 import { cn } from "@/components/ui/utils";
 import { OwnerShell } from "@/app/dashboard/owner-shell";
 import { AgentDraft, AgentInstructions, AgentPipelineToolbar, agentDraftFromAgent } from "./agent-sections";
-import { AgentTesting } from "./agent-testing";
+import { AgentSessionHistory } from "./agent-session-history";
 import { useDraftAutosave } from "./use-draft-autosave";
 import { ChatPanel } from "@/components/chat-panel";
-
+import { WebCallModal } from "@/components/web-call-modal";
 export interface SaveState {
   status: "idle" | "saving" | "saved" | "error";
   message?: string;
 }
 
-type EditorTab = "prompt" | "testing" | "history";
+type EditorTab = "prompt" | "history";
 const editorTabs: Array<{ value: EditorTab; label: string }> = [
   { value: "prompt", label: "Agent Prompt" },
-  { value: "testing", label: "Testing" },
   { value: "history", label: "History" },
 ];
 
@@ -36,6 +35,8 @@ export default function AgentEditorPage() {
   const [agent, setAgent] = useState<Agent | null>(null);
   const [draft, setDraft] = useState<AgentDraft | null>(null);
   const [chatOpen, setChatOpen] = useState(false);
+  const [webCallOpen, setWebCallOpen] = useState(false);
+  const [historyVersion, setHistoryVersion] = useState(0);
   const [catalog, setCatalog] = useState<ProviderCatalog | null>(null);
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [catalogLoading, setCatalogLoading] = useState(true);
@@ -44,7 +45,6 @@ export default function AgentEditorPage() {
   const [activeTab, setActiveTab] = useState<EditorTab>("prompt");
   const [reload, setReload] = useState(0);
   const [draftSaveState, setDraftSaveState] = useState<SaveState>({ status: "idle" });
-  const [flushToken, setFlushToken] = useState(0);
   const { flush: flushDraft } = useDraftAutosave({
     agentId,
     agent,
@@ -167,61 +167,71 @@ export default function AgentEditorPage() {
                   />
                 </div>
               </div>
-              <div className="flex flex-wrap items-center gap-3">
+              <div className="flex flex-wrap items-center gap-2 sm:gap-3">
+                {draftSaveState.status === "saving" ? (
+                  <span className="flex items-center gap-1.5 rounded-lg border border-border/60 bg-muted/30 px-3 py-1.5 text-xs font-medium text-muted-foreground" role="status">
+                    <span className="h-2 w-2 animate-pulse rounded-full bg-primary" />
+                    <span>Saving...</span>
+                  </span>
+                ) : draftSaveState.status === "error" ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      flushDraft();
+                    }}
+                    className="flex items-center gap-1.5 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-1.5 text-xs font-medium text-destructive transition-colors hover:bg-destructive/15"
+                    role="status"
+                    aria-label={`Error: ${draftSaveState.message}. Click to retry.`}
+                  >
+                    <span className="h-1.5 w-1.5 rounded-full bg-destructive" />
+                    <span>{draftSaveState.message || "Couldn't save"}</span>
+                    <span className="ml-1 font-semibold underline underline-offset-2">Retry</span>
+                  </button>
+                ) : draftSaveState.status === "saved" ? (
+                  <span className="flex items-center gap-1.5 rounded-lg border border-border/60 bg-muted/30 px-3 py-1.5 text-xs font-medium text-primary" role="status">
+                    <span className="h-1.5 w-1.5 rounded-full bg-primary" />
+                    <span>Saved</span>
+                  </span>
+                ) : null}
                 <button
                   type="button"
                   onClick={() => {
-                    const isBusyOrError =
-                      draftSaveState.status === "saving" ||
-                      draftSaveState.status === "error";
-                    if (isBusyOrError) {
-                      flushDraft();
-                      setFlushToken((token) => token + 1);
-                    } else {
-                      setChatOpen((prev) => !prev);
-                    }
+                    setWebCallOpen((prev) => !prev);
+                    if (!webCallOpen) setChatOpen(false);
                   }}
                   className={cn(
                     "flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors",
-                    draftSaveState.status === "error"
-                      ? "border-destructive/40 bg-destructive/10 text-destructive hover:bg-destructive/15"
+                    webCallOpen
+                      ? "border-primary/50 bg-primary/10 text-primary"
                       : "border-border/60 bg-muted/30 text-muted-foreground hover:bg-muted/50 hover:text-foreground"
                   )}
-                  role="status"
-                  aria-label={
-                    draftSaveState.status === "error"
-                      ? `Error: ${draftSaveState.message}. Click to retry.`
-                      : draftSaveState.status === "saving"
-                      ? "Saving changes"
-                      : draftSaveState.status === "saved"
-                      ? "Changes saved"
-                      : "Test chat"
-                  }
+                  aria-label="Web call"
+                  aria-pressed={webCallOpen}
                 >
-                  {draftSaveState.status === "saving" ? (
-                    <>
-                      <span className="h-2 w-2 animate-pulse rounded-full bg-primary" />
-                      <span className="text-muted-foreground">Saving...</span>
-                    </>
-                  ) : draftSaveState.status === "error" ? (
-                    <>
-                      <span className="h-1.5 w-1.5 rounded-full bg-destructive" />
-                      <span>{draftSaveState.message || "Couldn't save"}</span>
-                      <span className="ml-1 font-semibold underline underline-offset-2">Retry</span>
-                    </>
-                  ) : draftSaveState.status === "saved" ? (
-                    <>
-                      <span className="h-1.5 w-1.5 rounded-full bg-primary" />
-                      <span className="text-primary font-medium">Saved</span>
-                    </>
-                  ) : (
-                    <>
-                      <svg className="h-3.5 w-3.5 text-muted-foreground" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-                      </svg>
-                      <span>Test chat</span>
-                    </>
+                  <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z" />
+                  </svg>
+                  <span>Web call</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setChatOpen((prev) => !prev);
+                    if (!chatOpen) setWebCallOpen(false);
+                  }}
+                  className={cn(
+                    "flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors",
+                    chatOpen
+                      ? "border-primary/50 bg-primary/10 text-primary"
+                      : "border-border/60 bg-muted/30 text-muted-foreground hover:bg-muted/50 hover:text-foreground"
                   )}
+                  aria-label="Chat"
+                  aria-pressed={chatOpen}
+                >
+                  <svg className="h-3.5 w-3.5 text-muted-foreground" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+                  </svg>
+                  <span>Chat</span>
                 </button>
               </div>
             </div>
@@ -245,8 +255,8 @@ export default function AgentEditorPage() {
                     <AgentInstructions draft={draft} onPatch={patchDraft} />
                   </div>
                 ) : null}
-                {activeTab === "testing" || activeTab === "history" ? (
-                  <AgentTesting view={activeTab} agentId={agentId} agentName={agent.name} languages={draft.languages} defaultLanguage={draft.default_language} />
+                {activeTab === "history" ? (
+                  <AgentSessionHistory agentId={agentId} refreshVersion={historyVersion} />
                 ) : null}
               </TabPanel>
             </div>
@@ -254,14 +264,25 @@ export default function AgentEditorPage() {
         ) : null}
       </main>
       {agent && draft ? (
-        <ChatPanel
-          agentId={agentId}
-          agentName={draft.name || agent.name}
-          languages={draft.languages}
-          defaultLanguage={draft.default_language}
-          open={chatOpen}
-          onClose={() => setChatOpen(false)}
-        />
+        <>
+          <ChatPanel
+            agentId={agentId}
+            agentName={draft.name || agent.name}
+            languages={draft.languages}
+            defaultLanguage={draft.default_language}
+            open={chatOpen}
+            onClose={() => setChatOpen(false)}
+          />
+          <WebCallModal
+            agentId={agentId}
+            agentName={draft.name || agent.name}
+            languages={draft.languages}
+            defaultLanguage={draft.default_language}
+            open={webCallOpen}
+            onClose={() => setWebCallOpen(false)}
+            onSessionEnded={() => setHistoryVersion((version) => version + 1)}
+          />
+        </>
       ) : null}
     </OwnerShell>
   );

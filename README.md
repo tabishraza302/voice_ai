@@ -37,10 +37,16 @@ The backend starts before the migration step by design; API requests need the sc
 
 ```sh
 docker compose exec backend pytest
+docker compose exec frontend npm run test:captions
+docker compose exec frontend npm run lint -- --max-warnings 0
 docker compose exec frontend npm run build
 ```
 
 `backend/tests/conftest.py` forces `DATABASE_URL` to `TEST_DATABASE_URL`, and the test suite drops and recreates tables there. It must never point at the application database. Compose supplies `TEST_DATABASE_URL` automatically; without Compose, point it at a local disposable database (for example one running on port 55432).
+
+Scoped dependency overrides patch the lint parser's `minimatch` and Next's
+`postcss` dependencies while keeping Next 15 and ESLint 9. The locked graph is
+verified with the Node 22 Docker runtime.
 
 ### Structured agent prompts
 
@@ -51,10 +57,23 @@ say or ask and what to collect. Generated instructions with missing or reordered
 headings, or a step without spoken-action or collection guidance, use structured
 fallback instructions instead. Agent names and fallback purposes are kept on one line.
 
+Prompt generation and enhancement ask for natural capability clarification instead
+of fixed scripts, instruct agents to substitute collected values rather than read
+bracketed placeholders aloud, and tell agents to invoke `end_call` when the
+conversation is complete.
+
 The single-prompt editor supports Write, Split, and Preview modes without changing
 the Markdown source or draft autosave behavior. Test chat stays editable while an
 assistant reply streams; sending another message does not move incoming tokens out
 of the assistant's bubble. Warnings preserve partial replies and clear streaming state.
+
+Use **Web call** in the agent editor to open a call modal, select an available
+language, start or end a call, and inspect its scoped trace. **Chat** opens the
+separate text panel; **History** lists saved sessions and refreshes after a web call ends.
+
+Live voice captions update each speaker's unfinished turn independently, including
+when caller and agent events overlap. Ending a call or losing its transport keeps
+the received text and clears unfinished streaming markers.
 
 Chat and voice runtimes expose an `end_call` tool, and generated prompts include
 instructions to use it when the conversation is complete. In chat, the agent can
@@ -63,8 +82,15 @@ When both are present, the runtime keeps the streamed response and appends the
 tool farewell unless that exact farewell already ends the response. It saves
 the complete closing turn before marking the session `completed` and sending
 `session_ended`, then closes the WebSocket without requiring another user turn.
-Live voice farewell delivery remains unverified: the current handler can skip a
-tool-provided farewell during existing playback or stop before delayed audio starts.
+Tool-provided voice farewells wait for synthesis and backend audio-transport
+completion, with a ten-second safety limit. Already delivered farewells are not
+spoken again, while additional closing information is preserved. Final assistant
+captions and saved messages follow audio completion order. A late final
+transcription still becomes a caller turn after the VAD fallback window expires.
+Isolated backchannels that overlap bot playback are captioned and saved without
+starting another model turn, even when their transcript finalizes after audio
+drains. New utterances outside playback and meaningful commands still get normal
+responses.
 
 ## Environment
 

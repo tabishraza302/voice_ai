@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, apiErrorText } from "../lib/api";
 import type { ChatSessionCreated } from "../lib/types";
 import { Button } from "./ui/button";
@@ -52,10 +52,11 @@ export function ChatPanel({
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
-  const startSession = async () => {
+  const selectedLanguage = defaultLanguage || (languages.length > 0 ? languages[0] : "en");
+
+  const startSession = useCallback(async () => {
     setState({ kind: "creating" });
     try {
-      const selectedLanguage = defaultLanguage || (languages.length > 0 ? languages[0] : "en");
       const res = await api<ChatSessionCreated>(`/agents/${agentId}/chat-sessions`, {
         method: "POST",
         body: JSON.stringify({ language: selectedLanguage }),
@@ -67,18 +68,20 @@ export function ChatPanel({
         message: apiErrorText(err, "Could not start chat session. Check your agent configuration."),
       });
     }
-  };
+  }, [agentId, selectedLanguage]);
+
+  const stateKind = state.kind;
 
   // Trigger session start on open if closed
   useEffect(() => {
-    if (open && state.kind === "closed") {
-      startSession();
+    if (open && stateKind === "closed") {
+      void startSession();
     }
-  }, [open, state.kind]);
+  }, [open, stateKind, startSession]);
 
   // Clean up when panel is closed from outside
   useEffect(() => {
-    if (!open && state.kind !== "closed") {
+    if (!open && stateKind !== "closed") {
       if (wsRef.current) {
         if (wsRef.current.readyState === WebSocket.OPEN) {
           try {
@@ -90,7 +93,7 @@ export function ChatPanel({
       }
       setState({ kind: "closed" });
     }
-  }, [open]);
+  }, [open, stateKind]);
 
   // WebSocket connection effect
   const activeSessionId =
@@ -243,10 +246,11 @@ export function ChatPanel({
     };
   }, [activeSessionId, agentId]);
 
-  // Auto-scroll on new message content
+  const currentMessages =
+    state.kind === "active" || state.kind === "ended" ? state.messages : null;
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [state.kind === "active" || state.kind === "ended" ? state.messages : null]);
+  }, [currentMessages]);
 
   const isAssistantStreaming =
     state.kind === "active" && state.messages.some((m) => m.streaming);
@@ -302,7 +306,7 @@ export function ChatPanel({
 
   return (
     <aside
-      aria-label="Chat test panel"
+      aria-label="Chat panel"
       className={cn(
         "fixed inset-y-0 right-0 z-50 flex w-full max-w-[380px] flex-col border-l border-border bg-background shadow-2xl transition-transform duration-300 ease-in-out sm:w-[380px]",
         open ? "translate-x-0" : "translate-x-full pointer-events-none"
@@ -312,7 +316,7 @@ export function ChatPanel({
       <div className="flex items-center justify-between border-b border-border/80 px-4 py-3.5">
         <div className="min-w-0 pr-2">
           <div className="flex items-center gap-2">
-            <span className="text-sm font-semibold text-foreground">Chat test</span>
+            <span className="text-sm font-semibold text-foreground">Chat</span>
             {state.kind === "active" && (
               <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium text-emerald-600 dark:text-emerald-400">
                 <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
@@ -336,7 +340,7 @@ export function ChatPanel({
           <button
             type="button"
             onClick={onClose}
-            aria-label="Close chat test"
+            aria-label="Close chat panel"
             className="rounded-lg p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
           >
             <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
