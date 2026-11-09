@@ -219,6 +219,8 @@ pyjwt==2.15.1
     # via voice-agent-builder
 pylibsrtp==1.0.0
     # via aiortc
+pyrnnoise==0.4.5
+    # via pipecat-ai
 pyopenssl==26.4.0
     # via aiortc
 python-dotenv==1.2.4
