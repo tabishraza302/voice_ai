@@ -3,43 +3,26 @@
 import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { CallPanel } from "@/components/call-panel";
 import { ApiError, api, apiErrorText } from "@/lib/api";
-import type { CallMessage, CallSession, CallSessionGrant } from "@/lib/types";
+import type { CallMessage, CallSession } from "@/lib/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Select } from "@/components/ui/select";
 
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
 }
 
-export function AgentTesting({
-  view,
-  agentId,
-  agentName,
-  languages,
-  defaultLanguage,
-}: {
-  view: "testing" | "history";
-  agentId: string;
-  agentName: string;
-  languages: string[];
-  defaultLanguage: string | null;
-}) {
+export function AgentSessionHistory({ agentId, refreshVersion }: { agentId: string; refreshVersion: number }) {
   const router = useRouter();
-  const [language, setLanguage] = useState(defaultLanguage ?? languages[0] ?? "");
   const [sessions, setSessions] = useState<CallSession[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [latestSessionId, setLatestSessionId] = useState<string | null>(null);
   const [session, setSession] = useState<CallSession | null>(null);
   const [messages, setMessages] = useState<CallMessage[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(true);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
-  const [callError, setCallError] = useState<string | null>(null);
 
   const loadSessions = useCallback(async () => {
     setLoadingHistory(true);
@@ -61,7 +44,7 @@ export function AgentTesting({
 
   useEffect(() => {
     void loadSessions();
-  }, [loadSessions]);
+  }, [loadSessions, refreshVersion]);
 
   useEffect(() => {
     if (!selectedId) {
@@ -97,65 +80,12 @@ export function AgentTesting({
       current = false;
       controller.abort();
     };
-  }, [router, selectedId]);
+  }, [router, selectedId, refreshVersion]);
 
-  async function createCall(): Promise<CallSessionGrant> {
-    setCallError(null);
-    try {
-      const grant = await api<CallSessionGrant>(`/agents/${agentId}/test-calls`, {
-        method: "POST",
-        body: JSON.stringify(language ? { language } : {}),
-      });
-      setLatestSessionId(grant.session_id);
-      setSelectedId(grant.session_id);
-      void loadSessions();
-      return grant;
-    } catch (reason) {
-      setCallError(apiErrorText(reason, "Could not start a test call."));
-      throw reason;
-    }
-  }
-
-  function callEnded(sessionId: string) {
-    setLatestSessionId(sessionId);
-    setSelectedId(sessionId);
-    void loadSessions();
-  }
 
   return (
     <div className="space-y-8">
-      {view === "testing" ? (
-      <section className="space-y-4" aria-labelledby="test-call-heading">
-        <div>
-          <h3 id="test-call-heading" className="text-lg font-semibold">Test call</h3>
-          <p className="mt-1 text-sm leading-6 text-muted-foreground">Start a real test session using the agent's saved provider configuration.</p>
-        </div>
-        {languages.length === 0 ? (
-          <div className="rounded-xl border border-dashed p-4 text-sm leading-6 text-muted-foreground">
-            Choose a supported language in the Languages tab before starting a test call.
-          </div>
-        ) : (
-          <div className="max-w-sm space-y-1.5">
-            <label htmlFor="test-language" className="text-sm font-medium">Call language</label>
-            <Select id="test-language" value={language} onChange={(event) => setLanguage(event.currentTarget.value)}>
-              {languages.map((item) => <option key={item} value={item}>{item === "en" ? "English" : item === "hi" ? "Hindi" : item}</option>)}
-            </Select>
-          </div>
-        )}
-        {callError ? <p role="alert" className="rounded-xl border border-destructive/30 bg-destructive/10 px-3.5 py-3 text-sm text-destructive">{callError}</p> : null}
-        {latestSessionId ? (
-          <div className="flex flex-wrap items-center gap-3 rounded-xl border bg-muted/40 p-3 text-sm">
-            <span className="font-medium">Latest test session</span>
-            <span className="break-all text-muted-foreground">{latestSessionId}</span>
-            <Link href={`/sessions/${latestSessionId}/trace`} className="rounded-xl font-semibold text-primary underline-offset-4 hover:underline">View scoped trace</Link>
-          </div>
-        ) : null}
-        {languages.length > 0 ? <CallPanel createCall={createCall} title={`Test ${agentName}`} onEnded={callEnded} /> : null}
-      </section>
-      ) : null}
-
-      {view === "history" ? (
-      <section className="space-y-4 border-t pt-7" aria-labelledby="history-heading">
+      <section className="space-y-4" aria-labelledby="history-heading">
         <div className="flex flex-wrap items-end justify-between gap-3">
           <div>
             <h3 id="history-heading" className="text-lg font-semibold">Session history</h3>
@@ -233,7 +163,6 @@ export function AgentTesting({
           </div>
         )}
       </section>
-      ) : null}
     </div>
   );
 }

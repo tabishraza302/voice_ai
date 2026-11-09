@@ -13,10 +13,11 @@ import {
   type SmallWebRtcCall,
 } from "../lib/webrtc";
 import { Button } from "./ui/button";
-
+import { cn } from "./ui/utils";
 export type { CallSessionGrant } from "../lib/webrtc";
 
 type CaptionEntry = CallCaption & { id: number };
+const EMPTY_CAPTIONS: CaptionEntry[] = [];
 type CallDetails = {
   sessionId: string;
   captions: CaptionEntry[];
@@ -55,6 +56,8 @@ export type CallPanelProps = {
   createCall: () => Promise<CallSessionGrant>;
   title: string;
   onEnded?: (sessionId: string) => void;
+  className?: string;
+  hideHeader?: boolean;
 };
 
 const EMPTY_DETAILS: Pick<CallDetails, "captions" | "muted" | "audioBlocked"> = {
@@ -87,6 +90,23 @@ function panelReducer(state: PanelState, action: PanelAction): PanelState {
       return state;
     case "caption":
       if (state.kind === "connecting" || state.kind === "active" || state.kind === "ending") {
+        let unfinishedIndex = -1;
+        for (let index = state.captions.length - 1; index >= 0; index -= 1) {
+          const caption = state.captions[index];
+          if (caption.role === action.caption.role && !caption.final) {
+            unfinishedIndex = index;
+            break;
+          }
+        }
+        if (unfinishedIndex >= 0) {
+          const updated = [...state.captions];
+          updated[unfinishedIndex] = {
+            ...updated[unfinishedIndex],
+            text: action.caption.text,
+            final: action.caption.final,
+          };
+          return { ...state, captions: updated };
+        }
         return { ...state, captions: [...state.captions, action.caption] };
       }
       return state;
@@ -109,7 +129,7 @@ function panelReducer(state: PanelState, action: PanelAction): PanelState {
           kind: "ended",
           sessionId: state.sessionId,
           reason: action.reason,
-          captions: state.captions,
+          captions: state.captions.map((c) => (c.final === false ? { ...c, final: true } : c)),
         };
       }
       return state;
@@ -117,7 +137,12 @@ function panelReducer(state: PanelState, action: PanelAction): PanelState {
       return { kind: "error", message: action.message };
     case "failed":
       if (state.kind === "connecting" || state.kind === "active" || state.kind === "ending") {
-        return { ...state, kind: "failed", message: action.message };
+        return {
+          ...state,
+          kind: "failed",
+          message: action.message,
+          captions: state.captions.map((c) => (c.final === false ? { ...c, final: true } : c)),
+        };
       }
       return state;
     case "reset":
@@ -154,7 +179,7 @@ function isBusy(state: PanelState): boolean {
   );
 }
 
-export function CallPanel({ createCall, title, onEnded }: CallPanelProps) {
+export function CallPanel({ createCall, title, onEnded, className, hideHeader }: CallPanelProps) {
   const [state, dispatch] = useReducer(panelReducer, { kind: "ready" });
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const stateRef = useRef(state);
@@ -168,6 +193,7 @@ export function CallPanel({ createCall, title, onEnded }: CallPanelProps) {
   const captionIdRef = useRef(0);
   const onEndedRef = useRef(onEnded);
   stateRef.current = state;
+  const transcriptRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     onEndedRef.current = onEnded;
@@ -184,6 +210,7 @@ export function CallPanel({ createCall, title, onEnded }: CallPanelProps) {
     const timer = window.setInterval(update, 1_000);
     return () => window.clearInterval(timer);
   }, [startedAt]);
+
 
   useEffect(
     () => () => {
@@ -325,7 +352,12 @@ export function CallPanel({ createCall, title, onEnded }: CallPanelProps) {
       ? state.captions
       : state.kind === "ended"
         ? state.captions
-        : [];
+        : EMPTY_CAPTIONS;
+  useEffect(() => {
+    if (transcriptRef.current) {
+      transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight;
+    }
+  }, [currentCaptions]);
   const statusLabel =
     state.kind === "requesting-microphone"
       ? "Waiting for microphone permission"
@@ -353,36 +385,71 @@ export function CallPanel({ createCall, title, onEnded }: CallPanelProps) {
     (state.kind === "connecting" || state.kind === "active") && state.audioBlocked;
 
   return (
-    <section className="w-full rounded-2xl border bg-card p-5 text-card-foreground sm:p-7" aria-label={`Call with ${title}`}>
+    <section className={cn("w-full rounded-2xl border bg-card p-5 text-card-foreground sm:p-7", className)} aria-label={`Call with ${title}`}>
       <audio ref={audioRef} autoPlay playsInline className="sr-only" aria-label="Call audio" />
-      <div className="flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <h2 className="text-xl font-semibold tracking-tight">{title}</h2>
-          <p className="mt-1 text-sm text-muted-foreground">A voice conversation with captions.</p>
+      {!hideHeader ? (
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <h2 className="text-xl font-semibold tracking-tight">{title}</h2>
+            <p className="mt-1 text-sm text-muted-foreground">A voice conversation with captions.</p>
+          </div>
+          {active ? (
+            <time className="rounded-xl bg-muted px-3 py-1.5 text-sm tabular-nums text-muted-foreground" aria-label={`Call time ${formatDuration(elapsedSeconds)}`}>
+              {formatDuration(elapsedSeconds)}
+            </time>
+          ) : null}
         </div>
-        {active ? (
-          <time className="rounded-xl bg-muted px-3 py-1.5 text-sm tabular-nums text-muted-foreground" aria-label={`Call time ${formatDuration(elapsedSeconds)}`}>
+      ) : null}
+
+      <div className={cn("flex items-center justify-between gap-3", !hideHeader && "mt-6")} role="status" aria-live="polite" aria-atomic="true">
+        <div className="flex items-center gap-3">
+          <span
+            className={`h-2.5 w-2.5 rounded-full ${state.kind === "active" && state.speech === "speaking" ? "bg-primary" : isBusy(state) ? "bg-primary/60" : "bg-muted-foreground/40"}`}
+            aria-hidden="true"
+          />
+          <span className="text-sm font-medium text-foreground">{statusLabel}</span>
+        </div>
+        {hideHeader && active ? (
+          <time className="rounded-xl bg-muted px-2.5 py-1 text-xs tabular-nums text-muted-foreground" aria-label={`Call time ${formatDuration(elapsedSeconds)}`}>
             {formatDuration(elapsedSeconds)}
           </time>
         ) : null}
       </div>
 
-      <div className="mt-6 flex items-center gap-3" role="status" aria-live="polite" aria-atomic="true">
-        <span
-          className={`h-2.5 w-2.5 rounded-full ${state.kind === "active" && state.speech === "speaking" ? "bg-primary" : isBusy(state) ? "bg-primary/60" : "bg-muted-foreground/40"}`}
-          aria-hidden="true"
-        />
-        <span className="text-sm font-medium text-foreground">{statusLabel}</span>
-      </div>
-
-      <div className="mt-5 min-h-40 max-h-72 space-y-3 overflow-y-auto rounded-2xl bg-muted/40 p-4" aria-label="Live captions" aria-live="polite" aria-relevant="additions text">
+      <div ref={transcriptRef} className="mt-5 min-h-48 max-h-80 space-y-3 overflow-y-auto rounded-2xl bg-muted/40 p-4" aria-label="Live captions" aria-live="polite" aria-relevant="additions text">
         {currentCaptions.length > 0 ? (
-          currentCaptions.map((caption) => (
-            <p key={caption.id} className="text-sm leading-6 text-foreground">
-              <span className="mr-2 font-semibold text-primary">{caption.role === "assistant" ? "Agent" : "You"}</span>
-              {caption.text}
-            </p>
-          ))
+          currentCaptions.map((caption) => {
+            const isUser = caption.role === "user";
+            return (
+              <div
+                key={caption.id}
+                className={cn("flex flex-col gap-1 max-w-[85%]", isUser ? "ml-auto items-end" : "mr-auto items-start")}
+              >
+                <span className="text-[11px] font-semibold text-muted-foreground">
+                  {isUser ? "You" : "Agent"}
+                </span>
+                <div
+                  className={cn(
+                    "rounded-2xl px-3.5 py-2 text-sm leading-relaxed",
+                    isUser
+                      ? "bg-primary text-primary-foreground rounded-br-sm"
+                      : "bg-background text-foreground border border-border/60 shadow-sm rounded-bl-sm"
+                  )}
+                >
+                  <span>{caption.text}</span>
+                  {!caption.final ? (
+                    <span
+                      className={cn(
+                        "inline-block ml-1.5 h-2 w-2 rounded-full animate-pulse align-middle",
+                        isUser ? "bg-primary-foreground" : "bg-primary"
+                      )}
+                      aria-label="streaming speech"
+                    />
+                  ) : null}
+                </div>
+              </div>
+            );
+          })
         ) : (
           <p className="text-sm leading-6 text-muted-foreground">
             {state.kind === "ended"

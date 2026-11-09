@@ -8,6 +8,7 @@ export type CallSessionGrant = {
 export type CallCaption = {
   role: "user" | "assistant";
   text: string;
+  final?: boolean;
 };
 
 export type CallTransportEvent =
@@ -516,7 +517,8 @@ class SmallWebRtcCallController implements SmallWebRtcCall {
       value.text.trim().length > 0 &&
       value.text.length <= 12_000
     ) {
-      this.emit({ type: "caption", caption: { role: value.role, text: value.text } });
+      const final = "final" in value && typeof value.final === "boolean" ? value.final : true;
+      this.emit({ type: "caption", caption: { role: value.role, text: value.text, final } });
       return;
     }
 
