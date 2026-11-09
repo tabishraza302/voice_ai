@@ -468,8 +468,8 @@ async def _await_runtime_cleanup(runtime: CallRuntime) -> None:
         try:
             await asyncio.shield(runtime.cleanup_task)
         except Exception:
-            return
-
+            pass
+    await release_call_runtime(runtime)
 
 async def _close_handler(handler: SmallWebRTCRequestHandler | None) -> None:
     if handler is not None:
@@ -578,7 +578,7 @@ async def _initial_offer(payload: _OfferBody) -> dict[str, Any]:
         else:
             await _fail_created_session(grant.session_id)
         await _close_handler(handler)
-        if reserved and runtime is None:
+        if reserved:
             async with _registry_lock:
                 _reservations.pop(grant.session_id, None)
         raise
@@ -588,7 +588,7 @@ async def _initial_offer(payload: _OfferBody) -> dict[str, Any]:
         else:
             await _fail_created_session(grant.session_id)
         await _close_handler(handler)
-        if reserved and runtime is None:
+        if reserved:
             async with _registry_lock:
                 _reservations.pop(grant.session_id, None)
         raise
@@ -598,7 +598,7 @@ async def _initial_offer(payload: _OfferBody) -> dict[str, Any]:
         else:
             await _fail_created_session(grant.session_id)
         await _close_handler(handler)
-        if reserved and runtime is None:
+        if reserved:
             async with _registry_lock:
                 _reservations.pop(grant.session_id, None)
         raise HTTPException(status_code=502, detail="WebRTC signaling failed.") from None
