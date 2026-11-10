@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import (
@@ -306,22 +306,24 @@ async def create_agent(
 @router.post("/enhance-prompt", response_model=EnhancePromptResponse)
 async def enhance_agent_prompt(
     data: EnhancePromptRequest,
+    request: Request,
     user: Annotated[User, Depends(csrf)],
 ):
     from .agent_generator import enhance_prompt
-    enhanced = await enhance_prompt(data.prompt, data.model)
+    enhanced = await enhance_prompt(data.prompt, request.app.state.openai_http_client, data.model)
     return EnhancePromptResponse(enhanced_prompt=enhanced)
 
 
 @router.post("/generate-stream")
 async def generate_agent_stream(
     data: GenerateAgentRequest,
+    request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     user: Annotated[User, Depends(csrf)],
 ):
     from .agent_generator import stream_agent_generation
     return StreamingResponse(
-        stream_agent_generation(data.prompt, db, user.id, data.model),
+        stream_agent_generation(data.prompt, db, user.id, request.app.state.openai_http_client, data.model),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
