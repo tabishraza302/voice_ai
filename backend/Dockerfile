@@ -8,6 +8,9 @@ ENV PYTHONUNBUFFERED=1 \
 # Runtime libraries used by aiortc/Pipecat audio pipelines.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        libasound2 \
+        libssl3 \
+        ca-certificates \
         ffmpeg \
         libopus0 \
         libvpx7 \

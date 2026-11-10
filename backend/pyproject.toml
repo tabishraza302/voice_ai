@@ -11,7 +11,7 @@ dependencies = [
   "argon2-cffi>=23,<26",
   "aiortc==1.15.0",
   "pyjwt>=2.8,<3",
-  "pipecat-ai[cartesia,deepgram,elevenlabs,openai,webrtc,rnnoise]==1.13.0",
+  "pipecat-ai[azure,cartesia,deepgram,elevenlabs,openai,webrtc,rnnoise]==1.13.0",
   "opentelemetry-sdk>=1.30,<2",
   "opentelemetry-exporter-otlp-proto-http>=1.30,<2",
   "httpx>=0.28,<1",

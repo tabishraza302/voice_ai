@@ -252,6 +252,261 @@ def test_call_definition_rejects_missing_provider_credentials() -> None:
         CallDefinition.from_snapshot(uuid.uuid4(), "test", snapshot, env)
 
 
+def test_publishing_accepts_azure_speech_with_region_or_endpoint() -> None:
+    env = verified_environment()
+    azure_agent = provider_agent(
+        stt_provider="azure",
+        stt_model="azure-speech",
+        azure_stt_english_locale="en-IN",
+    )
+    # Region only
+    assert provider_publish_errors(azure_agent, env) == {}
+
+    # Endpoint only (overriding / without region)
+    env_endpoint = dict(env)
+    env_endpoint.pop("AZURE_SPEECH_REGION")
+    env_endpoint["AZURE_SPEECH_ENDPOINT"] = "https://eastus.api.cognitive.microsoft.com"
+    assert provider_publish_errors(azure_agent, env_endpoint) == {}
+
+
+def test_publishing_rejects_unsupported_stt_provider() -> None:
+    env = verified_environment()
+    agent = provider_agent(stt_provider="unsupported-stt")
+    errors = provider_publish_errors(agent, env)
+    assert errors.get("stt_provider") == ["Choose Deepgram or Azure for speech recognition."]
+
+
+@pytest.mark.parametrize(
+    ("provider", "wrong_model", "expected_message"),
+    [
+        ("azure", "nova-3", "The supported azure model is azure-speech."),
+        ("deepgram", "azure-speech", "The supported deepgram model is nova-3."),
+    ],
+)
+def test_publishing_rejects_mismatched_stt_model(
+    provider: str, wrong_model: str, expected_message: str
+) -> None:
+    env = verified_environment()
+    agent = provider_agent(stt_provider=provider, stt_model=wrong_model)
+    errors = provider_publish_errors(agent, env)
+    assert errors.get("stt_model") == [expected_message]
+
+
+def test_publishing_azure_speech_fails_closed_without_server_credentials() -> None:
+    env = verified_environment()
+    azure_agent = provider_agent(
+        stt_provider="azure",
+        stt_model="azure-speech",
+        azure_stt_english_locale="en-IN",
+    )
+
+    # Missing / whitespace AZURE_SPEECH_API_KEY
+    env_no_key = dict(env)
+    env_no_key["AZURE_SPEECH_API_KEY"] = "   "
+    errors_no_key = provider_publish_errors(azure_agent, env_no_key)
+    assert "Speech recognition is unavailable because AZURE_SPEECH_API_KEY is not configured on the server." in errors_no_key.get("stt_provider", [])
+
+    # Missing both AZURE_SPEECH_REGION and AZURE_SPEECH_ENDPOINT
+    env_no_routing = dict(env)
+    env_no_routing.pop("AZURE_SPEECH_REGION")
+    errors_no_routing = provider_publish_errors(azure_agent, env_no_routing)
+    assert "Azure speech recognition requires AZURE_SPEECH_REGION or AZURE_SPEECH_ENDPOINT on the server." in errors_no_routing.get("stt_provider", [])
+
+
+@pytest.mark.parametrize("locale", ["en-IN", "en-US", "en-GB"])
+def test_publishing_azure_speech_accepts_valid_english_locales(locale: str) -> None:
+    env = verified_environment()
+    agent = provider_agent(
+        stt_provider="azure",
+        stt_model="azure-speech",
+        languages=["en"],
+        azure_stt_english_locale=locale,
+    )
+    assert provider_publish_errors(agent, env) == {}
+
+
+@pytest.mark.parametrize("locale", ["en-FR", "invalid", None, ""])
+def test_publishing_azure_speech_rejects_invalid_english_locales(locale: str | None) -> None:
+    env = verified_environment()
+    agent = provider_agent(
+        stt_provider="azure",
+        stt_model="azure-speech",
+        languages=["en"],
+        azure_stt_english_locale=locale,
+    )
+    errors = provider_publish_errors(agent, env)
+    assert errors.get("azure_stt_english_locale") == [
+        "Choose an Azure English locale: en-IN, en-US, or en-GB."
+    ]
+
+
+def test_publishing_azure_speech_hindi_and_non_english_ignore_locale() -> None:
+    env = verified_environment()
+    # Hindi call language ignores dormant English locale preference
+    hindi_agent = provider_agent(
+        stt_provider="azure",
+        stt_model="azure-speech",
+        languages=["hi"],
+        azure_stt_english_locale=None,
+        voice_id="cartesia-hi",
+    )
+    assert provider_publish_errors(hindi_agent, env) == {}
+
+    # Unsupported language produces language error without superfluous locale error
+    unsupported_lang_agent = provider_agent(
+        stt_provider="azure",
+        stt_model="azure-speech",
+        languages=["fr"],
+        azure_stt_english_locale=None,
+    )
+    errors = provider_publish_errors(unsupported_lang_agent, env)
+    assert "languages" in errors
+    assert "azure_stt_english_locale" not in errors
+
+
+def test_provider_credential_isolation_between_azure_and_deepgram() -> None:
+    # Azure agent does not require DEEPGRAM_API_KEY
+    azure_env = verified_environment()
+    azure_env.pop("DEEPGRAM_API_KEY")
+    azure_snapshot = {
+        "global_prompt": {"text": "Global policy", "version": 1},
+        "policy": {
+            "max_call_duration_seconds": 900,
+            "max_concurrent_calls_per_agent": 1,
+            "max_concurrent_calls_overall": 4,
+        },
+        "language": "en",
+        "agent": {
+            **provider_agent(
+                stt_provider="azure",
+                stt_model="azure-speech",
+                azure_stt_english_locale="en-GB",
+            ),
+            "instructions": "Help caller",
+            "languages": ["en"],
+        },
+    }
+    definition = CallDefinition.from_snapshot(uuid.uuid4(), "test", azure_snapshot, azure_env)
+    assert definition.providers.stt_provider == "azure"
+    assert definition.providers.stt_api_key == "azure-test-secret"
+
+    # Deepgram agent does not require AZURE_SPEECH_API_KEY
+    dg_env = verified_environment()
+    dg_env.pop("AZURE_SPEECH_API_KEY", None)
+    dg_snapshot = {
+        "global_prompt": {"text": "Global policy", "version": 1},
+        "policy": {
+            "max_call_duration_seconds": 900,
+            "max_concurrent_calls_per_agent": 1,
+            "max_concurrent_calls_overall": 4,
+        },
+        "language": "en",
+        "agent": {
+            **provider_agent(stt_provider="deepgram", stt_model="nova-3"),
+            "instructions": "Help caller",
+            "languages": ["en"],
+        },
+    }
+    dg_definition = CallDefinition.from_snapshot(uuid.uuid4(), "test", dg_snapshot, dg_env)
+    assert dg_definition.providers.stt_provider == "deepgram"
+    assert dg_definition.providers.stt_api_key == "deepgram-test-secret"
+
+
+def test_call_definition_resolves_endpoint_over_region() -> None:
+    env = verified_environment()
+    env["AZURE_SPEECH_API_KEY"] = "  azure-secret  "
+    env["AZURE_SPEECH_REGION"] = "  eastus  "
+    env["AZURE_SPEECH_ENDPOINT"] = "  https://my-endpoint.azure.com  "
+    snapshot = {
+        "global_prompt": {"text": "Global policy", "version": 1},
+        "policy": {
+            "max_call_duration_seconds": 900,
+            "max_concurrent_calls_per_agent": 1,
+            "max_concurrent_calls_overall": 4,
+        },
+        "language": "en",
+        "agent": {
+            **provider_agent(
+                stt_provider="azure",
+                stt_model="azure-speech",
+                azure_stt_english_locale="en-GB",
+            ),
+            "instructions": "Help caller",
+            "languages": ["en"],
+        },
+    }
+    # Both set: endpoint wins, region is None, whitespace stripped
+    definition = CallDefinition.from_snapshot(uuid.uuid4(), "test", snapshot, env)
+    assert definition.providers.stt_endpoint == "https://my-endpoint.azure.com"
+    assert definition.providers.stt_region is None
+
+    # Region only: region is set, endpoint is None
+    env_region_only = dict(env)
+    env_region_only.pop("AZURE_SPEECH_ENDPOINT")
+    definition_reg = CallDefinition.from_snapshot(uuid.uuid4(), "test", snapshot, env_region_only)
+    assert definition_reg.providers.stt_region == "eastus"
+    assert definition_reg.providers.stt_endpoint is None
+
+
+def test_call_definition_resolves_effective_stt_language() -> None:
+    env = verified_environment()
+    # Azure English uses snapshot's exact locale without fallback
+    azure_en_snapshot = {
+        "global_prompt": {"text": "Global policy", "version": 1},
+        "policy": {
+            "max_call_duration_seconds": 900,
+            "max_concurrent_calls_per_agent": 1,
+            "max_concurrent_calls_overall": 4,
+        },
+        "language": "en",
+        "agent": {
+            **provider_agent(
+                stt_provider="azure",
+                stt_model="azure-speech",
+                azure_stt_english_locale="en-GB",
+            ),
+            "instructions": "Help caller",
+            "languages": ["en"],
+        },
+    }
+    def_en = CallDefinition.from_snapshot(uuid.uuid4(), "test", azure_en_snapshot, env)
+    assert def_en.providers.stt_language == "en-GB"
+
+    # Azure Hindi uses hi-IN
+    azure_hi_snapshot = {
+        **azure_en_snapshot,
+        "language": "hi",
+        "agent": {
+            **provider_agent(
+                stt_provider="azure",
+                stt_model="azure-speech",
+                languages=["hi"],
+                azure_stt_english_locale="en-GB",
+                voice_id="cartesia-hi",
+            ),
+            "instructions": "Help caller",
+            "languages": ["hi"],
+        },
+    }
+    def_hi = CallDefinition.from_snapshot(uuid.uuid4(), "test", azure_hi_snapshot, env)
+    assert def_hi.providers.stt_language == "hi-IN"
+
+    # Deepgram uses call language (en or hi), region and endpoint are None
+    dg_snapshot = {
+        **azure_en_snapshot,
+        "agent": {
+            **provider_agent(stt_provider="deepgram", stt_model="nova-3"),
+            "instructions": "Help caller",
+            "languages": ["en"],
+        },
+    }
+    def_dg = CallDefinition.from_snapshot(uuid.uuid4(), "test", dg_snapshot, env)
+    assert def_dg.providers.stt_provider == "deepgram"
+    assert def_dg.providers.stt_language == "en"
+    assert def_dg.providers.stt_region is None
+    assert def_dg.providers.stt_endpoint is None
+
+
 class _CompletionRuntimeProbe:
     def __init__(self) -> None:
         self.started: list[str | None] = []
@@ -571,7 +826,10 @@ async def test_farewell_waits_for_delayed_tts_start_and_audio_completion(
 
 
 @pytest.mark.anyio
-async def test_late_final_transcription_is_captioned_answered_and_saved(monkeypatch) -> None:
+@pytest.mark.parametrize("stt_provider", ["deepgram", "azure"])
+async def test_late_final_transcription_is_captioned_answered_and_saved(
+    monkeypatch, stt_provider: str
+) -> None:
     import asyncio
 
     from voice_pipeline_harness import ASSISTANT_TEXT, CALLER_TEXT, RunningVoicePipeline
@@ -579,6 +837,7 @@ async def test_late_final_transcription_is_captioned_answered_and_saved(monkeypa
     pipeline = RunningVoicePipeline(
         verified_environment(),
         scenario="late-transcription",
+        stt_provider=stt_provider,
     )
     try:
         await pipeline.start(monkeypatch)
@@ -590,13 +849,15 @@ async def test_late_final_transcription_is_captioned_answered_and_saved(monkeypa
             await asyncio.wait_for(pipeline.connection.user_final_caption.wait(), timeout=1.5)
         except asyncio.TimeoutError:
             pass
-        assert any(
-            message.get("type") == "caption"
+        caller_final_captions = [
+            message
+            for message in pipeline.connection.messages
+            if message.get("type") == "caption"
             and message.get("role") == "user"
             and message.get("text") == CALLER_TEXT
             and message.get("final") is True
-            for message in pipeline.connection.messages
-        ), "late final caller transcription was not surfaced as a final caption"
+        ]
+        assert len(caller_final_captions) == 1, "late final caller transcription was not surfaced as exactly one final caption"
 
         await asyncio.wait_for(pipeline.connection.assistant_final_caption.wait(), timeout=3)
         assert any(
@@ -606,6 +867,7 @@ async def test_late_final_transcription_is_captioned_answered_and_saved(monkeypa
             and message.get("final") is True
             for message in pipeline.connection.messages
         )
+        assert len(pipeline.model_turn_requests) == 1
 
         assert pipeline.client is not None and pipeline.session_id is not None
         deadline = asyncio.get_running_loop().time() + 3
@@ -616,10 +878,11 @@ async def test_late_final_transcription_is_captioned_answered_and_saved(monkeypa
             )
             assert saved_messages.status_code == 200
             messages = saved_messages.json()
-            user_saved = any(
-                message["role"] == "user" and message["content"] == CALLER_TEXT
+            user_saved = [
+                message["content"]
                 for message in messages
-            )
+                if message["role"] == "user"
+            ] == [CALLER_TEXT]
             assistant_saved = any(
                 message["role"] == "assistant" and message["content"] == ASSISTANT_TEXT
                 for message in messages
@@ -629,14 +892,76 @@ async def test_late_final_transcription_is_captioned_answered_and_saved(monkeypa
             if asyncio.get_running_loop().time() >= deadline:
                 break
             await asyncio.sleep(0.05)
-        assert any(
-            message["role"] == "user" and message["content"] == CALLER_TEXT
-            for message in messages
-        )
+        # Assert exactly one saved caller message (prevents interim saves and duplicates)
+        assert [message["content"] for message in messages if message["role"] == "user"] == [CALLER_TEXT]
         assert any(
             message["role"] == "assistant" and message["content"] == ASSISTANT_TEXT
             for message in messages
         )
+    finally:
+        await pipeline.close()
+
+
+@pytest.mark.anyio
+async def test_azure_hindi_runtime_exact_caption_and_saved_text(monkeypatch) -> None:
+    import asyncio
+    from voice_pipeline_harness import RunningVoicePipeline
+
+    hindi_text = "मेरा नाम आरव है।"
+    pipeline = RunningVoicePipeline(
+        verified_environment(),
+        scenario="transcription",
+        language="hi",
+        stt_provider="azure",
+    )
+    try:
+        await pipeline.start(monkeypatch)
+        await asyncio.wait_for(pipeline.stt.vad_started.wait(), timeout=3)
+        await asyncio.wait_for(pipeline.stt.vad_stopped.wait(), timeout=3)
+
+        # Deliver Hindi Azure interim followed by final transcription
+        await pipeline.stt.deliver_transcription("मेरा नाम", is_final=False, speech_final=False)
+        await pipeline.stt.deliver_transcription(hindi_text, is_final=True, speech_final=True)
+        await asyncio.wait_for(pipeline.connection.user_final_caption.wait(), timeout=3)
+
+        caller_final_captions = [
+            message
+            for message in pipeline.connection.messages
+            if message.get("type") == "caption"
+            and message.get("role") == "user"
+            and message.get("final") is True
+        ]
+        assert len(caller_final_captions) == 1
+        assert caller_final_captions[0].get("text") == hindi_text
+
+        await asyncio.wait_for(pipeline.connection.assistant_final_caption.wait(), timeout=3)
+
+        assert pipeline.client is not None and pipeline.session_id is not None
+        deadline = asyncio.get_running_loop().time() + 3
+        messages: list[dict[str, object]] = []
+        while True:
+            saved_messages = await pipeline.client.get(
+                f"/sessions/{pipeline.session_id}/messages"
+            )
+            assert saved_messages.status_code == 200
+            messages = saved_messages.json()
+            user_saved = [
+                message["content"]
+                for message in messages
+                if message["role"] == "user"
+            ] == [hindi_text]
+            assistant_saved = any(
+                message["role"] == "assistant" and message["content"] == "नमस्ते आरव!"
+                for message in messages
+            )
+            if user_saved and assistant_saved:
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+            await asyncio.sleep(0.05)
+        # Assert exactly one saved user message matching exact Hindi script
+        assert [message["content"] for message in messages if message["role"] == "user"] == [hindi_text]
+        assert len(pipeline.model_turn_requests) == 1
     finally:
         await pipeline.close()
 

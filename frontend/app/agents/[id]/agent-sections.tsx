@@ -21,6 +21,7 @@ export type AgentDraft = Pick<Agent,
   | "default_language"
   | "stt_provider"
   | "stt_model"
+  | "azure_stt_english_locale"
   | "llm_provider"
   | "llm_model"
   | "tts_provider"
@@ -38,6 +39,7 @@ export function agentDraftFromAgent(agent: Agent): AgentDraft {
     default_language: agent.default_language,
     stt_provider: agent.stt_provider,
     stt_model: agent.stt_model,
+    azure_stt_english_locale: agent.azure_stt_english_locale,
     llm_provider: agent.llm_provider,
     llm_model: agent.llm_model,
     tts_provider: agent.tts_provider,
@@ -55,6 +57,7 @@ export function draftChanges(draft: AgentDraft): AgentPatch {
     default_language: draft.default_language,
     stt_provider: draft.stt_provider,
     stt_model: draft.stt_model,
+    azure_stt_english_locale: draft.azure_stt_english_locale,
     llm_provider: draft.llm_provider,
     llm_model: draft.llm_model,
     tts_provider: draft.tts_provider,
@@ -133,10 +136,16 @@ export function AgentPipelineToolbar({
           <Label htmlFor="toolbar-stt" className="text-xs font-medium text-muted-foreground">STT (Speech-to-Text)</Label>
           <Select
             id="toolbar-stt"
-            value={draft.stt_provider ? `${draft.stt_provider}:${draft.stt_model ?? "nova-3"}` : ""}
+            value={draft.stt_provider && draft.stt_model ? `${draft.stt_provider}:${draft.stt_model}` : ""}
             onChange={(e) => {
               const val = e.currentTarget.value;
-              if (val === "deepgram:nova-3") {
+              if (val === "azure:azure-speech") {
+                onPatch({
+                  stt_provider: "azure",
+                  stt_model: "azure-speech",
+                  ...(draft.azure_stt_english_locale ? {} : { azure_stt_english_locale: "en-IN" }),
+                });
+              } else if (val === "deepgram:nova-3") {
                 onPatch({ stt_provider: "deepgram", stt_model: "nova-3" });
               } else {
                 onPatch({ stt_provider: null, stt_model: null });
@@ -144,9 +153,31 @@ export function AgentPipelineToolbar({
             }}
           >
             <option value="">Select STT</option>
+            <option value="azure:azure-speech">Azure Speech</option>
             <option value="deepgram:nova-3">Deepgram (Nova-3)</option>
           </Select>
         </div>
+
+        {draft.stt_provider === "azure" && draft.default_language === "en" ? (
+          <div className="space-y-1.5">
+            <Label htmlFor="toolbar-azure-english-locale" className="text-xs font-medium text-muted-foreground">
+              English recognition locale
+            </Label>
+            <Select
+              id="toolbar-azure-english-locale"
+              value={draft.azure_stt_english_locale ?? ""}
+              onChange={(e) => {
+                const val = e.currentTarget.value;
+                onPatch({ azure_stt_english_locale: val || null });
+              }}
+            >
+              <option value="">Select English locale</option>
+              <option value="en-IN">English (India)</option>
+              <option value="en-US">English (United States)</option>
+              <option value="en-GB">English (United Kingdom)</option>
+            </Select>
+          </div>
+        ) : null}
 
         <div className="space-y-1.5">
           <Label htmlFor="toolbar-llm" className="text-xs font-medium text-muted-foreground">LLM Model</Label>
