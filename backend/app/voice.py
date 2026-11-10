@@ -16,6 +16,7 @@ from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
     ErrorFrame,
     Frame,
+    InputAudioRawFrame,
     InterruptionFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
@@ -80,6 +81,21 @@ _RECENT_TURNS = 12
 _MAX_TRANSCRIPT_CHARS = 8_000
 _MAX_LLM_RESPONSE_CHARS = 12_000
 _PIPELINE_START_TIMEOUT_SECONDS = 30
+# Azure recognition results carry offset/duration in 100 ns ticks relative to
+# the input audio stream.
+_AZURE_TICKS_PER_SECOND = 10_000_000
+# VAD reports a stop after its stop_secs of silence. Snapshot the end of the
+# last speech window on the continuous input timeline at VAD stop and allow
+# Azure's segment endpoint a small margin; later silence must not move it.
+_AZURE_ENDPOINT_MARGIN_SECONDS = 0.2
+# VAD stop anchors one cancellable turn-end decision. With Silero VAD params
+# (start_secs=0.35, stop_secs=0.35), an internal pause of ~410ms triggers VAD
+# stop at 350ms, while resumed speech is not confirmed until 350ms of audio later
+# (~410ms after stop). A 450ms quiet deadline ensures that detector start
+# hysteresis does not prematurely flush completed prior clauses before resumed
+# speech can cancel the deadline. When a covering final arrives after this quiet
+# window has already elapsed, it completes and submits immediately with zero wait.
+_AZURE_TURN_QUIET_SECONDS = 0.45
 _BACKCHANNELS = frozenset({
     "ok",
     "okay",
@@ -441,6 +457,16 @@ class CallRuntime:
         self.vad_speech_active = False
         self.speech_generation = 0
         self.flush_task: asyncio.Task[None] | None = None
+        # Azure segments are not turn boundaries. Keep finalized segments in
+        # transcript_segments until VAD stop and a final covering the last
+        # speech window agree that the turn is complete. Azure offset/duration
+        # values and input_audio_ticks share the continuous STT input stream
+        # timeline.
+        self.input_audio_ticks = 0
+        self.azure_speech_end_ticks: int | None = None
+        self.azure_accepted_end_ticks: int | None = None
+        self.azure_turn_final_end_ticks: int | None = None
+        self.azure_interim_since_final = False
         self.response_generation = 0
         self.active_response_generation: int | None = None
         self.response_text: dict[int, list[str]] = {}
@@ -652,6 +678,15 @@ class CallRuntime:
 
     def is_bot_speaking(self) -> bool:
         return bool(self.playbacks) and not all(p.interrupted for p in self.playbacks.values())
+
+    def note_input_audio(self, frame: InputAudioRawFrame) -> None:
+        sample_rate = frame.sample_rate or 16_000
+        self.input_audio_ticks += (
+            frame.num_frames * _AZURE_TICKS_PER_SECOND // sample_rate
+        )
+
+    def azure_tolerance_ticks(self) -> int:
+        return int(_AZURE_ENDPOINT_MARGIN_SECONDS * _AZURE_TICKS_PER_SECOND)
 
 
     def note_interruption(self) -> None:
@@ -927,6 +962,10 @@ class _WorkflowProcessor(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         if direction == FrameDirection.DOWNSTREAM and isinstance(
+            frame, InputAudioRawFrame
+        ):
+            self.runtime.note_input_audio(frame)
+        if direction == FrameDirection.DOWNSTREAM and isinstance(
             frame, (TranscriptionFrame, InterimTranscriptionFrame)
         ):
             await self._handle_transcription_frame(frame)
@@ -947,6 +986,8 @@ class _WorkflowProcessor(FrameProcessor):
             self.runtime.vad_speech_active = True
             self.runtime.user_speaking = True
             self.runtime.speech_generation += 1
+            # A new speech window needs a new end snapshot at its own VAD stop.
+            self.runtime.azure_speech_end_ticks = None
             if is_continuation:
                 self.runtime.flush_task.cancel()
             if self.runtime.is_bot_speaking():
@@ -958,12 +999,28 @@ class _WorkflowProcessor(FrameProcessor):
                 await self.broadcast_interruption()
             await self.push_frame(UserStartedSpeakingFrame(), direction)
         elif isinstance(frame, VADUserStoppedSpeakingFrame):
-            self.runtime.vad_speech_active = False
-            self.runtime.user_speaking = False
-            self.runtime.speech_generation += 1
-            gen = self.runtime.speech_generation
-
-            self._schedule_fallback_flush(gen)
+            if self.runtime.definition.providers.stt_provider == "azure":
+                if not self.runtime.vad_speech_active and not self.runtime.user_speaking:
+                    return
+                self.runtime.vad_speech_active = False
+                self.runtime.user_speaking = False
+                self.runtime.speech_generation += 1
+                gen = self.runtime.speech_generation
+                stop_secs = max(0.0, float(getattr(frame, "stop_secs", 0.0) or 0.0))
+                # The last stop_secs of forwarded audio are the silence that made
+                # VAD declare the stop, so the speech window ends that much earlier.
+                self.runtime.azure_speech_end_ticks = max(
+                    0,
+                    self.runtime.input_audio_ticks
+                    - int(stop_secs * _AZURE_TICKS_PER_SECOND),
+                )
+                self._schedule_azure_turn_end(gen)
+            else:
+                self.runtime.vad_speech_active = False
+                self.runtime.user_speaking = False
+                self.runtime.speech_generation += 1
+                gen = self.runtime.speech_generation
+                self._schedule_fallback_flush(gen)
         elif isinstance(frame, InterruptionFrame):
             self.runtime.note_interruption()
         elif isinstance(frame, ErrorFrame):
@@ -985,11 +1042,147 @@ class _WorkflowProcessor(FrameProcessor):
 
         self.runtime.flush_task = asyncio.create_task(_fallback_flush())
 
+    def _cancel_turn_task(self) -> None:
+        task = self.runtime.flush_task
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _azure_turn_is_current(self, expected_gen: int) -> bool:
+        return (
+            not self.runtime.closing
+            and not self.runtime.closed
+            and self.runtime.speech_generation == expected_gen
+            and not self.runtime.vad_speech_active
+        )
+
+    def _azure_turn_is_complete(self) -> bool:
+        runtime = self.runtime
+        if runtime.vad_speech_active or runtime.azure_interim_since_final:
+            return False
+        if not runtime.transcript_segments:
+            return False
+        target = runtime.azure_speech_end_ticks
+        if target is None:
+            return True
+        final_end = runtime.azure_turn_final_end_ticks
+        if final_end is None:
+            # Without Azure timing there is no way to prove later audio was
+            # missed, so accept the recognized text.
+            return True
+        return final_end + runtime.azure_tolerance_ticks() >= target
+
+    def _schedule_azure_turn_end(self, expected_gen: int) -> None:
+        if self.runtime.closing or self.runtime.closed:
+            return
+        self._cancel_turn_task()
+        self.runtime.flush_task = asyncio.create_task(
+            self._azure_turn_end(expected_gen)
+        )
+
+    async def _azure_turn_end(self, expected_gen: int) -> None:
+        try:
+            await asyncio.sleep(_AZURE_TURN_QUIET_SECONDS)
+        except asyncio.CancelledError:
+            return
+        if not self._azure_turn_is_current(expected_gen):
+            return
+        if not self._azure_turn_is_complete():
+            # Keep the buffered speech pending for a covering final. Do not
+            # flush known-incomplete text just because the deadline expired.
+            return
+        await self._submit_azure_turn()
+
+    async def _submit_azure_turn(self) -> None:
+        text = " ".join(self.runtime.transcript_segments).strip()
+        self.runtime.transcript_segments.clear()
+        self.runtime.azure_speech_end_ticks = None
+        self.runtime.azure_turn_final_end_ticks = None
+        self.runtime.azure_interim_since_final = False
+        self.runtime.speech_generation += 1
+        task = self.runtime.flush_task
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+        if text:
+            await self.runtime.handle_final_transcription(text)
+
+    @staticmethod
+    def _azure_interval(frame: Frame) -> tuple[int, int] | None:
+        result = getattr(frame, "result", None)
+        inner = getattr(result, "result", None)
+        offset = getattr(inner, "offset", None) if inner is not None else None
+        duration = getattr(inner, "duration", None) if inner is not None else None
+        if offset is None:
+            offset = getattr(result, "offset", None)
+        if duration is None:
+            duration = getattr(result, "duration", None)
+        if offset is None or duration is None:
+            return None
+        try:
+            o_int = int(offset)
+            d_int = int(duration)
+            if o_int < 0 or d_int < 0:
+                return None
+            return o_int, d_int
+        except (TypeError, ValueError):
+            return None
+
+    async def _send_azure_partial_caption(self) -> None:
+        text = " ".join(self.runtime.transcript_segments).strip()
+        if text:
+            await self.runtime._send_caption("user", text, final=False)
+
+    async def _handle_azure_final(self, frame: Frame, raw_text: str) -> None:
+        runtime = self.runtime
+        interval = self._azure_interval(frame)
+        if interval is not None:
+            end_ticks = interval[0] + interval[1]
+            accepted_end = runtime.azure_accepted_end_ticks
+            if accepted_end is not None and end_ticks <= accepted_end:
+                return
+            # A monotonic accepted-end watermark deduplicates retransmissions
+            # without collapsing repeated text that has a real new interval.
+            runtime.azure_accepted_end_ticks = end_ticks
+            runtime.azure_turn_final_end_ticks = max(
+                runtime.azure_turn_final_end_ticks or 0, end_ticks
+            )
+
+        runtime.azure_interim_since_final = False
+        if raw_text:
+            runtime.transcript_segments.append(raw_text)
+            total_chars = (
+                sum(map(len, runtime.transcript_segments))
+                + len(runtime.transcript_segments)
+                - 1
+            )
+            if total_chars > _MAX_TRANSCRIPT_CHARS:
+                raise VoiceRuntimeError(
+                    "Caller speech exceeded the per-turn transcript limit."
+                )
+            await self._send_azure_partial_caption()
+
+        if runtime.vad_speech_active:
+            return
+
+        task = runtime.flush_task
+        if task is not None and not task.done():
+            # The VAD-stop deadline owns the decision. A final arriving inside
+            # the quiet window must not bypass or restart resumption
+            # cancellation; it only updates the evidence the deadline checks.
+            return
+        if not self._azure_turn_is_complete():
+            return
+        await self._submit_azure_turn()
+
 
     async def _handle_transcription_frame(self, frame: Frame) -> None:
         if isinstance(frame, InterimTranscriptionFrame):
             raw_text = frame.text.strip()
             if raw_text:
+                if (
+                    self.runtime.definition.providers.stt_provider == "azure"
+                    and self.runtime.transcript_segments
+                ):
+                    self.runtime.azure_interim_since_final = True
                 if self.runtime.is_bot_speaking():
                     self.runtime.transcript_overlapped_playback = True
                     if not _is_isolated_backchannel(raw_text):
@@ -1011,6 +1204,11 @@ class _WorkflowProcessor(FrameProcessor):
             if not _is_isolated_backchannel(raw_text):
                 self.runtime.note_interruption()
                 await self.broadcast_interruption()
+
+        if self.runtime.definition.providers.stt_provider == "azure":
+            if is_final:
+                await self._handle_azure_final(frame, raw_text)
+            return
 
         if is_final and raw_text:
             self.runtime.transcript_segments.append(raw_text)
