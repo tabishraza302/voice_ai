@@ -44,6 +44,8 @@ docker compose exec frontend npm run build
 
 `backend/tests/conftest.py` forces `DATABASE_URL` to `TEST_DATABASE_URL`, and the test suite drops and recreates tables there. It must never point at the application database. Compose supplies `TEST_DATABASE_URL` automatically; without Compose, point it at a local disposable database (for example one running on port 55432).
 
+Tests use the same pooled engine as production. AnyIO gives each async test a fresh event loop, so `conftest.py` disposes the pool after each async test in that test's loop; sync `TestClient` WebSocket tests use one lifespan loop per test. Do not replace this with a pytest-only `NullPool` bypass.
+
 Scoped dependency overrides patch the lint parser's `minimatch` and Next's
 `postcss` dependencies while keeping Next 15 and ESLint 9. The locked graph is
 verified with the Node 22 Docker runtime.
@@ -119,6 +121,8 @@ responses.
 | `SMALLWEBRTC_TURN_SHARED_SECRET` | TURN REST shared secret, at least 32 bytes, only with TURN URLs. |
 | `SMALLWEBRTC_TURN_CREDENTIAL_TTL_SECONDS` | TURN credential lifetime, 60–3600 seconds. |
 | `BACKEND_URL` | Next.js proxy target. Compose sets `http://backend:8000`; local dev defaults to `http://127.0.0.1:8000`. |
+
+PostgreSQL connections are pooled per backend process: 10 persistent connections plus 10 overflow connections, a 10-second checkout timeout, pre-ping, and a 5-minute recycle. The FastAPI lifespan disposes the pool on shutdown. Compose runs one uvicorn worker; if you add workers or replicas, multiply the pool cap and keep the total below PostgreSQL `max_connections` (100 in the Compose image).
 
 Provider/model/voice publishing is fail-closed. A draft saves incomplete, but publish returns field errors unless the exact combination is approved by server configuration. The visual-flow editor lets owners set each step's title and objective, collect free-form answers, and route to another step or End call. Saved steps are active.
 Migration 0008 drops legacy step configuration columns; historical session snapshots remain unchanged.
