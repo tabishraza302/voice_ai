@@ -1,10 +1,12 @@
 import asyncio
 import json
 import os
+import threading
 import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import asyncpg
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
@@ -12,7 +14,7 @@ from starlette.testclient import TestClient
 
 from app.agents import Agent
 from app.auth import COOKIE
-from app.chat import ChatRuntime, _active_chats, _chat_publish_errors
+from app.chat import ChatRuntime, _chat_publish_errors
 from app.db import Base, Session, engine
 from app.main import app
 from app.models import User
@@ -150,6 +152,12 @@ async def client():
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+@pytest.fixture
+def sync_client():
+    with TestClient(app) as test_client:
+        yield test_client
 
 
 async def login(client: AsyncClient, email: str) -> str:
@@ -388,8 +396,7 @@ async def test_end_call_preserves_tool_farewell_after_response_text(response_tex
     assert ws.closed is True
 
 
-def test_websocket_agent_ends_chat_on_end_call():
-    sync_client = TestClient(app)
+def test_websocket_agent_ends_chat_on_end_call(sync_client):
     email = f"wsuser-{uuid.uuid4().hex[:8]}@example.com"
     sync_client.post("/auth/register", json={"email": email, "password": "password123456"})
     login_resp = sync_client.post("/auth/login", json={"email": email, "password": "password123456"})
@@ -439,7 +446,7 @@ def test_websocket_agent_ends_chat_on_end_call():
             )).all()
             return session.status, [(message.role, message.content) for message in messages]
 
-    status, messages = asyncio.run(check_session())
+    status, messages = sync_client.portal.call(check_session)
     assert status == "completed"
     assert messages == [
         ("assistant", "How can I help?"),
@@ -448,8 +455,7 @@ def test_websocket_agent_ends_chat_on_end_call():
     ]
 
 
-def test_websocket_chat_turn_processing():
-    sync_client = TestClient(app)
+def test_websocket_chat_turn_processing(sync_client):
     unique_email = f"wsuser-{uuid.uuid4().hex[:8]}@example.com"
     assert (
         sync_client.post(
@@ -503,8 +509,7 @@ def test_websocket_chat_turn_processing():
             assert "".join(tokens) == "Hello, I can help!"
 
 
-def test_websocket_user_ends_chat():
-    sync_client = TestClient(app)
+def test_websocket_user_ends_chat(sync_client):
     email = f"wsuser-{uuid.uuid4().hex[:8]}@example.com"
     sync_client.post("/auth/register", json={"email": email, "password": "password123456"})
     login_resp = sync_client.post("/auth/login", json={"email": email, "password": "password123456"})
@@ -534,8 +539,295 @@ def test_websocket_user_ends_chat():
             ended = next(e for e in events if e.get("type") == "session_ended")
             assert ended["reason"] == "cancelled"
 
-def test_websocket_auth_rejection():
-    sync_client = TestClient(app)
+
+def test_websocket_disconnect_bounds_stalled_provider_close(sync_client):
+    email = f"wsuser-{uuid.uuid4().hex[:8]}@example.com"
+    sync_client.post("/auth/register", json={"email": email, "password": "password123456"})
+    login_resp = sync_client.post("/auth/login", json={"email": email, "password": "password123456"})
+    csrf_token = login_resp.json()["csrf_token"]
+    auth_headers = {"Origin": "http://localhost:3000", "X-CSRF-Token": csrf_token}
+
+    agent_resp = sync_client.post(
+        "/agents",
+        json={
+            "name": "Stall Agent",
+            "instructions": "test",
+            "languages": ["en"],
+            "llm_provider": "openai",
+            "llm_model": "gpt-4o-mini",
+        },
+        headers=auth_headers,
+    )
+    agent_id = agent_resp.json()["id"]
+
+    session_resp = sync_client.post(f"/agents/{agent_id}/chat-sessions", headers=auth_headers)
+    session_id = session_resp.json()["session_id"]
+
+    close_entered = threading.Event()
+    release_close = sync_client.portal.call(asyncio.Event)
+
+    class StallingClient:
+        def __init__(self):
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=AsyncMock(return_value=MockStream([content_chunk("Hello! ")]))
+                )
+            )
+
+        async def close(self):
+            close_entered.set()
+            await release_close.wait()
+
+    with patch("app.chat.AsyncOpenAI", return_value=StallingClient()):
+        session = sync_client.websocket_connect(
+            f"/agents/{agent_id}/chat-sessions/{session_id}/ws"
+        )
+        ws = session.__enter__()
+        receive_until(ws, "turn_complete")
+        ws.send_json({"type": "message", "content": "Hello there"})
+        receive_until(ws, "turn_complete")
+
+        disconnect_done = threading.Event()
+        disconnect_error = []
+
+        def disconnect():
+            try:
+                session.__exit__(None, None, None)
+            except BaseException as exc:
+                disconnect_error.append(exc)
+            finally:
+                disconnect_done.set()
+
+        worker = threading.Thread(target=disconnect)
+        worker.start()
+        try:
+            assert close_entered.wait(timeout=10), "provider close was not entered"
+            assert disconnect_done.wait(timeout=15), "disconnect did not complete within the watchdog"
+        finally:
+            sync_client.portal.call(release_close.set)
+            worker.join(timeout=15)
+
+    assert not disconnect_error, f"disconnect raised {disconnect_error[0]!r}"
+
+    messages = sync_client.get(f"/sessions/{session_id}/messages")
+    assert messages.status_code == 200
+    assert [
+        (message["sequence"], message["role"], message["content"])
+        for message in messages.json()
+    ] == [
+        (1, "assistant", "Hello! "),
+        (2, "user", "Hello there"),
+        (3, "assistant", "Hello! "),
+    ]
+
+
+def test_websocket_db_stalled_writer_cleanup_is_bounded(sync_client):
+    email = f"wsuser-{uuid.uuid4().hex[:8]}@example.com"
+    sync_client.post("/auth/register", json={"email": email, "password": "password123456"})
+    login_resp = sync_client.post("/auth/login", json={"email": email, "password": "password123456"})
+    csrf_token = login_resp.json()["csrf_token"]
+    auth_headers = {"Origin": "http://localhost:3000", "X-CSRF-Token": csrf_token}
+
+    agent_resp = sync_client.post(
+        "/agents",
+        json={
+            "name": "DB Stall Agent",
+            "instructions": "test",
+            "languages": ["en"],
+            "llm_provider": "openai",
+            "llm_model": "gpt-4o-mini",
+        },
+        headers=auth_headers,
+    )
+    agent_id = agent_resp.json()["id"]
+
+    session_resp = sync_client.post(f"/agents/{agent_id}/chat-sessions", headers=auth_headers)
+    session_id = session_resp.json()["session_id"]
+
+    reply_entered = threading.Event()
+
+    class DBStallClient:
+        def __init__(self):
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+            self._calls = 0
+
+        async def _create(self, **_kwargs):
+            self._calls += 1
+            if self._calls == 2:
+                reply_entered.set()
+            return MockStream([content_chunk("Hello! ")])
+
+        async def close(self):
+            return None
+
+    lock_held = threading.Event()
+    writer_stalled = threading.Event()
+    release_lock = threading.Event()
+    dsn = os.environ["DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql://")
+
+    async def hold_lock():
+        connection = await asyncpg.connect(dsn)
+        try:
+            await connection.execute("BEGIN")
+            await connection.execute(
+                "SELECT id FROM sessions WHERE id = $1 FOR UPDATE",
+                uuid.UUID(session_id),
+            )
+            lock_held.set()
+            for _ in range(200):
+                waiting = await connection.fetchrow(
+                    "SELECT 1 FROM pg_stat_activity "
+                    "WHERE datname = current_database() AND pid <> pg_backend_pid() "
+                    "AND wait_event_type = 'Lock' AND wait_event = 'transactionid'"
+                )
+                if waiting is not None:
+                    writer_stalled.set()
+                    break
+                await asyncio.sleep(0.05)
+            while not release_lock.is_set():
+                await asyncio.sleep(0.05)
+            await connection.execute("ROLLBACK")
+        finally:
+            await connection.close()
+
+    lock_thread = None
+    worker = None
+    turn_reader = None
+    turn_done = threading.Event()
+    turn_result = []
+    disconnect_done = threading.Event()
+    disconnect_error = []
+    session = None
+    try:
+        with patch("app.chat.AsyncOpenAI", return_value=DBStallClient()):
+            session = sync_client.websocket_connect(
+                f"/agents/{agent_id}/chat-sessions/{session_id}/ws"
+            )
+            ws = session.__enter__()
+            try:
+                receive_until(ws, "turn_complete")
+                lock_thread = threading.Thread(target=lambda: asyncio.run(hold_lock()))
+                lock_thread.start()
+                assert lock_held.wait(timeout=10), "row lock was not acquired"
+                ws.send_json({"type": "message", "content": "Hello there"})
+                assert reply_entered.wait(timeout=10), "reply turn was not entered"
+                assert writer_stalled.wait(timeout=10), "writer did not stall on the row lock"
+
+                def receive_warning():
+                    try:
+                        turn_result.extend(receive_until(ws, "warning"))
+                    except BaseException as exc:
+                        turn_result.append(exc)
+                    finally:
+                        turn_done.set()
+
+                turn_reader = threading.Thread(target=receive_warning)
+                turn_reader.start()
+                assert turn_done.wait(timeout=15), "DB-stalled turn did not finish within the watchdog"
+                assert turn_result and not isinstance(turn_result[0], BaseException), (
+                    f"WebSocket failed before reporting the stalled write: {turn_result!r}"
+                )
+                assert turn_result[-1]["message"] == (
+                    "The chat could not save this turn, so the session has ended."
+                )
+            finally:
+                if not turn_done.is_set():
+                    release_lock.set()
+
+                def disconnect():
+                    try:
+                        session.__exit__(None, None, None)
+                    except BaseException as exc:
+                        disconnect_error.append(exc)
+                    finally:
+                        disconnect_done.set()
+
+                worker = threading.Thread(target=disconnect)
+                worker.start()
+                assert disconnect_done.wait(timeout=15), "disconnect did not complete within the watchdog"
+    finally:
+        release_lock.set()
+        if lock_thread is not None:
+            lock_thread.join(timeout=15)
+        if worker is not None:
+            worker.join(timeout=15)
+        if turn_reader is not None:
+            turn_reader.join(timeout=15)
+
+    assert not disconnect_error, f"disconnect raised {disconnect_error[0]!r}"
+
+    session_detail = sync_client.get(f"/sessions/{session_id}")
+    messages = sync_client.get(f"/sessions/{session_id}/messages")
+    assert session_detail.status_code == 200
+    assert session_detail.json()["status"] == "active"
+    assert messages.status_code == 200
+    assert [
+        (message["sequence"], message["role"], message["content"])
+        for message in messages.json()
+    ] == [
+        (1, "assistant", "Hello! "),
+    ]
+
+    follow_up = sync_client.post(f"/agents/{agent_id}/chat-sessions", headers=auth_headers)
+    assert follow_up.status_code == 201
+
+
+def test_websocket_client_disconnect_finishes_cleanup(sync_client):
+    email = f"wsuser-{uuid.uuid4().hex[:8]}@example.com"
+    sync_client.post("/auth/register", json={"email": email, "password": "password123456"})
+    login_resp = sync_client.post("/auth/login", json={"email": email, "password": "password123456"})
+    csrf_token = login_resp.json()["csrf_token"]
+    auth_headers = {"Origin": "http://localhost:3000", "X-CSRF-Token": csrf_token}
+
+    agent_resp = sync_client.post(
+        "/agents",
+        json={
+            "name": "Disconnect Agent",
+            "instructions": "test",
+            "languages": ["en"],
+            "llm_provider": "openai",
+            "llm_model": "gpt-4o-mini",
+        },
+        headers=auth_headers,
+    )
+    agent_id = agent_resp.json()["id"]
+
+    session_resp = sync_client.post(f"/agents/{agent_id}/chat-sessions", headers=auth_headers)
+    session_id = session_resp.json()["session_id"]
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create = AsyncMock(
+        return_value=MockStream([content_chunk("Hello! ")])
+    )
+    mock_client.close = AsyncMock()
+
+    with patch("app.chat.AsyncOpenAI", return_value=mock_client):
+        session = sync_client.websocket_connect(
+            f"/agents/{agent_id}/chat-sessions/{session_id}/ws"
+        )
+        ws = session.__enter__()
+        receive_until(ws, "turn_complete")
+        ws.send_json({"type": "message", "content": "Hello there"})
+        receive_until(ws, "turn_complete")
+        session.__exit__(None, None, None)
+
+    session_detail = sync_client.get(f"/sessions/{session_id}")
+    messages = sync_client.get(f"/sessions/{session_id}/messages")
+    assert session_detail.status_code == 200
+    assert session_detail.json()["status"] == "cancelled"
+    assert messages.status_code == 200
+    assert [
+        (message["sequence"], message["role"], message["content"])
+        for message in messages.json()
+    ] == [
+        (1, "assistant", "Hello! "),
+        (2, "user", "Hello there"),
+        (3, "assistant", "Hello! "),
+    ]
+
+
+
+def test_websocket_auth_rejection(sync_client):
     with pytest.raises(Exception):
         with sync_client.websocket_connect(
             f"/agents/{uuid.uuid4()}/chat-sessions/{uuid.uuid4()}/ws"
@@ -543,8 +835,7 @@ def test_websocket_auth_rejection():
             pass
 
 
-def test_websocket_inactivity_timeout():
-    sync_client = TestClient(app)
+def test_websocket_inactivity_timeout(sync_client):
     email = f"wsuser-{uuid.uuid4().hex[:8]}@example.com"
     sync_client.post("/auth/register", json={"email": email, "password": "password123456"})
     login_resp = sync_client.post("/auth/login", json={"email": email, "password": "password123456"})
