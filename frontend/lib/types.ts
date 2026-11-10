@@ -27,6 +27,7 @@ export interface Agent {
   default_language: string | null;
   stt_provider: string | null;
   stt_model: string | null;
+  azure_stt_english_locale: string | null;
   llm_provider: string | null;
   llm_model: string | null;
   tts_provider: string | null;
@@ -47,6 +48,7 @@ export type AgentPatch = Partial<
     | "default_language"
     | "stt_provider"
     | "stt_model"
+    | "azure_stt_english_locale"
     | "llm_provider"
     | "llm_model"
     | "tts_provider"

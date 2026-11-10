@@ -61,6 +61,44 @@ async def create_agent(client: AsyncClient, token: str, slug: str) -> dict:
 
 
 @pytest.mark.anyio
+async def test_new_agent_defaults_to_azure_and_owner_can_save_english_locale(client):
+    token = await login(client, f"{uuid.uuid4()}@example.com")
+    agent = await create_agent(client, token, f"azure-{uuid.uuid4().hex[:8]}")
+    assert (agent["stt_provider"], agent["stt_model"]) == ("azure", "azure-speech")
+    assert agent["azure_stt_english_locale"] == "en-IN"
+    updated = await client.patch(
+        f"/agents/{agent['id']}",
+        json={"azure_stt_english_locale": " en-GB "},
+        headers=mutation_headers(token),
+    )
+    assert updated.status_code == 200
+    retrieved = await client.get(f"/agents/{agent['id']}")
+    assert retrieved.json()["azure_stt_english_locale"] == "en-GB"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("settings", [
+    {"stt_provider": "deepgram", "stt_model": "nova-3"},
+    {"stt_provider": None, "stt_model": None},
+    {"stt_provider": "deepgram"},
+    {"stt_model": "nova-3"},
+])
+async def test_explicit_stt_settings_survive_creation_and_unrelated_edit(client, settings):
+    token = await login(client, f"{uuid.uuid4()}@example.com")
+    response = await client.post(
+        "/agents", json={"name": "Existing choice", **settings}, headers=mutation_headers(token)
+    )
+    assert response.status_code == 201
+    agent = response.json()
+    updated = await client.patch(
+        f"/agents/{agent['id']}", json={"description": "Changed"}, headers=mutation_headers(token)
+    )
+    assert updated.status_code == 200
+    assert updated.json()["stt_provider"] == settings.get("stt_provider")
+    assert updated.json()["stt_model"] == settings.get("stt_model")
+
+
+@pytest.mark.anyio
 async def test_agent_routes_hide_other_owners_agents(client):
     owner_id = str(uuid.uuid4())
     owner_token = await login(client, f"{owner_id}@example.com")
@@ -154,6 +192,9 @@ async def test_every_agent_mutation_requires_csrf(client):
 async def test_publish_fails_closed_without_server_provider_configuration(client, monkeypatch):
     for name in (
         "DEEPGRAM_API_KEY",
+        "AZURE_SPEECH_API_KEY",
+        "AZURE_SPEECH_REGION",
+        "AZURE_SPEECH_ENDPOINT",
         "OPENAI_API_KEY",
         "CARTESIA_API_KEY",
         "ELEVENLABS_API_KEY",
@@ -191,6 +232,51 @@ async def test_publish_fails_closed_without_server_provider_configuration(client
     assert "agent.stt_provider" in errors
     assert "agent.llm_model" in errors
     assert "agent.voice_id" in errors
+    assert (await client.get(f"/agents/{agent['id']}")).json()["status"] == "draft"
+
+
+@pytest.mark.anyio
+async def test_publish_fails_closed_when_azure_speech_key_missing_preserving_draft(client, monkeypatch):
+    monkeypatch.delenv("AZURE_SPEECH_API_KEY", raising=False)
+    monkeypatch.setenv("AZURE_SPEECH_REGION", "eastus")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-only")
+    monkeypatch.setenv("VERIFIED_OPENAI_MODELS", "gpt-4o-mini")
+    monkeypatch.setenv("CARTESIA_API_KEY", "test-only")
+    monkeypatch.setenv(
+        "VERIFIED_TTS_VOICE_CATALOG",
+        '{"cartesia":{"sonic-3.6":{"test-voice":["en"]}}}',
+    )
+    token = await login(client, f"{uuid.uuid4()}@example.com")
+    agent = await create_agent(client, token, "azure-missing-key-agent")
+    headers = mutation_headers(token)
+
+    updated = await client.patch(
+        f"/agents/{agent['id']}",
+        headers=headers,
+        json={
+            "instructions": "Test instructions",
+            "languages": ["en"],
+            "default_language": "en",
+            "stt_provider": "azure",
+            "stt_model": "azure-speech",
+            "azure_stt_english_locale": "en-GB",
+            "llm_provider": "openai",
+            "llm_model": "gpt-4o-mini",
+            "tts_provider": "cartesia",
+            "tts_model": "sonic-3.6",
+            "voice_id": "test-voice",
+        },
+    )
+    assert updated.status_code == 200
+
+    response = await client.post(
+        f"/agents/{agent['id']}/publish",
+        headers=headers,
+    )
+    assert response.status_code == 422
+    errors = response.json()["detail"]
+    assert "agent.stt_provider" in errors
+    assert any("AZURE_SPEECH_API_KEY" in msg for msg in errors["agent.stt_provider"])
     assert (await client.get(f"/agents/{agent['id']}")).json()["status"] == "draft"
 
 
@@ -237,8 +323,32 @@ async def test_deleting_agent_removes_agent_record(client):
     assert remaining is None
 
 @pytest.mark.anyio
-async def test_publish_and_unpublish_persist_agent_state(client, monkeypatch):
-    monkeypatch.setenv("DEEPGRAM_API_KEY", "test-only")
+@pytest.mark.parametrize(
+    ("stt_provider", "stt_model", "english_locale", "env_vars"),
+    [
+        (
+            "deepgram",
+            "nova-3",
+            None,
+            {"DEEPGRAM_API_KEY": "test-only"},
+        ),
+        (
+            "azure",
+            "azure-speech",
+            "en-GB",
+            {"AZURE_SPEECH_API_KEY": "test-azure-key", "AZURE_SPEECH_REGION": "eastus"},
+        ),
+    ],
+)
+async def test_publish_and_unpublish_persist_agent_state(
+    client, monkeypatch, stt_provider, stt_model, english_locale, env_vars
+):
+    monkeypatch.delenv("DEEPGRAM_API_KEY", raising=False)
+    monkeypatch.delenv("AZURE_SPEECH_API_KEY", raising=False)
+    monkeypatch.delenv("AZURE_SPEECH_REGION", raising=False)
+    monkeypatch.delenv("AZURE_SPEECH_ENDPOINT", raising=False)
+    for key, val in env_vars.items():
+        monkeypatch.setenv(key, val)
     monkeypatch.setenv("OPENAI_API_KEY", "test-only")
     monkeypatch.setenv("VERIFIED_OPENAI_MODELS", "gpt-4o-mini")
     monkeypatch.setenv("CARTESIA_API_KEY", "test-only")
@@ -247,31 +357,38 @@ async def test_publish_and_unpublish_persist_agent_state(client, monkeypatch):
         '{"cartesia":{"sonic-3.6":{"test-voice":["en"]}}}',
     )
     token = await login(client, f"{uuid.uuid4()}@example.com")
-    agent = await create_agent(client, token, "publishable-agent")
+    agent = await create_agent(client, token, f"publishable-{stt_provider}")
     headers = mutation_headers(token)
+
+    patch_payload = {
+        "instructions": "Help callers find the right team.",
+        "languages": ["en"],
+        "default_language": "en",
+        "stt_provider": stt_provider,
+        "stt_model": stt_model,
+        "llm_provider": "openai",
+        "llm_model": "gpt-4o-mini",
+        "tts_provider": "cartesia",
+        "tts_model": "sonic-3.6",
+        "voice_id": "test-voice",
+    }
+    if english_locale is not None:
+        patch_payload["azure_stt_english_locale"] = english_locale
 
     updated = await client.patch(
         f"/agents/{agent['id']}",
-        json={
-            "instructions": "Help callers find the right team.",
-            "languages": ["en"],
-            "default_language": "en",
-            "stt_provider": "deepgram",
-            "stt_model": "nova-3",
-            "llm_provider": "openai",
-            "llm_model": "gpt-4o-mini",
-            "tts_provider": "cartesia",
-            "tts_model": "sonic-3.6",
-            "voice_id": "test-voice",
-        },
+        json=patch_payload,
         headers=headers,
     )
     assert updated.status_code == 200
-
+    if english_locale is not None:
+        assert updated.json()["azure_stt_english_locale"] == english_locale
 
     published = await client.post(f"/agents/{agent['id']}/publish", headers=headers)
     assert published.status_code == 200
     assert published.json()["status"] == "published"
+    if english_locale is not None:
+        assert published.json()["azure_stt_english_locale"] == english_locale
 
     unpublished = await client.post(f"/agents/{agent['id']}/unpublish", headers=headers)
     assert unpublished.status_code == 200

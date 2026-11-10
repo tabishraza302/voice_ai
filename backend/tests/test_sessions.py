@@ -24,6 +24,8 @@ from app.sessions import (
     load_signaling_context,
     set_session_status,
 )
+from app.voice import CallDefinition
+from voice_pipeline_harness import verified_environment
 
 
 @pytest.fixture
@@ -260,6 +262,9 @@ async def test_session_history_is_owner_scoped_for_detail_messages_and_answers(c
     assert len(stored_messages) == 2
 
 
+
+
+
 @pytest.mark.anyio
 async def test_expired_signaling_cannot_activate_a_call(client):
     token = await login(client, f"{uuid.uuid4()}@example.com")
@@ -378,3 +383,99 @@ async def test_suspended_agents_cannot_start_owner_or_public_calls(client):
     metadata = await client.get(f"/public/agents/{agent['slug']}")
     assert owner_call.status_code == 409
     assert public_call.status_code == metadata.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_azure_stt_locale_freeze_and_isolation(client):
+    token = await login(client, f"{uuid.uuid4()}@example.com")
+    slug = f"azure-freeze-{uuid.uuid4().hex[:12]}"
+    create_resp = await client.post(
+        "/agents",
+        headers=mutation_headers(token),
+        json={
+            "name": "Azure Reception",
+            "slug": slug,
+            "instructions": "Help the caller in British English.",
+            "languages": ["en"],
+            "default_language": "en",
+            "stt_provider": "azure",
+            "stt_model": "azure-speech",
+            "azure_stt_english_locale": "en-GB",
+            "llm_provider": "openai",
+            "llm_model": "gpt-4o-mini",
+            "tts_provider": "cartesia",
+            "tts_model": "sonic-3.6",
+            "voice_id": "cartesia-en",
+        },
+    )
+    assert create_resp.status_code == 201
+    agent = create_resp.json()
+
+    # First call en-GB
+    first_call_resp = await client.post(
+        f"/agents/{agent['id']}/test-calls",
+        headers=mutation_headers(token),
+        json={"language": "en"},
+    )
+    assert first_call_resp.status_code == 201
+    first_session_id = uuid.UUID(first_call_resp.json()["session_id"])
+
+    first_snapshot = await load_session_snapshot(first_session_id)
+    assert first_snapshot is not None
+    assert first_snapshot["agent"]["azure_stt_english_locale"] == "en-GB"
+
+    # Verify no server credentials/region/endpoint in snapshot
+    snap_str = str(first_snapshot).lower()
+    assert "api_key" not in snap_str
+    assert "stt_region" not in snap_str
+    assert "stt_endpoint" not in snap_str
+    assert "azure_speech" not in snap_str
+
+    env = verified_environment()
+    env["AZURE_SPEECH_API_KEY"] = "azure-secret"
+    env["AZURE_SPEECH_REGION"] = "eastus"
+
+    def1 = CallDefinition.from_snapshot(first_session_id, "test", first_snapshot, env)
+    assert def1.providers.stt_provider == "azure"
+    assert def1.providers.stt_language == "en-GB"
+
+    # Edit agent to en-US
+    patch_resp = await client.patch(
+        f"/agents/{agent['id']}",
+        headers=mutation_headers(token),
+        json={"azure_stt_english_locale": "en-US"},
+    )
+    assert patch_resp.status_code == 200
+    assert patch_resp.json()["azure_stt_english_locale"] == "en-US"
+
+    # Second call en-US
+    second_call_resp = await client.post(
+        f"/agents/{agent['id']}/test-calls",
+        headers=mutation_headers(token),
+        json={"language": "en"},
+    )
+    assert second_call_resp.status_code == 201
+    second_session_id = uuid.UUID(second_call_resp.json()["session_id"])
+
+    # First call remains en-GB
+    first_snapshot = await load_session_snapshot(first_session_id)
+    assert first_snapshot is not None
+    assert first_snapshot["agent"]["azure_stt_english_locale"] == "en-GB"
+    def1_again = CallDefinition.from_snapshot(first_session_id, "test", first_snapshot, env)
+    assert def1_again.providers.stt_language == "en-GB"
+
+    second_snapshot = await load_session_snapshot(second_session_id)
+    assert second_snapshot is not None
+    assert second_snapshot["agent"]["azure_stt_english_locale"] == "en-US"
+
+    def2 = CallDefinition.from_snapshot(second_session_id, "test", second_snapshot, env)
+    assert def2.providers.stt_language == "en-US"
+
+    # Verify public metadata has no keys/region/endpoint
+    await publish_agent(agent["id"])
+    metadata = await client.get(f"/public/agents/{slug}")
+    assert metadata.status_code == 200
+    meta_str = str(metadata.json()).lower()
+    assert "key" not in meta_str
+    assert "region" not in meta_str
+    assert "endpoint" not in meta_str

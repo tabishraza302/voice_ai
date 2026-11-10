@@ -221,6 +221,7 @@ def _agent_snapshot(agent: Agent) -> dict[str, Any]:
         "default_language": agent.default_language,
         "stt_provider": agent.stt_provider,
         "stt_model": agent.stt_model,
+        "azure_stt_english_locale": agent.azure_stt_english_locale,
         "llm_provider": agent.llm_provider,
         "llm_model": agent.llm_model,
         "tts_provider": agent.tts_provider,
