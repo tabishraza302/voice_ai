@@ -37,10 +37,13 @@ The backend starts before the migration step by design; API requests need the sc
 
 ```sh
 docker compose exec backend pytest
-docker compose exec frontend npm run test:captions
-docker compose exec frontend npm run lint -- --max-warnings 0
-docker compose exec frontend npm run build
+docker build --target tooling --build-arg BACKEND_URL=http://backend:8000 -t voice-agent-builder-frontend-tooling ./frontend
+docker run --rm voice-agent-builder-frontend-tooling npm run test:captions
+docker run --rm voice-agent-builder-frontend-tooling npm run lint -- --max-warnings 0
+docker run --rm voice-agent-builder-frontend-tooling npm run build
 ```
+
+The frontend's production image includes the standalone Next.js runtime and static assets on the Node base image. It also includes Node's `npm`, but not the project source, devDependencies, or package scripts; use the `tooling` build target for the documented checks.
 
 `backend/tests/conftest.py` forces `DATABASE_URL` to `TEST_DATABASE_URL`, and the test suite drops and recreates tables there. It must never point at the application database. Compose supplies `TEST_DATABASE_URL` automatically; without Compose, point it at a local disposable database (for example one running on port 55432).
 
