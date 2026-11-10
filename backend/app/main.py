@@ -1,15 +1,22 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from openai import DefaultAsyncHttpxClient
 
 from . import admin, agents, auth, chat, observability, provider_catalog, sessions, signaling
+from .db import engine
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
+async def lifespan(app: FastAPI):
     observability.configure_tracing()
-    await sessions.recover_interrupted_sessions()
-    yield
+    async with DefaultAsyncHttpxClient() as openai_http_client:
+        app.state.openai_http_client = openai_http_client
+        try:
+            await sessions.recover_interrupted_sessions()
+            yield
+        finally:
+            await engine.dispose()
 
 
 app = FastAPI(lifespan=lifespan)

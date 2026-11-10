@@ -1,3 +1,4 @@
+import asyncio
 import json
 import uuid
 from collections.abc import Callable
@@ -5,9 +6,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 
-from app.db import Base, engine
+from app.db import Base, Session, engine
 from app.main import app
+
 
 REQUIRED_SECTIONS = (
     "### Role & Spoken Persona",
@@ -41,9 +44,9 @@ async def client():
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.drop_all)
         await connection.run_sync(Base.metadata.create_all)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://localhost:3000") as test_client:
-        yield test_client
-
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://localhost:3000") as test_client:
+            yield test_client
 
 @pytest.fixture
 def anyio_backend():
@@ -64,20 +67,30 @@ def mutation_headers(token: str) -> dict[str, str]:
 def mock_stream_for(*chunks: str, on_call: Callable[[dict], None] | None = None):
     """Build an async streaming mock that yields the supplied text chunks in order."""
 
+    class MockStream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return None
+
+        async def __aiter__(self):
+            for chunk_text in chunks:
+                class MockDelta:
+                    content = chunk_text
+
+                class MockStreamChoice:
+                    delta = MockDelta()
+
+                class MockStreamChunk:
+                    choices = [MockStreamChoice()]
+
+                yield MockStreamChunk()
+
     async def mock_stream(*args, **kwargs):
         if on_call is not None:
             on_call(kwargs)
-        for chunk_text in chunks:
-            class MockDelta:
-                content = chunk_text
-
-            class MockStreamChoice:
-                delta = MockDelta()
-
-            class MockStreamChunk:
-                choices = [MockStreamChoice()]
-
-            yield MockStreamChunk()
+        return MockStream()
 
     return mock_stream
 
@@ -160,6 +173,88 @@ async def test_enhance_prompt_success(client, monkeypatch):
     assert "enhanced_prompt" in body
     assert_required_sections(body["enhanced_prompt"])
 
+
+
+@pytest.mark.anyio
+async def test_enhancement_reuses_provider_socket_without_reusing_response(monkeypatch):
+    requests = []
+    connection_ids = set()
+
+    async def provider_connection(reader, writer):
+        connection_ids.add(writer.get_extra_info("peername"))
+        try:
+            while True:
+                headers = await reader.readuntil(b"\r\n\r\n")
+                header_lines = headers.decode("latin1").split("\r\n")
+                content_length = next(
+                    int(line.split(":", 1)[1]) for line in header_lines if line.lower().startswith("content-length:")
+                )
+                payload = json.loads(await reader.readexactly(content_length))
+                prompt = payload["messages"][-1]["content"]
+                authorization = next(
+                    line.split(":", 1)[1].strip() for line in header_lines if line.lower().startswith("authorization:")
+                )
+                requests.append((prompt, payload["model"], authorization))
+                body = json.dumps(
+                    {
+                        "id": "local",
+                        "object": "chat.completion",
+                        "created": 1,
+                        "model": payload["model"],
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": f"Echo: {prompt}"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                ).encode()
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                    + str(len(body)).encode()
+                    + b"\r\nConnection: keep-alive\r\n\r\n"
+                    + body
+                )
+                await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(provider_connection, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    monkeypatch.setenv("OPENAI_API_KEY", "local-test-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", f"http://127.0.0.1:{port}/v1")
+    monkeypatch.setenv("VERIFIED_OPENAI_MODELS", "gpt-4o-mini,gpt-4.1-mini")
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.drop_all)
+            await connection.run_sync(Base.metadata.create_all)
+        async with app.router.lifespan_context(app):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://localhost:3000") as client:
+                token = await login(client, f"{uuid.uuid4()}@example.com")
+                headers = mutation_headers(token)
+                results = []
+                for prompt, model in (
+                    ("First distinct prompt", "gpt-4o-mini"),
+                    ("Second distinct prompt", "gpt-4.1-mini"),
+                ):
+                    response = await client.post(
+                        "/agents/enhance-prompt", json={"prompt": prompt, "model": model}, headers=headers
+                    )
+                    assert response.status_code == 200, response.text
+                    results.append(response.json()["enhanced_prompt"])
+        assert results == ["Echo: First distinct prompt", "Echo: Second distinct prompt"]
+        assert requests == [
+            ("First distinct prompt", "gpt-4o-mini", "Bearer local-test-key"),
+            ("Second distinct prompt", "gpt-4.1-mini", "Bearer local-test-key"),
+        ]
+        assert len(connection_ids) == 1
+    finally:
+        server.close()
+        await server.wait_closed()
 
 @pytest.mark.anyio
 async def test_generate_stream_requires_auth_and_csrf(client):

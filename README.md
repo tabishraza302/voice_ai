@@ -14,7 +14,7 @@ Prerequisites: Docker Desktop/Compose, a browser with microphone access, and rea
    cp .env.example .env
    ```
 
-   At minimum set `SESSION_SECRET`, `POSTGRES_PASSWORD`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `OPENAI_API_KEY`, STT credentials (`AZURE_SPEECH_API_KEY` with `AZURE_SPEECH_REGION` or `AZURE_SPEECH_ENDPOINT`, or `DEEPGRAM_API_KEY`), and one TTS key. See [Environment](#environment) below.
+   At minimum set `SESSION_SECRET`, `POSTGRES_PASSWORD`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `DEV_USER_EMAIL`, `DEV_USER_PASSWORD`, `OPENAI_API_KEY`, STT credentials (`AZURE_SPEECH_API_KEY` with `AZURE_SPEECH_REGION` or `AZURE_SPEECH_ENDPOINT`, or `DEEPGRAM_API_KEY`), and one TTS key. Both account passwords must have at least 12 characters. See [Environment](#environment) below.
 
 2. Build and start the services:
 
@@ -22,14 +22,14 @@ Prerequisites: Docker Desktop/Compose, a browser with microphone access, and rea
    docker compose up --build -d
    ```
 
-3. Apply migrations and create the administrator. Both commands are idempotent:
+3. Apply migrations and seed the administrator and development user. Both commands are safe to rerun:
 
    ```sh
    docker compose exec backend alembic upgrade head
-   docker compose exec backend python -m app.bootstrap
+   docker compose exec backend python -m app.seed
    ```
 
-4. Open <http://localhost:3000>. Sign in as the administrator, or register a normal owner account. Phoenix is at <http://127.0.0.1:6006> (loopback only).
+4. Open <http://localhost:3000>. Sign in using either configured account, or register another normal owner account. Phoenix is at <http://127.0.0.1:6006> (loopback only).
 
 The backend starts before the migration step by design; API requests need the schema, so run steps 3 and 4 in order. The postgres init script creates the separate `voice_test` database used only by pytest.
 
@@ -43,6 +43,8 @@ docker compose exec frontend npm run build
 ```
 
 `backend/tests/conftest.py` forces `DATABASE_URL` to `TEST_DATABASE_URL`, and the test suite drops and recreates tables there. It must never point at the application database. Compose supplies `TEST_DATABASE_URL` automatically; without Compose, point it at a local disposable database (for example one running on port 55432).
+
+Tests use the same pooled engine as production. AnyIO gives each async test a fresh event loop, so `conftest.py` disposes the pool after each async test in that test's loop; sync `TestClient` WebSocket tests use one lifespan loop per test. Do not replace this with a pytest-only `NullPool` bypass.
 
 Scoped dependency overrides patch the lint parser's `minimatch` and Next's
 `postcss` dependencies while keeping Next 15 and ESLint 9. The locked graph is
@@ -123,6 +125,8 @@ responses.
 | `SMALLWEBRTC_TURN_CREDENTIAL_TTL_SECONDS` | TURN credential lifetime, 60–3600 seconds. |
 | `BACKEND_URL` | Next.js proxy target. Compose sets `http://backend:8000`; local dev defaults to `http://127.0.0.1:8000`. |
 
+PostgreSQL connections are pooled per backend process: 10 persistent connections plus 10 overflow connections, a 10-second checkout timeout, pre-ping, and a 5-minute recycle. The FastAPI lifespan disposes the pool on shutdown. Compose runs one uvicorn worker; if you add workers or replicas, multiply the pool cap and keep the total below PostgreSQL `max_connections` (100 in the Compose image).
+
 Provider/model/voice publishing is fail-closed. A draft saves incomplete, but publish returns field errors unless the exact combination is approved by server configuration. The visual-flow editor lets owners set each step's title and objective, collect free-form answers, and route to another step or End call. Saved steps are active.
 Migration 0008 drops legacy step configuration columns; historical session snapshots remain unchanged.
 
@@ -178,7 +182,7 @@ cd backend
 uv sync --all-groups
 set -a; source ../.env; set +a
 alembic upgrade head
-python -m app.bootstrap
+python -m app.seed
 uvicorn app.main:app --reload
 pytest
 ```
@@ -196,6 +200,23 @@ The frontend rewrites `/api/*` to `BACKEND_URL`; there is no CORS configuration 
 ## Login
 
 Passwordless User and Admin buttons are available only when `ALLOW_DEV_LOGIN=true` and `ENVIRONMENT=development`. They use `DEV_USER_EMAIL`/`DEV_USER_PASSWORD` and `ADMIN_EMAIL`/`ADMIN_PASSWORD`, which must match existing accounts with the corresponding roles; they never create accounts or promote an existing user. Browser requests must include an exact `Origin` matching `APP_ORIGIN`.
+
+To create both accounts without registering them manually, run:
+
+```sh
+docker compose exec backend python -m app.seed
+```
+
+For a backend outside Docker, load `.env` and run `uv run python -m app.seed` from `backend/`.
+Seeding requires `ENVIRONMENT=development` and uses `ADMIN_EMAIL`/`ADMIN_PASSWORD`
+and `DEV_USER_EMAIL`/`DEV_USER_PASSWORD`. Emails must be different; passwords must
+have at least 12 characters. The command creates missing accounts and checks
+existing credentials without changing passwords, IDs, or roles. Invalid credentials,
+role conflicts, or password mismatches stop the command without saving either account.
+If a password differs, set the environment value to the existing account's password
+and recreate the backend container with `docker compose up -d backend` before rerunning.
+The command does not enable passwordless login or create agents or call history.
+For production, use `python -m app.bootstrap` instead to create only the administrator.
 
 This option grants a session without asking for a password. Keep it disabled unless developing locally. It is not safe on shared or untrusted networks—even when the configured Origin check is enabled, non-browser clients can send that header. The default Compose ingress listens on all interfaces, so a machine reachable by other people must not enable this option. Production always disables the endpoints.
 

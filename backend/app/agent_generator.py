@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 from typing import NamedTuple
 
 from fastapi import HTTPException
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -169,7 +169,9 @@ def _has_required_sections(instructions: str) -> bool:
     )
 
 
-def get_openai_client(model_override: str | None = None) -> tuple[AsyncOpenAI, str]:
+def get_openai_client(
+    http_client: DefaultAsyncHttpxClient, model_override: str | None = None
+) -> tuple[AsyncOpenAI, str]:
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise HTTPException(503, "OpenAI is unavailable because OPENAI_API_KEY is not configured on the server.")
@@ -187,17 +189,19 @@ def get_openai_client(model_override: str | None = None) -> tuple[AsyncOpenAI, s
     else:
         model = "gpt-4o-mini"
 
-    return AsyncOpenAI(api_key=api_key, timeout=60.0), model
+    return AsyncOpenAI(api_key=api_key, timeout=60.0, http_client=http_client), model
 
 
-async def enhance_prompt(prompt: str, model_name: str | None = None) -> str:
+async def enhance_prompt(
+    prompt: str, http_client: DefaultAsyncHttpxClient, model_name: str | None = None
+) -> str:
     cleaned = prompt.strip()
     if not cleaned:
         raise HTTPException(422, "Prompt cannot be empty.")
     if len(cleaned) < 10:
         raise HTTPException(422, "Prompt must be at least 10 characters long.")
 
-    client, model = get_openai_client(model_name)
+    client, model = get_openai_client(http_client, model_name)
     try:
         response = await client.chat.completions.create(
             model=model,
@@ -225,6 +229,7 @@ async def stream_agent_generation(
     prompt: str,
     db: AsyncSession,
     owner_id: uuid.UUID,
+    http_client: DefaultAsyncHttpxClient,
     model_name: str | None = None,
 ) -> AsyncIterator[str]:
     from .agents import Agent, generate_slug
@@ -237,7 +242,7 @@ async def stream_agent_generation(
         return
 
     try:
-        client, model = get_openai_client(model_name)
+        client, model = get_openai_client(http_client, model_name)
     except HTTPException as e:
         yield _format_sse("error", {"message": e.detail})
         return
@@ -258,20 +263,19 @@ async def stream_agent_generation(
             stream=True,
         )
 
-        async for chunk in response:
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            delta_content = getattr(delta, "content", None)
-            if delta_content:
-                full_text += delta_content
-                yield _format_sse("token", {"text": delta_content})
+        async with response:
+            async for chunk in response:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                delta_content = getattr(delta, "content", None)
+                if delta_content:
+                    full_text += delta_content
+                    yield _format_sse("token", {"text": delta_content})
 
-                if not instruction_milestone_sent and '"instructions"' in full_text:
-                    instruction_milestone_sent = True
-                    yield _format_sse("milestone", {"phase": "instructions"})
-
-
+                    if not instruction_milestone_sent and '"instructions"' in full_text:
+                        instruction_milestone_sent = True
+                        yield _format_sse("milestone", {"phase": "instructions"})
     except Exception as exc:
         yield _format_sse("error", {"message": f"OpenAI streaming failed: {str(exc)}"})
         return
