@@ -85,8 +85,13 @@ the complete closing turn before marking the session `completed` and sending
 Tool-provided voice farewells wait for synthesis and backend audio-transport
 completion, with a ten-second safety limit. Already delivered farewells are not
 spoken again, while additional closing information is preserved. Final assistant
-captions and saved messages follow audio completion order. A late final
-transcription still becomes a caller turn after the VAD fallback window expires.
+captions and saved messages follow audio completion order. Azure Speech segments
+are buffered into one pending caller turn: it is sent only after VAD reports
+speech stopped and a finalized segment covers the last speech window, so resumed
+speech combines with earlier segments and a late covering final completes the
+turn instead of flushing partial text at a deadline. Deepgram keeps its existing
+`is_final`/`speech_final` behavior, where a late final still becomes a caller
+turn after the fallback window expires.
 Isolated backchannels that overlap bot playback are captioned and saved without
 starting another model turn, even when their transcript finalizes after audio
 drains. New utterances outside playback and meaningful commands still get normal
