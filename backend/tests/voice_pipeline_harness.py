@@ -10,6 +10,7 @@ from typing import Any
 from httpx import ASGITransport, AsyncClient
 from pipecat.frames.frames import (
     Frame,
+    InputAudioRawFrame,
     InterimTranscriptionFrame,
     InterruptionFrame,
     LLMContextFrame,
@@ -87,6 +88,7 @@ class RunningVoicePipeline:
             "natural-farewell-delayed",
             "prior-speech-starts-late",
             "backchannel-during-playback",
+            "turn-handling",
         }:
             raise ValueError(f"Unsupported pipeline test scenario: {scenario}")
         self.environment = environment
@@ -206,8 +208,11 @@ class RunningVoicePipeline:
             async def deliver_vad_start(self) -> None:
                 await self.push_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
 
-            async def deliver_vad_stop(self) -> None:
-                await self.push_frame(VADUserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+            async def deliver_vad_stop(self, stop_secs: float = 0.0) -> None:
+                await self.push_frame(
+                    VADUserStoppedSpeakingFrame(stop_secs=stop_secs),
+                    FrameDirection.DOWNSTREAM,
+                )
 
             async def deliver_transcription(
                 self,
@@ -215,9 +220,19 @@ class RunningVoicePipeline:
                 *,
                 is_final: bool = True,
                 speech_final: bool = True,
+                offset: int | None = None,
+                duration: int | None = None,
             ) -> None:
                 if harness.stt_provider == "azure":
                     if is_final or speech_final:
+                        result_inner = SimpleNamespace(
+                            reason="RecognizedSpeech",
+                            text=text,
+                        )
+                        if offset is not None:
+                            result_inner.offset = offset
+                        if duration is not None:
+                            result_inner.duration = duration
                         await self.push_frame(
                             TranscriptionFrame(
                                 text=text,
@@ -225,10 +240,9 @@ class RunningVoicePipeline:
                                 timestamp="0",
                                 finalized=True,
                                 result=SimpleNamespace(
-                                    result=SimpleNamespace(
-                                        reason="RecognizedSpeech",
-                                        text=text,
-                                    )
+                                    result=result_inner,
+                                    offset=offset,
+                                    duration=duration,
                                 ),
                             ),
                             FrameDirection.DOWNSTREAM,
@@ -256,6 +270,32 @@ class RunningVoicePipeline:
                         ),
                         FrameDirection.DOWNSTREAM,
                     )
+
+            async def deliver_audio(
+                self,
+                duration_ms: int,
+                *,
+                sample_rate: int = 16_000,
+            ) -> None:
+                """Forward caller audio frames downstream without a transcript.
+
+                Real STT services pass input audio through by default. This lets
+                turn-handling tests advance the audio timeline (as Azure sees
+                it) when no interim transcription arrives.
+                """
+                remaining = max(0, duration_ms)
+                while remaining > 0:
+                    chunk_ms = min(20, remaining)  # 20 ms, matching WebRTC
+                    chunk_samples = max(1, sample_rate * chunk_ms // 1000)
+                    await self.push_frame(
+                        InputAudioRawFrame(
+                            audio=b"\x00\x00" * chunk_samples,
+                            sample_rate=sample_rate,
+                            num_channels=1,
+                        ),
+                        FrameDirection.DOWNSTREAM,
+                    )
+                    remaining -= chunk_ms
 
             async def _send_late_transcription(self) -> None:
                 await asyncio.sleep(0.6)
@@ -380,6 +420,11 @@ class RunningVoicePipeline:
                         reply = "नमस्ते आरव!" if "मेरा नाम आरव है।" in user_messages else ASSISTANT_TEXT
                         await self.push_frame(LLMFullResponseStartFrame(), direction)
                         await self.push_frame(LLMTextFrame(text=reply), direction)
+                        await self.push_frame(LLMFullResponseEndFrame(), direction)
+                        return
+                    if harness.scenario == "turn-handling" and user_messages:
+                        await self.push_frame(LLMFullResponseStartFrame(), direction)
+                        await self.push_frame(LLMTextFrame(text=ASSISTANT_TEXT), direction)
                         await self.push_frame(LLMFullResponseEndFrame(), direction)
                         return
                     if harness.scenario == "farewell" and "Goodbye." in user_messages:
@@ -561,7 +606,7 @@ class RunningVoicePipeline:
                     if self._playback_task and not self._playback_task.done():
                         self._playback_task.cancel()
                 if direction == FrameDirection.DOWNSTREAM and isinstance(frame, LLMTextFrame):
-                    if harness.scenario in {"late-transcription", "transcription", "duplicate-farewell", "extended-farewell"}:
+                    if harness.scenario in {"late-transcription", "transcription", "duplicate-farewell", "extended-farewell", "turn-handling"}:
                         await self._call_event_handler("on_tts_request", "assistant-reply", frame.text)
                         await self._push_audio("assistant-reply", stop=True)
                     elif harness.scenario in {"natural-farewell-delayed", "prior-speech-starts-late"}:
