@@ -10,6 +10,7 @@ from typing import Any
 from httpx import ASGITransport, AsyncClient
 from pipecat.frames.frames import (
     Frame,
+    InterimTranscriptionFrame,
     InterruptionFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
@@ -46,6 +47,8 @@ OUTSIDE_ACK_REPLY_TEXT = "I am listening."
 def verified_environment() -> dict[str, str]:
     return {
         "DEEPGRAM_API_KEY": "deepgram-test-secret",
+        "AZURE_SPEECH_API_KEY": "azure-test-secret",
+        "AZURE_SPEECH_REGION": "eastus",
         "OPENAI_API_KEY": "openai-test-secret",
         "VERIFIED_OPENAI_MODELS": "gpt-4o-mini,gpt-4.1-mini",
         "CARTESIA_API_KEY": "cartesia-test-secret",
@@ -70,15 +73,28 @@ class RunningVoicePipeline:
         scenario: str,
         existing_speech: bool = False,
         language: str = "en",
+        stt_provider: str = "deepgram",
+        azure_stt_english_locale: str = "en-IN",
         backchannel_text: str = BACKCHANNEL_TEXT,
         command_text: str = COMMAND_TEXT,
     ) -> None:
-        if scenario not in {"farewell", "late-transcription", "duplicate-farewell", "extended-farewell", "natural-farewell-delayed", "prior-speech-starts-late", "backchannel-during-playback"}:
+        if scenario not in {
+            "transcription",
+            "farewell",
+            "late-transcription",
+            "duplicate-farewell",
+            "extended-farewell",
+            "natural-farewell-delayed",
+            "prior-speech-starts-late",
+            "backchannel-during-playback",
+        }:
             raise ValueError(f"Unsupported pipeline test scenario: {scenario}")
         self.environment = environment
         self.scenario = scenario
         self.existing_speech = existing_speech
         self.language = language
+        self.stt_provider = stt_provider
+        self.azure_stt_english_locale = azure_stt_english_locale
         self.backchannel_text = backchannel_text
         self.command_text = command_text
         self.events: list[str] = []
@@ -158,7 +174,7 @@ class RunningVoicePipeline:
             async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
                 await super().process_frame(frame, direction)
                 if (
-                    harness.scenario == "late-transcription"
+                    harness.scenario in {"late-transcription", "transcription"}
                     and direction == FrameDirection.DOWNSTREAM
                     and isinstance(frame, StartFrame)
                 ):
@@ -177,7 +193,7 @@ class RunningVoicePipeline:
             def output(self) -> FrameProcessor:
                 return self._output
 
-        class FakeDeepgram(PassThroughProcessor):
+        class FakeSTT(PassThroughProcessor):
             def __init__(self, *args: Any, **kwargs: Any) -> None:
                 super().__init__()
                 self._sent_farewell_transcript = False
@@ -186,12 +202,12 @@ class RunningVoicePipeline:
                 self.vad_started = asyncio.Event()
                 self.vad_stopped = asyncio.Event()
                 harness.stt = self
+
             async def deliver_vad_start(self) -> None:
                 await self.push_frame(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
 
             async def deliver_vad_stop(self) -> None:
                 await self.push_frame(VADUserStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
-
 
             async def deliver_transcription(
                 self,
@@ -200,34 +216,88 @@ class RunningVoicePipeline:
                 is_final: bool = True,
                 speech_final: bool = True,
             ) -> None:
-                await self.push_frame(
-                    TranscriptionFrame(
-                        text=text,
-                        user_id="caller",
-                        timestamp="0",
-                        result=SimpleNamespace(
-                            is_final=is_final,
-                            speech_final=speech_final,
-                            from_finalize=False,
+                if harness.stt_provider == "azure":
+                    if is_final or speech_final:
+                        await self.push_frame(
+                            TranscriptionFrame(
+                                text=text,
+                                user_id="caller",
+                                timestamp="0",
+                                finalized=True,
+                                result=SimpleNamespace(
+                                    result=SimpleNamespace(
+                                        reason="RecognizedSpeech",
+                                        text=text,
+                                    )
+                                ),
+                            ),
+                            FrameDirection.DOWNSTREAM,
+                        )
+                    else:
+                        await self.push_frame(
+                            InterimTranscriptionFrame(
+                                text=text,
+                                user_id="caller",
+                                timestamp="0",
+                            ),
+                            FrameDirection.DOWNSTREAM,
+                        )
+                else:
+                    await self.push_frame(
+                        TranscriptionFrame(
+                            text=text,
+                            user_id="caller",
+                            timestamp="0",
+                            result=SimpleNamespace(
+                                is_final=is_final,
+                                speech_final=speech_final,
+                                from_finalize=False,
+                            ),
                         ),
-                    ),
-                    FrameDirection.DOWNSTREAM,
-                )
+                        FrameDirection.DOWNSTREAM,
+                    )
+
             async def _send_late_transcription(self) -> None:
                 await asyncio.sleep(0.6)
-                await self.push_frame(
-                    TranscriptionFrame(
-                        text=CALLER_TEXT,
-                        user_id="caller",
-                        timestamp="0",
-                        result=SimpleNamespace(
-                            is_final=True,
-                            speech_final=False,
-                            from_finalize=False,
+                if harness.stt_provider == "azure":
+                    await self.push_frame(
+                        InterimTranscriptionFrame(
+                            text="My account number",
+                            user_id="caller",
+                            timestamp="0",
                         ),
-                    ),
-                    FrameDirection.DOWNSTREAM,
-                )
+                        FrameDirection.DOWNSTREAM,
+                    )
+                    await asyncio.sleep(0.05)
+                    await self.push_frame(
+                        TranscriptionFrame(
+                            text=CALLER_TEXT,
+                            user_id="caller",
+                            timestamp="0",
+                            finalized=True,
+                            result=SimpleNamespace(
+                                result=SimpleNamespace(
+                                    reason="RecognizedSpeech",
+                                    text=CALLER_TEXT,
+                                )
+                            ),
+                        ),
+                        FrameDirection.DOWNSTREAM,
+                    )
+                else:
+                    await self.push_frame(
+                        TranscriptionFrame(
+                            text=CALLER_TEXT,
+                            user_id="caller",
+                            timestamp="0",
+                            result=SimpleNamespace(
+                                is_final=True,
+                                speech_final=False,
+                                from_finalize=False,
+                            ),
+                        ),
+                        FrameDirection.DOWNSTREAM,
+                    )
                 self.late_transcription_sent.set()
 
             async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
@@ -248,19 +318,36 @@ class RunningVoicePipeline:
                     and not self._sent_farewell_transcript
                 ):
                     self._sent_farewell_transcript = True
-                    await self.push_frame(
-                        TranscriptionFrame(
-                            text="Goodbye.",
-                            user_id="caller",
-                            timestamp="0",
-                            result=SimpleNamespace(
-                                is_final=True,
-                                speech_final=True,
-                                from_finalize=False,
+                    if harness.stt_provider == "azure":
+                        await self.push_frame(
+                            TranscriptionFrame(
+                                text="Goodbye.",
+                                user_id="caller",
+                                timestamp="0",
+                                finalized=True,
+                                result=SimpleNamespace(
+                                    result=SimpleNamespace(
+                                        reason="RecognizedSpeech",
+                                        text="Goodbye.",
+                                    )
+                                ),
                             ),
-                        ),
-                        direction,
-                    )
+                            direction,
+                        )
+                    else:
+                        await self.push_frame(
+                            TranscriptionFrame(
+                                text="Goodbye.",
+                                user_id="caller",
+                                timestamp="0",
+                                result=SimpleNamespace(
+                                    is_final=True,
+                                    speech_final=True,
+                                    from_finalize=False,
+                                ),
+                            ),
+                            direction,
+                        )
                 elif (
                     harness.scenario == "backchannel-during-playback"
                     and isinstance(frame, StartFrame)
@@ -289,9 +376,10 @@ class RunningVoicePipeline:
                     if user_messages:
                         harness.model_turn_requests.append(user_messages[-1])
                         harness.model_context_turns.append(list(user_messages))
-                    if harness.scenario == "late-transcription" and CALLER_TEXT in user_messages:
+                    if harness.scenario in {"late-transcription", "transcription"} and any(msg in user_messages for msg in (CALLER_TEXT, "मेरा नाम आरव है।")):
+                        reply = "नमस्ते आरव!" if "मेरा नाम आरव है।" in user_messages else ASSISTANT_TEXT
                         await self.push_frame(LLMFullResponseStartFrame(), direction)
-                        await self.push_frame(LLMTextFrame(text=ASSISTANT_TEXT), direction)
+                        await self.push_frame(LLMTextFrame(text=reply), direction)
                         await self.push_frame(LLMFullResponseEndFrame(), direction)
                         return
                     if harness.scenario == "farewell" and "Goodbye." in user_messages:
@@ -473,7 +561,7 @@ class RunningVoicePipeline:
                     if self._playback_task and not self._playback_task.done():
                         self._playback_task.cancel()
                 if direction == FrameDirection.DOWNSTREAM and isinstance(frame, LLMTextFrame):
-                    if harness.scenario in {"late-transcription", "duplicate-farewell", "extended-farewell"}:
+                    if harness.scenario in {"late-transcription", "transcription", "duplicate-farewell", "extended-farewell"}:
                         await self._call_event_handler("on_tts_request", "assistant-reply", frame.text)
                         await self._push_audio("assistant-reply", stop=True)
                     elif harness.scenario in {"natural-farewell-delayed", "prior-speech-starts-late"}:
@@ -540,7 +628,7 @@ class RunningVoicePipeline:
             def send_app_message(self, message: dict[str, object]) -> None:
                 self.messages.append(message)
                 if message.get("type") == "caption":
-                    if message.get("role") == "user" and message.get("text") == CALLER_TEXT:
+                    if message.get("role") == "user":
                         self.any_user_caption.set()
                         if message.get("final") is True:
                             self.user_final_caption.set()
@@ -570,7 +658,7 @@ class RunningVoicePipeline:
                         self.command_reply_caption.set()
                     if (
                         message.get("role") == "assistant"
-                        and message.get("text") == ASSISTANT_TEXT
+                        and message.get("text") in {ASSISTANT_TEXT, "नमस्ते आरव!"}
                         and message.get("final") is True
                     ):
                         self.assistant_final_caption.set()
@@ -600,7 +688,8 @@ class RunningVoicePipeline:
                 return None
 
         monkeypatch.setattr("app.voice.SmallWebRTCTransport", FakeTransport)
-        monkeypatch.setattr("app.voice.DeepgramSTTService", FakeDeepgram)
+        monkeypatch.setattr("app.voice.DeepgramSTTService", FakeSTT)
+        monkeypatch.setattr("app.voice.AzureSTTService", FakeSTT)
         monkeypatch.setattr("app.voice.OpenAILLMService", FakeOpenAI)
         monkeypatch.setattr("app.voice.CartesiaTTSService", FakeCartesia)
 
@@ -638,6 +727,7 @@ class RunningVoicePipeline:
             "X-CSRF-Token": login.json()["csrf_token"],
         }
         voice_id = "cartesia-hi" if self.language == "hi" else "cartesia-en"
+        stt_model = "azure-speech" if self.stt_provider == "azure" else "nova-3"
         agent_response = await self.client.post(
             "/agents",
             headers=headers,
@@ -647,8 +737,9 @@ class RunningVoicePipeline:
                 "instructions": "Help the caller.",
                 "languages": [self.language],
                 "default_language": self.language,
-                "stt_provider": "deepgram",
-                "stt_model": "nova-3",
+                "stt_provider": self.stt_provider,
+                "stt_model": stt_model,
+                "azure_stt_english_locale": self.azure_stt_english_locale,
                 "llm_provider": "openai",
                 "llm_model": "gpt-4o-mini",
                 "tts_provider": "cartesia",

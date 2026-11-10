@@ -2,7 +2,7 @@
 
 A self-service voice agent platform. Owners create agents with question steps and answer-based routing; callers use a public `/a/[slug]` page; administrators manage global prompt policy, users and suspensions. Voice calls use Pipecat SmallWebRTC with provider keys held only by the backend. PostgreSQL stores configuration, call snapshots, messages and answers. Phoenix receives redacted OpenTelemetry timing and error spans.
 
-Stack: FastAPI + async SQLAlchemy/Alembic + PostgreSQL, Next.js 15 + Tailwind, Pipecat SmallWebRTC (Deepgram STT, OpenAI LLM, Cartesia/ElevenLabs TTS), Phoenix.
+Stack: FastAPI + async SQLAlchemy/Alembic + PostgreSQL, Next.js 15 + Tailwind, Pipecat SmallWebRTC (Azure Speech and Deepgram STT, OpenAI LLM, Cartesia/ElevenLabs TTS), Phoenix.
 
 ## Quick start (Docker Compose)
 
@@ -14,7 +14,7 @@ Prerequisites: Docker Desktop/Compose, a browser with microphone access, and rea
    cp .env.example .env
    ```
 
-   At minimum set `SESSION_SECRET`, `POSTGRES_PASSWORD`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `DEV_USER_EMAIL`, `DEV_USER_PASSWORD`, `OPENAI_API_KEY`, `DEEPGRAM_API_KEY`, and one TTS key. Both account passwords must have at least 12 characters. See [Environment](#environment) below.
+   At minimum set `SESSION_SECRET`, `POSTGRES_PASSWORD`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `DEV_USER_EMAIL`, `DEV_USER_PASSWORD`, `OPENAI_API_KEY`, STT credentials (`AZURE_SPEECH_API_KEY` with `AZURE_SPEECH_REGION` or `AZURE_SPEECH_ENDPOINT`, or `DEEPGRAM_API_KEY`), and one TTS key. Both account passwords must have at least 12 characters. See [Environment](#environment) below.
 
 2. Build and start the services:
 
@@ -109,6 +109,9 @@ responses.
 | `DATABASE_URL` | Async PostgreSQL URL, `postgresql+asyncpg://...`. Compose supplies the service host and password. |
 | `TEST_DATABASE_URL` | Disposable database used by pytest. Compose supplies it; without Compose, set it to a local disposable database. |
 | `DEEPGRAM_API_KEY` | Deepgram `nova-3` speech recognition. |
+| `AZURE_SPEECH_API_KEY` | Azure Speech service API key for speech recognition (`azure-speech`). |
+| `AZURE_SPEECH_REGION` | Azure Speech region (e.g. `eastus`, `centralindia`). Standard key+region setup; required unless `AZURE_SPEECH_ENDPOINT` is set. |
+| `AZURE_SPEECH_ENDPOINT` | Optional full Azure Speech SDK endpoint URL (overrides `AZURE_SPEECH_REGION`). |
 | `OPENAI_API_KEY` | OpenAI language model and structured extraction. Note the exact name: `OPENAI_KEY` is not read. |
 | `CARTESIA_API_KEY`, `ELEVENLABS_API_KEY` | TTS credentials; at least one provider is required. |
 | `VERIFIED_OPENAI_MODELS` | Comma-separated OpenAI models owners may publish. |
@@ -132,7 +135,7 @@ VERIFIED_OPENAI_MODELS=gpt-4.1-mini,gpt-4o-mini
 VERIFIED_TTS_VOICE_CATALOG={"cartesia":{"sonic-3.6":{"your-voice-id":["en","hi"]}},"elevenlabs":{"eleven_flash_v2_5":{"your-voice-id":["en"]}}}
 ```
 
-Supported combinations in this build: Deepgram `nova-3`, OpenAI models from the allowlist, Cartesia `sonic-3.6`, ElevenLabs `eleven_flash_v2_5`, languages `en` and `hi`. A call uses one language. Publishing more than one language is rejected until live TTS language switching is verified end to end.
+Supported combinations in this build: STT providers Azure Speech (`azure-speech`) and Deepgram (`nova-3`), OpenAI models from the allowlist, Cartesia `sonic-3.6`, ElevenLabs `eleven_flash_v2_5`, languages `en` and `hi`. New agents default to Azure Speech (`azure-speech`) with default English recognition locale `en-IN`; Deepgram remains selectable with no runtime fallback between providers. Publishing and placing calls requires server credentials for the selected STT provider: `AZURE_SPEECH_API_KEY` plus `AZURE_SPEECH_REGION` (or optional full Speech SDK service endpoint `AZURE_SPEECH_ENDPOINT` overriding region) for Azure, or `DEEPGRAM_API_KEY` for Deepgram. Supported English recognition locales for Azure Speech are `en-IN`, `en-US`, and `en-GB`. When call language is `hi`, Azure recognition uses `hi-IN` regardless of English locale setting. A call uses one language. Publishing more than one language is rejected until live TTS language switching is verified end to end.
 
 ## Deployment notes
 
@@ -232,7 +235,7 @@ This option grants a session without asking for a password. Keep it disabled unl
 | Login appears to succeed but no session persists | `ENVIRONMENT=production` over HTTP; use HTTPS or set `development`. |
 | State-changing request returns 403 | `APP_ORIGIN` must exactly match the browser origin (scheme, host, port). |
 | Publish rejects providers | Exact key names, model allowlist, voice catalog language entry, and one language only. |
-| Call returns 503 | Missing `DEEPGRAM_API_KEY`, `OPENAI_API_KEY`, or the selected TTS key. |
+| Call returns 503 | Missing selected STT credentials (`AZURE_SPEECH_API_KEY` and `AZURE_SPEECH_REGION`/`AZURE_SPEECH_ENDPOINT` for Azure, or `DEEPGRAM_API_KEY` for Deepgram), `OPENAI_API_KEY`, or the selected TTS key. |
 | Call cannot connect across networks | Configure TURN; check firewall/UDP and the ICE server endpoint. |
 | Trace page returns 503 | Phoenix is not configured/reachable, or `PHOENIX_OTLP_ENDPOINT`/`PHOENIX_URL` are wrong. |
 | `pytest` cannot connect | The disposable `voice_test` database does not exist or `TEST_DATABASE_URL` is wrong. |

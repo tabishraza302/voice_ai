@@ -298,6 +298,9 @@ async def test_generate_stream_creates_agent_with_instructions(client, monkeypat
     agent_resp = await client.get(f"/agents/{agent_id}", headers=mutation_headers(token))
     assert agent_resp.status_code == 200
     assert agent_resp.json()["instructions"] == STRUCTURED_INSTRUCTIONS
+    assert agent_resp.json()["stt_provider"] == "azure"
+    assert agent_resp.json()["stt_model"] == "azure-speech"
+    assert agent_resp.json()["azure_stt_english_locale"] == "en-IN"
 
 
 @pytest.mark.anyio

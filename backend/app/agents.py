@@ -56,6 +56,7 @@ class Agent(Base):
     default_language: Mapped[str | None] = mapped_column(String(35), nullable=True)
     stt_provider: Mapped[str | None] = mapped_column(String(40), nullable=True)
     stt_model: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    azure_stt_english_locale: Mapped[str | None] = mapped_column(String(35), nullable=True)
     llm_provider: Mapped[str | None] = mapped_column(String(40), nullable=True)
     llm_model: Mapped[str | None] = mapped_column(String(80), nullable=True)
     tts_provider: Mapped[str | None] = mapped_column(String(40), nullable=True)
@@ -78,6 +79,7 @@ class AgentPatch(BaseModel):
     default_language: str | None = Field(default=None, max_length=35)
     stt_provider: str | None = Field(default=None, max_length=40)
     stt_model: str | None = Field(default=None, max_length=80)
+    azure_stt_english_locale: str | None = Field(default=None, max_length=35)
     llm_provider: str | None = Field(default=None, max_length=40)
     llm_model: str | None = Field(default=None, max_length=80)
     tts_provider: str | None = Field(default=None, max_length=40)
@@ -99,6 +101,7 @@ class AgentPatch(BaseModel):
         "description",
         "stt_provider",
         "stt_model",
+        "azure_stt_english_locale",
         "llm_provider",
         "llm_model",
         "tts_provider",
@@ -150,6 +153,7 @@ class AgentCreate(AgentPatch):
     name: str = Field(min_length=1, max_length=120)
     slug: str | None = Field(default=None, min_length=1, max_length=80)
     languages: list[str] = Field(default_factory=list, max_length=12)
+    azure_stt_english_locale: str | None = Field(default="en-IN", max_length=35)
 
     @field_validator("slug")
     @classmethod
@@ -174,6 +178,7 @@ class AgentRead(BaseModel):
     default_language: str | None
     stt_provider: str | None
     stt_model: str | None
+    azure_stt_english_locale: str | None = None
     llm_provider: str | None
     llm_model: str | None
     tts_provider: str | None
@@ -296,6 +301,9 @@ async def create_agent(
     payload = data.model_dump()
     if not payload.get("slug"):
         payload["slug"] = generate_slug(data.name)
+    if "stt_provider" not in data.model_fields_set and "stt_model" not in data.model_fields_set:
+        payload["stt_provider"] = "azure"
+        payload["stt_model"] = "azure-speech"
     agent = Agent(id=uuid.uuid4(), owner_id=user.id, **payload)
     db.add(agent)
     await _commit_agent(db, agent)

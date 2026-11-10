@@ -39,10 +39,12 @@ from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.processors.aggregators.llm_context import NOT_GIVEN, LLMContext
 from pipecat.processors.audio.vad_processor import VADProcessor
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.services.azure.stt import AzureSTTService, AzureSTTSettings
 from pipecat.services.cartesia.tts import CartesiaTTSService, CartesiaTTSSettings
 from pipecat.services.deepgram.stt import DeepgramSTTService, DeepgramSTTSettings
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, ElevenLabsTTSSettings
 from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.transcriptions.language import Language
 from pipecat.transports.base_transport import TransportParams
 from pipecat.audio.filters.rnnoise_filter import RNNoiseFilter
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
@@ -52,7 +54,13 @@ from .observability import tracing_enabled
 from pipecat.workers.runner import WorkerRunner
 
 SUPPORTED_LANGUAGES = frozenset({"en", "hi"})
-SUPPORTED_STT_PROVIDER = "deepgram"
+SUPPORTED_STT_MODELS = {
+    "deepgram": "nova-3",
+    "azure": "azure-speech",
+}
+SUPPORTED_AZURE_ENGLISH_LOCALES = frozenset({"en-IN", "en-US", "en-GB"})
+
+
 def _build_transport_params() -> TransportParams:
     return TransportParams(
         audio_in_enabled=True,
@@ -62,7 +70,7 @@ def _build_transport_params() -> TransportParams:
         audio_out_sample_rate=24_000,
     )
 
-SUPPORTED_STT_MODEL = "nova-3"
+
 SUPPORTED_LLM_PROVIDER = "openai"
 SUPPORTED_TTS_MODELS = {
     "cartesia": "sonic-3.6",
@@ -189,12 +197,24 @@ def provider_publish_errors(
                 add("languages", f"Language '{language}' is not supported by the verified voice runtime.")
 
     stt_provider = _agent_value(agent, "stt_provider")
-    if stt_provider != SUPPORTED_STT_PROVIDER:
-        add("stt_provider", "Only Deepgram speech recognition is available.")
-    if _agent_value(agent, "stt_model") != SUPPORTED_STT_MODEL:
-        add("stt_model", f"The verified Deepgram model is {SUPPORTED_STT_MODEL}.")
-    if not settings.get("DEEPGRAM_API_KEY", "").strip():
-        add("stt_provider", "Speech recognition is unavailable because DEEPGRAM_API_KEY is not configured on the server.")
+    if stt_provider not in SUPPORTED_STT_MODELS:
+        add("stt_provider", "Choose Deepgram or Azure for speech recognition.")
+    else:
+        expected_model = SUPPORTED_STT_MODELS[stt_provider]
+        if _agent_value(agent, "stt_model") != expected_model:
+            add("stt_model", f"The supported {stt_provider} model is {expected_model}.")
+        if stt_provider == "deepgram":
+            if not settings.get("DEEPGRAM_API_KEY", "").strip():
+                add("stt_provider", "Speech recognition is unavailable because DEEPGRAM_API_KEY is not configured on the server.")
+        elif stt_provider == "azure":
+            if not settings.get("AZURE_SPEECH_API_KEY", "").strip():
+                add("stt_provider", "Speech recognition is unavailable because AZURE_SPEECH_API_KEY is not configured on the server.")
+            if not settings.get("AZURE_SPEECH_REGION", "").strip() and not settings.get("AZURE_SPEECH_ENDPOINT", "").strip():
+                add("stt_provider", "Azure speech recognition requires AZURE_SPEECH_REGION or AZURE_SPEECH_ENDPOINT on the server.")
+            if selected_languages == ("en",):
+                locale = _agent_value(agent, "azure_stt_english_locale")
+                if locale not in SUPPORTED_AZURE_ENGLISH_LOCALES:
+                    add("azure_stt_english_locale", "Choose an Azure English locale: en-IN, en-US, or en-GB.")
 
     llm_provider = _agent_value(agent, "llm_provider")
     if llm_provider != SUPPORTED_LLM_PROVIDER:
@@ -237,8 +257,12 @@ def provider_publish_errors(
 
 @dataclass(frozen=True, slots=True)
 class ProviderConfig:
+    stt_provider: Literal["deepgram", "azure"]
     stt_model: str
     stt_api_key: str
+    stt_region: str | None
+    stt_endpoint: str | None
+    stt_language: str
     llm_model: str
     llm_api_key: str
     tts_provider: Literal["cartesia", "elevenlabs"]
@@ -311,19 +335,46 @@ class CallDefinition:
             )
             raise VoiceUnavailableError(summary)
 
+        stt_provider = agent_data["stt_provider"]
+        if stt_provider == "deepgram":
+            stt_api_key = env["DEEPGRAM_API_KEY"].strip()
+            stt_region = None
+            stt_endpoint = None
+            stt_language = language
+        elif stt_provider == "azure":
+            stt_api_key = env["AZURE_SPEECH_API_KEY"].strip()
+            raw_endpoint = env.get("AZURE_SPEECH_ENDPOINT", "").strip() or None
+            raw_region = env.get("AZURE_SPEECH_REGION", "").strip() or None
+            if raw_endpoint is not None:
+                stt_endpoint = raw_endpoint
+                stt_region = None
+            else:
+                stt_endpoint = None
+                stt_region = raw_region
+            if language == "hi":
+                stt_language = "hi-IN"
+            else:
+                stt_language = agent_data["azure_stt_english_locale"]
+        else:
+            raise VoiceUnavailableError("The frozen STT provider is unavailable.")
+
         tts_provider = agent_data["tts_provider"]
         tts_model = agent_data["tts_model"]
         voice_id = agent_data["voice_id"]
         if tts_provider not in {"cartesia", "elevenlabs"}:
             raise VoiceUnavailableError("The frozen TTS provider is unavailable.")
         providers = ProviderConfig(
+            stt_provider=stt_provider,
             stt_model=agent_data["stt_model"],
-            stt_api_key=env["DEEPGRAM_API_KEY"],
+            stt_api_key=stt_api_key,
+            stt_region=stt_region,
+            stt_endpoint=stt_endpoint,
+            stt_language=stt_language,
             llm_model=agent_data["llm_model"],
-            llm_api_key=env["OPENAI_API_KEY"],
+            llm_api_key=env["OPENAI_API_KEY"].strip(),
             tts_provider=tts_provider,
             tts_model=tts_model,
-            tts_api_key=env["CARTESIA_API_KEY" if tts_provider == "cartesia" else "ELEVENLABS_API_KEY"],
+            tts_api_key=env["CARTESIA_API_KEY" if tts_provider == "cartesia" else "ELEVENLABS_API_KEY"].strip(),
             voice_id=voice_id,
             language=language,
         )
@@ -458,17 +509,26 @@ class CallRuntime:
         params = _build_transport_params()
         self.transport = SmallWebRTCTransport(connection, params=params)
         providers = self.definition.providers
-        stt = DeepgramSTTService(
-            api_key=providers.stt_api_key,
-            settings=DeepgramSTTSettings(
-                model=providers.stt_model,
-                language=providers.language,
-                endpointing=300,
-                interim_results=True,
-                smart_format=True,
-                numerals=True,
-            ),
-        )
+        if providers.stt_provider == "deepgram":
+            stt = DeepgramSTTService(
+                api_key=providers.stt_api_key,
+                settings=DeepgramSTTSettings(
+                    model=providers.stt_model,
+                    language=providers.language,
+                    endpointing=300,
+                    interim_results=True,
+                    smart_format=True,
+                    numerals=True,
+                ),
+            )
+        else:
+            stt = AzureSTTService(
+                api_key=providers.stt_api_key,
+                region=providers.stt_region,
+                private_endpoint=providers.stt_endpoint,
+                sample_rate=16000,
+                settings=AzureSTTSettings(language=Language(providers.stt_language)),
+            )
         llm = OpenAILLMService(
             api_key=providers.llm_api_key,
             model=providers.llm_model,
@@ -941,8 +1001,9 @@ class _WorkflowProcessor(FrameProcessor):
             return
 
         result = getattr(frame, "result", None)
-        is_final = bool(getattr(result, "is_final", False))
-        speech_final = bool(getattr(result, "speech_final", False))
+        finalized = bool(getattr(frame, "finalized", False))
+        is_final = finalized or bool(getattr(result, "is_final", False))
+        speech_final = finalized or bool(getattr(result, "speech_final", False))
         from_finalize = bool(getattr(result, "from_finalize", False))
         raw_text = getattr(frame, "text", "").strip()
         if raw_text and self.runtime.is_bot_speaking():
