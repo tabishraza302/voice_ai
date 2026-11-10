@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import anyio
 import asyncio
 from collections import deque
 from collections.abc import Mapping
@@ -37,6 +38,7 @@ from .sessions import (
 logger = logging.getLogger(__name__)
 
 _CHAT_IDLE_TIMEOUT_SECONDS = 1800
+_CHAT_CLEANUP_TIMEOUT_SECONDS = 5.0
 _RECENT_TURNS = 12
 
 _END_CALL_TOOL = {
@@ -240,14 +242,30 @@ class ChatRuntime:
     def _messages(self, directive: str | None = None) -> list[dict[str, Any]]:
         return [self._system_message(directive), *self.recent_conversation]
 
-    async def _finish_turn(self, websocket: WebSocket, text: str) -> None:
+    async def _finish_turn(self, websocket: WebSocket, text: str) -> bool:
         self.writer.enqueue_message("assistant", text)
         self.recent_conversation.append({"role": "assistant", "content": text})
-        try:
-            await self.writer.drain()
-        except Exception:
-            logger.exception("Failed to persist chat turn")
+        with anyio.move_on_after(_CHAT_CLEANUP_TIMEOUT_SECONDS) as persist_scope:
+            try:
+                await self.writer.drain()
+            except Exception:
+                logger.exception("Failed to persist chat turn")
+        if persist_scope.cancelled_caught:
+            logger.error(
+                "Chat turn persistence exceeded the %.2fs deadline; ending chat (session_id=%s)",
+                _CHAT_CLEANUP_TIMEOUT_SECONDS,
+                self.session_id,
+            )
+            await websocket.send_json(
+                {
+                    "type": "warning",
+                    "message": "The chat could not save this turn, so the session has ended.",
+                }
+            )
+            await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+            return True
         await websocket.send_json({"type": "turn_complete", "content": text})
+        return False
 
     async def _run_turn(self, websocket: WebSocket) -> bool:
         messages = self._messages()
@@ -304,7 +322,8 @@ class ChatRuntime:
             text = "I'm here. How can I help you?"
             await websocket.send_json({"type": "token", "content": text})
 
-        await self._finish_turn(websocket, text)
+        if await self._finish_turn(websocket, text):
+            return True
 
         if end_call_invoked:
             await set_session_status(self.session_id, "completed")
@@ -427,11 +446,14 @@ async def chat_websocket(
                 terminal = await runtime.send_greeting(websocket)
                 if terminal:
                     return
+            except WebSocketDisconnect:
+                raise
             except Exception as error:
                 logger.exception("Initial greeting failed")
-                await websocket.send_json(
-                    {"type": "warning", "message": f"Initial greeting failed: {error}"}
-                )
+                with contextlib.suppress(Exception):
+                    await websocket.send_json(
+                        {"type": "warning", "message": f"Initial greeting failed: {error}"}
+                    )
         while True:
             data = await websocket.receive_json()
             if not isinstance(data, dict):
@@ -463,10 +485,22 @@ async def chat_websocket(
         with contextlib.suppress(asyncio.CancelledError):
             await idle_task
 
-        _active_chats.pop(session_id, None)
-        await runtime.close()
+        with anyio.CancelScope(shield=True):
+            _active_chats.pop(session_id, None)
+            with anyio.move_on_after(_CHAT_CLEANUP_TIMEOUT_SECONDS) as cleanup_scope:
+                await runtime.close()
 
-        async with DbSession() as db:
-            call = await db.get(CallSession, session_id)
-            if call and call.status == "active":
-                await set_session_status(session_id, "cancelled")
+                call_status = None
+                async with DbSession() as db:
+                    call = await db.get(CallSession, session_id)
+                    if call is not None:
+                        call_status = call.status
+                if call_status == "active":
+                    await set_session_status(session_id, "cancelled")
+
+        if cleanup_scope.cancelled_caught:
+            logger.error(
+                "Chat session cleanup exceeded the %.2fs deadline; session status may not be final (session_id=%s)",
+                _CHAT_CLEANUP_TIMEOUT_SECONDS,
+                session_id,
+            )
