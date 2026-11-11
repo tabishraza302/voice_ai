@@ -41,6 +41,11 @@ services:
       timeout: 3s
       retries: 10
 
+  redis-audio:
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    restart: unless-stopped
+    # Internal only: no published host ports; dedicated LRU cache for TTS audio clips
 
   backend:
     build:
@@ -60,6 +65,11 @@ services:
       PHOENIX_PROJECT_NAME: ${PHOENIX_PROJECT_NAME:-voice-agent}
       FORWARDED_ALLOW_IPS: ${FRONTEND_PROXY_IP:-172.29.253.10}
       REDIS_URL: redis://redis:6379/0
+      TTS_CACHE_REDIS_URL: ${TTS_CACHE_REDIS_URL:-redis://redis-audio:6379/0}
+      TTS_CACHE_PHRASES_JSON:
+      # The cache tests write to the audio cache's own Redis, never to the one
+      # the application coordinates its calls with.
+      TEST_TTS_CACHE_REDIS_URL: redis://redis-audio:6379/0
     depends_on:
       postgres:
         condition: service_healthy
@@ -67,6 +77,11 @@ services:
         condition: service_started
       redis:
         condition: service_healthy
+      # The optional TTS audio cache. It is started with the rest of the stack
+      # but the backend never waits for it to be ready: the cache is optional
+      # and every cache failure is a miss.
+      redis-audio:
+        condition: service_started
     ports:
       - "127.0.0.1:${BACKEND_PORT:-8000}:8000"
     healthcheck:

@@ -479,7 +479,7 @@ async def _close_handler(handler: SmallWebRTCRequestHandler | None) -> None:
             return
 
 
-async def _initial_offer(payload: _OfferBody) -> dict[str, Any]:
+async def _initial_offer(payload: _OfferBody, *, tts_cache: Any = None) -> dict[str, Any]:
     assert payload.signaling_token is not None
     grant = await _consume_signaling_token(payload.signaling_token)
     handler: SmallWebRTCRequestHandler | None = None
@@ -505,7 +505,9 @@ async def _initial_offer(payload: _OfferBody) -> dict[str, Any]:
         await _reserve_call(grant.session_id, grant.agent_id, per_agent_limit, overall_limit)
         reserved = True
         try:
-            runtime = create_call_runtime(grant.session_id, grant.call_type, snapshot)
+            runtime = create_call_runtime(
+                grant.session_id, grant.call_type, snapshot, tts_cache=tts_cache
+            )
         except VoiceUnavailableError as error:
             raise HTTPException(status_code=503, detail=str(error)) from None
         except Exception:
@@ -644,7 +646,10 @@ async def offer(request: Request) -> dict[str, Any]:
     payload = _validate_model(_OfferBody, await _read_json(request, _MAX_OFFER_BYTES))
     assert isinstance(payload, _OfferBody)
     if payload.pc_id is None:
-        return await _initial_offer(payload)
+        # The optional TTS audio cache is owned by the app; the call runtime
+        # receives it so it can replay cached speech instead of synthesizing.
+        tts_cache = getattr(request.app.state, "tts_cache", None)
+        return await _initial_offer(payload, tts_cache=tts_cache)
 
     assert payload.renegotiation_token is not None
     live = await _authorize_live_call(payload.pc_id, payload.renegotiation_token)
