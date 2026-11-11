@@ -32,6 +32,7 @@ services:
       - "127.0.0.1:${PHOENIX_PORT:-6006}:6006"
   redis:
     image: redis:7-alpine
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
     restart: unless-stopped
     ports:
       - "127.0.0.1:${REDIS_PORT:-6380}:6379"
@@ -60,6 +61,7 @@ services:
       PHOENIX_PROJECT_NAME: ${PHOENIX_PROJECT_NAME:-voice-agent}
       FORWARDED_ALLOW_IPS: ${FRONTEND_PROXY_IP:-172.29.253.10}
       REDIS_URL: redis://redis:6379/0
+      TEST_REDIS_URL: redis://redis:6379/0
     depends_on:
       postgres:
         condition: service_healthy

@@ -278,8 +278,9 @@ async def client():
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.drop_all)
         await connection.run_sync(Base.metadata.create_all)
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://localhost:3000") as test_client:
-        yield test_client
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://localhost:3000") as test_client:
+            yield test_client
 
 
 @pytest.fixture
