@@ -1,18 +1,20 @@
+import asyncio
 import json
 import logging
 import os
 import re
+import secrets
 import time
 from collections.abc import Mapping
 from typing import Annotated, Any
 
 import httpx
-import redis.asyncio as aioredis
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict
 
 from .auth import current_user
 from .models import User
+from .redis import RedisResources
 from .voice import SUPPORTED_LANGUAGES, SUPPORTED_TTS_MODELS
 
 logger = logging.getLogger(__name__)
@@ -26,6 +28,13 @@ _PROVIDER_KEY_NAMES = {
 _OPENAI_MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 CACHE_TTL_SECONDS = 300
 _IN_MEMORY_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+
+_COMPARE_DELETE_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
 
 
 class OpenAIModelRead(BaseModel):
@@ -112,17 +121,21 @@ def _openai_catalog(env: Mapping[str, str]) -> OpenAIProviderRead:
     )
 
 
-async def _get_cached_voices(provider: str, redis_url: str | None) -> list[TTSVoiceRead] | None:
-    if redis_url:
+async def _get_cached_voices(provider: str, resources: RedisResources | None) -> list[TTSVoiceRead] | None:
+    if resources is not None:
         try:
-            client = aioredis.from_url(redis_url, decode_responses=True, socket_timeout=1.0)
-            async with client:
-                cached_json = await client.get(f"tts:voices:{provider}")
-                if cached_json:
-                    raw_list = json.loads(cached_json)
-                    return [TTSVoiceRead(**item) for item in raw_list]
+            cached_json = await resources.commands.get(resources.key(f"tts:voices:{provider}"))
+            if cached_json is not None:
+                raw_list = json.loads(cached_json)
+                return [TTSVoiceRead(**item) for item in raw_list]
         except Exception as exc:
             logger.debug("Redis cache get error for %s: %s", provider, exc)
+            mem = _IN_MEMORY_CACHE.get(provider)
+            if mem:
+                expiry, mem_list = mem
+                if time.monotonic() < expiry:
+                    return [TTSVoiceRead(**item) for item in mem_list]
+            raise
 
     mem = _IN_MEMORY_CACHE.get(provider)
     if mem:
@@ -133,15 +146,32 @@ async def _get_cached_voices(provider: str, redis_url: str | None) -> list[TTSVo
     return None
 
 
-async def _set_cached_voices(provider: str, voices: list[TTSVoiceRead], redis_url: str | None) -> None:
+async def _fallback_voices(
+    provider: str,
+    api_key: str,
+    resources: RedisResources | None,
+) -> list[TTSVoiceRead]:
+    mem = _IN_MEMORY_CACHE.get(provider)
+    if mem and time.monotonic() < mem[0]:
+        return [TTSVoiceRead(**item) for item in mem[1]]
+    voices = await _fetch_provider_voices(provider, api_key)
+    await _set_cached_voices(provider, voices, resources)
+    return voices
+
+
+async def _set_cached_voices(
+    provider: str, voices: list[TTSVoiceRead], resources: RedisResources | None
+) -> None:
     raw_list = [v.model_dump() for v in voices]
     _IN_MEMORY_CACHE[provider] = (time.monotonic() + CACHE_TTL_SECONDS, raw_list)
 
-    if redis_url:
+    if resources is not None:
         try:
-            client = aioredis.from_url(redis_url, decode_responses=True, socket_timeout=1.0)
-            async with client:
-                await client.set(f"tts:voices:{provider}", json.dumps(raw_list), ex=CACHE_TTL_SECONDS)
+            await resources.commands.set(
+                resources.key(f"tts:voices:{provider}"),
+                json.dumps(raw_list),
+                ex=CACHE_TTL_SECONDS,
+            )
         except Exception as exc:
             logger.debug("Redis cache set error for %s: %s", provider, exc)
 
@@ -213,10 +243,19 @@ async def _fetch_elevenlabs_voices(api_key: str) -> list[TTSVoiceRead]:
         return voices
 
 
+async def _fetch_provider_voices(provider: str, api_key: str) -> list[TTSVoiceRead]:
+    if provider == "cartesia":
+        return await _fetch_cartesia_voices(api_key)
+    if provider == "elevenlabs":
+        return await _fetch_elevenlabs_voices(api_key)
+    return []
+
+
 async def _tts_provider_catalog(
     env: Mapping[str, str],
     provider: str,
     model_id: str,
+    resources: RedisResources | None = None,
 ) -> TTSProviderRead:
     key_name = _PROVIDER_KEY_NAMES[provider]
     api_key = env.get(key_name, "").strip()
@@ -229,19 +268,84 @@ async def _tts_provider_catalog(
             models=[],
         )
 
-    redis_url = env.get("REDIS_URL")
-    cached_voices = await _get_cached_voices(provider, redis_url)
+    redis_available = True
+    cached_voices: list[TTSVoiceRead] | None = None
+    try:
+        cached_voices = await _get_cached_voices(provider, resources)
+    except Exception as exc:
+        logger.debug("Redis unavailable on catalog get for %s: %s", provider, exc)
+        redis_available = False
+
     if cached_voices is not None:
         voices = cached_voices
     else:
         try:
-            if provider == "cartesia":
-                voices = await _fetch_cartesia_voices(api_key)
-            elif provider == "elevenlabs":
-                voices = await _fetch_elevenlabs_voices(api_key)
+            if resources is not None and redis_available:
+                lock_key = resources.key(f"lock:tts:voices:{provider}")
+                nonce = secrets.token_hex(16)
+                acquired = False
+                try:
+                    acquired = bool(await resources.commands.set(lock_key, nonce, nx=True, ex=15))
+                except Exception as exc:
+                    logger.debug("Failed to acquire catalog lock due to Redis error: %s", exc)
+                    redis_available = False
+
+                if not redis_available:
+                    # Immediate direct fallback on Redis outage — do not enter 3s waiter loop
+                    voices = await _fallback_voices(provider, api_key, resources)
+                elif acquired:
+                    try:
+                        rechecked: list[TTSVoiceRead] | None = None
+                        try:
+                            rechecked = await _get_cached_voices(provider, resources)
+                        except Exception:
+                            pass
+                        if rechecked is not None:
+                            voices = rechecked
+                        else:
+                            voices = await _fetch_provider_voices(provider, api_key)
+                            await _set_cached_voices(provider, voices, resources)
+                    finally:
+                        try:
+                            await resources.commands.eval(_COMPARE_DELETE_LUA, 1, lock_key, nonce)
+                        except Exception:
+                            pass
+                else:
+                    # Lock is held by another worker; poll every 150ms bounded by remaining 3.0s total budget
+                    deadline = time.monotonic() + 3.0
+                    voices = None
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        sleep_time = min(0.15, remaining)
+                        await asyncio.sleep(sleep_time)
+
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+
+                        try:
+                            cached_json = await asyncio.wait_for(
+                                resources.commands.get(resources.key(f"tts:voices:{provider}")),
+                                timeout=remaining,
+                            )
+                            if cached_json is not None:
+                                raw_list = json.loads(cached_json)
+                                voices = [TTSVoiceRead(**item) for item in raw_list]
+                                _IN_MEMORY_CACHE[provider] = (time.monotonic() + CACHE_TTL_SECONDS, raw_list)
+                                break
+                        except TimeoutError:
+                            break
+                        except Exception as exc:
+                            logger.debug("Redis error during catalog waiter polling: %s", exc)
+                            break
+
+                    if voices is None:
+                        # Bounded fallback on deadline exhaustion or waiter outage: direct fallback, no another wait
+                        voices = await _fallback_voices(provider, api_key, resources)
             else:
-                voices = []
-            await _set_cached_voices(provider, voices, redis_url)
+                voices = await _fallback_voices(provider, api_key, resources if redis_available else None)
         except httpx.HTTPStatusError as exc:
             error_detail = exc.response.text[:200]
             try:
@@ -283,10 +387,12 @@ async def _tts_provider_catalog(
     )
 
 
-async def _build_provider_catalog(env: Mapping[str, str]) -> ProviderCatalogRead:
+async def _build_provider_catalog(
+    env: Mapping[str, str], resources: RedisResources | None = None
+) -> ProviderCatalogRead:
     tts_providers: list[TTSProviderRead] = []
     for provider, model_id in SUPPORTED_TTS_MODELS.items():
-        tts_providers.append(await _tts_provider_catalog(env, provider, model_id))
+        tts_providers.append(await _tts_provider_catalog(env, provider, model_id, resources=resources))
 
     return ProviderCatalogRead(
         openai=_openai_catalog(env),
@@ -295,5 +401,6 @@ async def _build_provider_catalog(env: Mapping[str, str]) -> ProviderCatalogRead
 
 
 @router.get("/provider-catalog", response_model=ProviderCatalogRead)
-async def get_provider_catalog(user: Annotated[User, Depends(current_user)]):
-    return await _build_provider_catalog(os.environ)
+async def get_provider_catalog(request: Request, user: Annotated[User, Depends(current_user)]):
+    resources = getattr(request.app.state, "redis", None)
+    return await _build_provider_catalog(os.environ, resources=resources)

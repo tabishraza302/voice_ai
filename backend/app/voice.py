@@ -52,6 +52,8 @@ from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transcriptions.language import Language
 from pipecat.transports.base_transport import TransportParams
 from pipecat.audio.filters.rnnoise_filter import RNNoiseFilter
+
+from .coordination import CallClaim, Coordination
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.utils.asyncio.task_manager import TaskManager
@@ -86,6 +88,7 @@ _RECENT_TURNS = 12
 _MAX_TRANSCRIPT_CHARS = 8_000
 _MAX_LLM_RESPONSE_CHARS = 12_000
 _PIPELINE_START_TIMEOUT_SECONDS = 30
+_CLEANUP_STEP_TIMEOUT_SECONDS: float = 5.0
 # Azure recognition results carry offset/duration in 100 ns ticks relative to
 # the input audio stream.
 _AZURE_TICKS_PER_SECOND = 10_000_000
@@ -440,16 +443,26 @@ class _FarewellState:
 class CallRuntime:
     """One call's frozen settings, pipeline, and goal-driven dialogue."""
 
+    cleanup_task: asyncio.Task[None] | None = None
+
     def __init__(
         self,
         definition: CallDefinition,
         writer: Any,
         *,
         tts_cache: TTSAudioCache | None = None,
+        claim: CallClaim | None = None,
+        coordination: Coordination | None = None,
     ) -> None:
         self.definition = definition
         self.writer = writer
         self.tts_cache: TTSAudioCache | None = tts_cache
+        self.claim: CallClaim | None = claim
+        self.coordination: Coordination | None = coordination
+        self.pc_id: str | None = None
+        self.lease_lock = asyncio.Lock()
+        self.lease_deadline: float = 0.0
+        self.watchdog_task: asyncio.Task[None] | None = None
         self.recent_conversation: deque[dict[str, str]] = deque(maxlen=_RECENT_TURNS)
         self.transcript_segments: list[str] = []
         self.connection: SmallWebRTCConnection | None = None
@@ -519,6 +532,8 @@ class CallRuntime:
         env: Mapping[str, str] | None = None,
         *,
         tts_cache: TTSAudioCache | None = None,
+        claim: CallClaim | None = None,
+        coordination: Coordination | None = None,
     ) -> CallRuntime:
         settings = os.environ if env is None else env
         definition = CallDefinition.from_snapshot(session_id, call_type, snapshot, settings)
@@ -529,6 +544,8 @@ class CallRuntime:
             definition,
             writer,
             tts_cache=tts_cache,
+            claim=claim,
+            coordination=coordination,
         )
 
     @property
@@ -708,10 +725,12 @@ class CallRuntime:
         self.request_stop("expired")
 
     def request_stop(self, status: str) -> None:
-        if self.closing:
-            return
         if status not in {"completed", "failed", "cancelled", "expired"}:
             status = "failed"
+        if self.closing:
+            if status == "failed":
+                self.termination_status = "failed"
+            return
         self.closing = True
         self.termination_status = status
         if status == "completed" and self.connection is not None:
@@ -719,10 +738,11 @@ class CallRuntime:
                 self.connection.send_app_message({"type": "call.completed"})
             except Exception:
                 pass
-        self.cleanup_task = asyncio.create_task(
-            _cleanup_runtime(self),
-            name=f"voice-cleanup-{self.session_id}",
-        )
+        if self.cleanup_task is None:
+            self.cleanup_task = asyncio.create_task(
+                _cleanup_runtime(self),
+                name=f"voice-cleanup-{self.session_id}",
+            )
     async def receive_app_message(self, *args: Any, **kwargs: Any) -> None:
         message = args[1] if len(args) > 1 else (args[0] if args else kwargs.get("message"))
         if isinstance(message, dict) and message.get("type") == "end":
@@ -1592,6 +1612,8 @@ def create_call_runtime(
     env: Mapping[str, str] | None = None,
     *,
     tts_cache: TTSAudioCache | None = None,
+    claim: CallClaim | None = None,
+    coordination: Coordination | None = None,
 ) -> CallRuntime:
     return CallRuntime.create(
         session_id,
@@ -1599,6 +1621,8 @@ def create_call_runtime(
         snapshot,
         env,
         tts_cache=tts_cache,
+        claim=claim,
+        coordination=coordination,
     )
 
 
@@ -1611,35 +1635,77 @@ async def _cleanup_runtime(runtime: CallRuntime) -> None:
             runtime.duration_task.cancel()
         if runtime.flush_task is not None and not runtime.flush_task.done():
             runtime.flush_task.cancel()
-        if runtime.worker is not None and worker_task is not None and not worker_task.done():
+        if runtime.worker is not None:
             try:
-                await runtime.worker.cancel()
+                await asyncio.wait_for(
+                    runtime.worker.cancel(),
+                    timeout=_CLEANUP_STEP_TIMEOUT_SECONDS,
+                )
             except Exception:
                 status = "failed"
-            if worker_task is not current_task:
-                try:
-                    await asyncio.wait_for(asyncio.shield(worker_task), timeout=10)
-                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-                    status = "failed"
+                runtime.termination_status = "failed"
+        if worker_task is not None and worker_task is not current_task and not worker_task.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(worker_task),
+                    timeout=_CLEANUP_STEP_TIMEOUT_SECONDS,
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                status = "failed"
+                runtime.termination_status = "failed"
+                if not worker_task.done():
+                    worker_task.cancel()
         if runtime.connection is not None:
             try:
-                await runtime.connection.disconnect()
+                await asyncio.wait_for(
+                    runtime.connection.disconnect(),
+                    timeout=_CLEANUP_STEP_TIMEOUT_SECONDS,
+                )
             except Exception:
                 status = "failed"
-        try:
-            await runtime.writer.flush()
-        except Exception:
+                runtime.termination_status = "failed"
+        if runtime.watchdog_task is not None and runtime.watchdog_task is not current_task:
+            runtime.watchdog_task.cancel()
+            try:
+                await runtime.watchdog_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if runtime.writer is not None:
+            try:
+                await asyncio.wait_for(
+                    runtime.writer.flush(),
+                    timeout=_CLEANUP_STEP_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                status = "failed"
+                runtime.termination_status = "failed"
+
+        if runtime.termination_status == "failed":
             status = "failed"
+        else:
+            status = runtime.termination_status or status
         from .sessions import set_session_status
 
         try:
-            await set_session_status(
-                runtime.session_id,
-                status,
-            )
+            if runtime.coordination is not None and runtime.claim is not None:
+                await set_session_status(
+                    runtime.session_id,
+                    status,
+                    claim=runtime.claim,
+                )
+            else:
+                await set_session_status(
+                    runtime.session_id,
+                    status,
+                )
         except Exception:
             status = "failed"
 
+        if runtime.coordination is not None and runtime.claim is not None:
+            try:
+                await runtime.coordination.release(runtime.claim, pc_id=runtime.pc_id)
+            except Exception:
+                pass
         runtime.closed = True
         runtime.termination_status = status
     finally:
