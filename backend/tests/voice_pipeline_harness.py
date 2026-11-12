@@ -28,10 +28,12 @@ from pipecat.frames.frames import (
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from datetime import datetime, timedelta, timezone
+from sqlalchemy import text, update
 
-from app.db import Base, engine
+from app.db import Base, Session, engine
 from app.main import app
-from app.sessions import load_session_snapshot, set_session_status
+from app.sessions import CallSession, load_session_snapshot, set_session_status
 from app.voice import CallRuntime
 
 CALLER_TEXT = "My account number ends in 42."
@@ -744,6 +746,8 @@ class RunningVoicePipeline:
             "test",
             self.snapshot,
             self.environment,
+            claim=getattr(self, "claim", None),
+            coordination=getattr(self, "coordination", None),
         )
         self.connection = Connection()
         await self.runtime.attach(self.connection)
@@ -751,6 +755,10 @@ class RunningVoicePipeline:
     async def _create_session(self) -> None:
         async with engine.begin() as db_connection:
             await db_connection.run_sync(Base.metadata.create_all)
+        self._lifespan_cm = None
+        if getattr(app.state, "coordination", None) is None:
+            self._lifespan_cm = app.router.lifespan_context(app)
+            await self._lifespan_cm.__aenter__()
         self.client = AsyncClient(
             transport=ASGITransport(app=app),
             base_url="http://localhost:3000",
@@ -800,9 +808,35 @@ class RunningVoicePipeline:
         )
         assert call_response.status_code == 201
         self.session_id = uuid.UUID(call_response.json()["session_id"])
+        signaling_token = call_response.json()["signaling_token"]
         self.snapshot = await load_session_snapshot(self.session_id)
         assert self.snapshot is not None
-        assert await set_session_status(self.session_id, "active")
+
+        coordination = getattr(app.state, "coordination", None)
+        if coordination is not None:
+            claim = await coordination.consume_token(signaling_token)
+            obs = await coordination.begin_setup(claim)
+            async with Session() as db:
+                await db.execute(text("SELECT pg_advisory_xact_lock(42000001)"))
+                await db.execute(
+                    update(CallSession)
+                    .where(CallSession.id == self.session_id, CallSession.status == "created")
+                    .values(
+                        worker_id=coordination.worker_id,
+                        claim_generation=obs.claim.generation,
+                        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=45),
+                        updated_at=datetime.now(timezone.utc),
+                    )
+                )
+                await db.commit()
+            assert await set_session_status(self.session_id, "active", claim=obs.claim)
+            active_obs = await coordination.activate(obs.claim, "test-harness-pc")
+            self.claim = active_obs.claim
+            self.coordination = coordination
+        else:
+            assert await set_session_status(self.session_id, "active")
+            self.claim = None
+            self.coordination = None
 
     async def close(self, *, close_client: bool = True) -> None:
         if self.tts is not None:
@@ -824,6 +858,10 @@ class RunningVoicePipeline:
             task.cancel()
         if pending_tasks:
             await asyncio.gather(*pending_tasks, return_exceptions=True)
-        if close_client and self.client is not None:
-            await self.client.aclose()
-            self.client = None
+        if close_client:
+            if self.client is not None:
+                await self.client.aclose()
+                self.client = None
+            if getattr(self, "_lifespan_cm", None) is not None:
+                await self._lifespan_cm.__aexit__(None, None, None)
+                self._lifespan_cm = None
