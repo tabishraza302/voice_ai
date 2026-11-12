@@ -177,6 +177,15 @@ SMALLWEBRTC_TURN_SHARED_SECRET=a-random-secret-of-at-least-32-bytes
 
 Do not claim public calling works across networks without a working TURN path. The browser also requires a secure context: `https://` or `http://localhost` for microphone permission.
 
+### Shared Redis pools and operational limits
+
+The backend uses bounded reusable connection pools for Redis operations:
+- **Commands pool**: 32 connections for general caching, provider catalogs, and rate limits.
+- **Control pool**: 8 connections for health and critical control operations.
+- **Blocking pool**: 32 connections for dedicated blocking waits.
+
+Redis must be configured with `maxmemory 256mb` and `maxmemory-policy noeviction`. Connection pools are managed as part of the application lifespan and cleanly closed upon shutdown.
+
 ### Single-process limits
 
 The backend runs as one process by design. Signaling tokens, rate limits and live-call caps are in memory, so do not run multiple backend workers/replicas without replacing them with shared state. Agent suspension blocks new calls without terminating existing calls. Active-call deletion is rejected; call duration and concurrency policy come from the frozen admin policy snapshot.
