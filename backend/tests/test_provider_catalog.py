@@ -318,10 +318,13 @@ async def test_app_startup_prefers_redis_url_over_test_redis_url(monkeypatch):
     monkeypatch.setenv("CARTESIA_API_KEY", "cartesia-key")
     monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
     monkeypatch.setattr("app.provider_catalog._fetch_cartesia_voices", mock_cartesia)
-    monkeypatch.setattr("app.sessions.recover_interrupted_sessions", AsyncMock())
 
+    from app.db import Base, engine
     from app.main import app
     from app.provider_catalog import _build_provider_catalog
+
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
 
     # Reset any existing app.state.redis and redis_namespace so lifespan opens from environment
     app.state.redis = None

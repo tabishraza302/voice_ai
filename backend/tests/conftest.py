@@ -58,3 +58,21 @@ async def redis_resources(anyio_backend):
         async for key in resources.commands.scan_iter(match=f"{namespace}:*"):
             await resources.commands.unlink(key)
         await resources.close()
+
+
+@pytest.fixture
+async def managed_client(anyio_backend, redis_resources):
+    from httpx import ASGITransport, AsyncClient
+    from app.main import app
+    from app.db import Base, engine
+
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+
+    app.state.redis = redis_resources
+    app.state.redis_namespace = redis_resources.namespace
+
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://localhost:3000") as test_client:
+            yield test_client

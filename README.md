@@ -47,6 +47,8 @@ The frontend's production image includes the standalone Next.js runtime and stat
 
 `backend/tests/conftest.py` forces `DATABASE_URL` to `TEST_DATABASE_URL`, and the test suite drops and recreates tables there. It must never point at the application database. Compose supplies `TEST_DATABASE_URL` automatically; without Compose, point it at a local disposable database (for example one running on port 55432).
 
+Run one pytest suite at a time against that disposable database. The suites drop and recreate its tables and users, so a suite running beside another one makes the other one's authenticated requests fail with `401 Unauthorized`: the user row behind a valid session cookie is gone by the time the request is served.
+
 Tests use the same pooled engine as production. AnyIO gives each async test a fresh event loop, so `conftest.py` disposes the pool after each async test in that test's loop; sync `TestClient` WebSocket tests use one lifespan loop per test. Do not replace this with a pytest-only `NullPool` bypass.
 
 Scoped dependency overrides patch the lint parser's `minimatch` and Next's
