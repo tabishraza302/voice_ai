@@ -7,9 +7,12 @@ import os
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 import re
 import uuid
+
+if TYPE_CHECKING:
+    from .tts_cache import TTSAudioCache
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
@@ -45,6 +48,7 @@ from pipecat.services.cartesia.tts import CartesiaTTSService, CartesiaTTSSetting
 from pipecat.services.deepgram.stt import DeepgramSTTService, DeepgramSTTSettings
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, ElevenLabsTTSSettings
 from pipecat.services.openai.llm import OpenAILLMService
+
 from pipecat.transcriptions.language import Language
 from pipecat.transports.base_transport import TransportParams
 from pipecat.audio.filters.rnnoise_filter import RNNoiseFilter
@@ -53,6 +57,7 @@ from .coordination import CallClaim, Coordination
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.utils.asyncio.task_manager import TaskManager
+from .cached_tts import CachedCartesiaTTSService, CachedElevenLabsTTSService
 from .observability import tracing_enabled
 from pipecat.workers.runner import WorkerRunner
 
@@ -421,6 +426,8 @@ class _Playback:
     generation: int
     step_id: str | None = None
     interrupted: bool = False
+    interruptible: bool = True
+    transport_completed: bool = False
 
 
 @dataclass(slots=True)
@@ -443,11 +450,13 @@ class CallRuntime:
         definition: CallDefinition,
         writer: Any,
         *,
+        tts_cache: TTSAudioCache | None = None,
         claim: CallClaim | None = None,
         coordination: Coordination | None = None,
     ) -> None:
         self.definition = definition
         self.writer = writer
+        self.tts_cache: TTSAudioCache | None = tts_cache
         self.claim: CallClaim | None = claim
         self.coordination: Coordination | None = coordination
         self.pc_id: str | None = None
@@ -486,6 +495,18 @@ class CallRuntime:
         self.response_text: dict[int, list[str]] = {}
         self.response_complete: set[int] = set()
         self.response_interrupted: set[int] = set()
+        # The generations whose end has been handed on downstream. That frame
+        # is the boundary of the reply: everything the reply is made of has
+        # been handed to the TTS service by then.
+        self.response_ended: set[int] = set()
+        self.in_flight_generations: set[int] = set()
+        self.delivered_generations: set[int] = set()
+        # The segments of a response that have been handed to the TTS service
+        # and have not produced their output yet. The end of the response and
+        # the output of its segments arrive in either order, so a response is
+        # only closed when both are in.
+        self.response_segments: dict[int, set[str]] = {}
+        self.segment_generation: dict[str, int] = {}
         self.playbacks: dict[str | None, _Playback] = {}
         self.runner: WorkerRunner | None = None
         self.end_call_pending = False
@@ -496,7 +517,11 @@ class CallRuntime:
         self.workflow_processor = _WorkflowProcessor(self)
         self.response_capture = _ResponseCaptureProcessor(self)
         self.tts_context_tracker = _TTSContextTracker(self)
-        self.output_completion = _OutputCompletionProcessor(self, self.tts_context_tracker.audio_contexts)
+        self.output_completion = _OutputCompletionProcessor(
+            self,
+            self.tts_context_tracker.audio_contexts,
+            self.tts_context_tracker.uninterruptible_contexts,
+        )
 
     @classmethod
     def create(
@@ -506,6 +531,7 @@ class CallRuntime:
         snapshot: Mapping[str, Any],
         env: Mapping[str, str] | None = None,
         *,
+        tts_cache: TTSAudioCache | None = None,
         claim: CallClaim | None = None,
         coordination: Coordination | None = None,
     ) -> CallRuntime:
@@ -514,7 +540,13 @@ class CallRuntime:
         from .sessions import SessionWriter
 
         writer = SessionWriter(session_id)
-        return cls(definition, writer, claim=claim, coordination=coordination)
+        return cls(
+            definition,
+            writer,
+            tts_cache=tts_cache,
+            claim=claim,
+            coordination=coordination,
+        )
 
     @property
     def session_id(self) -> uuid.UUID:
@@ -578,23 +610,43 @@ class CallRuntime:
         )
         llm.register_function("end_call", self._handle_end_call)
         if providers.tts_provider == "cartesia":
-            tts = CartesiaTTSService(
-                api_key=providers.tts_api_key,
-                settings=CartesiaTTSSettings(
-                    model=providers.tts_model,
-                    voice=providers.voice_id,
-                    language=providers.language,
-                ),
+            # The settings are built once and handed to either service, so the
+            # cached path and the plain path cannot drift apart.
+            cartesia_settings = CartesiaTTSSettings(
+                model=providers.tts_model,
+                voice=providers.voice_id,
+                language=providers.language,
             )
+            if self.tts_cache is not None and self.tts_cache.enabled:
+                tts = CachedCartesiaTTSService(
+                    api_key=providers.tts_api_key,
+                    settings=cartesia_settings,
+                    cache=self.tts_cache,
+                    agent_id=self.agent_id,
+                )
+            else:
+                tts = CartesiaTTSService(
+                    api_key=providers.tts_api_key,
+                    settings=cartesia_settings,
+                )
         else:
-            tts = ElevenLabsTTSService(
-                api_key=providers.tts_api_key,
-                settings=ElevenLabsTTSSettings(
-                    model=providers.tts_model,
-                    voice=providers.voice_id,
-                    language=providers.language,
-                ),
+            elevenlabs_settings = ElevenLabsTTSSettings(
+                model=providers.tts_model,
+                voice=providers.voice_id,
+                language=providers.language,
             )
+            if self.tts_cache is not None and self.tts_cache.enabled:
+                tts = CachedElevenLabsTTSService(
+                    api_key=providers.tts_api_key,
+                    settings=elevenlabs_settings,
+                    cache=self.tts_cache,
+                    agent_id=self.agent_id,
+                )
+            else:
+                tts = ElevenLabsTTSService(
+                    api_key=providers.tts_api_key,
+                    settings=elevenlabs_settings,
+                )
         tts.add_event_handler("on_tts_request", self._on_tts_request)
         vad = SileroVADAnalyzer(
             sample_rate=16_000,
@@ -713,102 +765,251 @@ class CallRuntime:
         generation = self.active_response_generation
         if generation is not None:
             self.response_interrupted.add(generation)
+        for gen in list(self.in_flight_generations):
+            self.response_interrupted.add(gen)
+            # An interrupted reply is never persisted, so its text and the
+            # segments it was waiting for are dropped with it.
+            self.response_text.pop(gen, None)
+            self.response_ended.discard(gen)
+            for context_id in self.response_segments.pop(gen, set()):
+                self.segment_generation.pop(context_id, None)
+        self.in_flight_generations.clear()
         for playback in self.playbacks.values():
-            playback.interrupted = True
-        self.tts_request_texts.clear()
+            if playback.interruptible:
+                playback.interrupted = True
+        uninterruptible_ids = {
+            ctx_id for ctx_id, p in self.playbacks.items() if not p.interruptible
+        }
+        if self.farewell.pending and self.farewell.mode == "explicit" and self.farewell.context_id:
+            uninterruptible_ids.add(self.farewell.context_id)
+        self.tts_request_texts = {
+            k: v for k, v in self.tts_request_texts.items() if k in uninterruptible_ids
+        }
 
     def _on_tts_request(self, service: Any, context_id: str, text: str) -> None:
         text_str = str(text).strip() if text else ""
         self.tts_request_texts[context_id] = text_str
+        is_explicit_farewell = False
         if self.farewell.pending and self.farewell.message and not self.farewell.started:
             farewell_text = self.farewell.message.strip()
             if self.farewell.mode == "explicit":
                 if text_str.casefold() == farewell_text.casefold():
                     self.farewell.context_id = context_id
+                    is_explicit_farewell = True
             elif self.farewell.mode == "natural":
                 if text_str and (text_str.casefold() in farewell_text.casefold() or farewell_text.casefold() in text_str.casefold()):
                     self.farewell.context_id = context_id
+        if is_explicit_farewell:
+            # The forced farewell is an utterance of its own, not a segment of
+            # the reply that is still being spoken.
+            return
+        generation = self.active_response_generation
+        if generation is not None and generation in self.in_flight_generations:
+            # The segment has been handed to the TTS service: the response it
+            # belongs to cannot be closed before it has produced its output.
+            self.response_segments.setdefault(generation, set()).add(context_id)
+            self.segment_generation[context_id] = generation
 
-    async def on_tts_started(self, frame: TTSStartedFrame) -> None:
+    async def on_tts_started(
+        self,
+        frame: TTSStartedFrame,
+        *,
+        generation: int | None = None,
+        interruptible: bool = True,
+    ) -> None:
         context_id = frame.context_id
         if context_id in self.playbacks:
             self.request_stop("failed")
             return
         is_farewell_context = (
             self.farewell.pending
-            and self.farewell.context_id is not None
-            and context_id == self.farewell.context_id
+            and (
+                (self.farewell.context_id is not None and context_id == self.farewell.context_id)
+                or (
+                    self.farewell.message
+                    and self.tts_request_texts.get(context_id, "").strip().casefold()
+                    == self.farewell.message.strip().casefold()
+                )
+            )
         )
         if is_farewell_context and not self.farewell.started:
             self.farewell.started = True
+            self.farewell.context_id = context_id
+
+        effective_generation = generation if generation is not None else (self.active_response_generation or 0)
 
         if self.farewell.mode == "explicit" and is_farewell_context:
+            self.farewell.started = True
+            self.farewell.context_id = context_id
             self.playbacks[context_id] = _Playback(
                 context_id=context_id,
                 kind="farewell",
                 generation=0,
                 interrupted=False,
+                interruptible=False,
             )
-        elif self.active_response_generation is not None:
+        elif effective_generation > 0:
             self.playbacks[context_id] = _Playback(
                 context_id=context_id,
                 kind="llm",
-                generation=self.active_response_generation,
-                interrupted=self.user_speaking or self.active_response_generation in self.response_interrupted,
+                generation=effective_generation,
+                interrupted=self.user_speaking or effective_generation in self.response_interrupted,
+                interruptible=interruptible,
+            )
+        elif is_farewell_context:
+            self.playbacks[context_id] = _Playback(
+                context_id=context_id,
+                kind="farewell",
+                generation=0,
+                interrupted=False,
+                interruptible=interruptible,
             )
         else:
             self.playbacks[context_id] = _Playback(
                 context_id=context_id,
-                kind="farewell",
+                kind="exact",
                 generation=0,
                 interrupted=False,
+                interruptible=interruptible,
             )
 
     async def on_tts_stopped(self, frame: TTSStoppedFrame, *, transport_completed: bool) -> None:
         req_text = self.tts_request_texts.pop(frame.context_id, None) or ""
         playback = self.playbacks.pop(frame.context_id, None)
+        # The segment is over, whether or not it produced any output: the
+        # response it belongs to may now be closed.
+        segment_generation = self.segment_generation.pop(frame.context_id, None)
+        if segment_generation is not None:
+            outstanding = self.response_segments.get(segment_generation)
+            if outstanding is not None:
+                outstanding.discard(frame.context_id)
+        generation = (
+            segment_generation
+            if segment_generation is not None
+            else (playback.generation if playback is not None else 0)
+        )
         if playback is None:
+            # The runtime never saw this segment start, but its output is over
+            # all the same: the response it belongs to may now be closed.
+            await self._finalize_response(generation)
             return
 
-        is_farewell = False
-        if self.farewell.pending:
-            if self.farewell.mode == "natural" and self.farewell.generation is not None:
-                is_farewell = playback.generation == self.farewell.generation
-            elif self.farewell.mode == "explicit" and self.farewell.message:
-                is_farewell = (
-                    frame.context_id == self.farewell.context_id
-                    or req_text.casefold() == self.farewell.message.strip().casefold()
-                )
+        is_explicit_farewell = (
+            self.farewell.pending
+            and self.farewell.mode == "explicit"
+            and (
+                frame.context_id == self.farewell.context_id
+                or (self.farewell.message and req_text.casefold() == self.farewell.message.strip().casefold())
+            )
+        )
 
         if not transport_completed:
             if not playback.interrupted:
                 self.request_stop("failed")
-            if is_farewell:
+            if is_explicit_farewell:
                 self.farewell = _FarewellState()
             return
 
-        generation = playback.generation
-        chunks = self.response_text.pop(generation, [])
-        text = "".join(chunks).strip()
-        is_complete = generation in self.response_complete
-        self.response_complete.discard(generation)
-        self.response_interrupted.discard(generation)
-        if not playback.interrupted and is_complete and text:
-            self._persist_message(text)
-            self.recent_conversation.append({"role": "assistant", "content": text})
-            await self._send_caption("assistant", text, final=True)
-            self.last_delivered_speech = text
-        elif not playback.interrupted and is_farewell and self.farewell.mode == "explicit" and self.farewell.message:
+        playback.transport_completed = True
+        if not playback.interrupted and generation > 0:
+            self.delivered_generations.add(generation)
+        # The reply is only closed once its text and the output of all of its
+        # segments are in, so a segment that is still on its way neither loses
+        # the reply nor lets the call end before it was spoken.
+        await self._finalize_response(generation)
+
+        if is_explicit_farewell and not playback.interrupted and self.farewell.message:
             farewell_text = self.farewell.message
             self._persist_message(farewell_text, role="assistant")
             self.recent_conversation.append({"role": "assistant", "content": farewell_text})
             await self._send_caption("assistant", farewell_text, final=True)
             self.last_delivered_speech = farewell_text
-
-        if is_farewell:
             self.farewell = _FarewellState()
-        if self.end_call_pending and not self.playbacks and not self.farewell.pending:
+            if self.end_call_pending and not self.playbacks and not self.farewell.pending and not self.in_flight_generations:
+                self.request_stop("completed")
+
+    async def _finalize_response(self, generation: int) -> None:
+        """Close a response once its text and the output of its segments are in.
+
+        The end of the response and the output of its segments arrive in
+        either order: the provider's audio can still be on its way when the
+        response ends, and the transport can hand the end of the response on
+        before the last segment has been played. A response is therefore only
+        closed when both are in, so that a segment that is still on its way
+        neither loses the reply nor lets the call end before it was spoken.
+        """
+        if generation <= 0:
+            return
+        if generation not in self.in_flight_generations:
+            return
+        if generation not in self.response_ended:
+            # The end of the response has not been handed on yet: the reply is
+            # not complete, so it may not be closed.
+            return
+        if generation not in self.response_complete:
+            # The response itself has not ended yet.
+            return
+        if self.response_segments.get(generation):
+            # A segment of this response has not produced its output yet.
+            return
+
+        text = "".join(self.response_text.get(generation, [])).strip()
+        is_interrupted = generation in self.response_interrupted
+        delivered = generation in self.delivered_generations
+        self.response_text.pop(generation, None)
+        self.response_complete.discard(generation)
+        self.response_interrupted.discard(generation)
+        self.response_ended.discard(generation)
+        self.delivered_generations.discard(generation)
+        self.in_flight_generations.discard(generation)
+        self.response_segments.pop(generation, None)
+
+        if not is_interrupted and delivered and text:
+            self._persist_message(text)
+            self.recent_conversation.append({"role": "assistant", "content": text})
+            await self._send_caption("assistant", text, final=True)
+            self.last_delivered_speech = text
+
+        if (
+            self.farewell.pending
+            and self.farewell.mode == "natural"
+            and self.farewell.generation == generation
+        ):
+            # The farewell of this reply has been spoken: it is over.
+            self.farewell = _FarewellState()
+
+        self._maybe_complete_call()
+
+    def _maybe_complete_call(self) -> None:
+        """End the call once everything it had to say has been said.
+
+        A reply that is still being spoken keeps the call open: the caller
+        may not be cut off in the middle of an answer, and a farewell that is
+        still on its way has not been said yet.
+        """
+        if (
+            self.end_call_pending
+            and not self.playbacks
+            and not self.farewell.pending
+            and not self.in_flight_generations
+        ):
             self.request_stop("completed")
+
+    async def on_llm_response_completed(self, frame: LLMFullResponseEndFrame) -> None:
+        generation = getattr(frame, "generation", None)
+        if generation is None:
+            return
+        # The end of the response has been handed on: every segment of the
+        # reply has been given to the TTS service by now. The reply itself is
+        # only closed once the output of those segments is in as well, so a
+        # segment that is still on its way neither loses the reply nor lets
+        # the call end before it was spoken.
+        self.response_ended.add(generation)
+        await self._finalize_response(generation)
+        # The reply may still be on its way, in which case the call stays
+        # open; this is also the point where a call that has nothing left to
+        # say is ended.
+        self._maybe_complete_call()
 
     async def _handle_end_call(self, params: Any) -> None:
         args = getattr(params, "arguments", {}) or {}
@@ -851,14 +1052,15 @@ class CallRuntime:
                         self.farewell.context_id = ctx_id
                         break
         elif message and not already_delivered:
-
             self.farewell = _FarewellState(
                 pending=True,
                 mode="explicit",
                 message=message,
             )
+            speak_frame = TTSSpeakFrame(text=message)
+            speak_frame.interruptible = False
             await self.workflow_processor.push_frame(
-                TTSSpeakFrame(text=message),
+                speak_frame,
                 FrameDirection.DOWNSTREAM,
             )
         callback = getattr(params, "result_callback", None)
@@ -867,6 +1069,9 @@ class CallRuntime:
             if asyncio.iscoroutine(res):
                 await res
         self.end_call_pending = True
+        if not self.playbacks and not self.farewell.pending and not self.in_flight_generations:
+            self.request_stop("completed")
+            return
 
         async def _safety_stop() -> None:
             max_wait = 10.0 if message else 1.5
@@ -875,7 +1080,7 @@ class CallRuntime:
             while waited < max_wait and not self.closing:
                 await asyncio.sleep(poll_interval)
                 waited += poll_interval
-                if not self.playbacks and not self.farewell.pending:
+                if not self.playbacks and not self.farewell.pending and not self.in_flight_generations:
                     break
             if not self.closing:
                 self.request_stop("completed")
@@ -931,6 +1136,7 @@ class CallRuntime:
         generation = self.response_generation
         self.active_response_generation = generation
         self.response_text[generation] = []
+        self.in_flight_generations.add(generation)
         return generation
 
     def append_llm_text(self, text: str) -> str:
@@ -1270,12 +1476,14 @@ class _ResponseCaptureProcessor(FrameProcessor):
         await super().process_frame(frame, direction)
         if direction == FrameDirection.DOWNSTREAM:
             if isinstance(frame, LLMFullResponseStartFrame):
-                self.runtime.begin_llm_response()
+                gen = self.runtime.begin_llm_response()
+                setattr(frame, "generation", gen)
             elif isinstance(frame, LLMTextFrame):
                 full_text = self.runtime.append_llm_text(frame.text)
                 if full_text:
                     await self.runtime._send_caption("assistant", full_text, final=False)
             elif isinstance(frame, LLMFullResponseEndFrame):
+                setattr(frame, "generation", self.runtime.active_response_generation)
                 self.runtime.finish_llm_response()
             elif isinstance(frame, InterruptionFrame):
                 self.runtime.interrupt_llm_response()
@@ -1291,19 +1499,67 @@ class _TTSContextTracker(FrameProcessor):
         # Only this upstream tracker clears all contexts; downstream processing
         # may lag behind newly queued speech and must not invalidate it.
         self.audio_contexts: set[str] = set()
+        self.uninterruptible_contexts: set[str] = set()
+        self.current_generation: int | None = None
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         stop_due_to_error = False
         if direction == FrameDirection.DOWNSTREAM:
-            if isinstance(frame, InterruptionFrame):
-                self.audio_contexts.clear()
+            if isinstance(frame, LLMFullResponseStartFrame):
+                gen = getattr(frame, "generation", None)
+                if gen is not None:
+                    self.current_generation = gen
+            elif isinstance(frame, LLMFullResponseEndFrame):
+                self.current_generation = None
+            elif isinstance(frame, InterruptionFrame):
+                self.current_generation = None
+                # Discard only interruptible contexts; preserve uninterruptible ones
+                self.audio_contexts.intersection_update(self.uninterruptible_contexts)
             elif isinstance(frame, TTSStartedFrame):
-                await self.runtime.on_tts_started(frame)
+                farewell = getattr(self.runtime, "farewell", None)
+                req_texts = getattr(self.runtime, "tts_request_texts", {})
+                is_explicit_farewell = (
+                    farewell is not None
+                    and getattr(farewell, "pending", False)
+                    and getattr(farewell, "mode", None) == "explicit"
+                    and (
+                        (
+                            getattr(farewell, "context_id", None) is not None
+                            and getattr(farewell, "context_id", None) == frame.context_id
+                        )
+                        or (
+                            getattr(farewell, "message", None)
+                            and req_texts.get(frame.context_id, "").strip().casefold()
+                            == str(farewell.message).strip().casefold()
+                        )
+                    )
+                )
+                interruptible = not is_explicit_farewell and getattr(frame, "interruptible", True)
+                if not interruptible:
+                    frame.interruptible = False
+                    if frame.context_id is not None:
+                        self.uninterruptible_contexts.add(frame.context_id)
+                try:
+                    await self.runtime.on_tts_started(
+                        frame,
+                        generation=self.current_generation,
+                        interruptible=interruptible,
+                    )
+                except TypeError:
+                    await self.runtime.on_tts_started(frame)
             elif isinstance(frame, TTSAudioRawFrame) and frame.context_id is not None:
                 self.audio_contexts.add(frame.context_id)
+                if frame.context_id in self.uninterruptible_contexts or not getattr(frame, "interruptible", True):
+                    self.uninterruptible_contexts.add(frame.context_id)
+                    frame.interruptible = False
+            elif isinstance(frame, TTSStoppedFrame) and frame.context_id is not None:
+                if frame.context_id in self.uninterruptible_contexts or not getattr(frame, "interruptible", True):
+                    self.uninterruptible_contexts.add(frame.context_id)
+                    frame.interruptible = False
             elif isinstance(frame, ErrorFrame):
                 self.audio_contexts.clear()
+                self.uninterruptible_contexts.clear()
                 stop_due_to_error = True
         await self.push_frame(frame, direction)
         if stop_due_to_error:
@@ -1311,10 +1567,18 @@ class _TTSContextTracker(FrameProcessor):
 
 
 class _OutputCompletionProcessor(FrameProcessor):
-    def __init__(self, runtime: CallRuntime, audio_contexts: set[str]) -> None:
+    def __init__(
+        self,
+        runtime: CallRuntime,
+        audio_contexts: set[str],
+        uninterruptible_contexts: set[str] | None = None,
+    ) -> None:
         super().__init__()
         self.runtime = runtime
         self.audio_contexts = audio_contexts
+        self.uninterruptible_contexts = (
+            uninterruptible_contexts if uninterruptible_contexts is not None else set()
+        )
 
     # SmallWebRTCOutputTransport forwards TTSStoppedFrame only after preceding
     # queued audio has been sent through the server's WebRTC audio track.
@@ -1327,6 +1591,7 @@ class _OutputCompletionProcessor(FrameProcessor):
                 if frame.context_id is not None:
                     transport_completed = frame.context_id in self.audio_contexts
                     self.audio_contexts.discard(frame.context_id)
+                    self.uninterruptible_contexts.discard(frame.context_id)
         await self.push_frame(frame, direction)
         if direction == FrameDirection.DOWNSTREAM:
             if isinstance(frame, TTSStoppedFrame):
@@ -1334,6 +1599,9 @@ class _OutputCompletionProcessor(FrameProcessor):
                     frame,
                     transport_completed=transport_completed,
                 )
+            elif isinstance(frame, LLMFullResponseEndFrame):
+                if hasattr(self.runtime, "on_llm_response_completed"):
+                    await self.runtime.on_llm_response_completed(frame)
             elif isinstance(frame, ErrorFrame):
                 self.runtime.request_stop("failed")
 
@@ -1343,6 +1611,7 @@ def create_call_runtime(
     snapshot: Mapping[str, Any],
     env: Mapping[str, str] | None = None,
     *,
+    tts_cache: TTSAudioCache | None = None,
     claim: CallClaim | None = None,
     coordination: Coordination | None = None,
 ) -> CallRuntime:
@@ -1351,6 +1620,7 @@ def create_call_runtime(
         call_type,
         snapshot,
         env,
+        tts_cache=tts_cache,
         claim=claim,
         coordination=coordination,
     )

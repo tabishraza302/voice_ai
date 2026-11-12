@@ -22,6 +22,11 @@ Prerequisites: Docker Desktop/Compose, a browser with microphone access, and rea
    docker compose up --build -d
    ```
 
+   The optional TTS audio cache runs in its own `redis-audio` container. The
+   backend depends on it with `service_started`, so it comes up with the rest
+   of the stack; the backend does not wait for it to be ready, because the
+   cache is optional and every cache failure is a miss.
+
 3. Apply migrations and seed the administrator and development user. Both commands are safe to rerun:
 
    ```sh
@@ -191,6 +196,19 @@ Redis must be configured with `maxmemory 256mb` and `maxmemory-policy noeviction
 ### Single-process limits
 
 The backend runs as one process by design. Signaling tokens, rate limits and live-call caps are in memory, so do not run multiple backend workers/replicas without replacing them with shared state. Agent suspension blocks new calls without terminating existing calls. Active-call deletion is rejected; call duration and concurrency policy come from the frozen admin policy snapshot.
+
+### TTS audio cache
+
+The backend can keep the speech it already synthesized, so a repeated phrase is replayed instead of synthesized again. The cache is optional and off unless it is configured.
+
+- *Scope and isolation*: cache entries are scoped strictly to the agent ID and provider account fingerprint (SHA-256 of server API key), and hash the provider, model, voice ID, language, audio format, effective sorted settings, and exact prepared text. Different agents, credential changes, or altered synthesis options miss automatically.
+- *Admission and retention*: only complete, successful synthesis within 10 seconds (480,000 bytes at 24kHz mono PCM) is stored; partial, error, or interrupted audio is immediately discarded and never cached. Default TTL is 24 hours. Forced farewell messages (`end_call`) are eligible only when their exact full text matches the allowlist. No personalized or semantic caching is performed.
+- *Fail-open resilience*: lookup and store operations fail open with a strict 50ms timeout; any Redis error or timeout falls back immediately to streaming from the upstream provider. Cache hits replay audio with remapped relative word timestamps under fresh context IDs without incurring provider usage.
+- *Context and tradeoffs*: when caching is enabled, speech segments use isolated provider contexts to guarantee exact phrase matching and prevent personal information leakage across sentences. This involves a slight provider-side context creation overhead compared to single long-lived turn contexts; when disabled, the runtime preserves standard single-turn provider context behavior. Exact-match hit rates depend on actual repeated spoken phrases, and no performance or speed claims are asserted without empirical measurement.
+
+Configure it with `TTS_CACHE_REDIS_URL` (blank disables it outside Compose) and `TTS_CACHE_PHRASES_JSON` (an explicit list of approved phrases; `[]` disables admission). In Compose the cache runs in its own internal-only `redis-audio` container with a 128MB LRU ceiling, started with the rest of the stack and never waited for: the backend only waits for a readiness it does not require.
+
+The tests of the audio cache write to an audio cache Redis of their own, never to the Redis the application coordinates its calls with. Point them at it with `TEST_TTS_CACHE_REDIS_URL` (the backend container gets `redis://redis-audio:6379/0`). Outside Compose, run a Redis of its own for them, for example `redis-server --port 6381 --save '' --appendonly no`, and set `TEST_TTS_CACHE_REDIS_URL=redis://127.0.0.1:6381/0`. Each test removes the keys it wrote when it is done.
 
 ## Development without Docker
 

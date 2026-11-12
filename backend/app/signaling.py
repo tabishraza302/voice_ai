@@ -496,6 +496,8 @@ async def _setup_watchdog(runtime: CallRuntime, coordination: Coordination) -> N
 async def _initial_offer(
     payload: _OfferBody,
     coordination: Coordination,
+    *,
+    tts_cache: Any = None,
 ) -> dict[str, Any]:
     assert payload.signaling_token is not None
     grant = await coordination.consume_token(payload.signaling_token)
@@ -584,6 +586,7 @@ async def _initial_offer(
                 snapshot,
                 claim=obs.claim,
                 coordination=coordination,
+                tts_cache=tts_cache,
             )
         except VoiceUnavailableError as error:
             raise HTTPException(status_code=503, detail=str(error)) from None
@@ -1025,7 +1028,10 @@ async def offer(request: Request) -> Any:
     payload = _validate_model(_OfferBody, await _read_json(request, MAX_OFFER_BYTES))
     assert isinstance(payload, _OfferBody)
     if payload.pc_id is None:
-        return await _initial_offer(payload, coordination)
+        # The optional TTS audio cache is owned by the app; the call runtime
+        # receives it so it can replay cached speech instead of synthesizing.
+        tts_cache = getattr(request.app.state, "tts_cache", None)
+        return await _initial_offer(payload, coordination, tts_cache=tts_cache)
 
     assert payload.renegotiation_token is not None
     signaling_rpc: SignalingRpc = request.app.state.signaling_rpc

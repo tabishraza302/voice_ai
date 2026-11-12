@@ -7,7 +7,11 @@ from types import SimpleNamespace
 import pytest
 from pipecat.frames.frames import (
     Frame,
+    InterruptionFrame,
     LLMContextFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    LLMTextFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
     TTSStoppedFrame,
@@ -19,8 +23,10 @@ from app.voice import (
     CallDefinition,
     CallRuntime,
     VoiceUnavailableError,
+    _FarewellState,
     _OutputCompletionProcessor,
     _Playback,
+    _ResponseCaptureProcessor,
     _TTSContextTracker,
     provider_publish_errors,
     validate_tts_voice_selection,
@@ -513,7 +519,7 @@ class _CompletionRuntimeProbe:
         self.completed: list[str | None] = []
         self.unconfirmed: list[str | None] = []
 
-    async def on_tts_started(self, frame: TTSStartedFrame) -> None:
+    async def on_tts_started(self, frame: TTSStartedFrame, *args: Any, **kwargs: Any) -> None:
         self.started.append(frame.context_id)
 
     async def on_tts_stopped(
@@ -713,11 +719,14 @@ async def test_voice_runtime_handle_end_call_waits_for_playback(monkeypatch) -> 
     assert runtime.closing is False
     assert messages == []
 
-    # Complete the playback
+    # Complete the playback and downstream turn barrier
     await runtime.on_tts_stopped(
         TTSStoppedFrame(context_id="farewell-ctx"),
         transport_completed=True,
     )
+    end_frame = LLMFullResponseEndFrame()
+    end_frame.generation = 1
+    await runtime.on_llm_response_completed(end_frame)
 
     assert runtime.closing is True
     assert runtime.termination_status == "completed"
@@ -765,6 +774,397 @@ async def test_voice_runtime_handle_end_call_safety_timer(monkeypatch) -> None:
     assert messages == [{"type": "call.completed"}]
     if runtime.cleanup_task:
         await runtime.cleanup_task
+
+
+@pytest.mark.anyio
+async def test_multisegment_llm_response_not_finalized_at_first_segment(monkeypatch) -> None:
+    async def no_op_cleanup(runtime: CallRuntime) -> None:
+        return None
+    monkeypatch.setattr("app.voice._cleanup_runtime", no_op_cleanup)
+
+    definition = make_definition()
+    writer = FakeWriter()
+    runtime = CallRuntime(definition, writer)
+    captions: list[dict[str, Any]] = []
+
+    class Connection:
+        def send_app_message(self, message: dict[str, Any]) -> None:
+            if message.get("type") == "caption":
+                captions.append(message)
+
+    runtime.connection = Connection()
+
+    capture = _ResponseCaptureProcessor(runtime)
+    tracker = _TTSContextTracker(runtime)
+    output = _OutputCompletionProcessor(runtime, tracker.audio_contexts)
+
+    # 1. LLM generates 2 segments
+    start_frame = LLMFullResponseStartFrame()
+    await capture.process_frame(start_frame, FrameDirection.DOWNSTREAM)
+    await capture.process_frame(LLMTextFrame(text="Hello! "), FrameDirection.DOWNSTREAM)
+    await capture.process_frame(LLMTextFrame(text="Your balance is 42."), FrameDirection.DOWNSTREAM)
+    end_frame = LLMFullResponseEndFrame()
+    await capture.process_frame(end_frame, FrameDirection.DOWNSTREAM)
+
+    # Segment 1 starts and stops
+    await tracker.process_frame(TTSStartedFrame(context_id="ctx-1"), FrameDirection.DOWNSTREAM)
+    await tracker.process_frame(
+        TTSAudioRawFrame(audio=b"\x00" * 320, sample_rate=16000, num_channels=1, context_id="ctx-1"),
+        FrameDirection.DOWNSTREAM,
+    )
+    await output.process_frame(TTSStoppedFrame(context_id="ctx-1"), FrameDirection.DOWNSTREAM)
+
+    # After segment 1 stop, the full 2-sentence response MUST NOT be persisted yet!
+    assert writer.messages == [], "Full response was prematurely persisted at the first segment stop!"
+    assert not any(c.get("final") is True for c in captions), "Final caption was prematurely sent at the first segment stop!"
+
+    # Segment 2 starts and stops
+    await tracker.process_frame(TTSStartedFrame(context_id="ctx-2"), FrameDirection.DOWNSTREAM)
+    await tracker.process_frame(
+        TTSAudioRawFrame(audio=b"\x00" * 320, sample_rate=16000, num_channels=1, context_id="ctx-2"),
+        FrameDirection.DOWNSTREAM,
+    )
+    await output.process_frame(TTSStoppedFrame(context_id="ctx-2"), FrameDirection.DOWNSTREAM)
+
+    # Still waiting for downstream turn barrier
+    assert writer.messages == []
+
+    # Downstream turn barrier arrives
+    await output.process_frame(end_frame, FrameDirection.DOWNSTREAM)
+
+    # Now persisted exactly once!
+    assert len(writer.messages) == 1
+    assert writer.messages[0] == ("assistant", "Hello! Your balance is 42.")
+    assert any(
+        c.get("final") is True and c.get("text") == "Hello! Your balance is 42."
+        for c in captions
+    )
+
+
+@pytest.mark.anyio
+async def test_twosegment_natural_farewell_not_stopped_at_first_segment(monkeypatch) -> None:
+    async def no_op_cleanup(runtime: CallRuntime) -> None:
+        return None
+    monkeypatch.setattr("app.voice._cleanup_runtime", no_op_cleanup)
+
+    definition = make_definition()
+    writer = FakeWriter()
+    runtime = CallRuntime(definition, writer)
+    messages: list[dict[str, Any]] = []
+
+    class Connection:
+        def send_app_message(self, message: dict[str, Any]) -> None:
+            messages.append(message)
+
+    runtime.connection = Connection()
+
+    capture = _ResponseCaptureProcessor(runtime)
+    tracker = _TTSContextTracker(runtime)
+    output = _OutputCompletionProcessor(runtime, tracker.audio_contexts)
+
+    # Natural farewell turn
+    start_frame = LLMFullResponseStartFrame()
+    await capture.process_frame(start_frame, FrameDirection.DOWNSTREAM)
+    await capture.process_frame(LLMTextFrame(text="Thank you for calling. "), FrameDirection.DOWNSTREAM)
+    await capture.process_frame(LLMTextFrame(text="Goodbye!"), FrameDirection.DOWNSTREAM)
+    end_frame = LLMFullResponseEndFrame()
+    await capture.process_frame(end_frame, FrameDirection.DOWNSTREAM)
+
+    runtime.farewell = _FarewellState(
+        pending=True,
+        mode="natural",
+        generation=runtime.active_response_generation,
+        message="Thank you for calling. Goodbye!",
+    )
+    runtime.end_call_pending = True
+
+    # Segment 1 starts and stops
+    await tracker.process_frame(TTSStartedFrame(context_id="farewell-seg-1"), FrameDirection.DOWNSTREAM)
+    await tracker.process_frame(
+        TTSAudioRawFrame(audio=b"\x00" * 320, sample_rate=16000, num_channels=1, context_id="farewell-seg-1"),
+        FrameDirection.DOWNSTREAM,
+    )
+    await output.process_frame(TTSStoppedFrame(context_id="farewell-seg-1"), FrameDirection.DOWNSTREAM)
+
+    # Segment 1 stopped, but segment 2 hasn't played yet: call must NOT be closed!
+    assert runtime.closing is False, "Call was prematurely terminated after only the first farewell segment!"
+
+    # Segment 2 starts and stops
+    await tracker.process_frame(TTSStartedFrame(context_id="farewell-seg-2"), FrameDirection.DOWNSTREAM)
+    await tracker.process_frame(
+        TTSAudioRawFrame(audio=b"\x00" * 320, sample_rate=16000, num_channels=1, context_id="farewell-seg-2"),
+        FrameDirection.DOWNSTREAM,
+    )
+    await output.process_frame(TTSStoppedFrame(context_id="farewell-seg-2"), FrameDirection.DOWNSTREAM)
+
+    assert runtime.closing is False
+
+    # Downstream turn barrier arrives
+    await output.process_frame(end_frame, FrameDirection.DOWNSTREAM)
+
+    assert runtime.closing is True
+    assert runtime.termination_status == "completed"
+    assert {"type": "call.completed"} in messages
+
+
+@pytest.mark.anyio
+async def test_interruption_during_segment_two_discards_full_persistence(monkeypatch) -> None:
+    async def no_op_cleanup(runtime: CallRuntime) -> None:
+        return None
+    monkeypatch.setattr("app.voice._cleanup_runtime", no_op_cleanup)
+
+    definition = make_definition()
+    writer = FakeWriter()
+    runtime = CallRuntime(definition, writer)
+
+    class Connection:
+        def send_app_message(self, message: dict[str, Any]) -> None:
+            pass
+
+    runtime.connection = Connection()
+
+    capture = _ResponseCaptureProcessor(runtime)
+    tracker = _TTSContextTracker(runtime)
+    output = _OutputCompletionProcessor(runtime, tracker.audio_contexts)
+
+    # 1. LLM generates 2 segments
+    start_frame = LLMFullResponseStartFrame()
+    await capture.process_frame(start_frame, FrameDirection.DOWNSTREAM)
+    await capture.process_frame(LLMTextFrame(text="First part. "), FrameDirection.DOWNSTREAM)
+    await capture.process_frame(LLMTextFrame(text="Second part."), FrameDirection.DOWNSTREAM)
+    end_frame = LLMFullResponseEndFrame()
+    await capture.process_frame(end_frame, FrameDirection.DOWNSTREAM)
+
+    # Segment 1 delivered successfully
+    await tracker.process_frame(TTSStartedFrame(context_id="seg-1"), FrameDirection.DOWNSTREAM)
+    await tracker.process_frame(TTSAudioRawFrame(audio=b"\x00" * 320, sample_rate=16000, num_channels=1, context_id="seg-1"), FrameDirection.DOWNSTREAM)
+    await output.process_frame(TTSStoppedFrame(context_id="seg-1"), FrameDirection.DOWNSTREAM)
+    assert writer.messages == []
+
+    # Segment 2 starts
+    await tracker.process_frame(TTSStartedFrame(context_id="seg-2"), FrameDirection.DOWNSTREAM)
+    await tracker.process_frame(TTSAudioRawFrame(audio=b"\x00" * 320, sample_rate=16000, num_channels=1, context_id="seg-2"), FrameDirection.DOWNSTREAM)
+
+    # Interruption occurs while segment 2 is playing!
+    interruption = InterruptionFrame()
+    await capture.process_frame(interruption, FrameDirection.DOWNSTREAM)
+    await tracker.process_frame(interruption, FrameDirection.DOWNSTREAM)
+    await output.process_frame(interruption, FrameDirection.DOWNSTREAM)
+
+    # Segment 2 stop arrives after interruption
+    await output.process_frame(TTSStoppedFrame(context_id="seg-2"), FrameDirection.DOWNSTREAM)
+
+    # End frame barrier arrives (if not cleared by tts)
+    await output.process_frame(end_frame, FrameDirection.DOWNSTREAM)
+
+    # The entire generated response MUST NOT be persisted as spoken
+    assert writer.messages == [], "Interrupted response was incorrectly persisted as spoken!"
+
+
+@pytest.mark.anyio
+async def test_forced_farewell_uninterruptible_across_interruption(monkeypatch) -> None:
+    async def no_op_cleanup(runtime: CallRuntime) -> None:
+        return None
+    monkeypatch.setattr("app.voice._cleanup_runtime", no_op_cleanup)
+
+    definition = make_definition()
+    writer = FakeWriter()
+    runtime = CallRuntime(definition, writer)
+    messages: list[dict[str, Any]] = []
+
+    class Connection:
+        def send_app_message(self, message: dict[str, Any]) -> None:
+            messages.append(message)
+
+    runtime.connection = Connection()
+
+    tracker = _TTSContextTracker(runtime)
+    output = _OutputCompletionProcessor(
+        runtime,
+        tracker.audio_contexts,
+        tracker.uninterruptible_contexts,
+    )
+
+    # Forced explicit farewell. In production the TTS request hook records the
+    # farewell text and context before TTSStartedFrame reaches the tracker.
+    runtime.farewell = _FarewellState(
+        pending=True,
+        mode="explicit",
+        message="Thank you for calling. Goodbye!",
+        context_id="forced-farewell-ctx",
+    )
+    runtime.tts_request_texts["forced-farewell-ctx"] = "Thank you for calling. Goodbye!"
+    runtime.end_call_pending = True
+
+    # Uninterruptible started frame
+    started = TTSStartedFrame(context_id="forced-farewell-ctx")
+    started.interruptible = False
+    await tracker.process_frame(started, FrameDirection.DOWNSTREAM)
+
+    audio = TTSAudioRawFrame(audio=b"\x00" * 320, sample_rate=16000, num_channels=1, context_id="forced-farewell-ctx")
+    audio.interruptible = False
+    await tracker.process_frame(audio, FrameDirection.DOWNSTREAM)
+
+    # Interruption arrives after audio was queued but before stop marker
+    interruption = InterruptionFrame()
+    await tracker.process_frame(interruption, FrameDirection.DOWNSTREAM)
+    runtime.note_interruption()
+
+    # The uninterruptible playback context must remain in audio_contexts and not be marked interrupted
+    assert "forced-farewell-ctx" in tracker.audio_contexts
+    assert runtime.playbacks["forced-farewell-ctx"].interrupted is False
+
+    # Stop marker arrives
+    stopped = TTSStoppedFrame(context_id="forced-farewell-ctx")
+    stopped.interruptible = False
+    await output.process_frame(stopped, FrameDirection.DOWNSTREAM)
+
+    # Completes successfully, message persisted, call completed
+    assert runtime.closing is True
+    assert runtime.termination_status == "completed"
+    assert {"type": "call.completed"} in messages
+    assert writer.messages == [("assistant", "Thank you for calling. Goodbye!")]
+
+
+@pytest.mark.anyio
+async def test_cached_forced_farewell_uninterruptible_when_frames_arrive_with_default_interruptible(monkeypatch) -> None:
+    async def no_op_cleanup(runtime: CallRuntime) -> None:
+        return None
+    monkeypatch.setattr("app.voice._cleanup_runtime", no_op_cleanup)
+
+    definition = make_definition()
+    writer = FakeWriter()
+    runtime = CallRuntime(definition, writer)
+    messages: list[dict[str, Any]] = []
+
+    class Connection:
+        def send_app_message(self, message: dict[str, Any]) -> None:
+            messages.append(message)
+
+    runtime.connection = Connection()
+
+    tracker = _TTSContextTracker(runtime)
+    output = _OutputCompletionProcessor(
+        runtime,
+        tracker.audio_contexts,
+        tracker.uninterruptible_contexts,
+    )
+
+    # Forced explicit farewell triggered
+    runtime.farewell = _FarewellState(
+        pending=True,
+        mode="explicit",
+        message="Goodbye!",
+        context_id="cached-farewell-ctx",
+    )
+    runtime.tts_request_texts["cached-farewell-ctx"] = "Goodbye!"
+    runtime.end_call_pending = True
+
+    # Cached provider frames arrive with DEFAULT interruptible=True (cached provider has no concept of farewell)
+    started = TTSStartedFrame(context_id="cached-farewell-ctx")
+    assert started.interruptible is True
+    await tracker.process_frame(started, FrameDirection.DOWNSTREAM)
+
+    # Tracker must enforce interruptible=False on the started frame and register context
+    assert started.interruptible is False
+    assert "cached-farewell-ctx" in tracker.uninterruptible_contexts
+    assert runtime.playbacks["cached-farewell-ctx"].interruptible is False
+
+    audio = TTSAudioRawFrame(audio=b"\x00" * 320, sample_rate=16000, num_channels=1, context_id="cached-farewell-ctx")
+    assert audio.interruptible is True
+    await tracker.process_frame(audio, FrameDirection.DOWNSTREAM)
+    # Tracker must force interruptible=False on audio frame before transport gate
+    assert audio.interruptible is False
+    assert "cached-farewell-ctx" in tracker.audio_contexts
+
+    # Interruption arrives after last audio but before stop marker
+    interruption = InterruptionFrame()
+    await tracker.process_frame(interruption, FrameDirection.DOWNSTREAM)
+    runtime.note_interruption()
+
+    # Audio context must remain tracked and not marked interrupted
+    assert "cached-farewell-ctx" in tracker.audio_contexts
+    assert runtime.playbacks["cached-farewell-ctx"].interrupted is False
+
+    # Stop marker arrives with default interruptible=True
+    stopped = TTSStoppedFrame(context_id="cached-farewell-ctx")
+    assert stopped.interruptible is True
+    await tracker.process_frame(stopped, FrameDirection.DOWNSTREAM)
+    assert stopped.interruptible is False
+
+    # Transport completion processes stop frame
+    await output.process_frame(stopped, FrameDirection.DOWNSTREAM)
+
+    # Call completes successfully with farewell delivered
+    assert runtime.closing is True
+    assert runtime.termination_status == "completed"
+    assert {"type": "call.completed"} in messages
+    assert writer.messages == [("assistant", "Goodbye!")]
+
+
+@pytest.mark.anyio
+async def test_turn_overlap_preserves_distinct_generations(monkeypatch) -> None:
+    async def no_op_cleanup(runtime: CallRuntime) -> None:
+        return None
+    monkeypatch.setattr("app.voice._cleanup_runtime", no_op_cleanup)
+
+    definition = make_definition()
+    writer = FakeWriter()
+    runtime = CallRuntime(definition, writer)
+
+    class Connection:
+        def send_app_message(self, message: dict[str, Any]) -> None:
+            pass
+
+    runtime.connection = Connection()
+
+    capture = _ResponseCaptureProcessor(runtime)
+    tracker = _TTSContextTracker(runtime)
+    output = _OutputCompletionProcessor(runtime, tracker.audio_contexts)
+
+    # Turn 1
+    turn1_start = LLMFullResponseStartFrame()
+    await capture.process_frame(turn1_start, FrameDirection.DOWNSTREAM)
+    await capture.process_frame(LLMTextFrame(text="Turn 1 speech."), FrameDirection.DOWNSTREAM)
+    turn1_end = LLMFullResponseEndFrame()
+    await capture.process_frame(turn1_end, FrameDirection.DOWNSTREAM)
+
+    # Turn 1 start reaches tracker
+    await tracker.process_frame(turn1_start, FrameDirection.DOWNSTREAM)
+    await tracker.process_frame(TTSStartedFrame(context_id="turn1-ctx"), FrameDirection.DOWNSTREAM)
+    await tracker.process_frame(TTSAudioRawFrame(audio=b"\x00" * 320, sample_rate=16000, num_channels=1, context_id="turn1-ctx"), FrameDirection.DOWNSTREAM)
+
+    # While Turn 1 is playing out, Turn 2 starts upstream!
+    turn2_start = LLMFullResponseStartFrame()
+    await capture.process_frame(turn2_start, FrameDirection.DOWNSTREAM)
+    await capture.process_frame(LLMTextFrame(text="Turn 2 speech."), FrameDirection.DOWNSTREAM)
+    turn2_end = LLMFullResponseEndFrame()
+    await capture.process_frame(turn2_end, FrameDirection.DOWNSTREAM)
+
+    # Turn 1 context has generation 1
+    assert runtime.playbacks["turn1-ctx"].generation == 1
+
+    # Turn 1 finishes playing downstream
+    await output.process_frame(TTSStoppedFrame(context_id="turn1-ctx"), FrameDirection.DOWNSTREAM)
+    await output.process_frame(turn1_end, FrameDirection.DOWNSTREAM)
+
+    # Turn 1 message persisted
+    assert writer.messages == [("assistant", "Turn 1 speech.")]
+
+    # Now Turn 2 flows downstream
+    await tracker.process_frame(turn2_start, FrameDirection.DOWNSTREAM)
+    await tracker.process_frame(TTSStartedFrame(context_id="turn2-ctx"), FrameDirection.DOWNSTREAM)
+    await tracker.process_frame(TTSAudioRawFrame(audio=b"\x00" * 320, sample_rate=16000, num_channels=1, context_id="turn2-ctx"), FrameDirection.DOWNSTREAM)
+    assert runtime.playbacks["turn2-ctx"].generation == 2
+
+    await output.process_frame(TTSStoppedFrame(context_id="turn2-ctx"), FrameDirection.DOWNSTREAM)
+    await output.process_frame(turn2_end, FrameDirection.DOWNSTREAM)
+
+    # Turn 2 message persisted in order
+    assert writer.messages == [
+        ("assistant", "Turn 1 speech."),
+        ("assistant", "Turn 2 speech."),
+    ]
 
 
 @pytest.mark.parametrize(

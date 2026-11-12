@@ -16,6 +16,7 @@ from .coordination import Coordination
 from .db import Session as DbSession, engine
 from .redis import open_redis_resources
 from .signaling_rpc import SignalingRpc
+from .tts_cache import TTSAudioCache
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +191,14 @@ async def lifespan(app: FastAPI):
 
     async with DefaultAsyncHttpxClient() as openai_http_client:
         app.state.openai_http_client = openai_http_client
+        # The optional TTS audio cache. It is owned by the app, so every call
+        # shares one client, and it never keeps the application from starting:
+        # a cache that cannot be used simply admits nothing.
+        tts_cache = TTSAudioCache(
+            redis_url=os.environ.get("TTS_CACHE_REDIS_URL"),
+            phrases_json=os.environ.get("TTS_CACHE_PHRASES_JSON"),
+        )
+        app.state.tts_cache = tts_cache
         try:
             yield
         finally:
@@ -230,7 +239,9 @@ async def lifespan(app: FastAPI):
             app.state.redis = None
             app.state.signaling_rpc = None
             app.state.worker_id = None
+            app.state.tts_cache = None
 
+            await tts_cache.close()
             await engine.dispose()
 
 

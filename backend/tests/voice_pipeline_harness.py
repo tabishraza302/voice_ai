@@ -634,13 +634,22 @@ class RunningVoicePipeline:
                         return
                     return
                 if direction == FrameDirection.DOWNSTREAM and isinstance(frame, LLMFullResponseEndFrame):
-                    if harness.scenario == "backchannel-during-playback" and self.open_reply_context:
-                        ctx = self.open_reply_context
-                        self.open_reply_context = None
-                        await self.push_frame(
-                            TTSStoppedFrame(context_id=ctx),
-                            FrameDirection.DOWNSTREAM,
-                        )
+                    if harness.scenario == "backchannel-during-playback":
+                        # The assistant playback of the previous turn may still
+                        # be running: the end of a turn only closes it once the
+                        # audio it queued has been played.
+                        if self._playback_task and not self._playback_task.done():
+                            try:
+                                await self._playback_task
+                            except asyncio.CancelledError:
+                                pass
+                        if self.open_reply_context:
+                            ctx = self.open_reply_context
+                            self.open_reply_context = None
+                            await self.push_frame(
+                                TTSStoppedFrame(context_id=ctx),
+                                FrameDirection.DOWNSTREAM,
+                            )
                 if direction == FrameDirection.DOWNSTREAM and isinstance(frame, TTSSpeakFrame):
                     self.synthesis_requested.set()
                     self.spoken_requests.append(frame.text)
